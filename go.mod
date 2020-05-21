@@ -1,4 +1,4 @@
-module github.com/jamesroutley/rss-feed/rss-feed-generator
+module github.com/jamesroutley/news.routley.io
 
 go 1.13
 
