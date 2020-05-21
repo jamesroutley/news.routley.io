@@ -14,6 +14,11 @@ import (
 	"github.com/mmcdole/gofeed"
 )
 
+type TemplateData struct {
+	Posts     []*Post
+	Timestamp string
+}
+
 type Post struct {
 	Link      string
 	Title     string
@@ -30,6 +35,8 @@ var (
 
 	// Show up to 30 days of posts
 	relevantDuration = 30 * 24 * time.Hour
+
+	timeFormat = "on 02 January 2006 at 15:04 MST"
 
 	outputDir  = "docs" // So we can host the site on GitHub Pages
 	outputFile = "index.html"
@@ -54,7 +61,12 @@ func run(ctx context.Context) error {
 	}
 	defer f.Close()
 
-	if err := executeTemplate(f, posts); err != nil {
+	templateData := &TemplateData{
+		Posts:     posts,
+		Timestamp: time.Now().UTC().Format(timeFormat),
+	}
+
+	if err := executeTemplate(f, templateData); err != nil {
 		return err
 	}
 
@@ -100,7 +112,7 @@ func getPosts(ctx context.Context, feeds []string) []*Post {
 	return posts
 }
 
-func executeTemplate(writer io.Writer, posts []*Post) error {
+func executeTemplate(writer io.Writer, templateData *TemplateData) error {
 	htmlTemplate := `
 <!DOCTYPE html>
 <html>
@@ -115,9 +127,13 @@ func executeTemplate(writer io.Writer, posts []*Post) error {
 		<h1>News</h1>
 
 		<ol>
-			{{ range . }}<li><a href="{{ .Link }}">{{ .Title }}</a> ({{ .Host }})</li>
+			{{ range .Posts }}<li><a href="{{ .Link }}">{{ .Title }}</a> ({{ .Host }})</li>
 			{{ end }}
 		</ol>
+
+		<footer>
+			<p>Last updated {{ .Timestamp }}</p>
+		</footer>
 	</body>
 </html>
 `
@@ -126,7 +142,7 @@ func executeTemplate(writer io.Writer, posts []*Post) error {
 	if err != nil {
 		return err
 	}
-	if err := tmpl.Execute(writer, posts); err != nil {
+	if err := tmpl.Execute(writer, templateData); err != nil {
 		return err
 	}
 
