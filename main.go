@@ -31,6 +31,8 @@ var (
 		"https://themargins.substack.com/feed.xml",
 		"https://jvns.ca/atom.xml",
 		"https://joy.recurse.com/feed.atom",
+		"https://danluu.com/atom.xml",
+		"https://blog.veitheller.de/feed.rss",
 	}
 
 	// Show up to 30 days of posts
@@ -40,10 +42,15 @@ var (
 
 	outputDir  = "docs" // So we can host the site on GitHub Pages
 	outputFile = "index.html"
+
+	// Error out if fetching feeds takes longer than a minute
+	timeout = time.Minute
 )
 
 func main() {
-	if err := run(context.TODO()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -132,6 +139,7 @@ func executeTemplate(writer io.Writer, templateData *TemplateData) error {
 		</ol>
 
 		<footer>
+			<p><a href="https://github.com/jamesroutley/news.routley.io">What is this?</a></p>
 			<p>Last updated {{ .Timestamp }}</p>
 		</footer>
 	</body>
