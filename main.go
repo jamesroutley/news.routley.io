@@ -33,10 +33,11 @@ var (
 		"https://joy.recurse.com/feed.atom",
 		"https://danluu.com/atom.xml",
 		"https://blog.veitheller.de/feed.rss",
+		"https://twobithistory.org/feed.xml",
 	}
 
-	// Show up to 30 days of posts
-	relevantDuration = 30 * 24 * time.Hour
+	// Show up to 60 days of posts
+	relevantDuration = 60 * 24 * time.Hour
 
 	timeFormat = "on 02 January 2006 at 15:04 MST"
 
