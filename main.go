@@ -129,7 +129,22 @@ func executeTemplate(writer io.Writer, templateData *TemplateData) error {
 		<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
 		<meta name="viewport" content="width=device-width, initial-scale=1">
 		<title>James Routley | Feed</title>
-		<link type="text/css" rel="stylesheet" href="css/styles.css">
+		<style>
+			@import url("https://fonts.googleapis.com/css2?family=Nanum+Myeongjo&display=swap");
+
+			body {
+				font-family: "Nanum Myeongjo", serif;
+				line-height: 1.7;
+				max-width: 600px;
+				margin: 50px auto 50px;
+				padding: 0 12px 0;
+				height: 100%;
+			}
+
+			li {
+				padding-bottom: 16px;
+			}
+		</style>
 	</head>
 	<body>
 		<h1>News</h1>
