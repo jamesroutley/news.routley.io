@@ -34,6 +34,11 @@ var (
 		"https://danluu.com/atom.xml",
 		"https://blog.veitheller.de/feed.rss",
 		"https://twobithistory.org/feed.xml",
+		"https://rachelbythebay.com/w/atom.xml",
+		"https://scattered-thoughts.net/rss.xml",
+
+		// My mum's food blog 💖
+		"https://gochugarugirl.com/feed/",
 	}
 
 	// Show up to 60 days of posts
