@@ -39,6 +39,9 @@ var (
 
 		// My mum's food blog 💖
 		"https://gochugarugirl.com/feed/",
+
+		"https://commoncog.com/blog/rss/",
+		"https://highgrowthengineering.substack.com/feed",
 	}
 
 	// Show up to 60 days of posts
