@@ -15,8 +15,7 @@ import (
 )
 
 type TemplateData struct {
-	Posts     []*Post
-	Timestamp string
+	Posts []*Post
 }
 
 type Post struct {
@@ -79,8 +78,7 @@ func run(ctx context.Context) error {
 	defer f.Close()
 
 	templateData := &TemplateData{
-		Posts:     posts,
-		Timestamp: time.Now().UTC().Format(timeFormat),
+		Posts: posts,
 	}
 
 	if err := executeTemplate(f, templateData); err != nil {
@@ -165,7 +163,6 @@ func executeTemplate(writer io.Writer, templateData *TemplateData) error {
 
 		<footer>
 			<p><a href="https://github.com/jamesroutley/news.routley.io">What is this?</a></p>
-			<p>Last updated {{ .Timestamp }}</p>
 		</footer>
 	</body>
 </html>
