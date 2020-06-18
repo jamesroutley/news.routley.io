@@ -2,6 +2,8 @@
 
 Hello! This repo houses the code that generates my personal RSS feed. It's hosted at [news.routley.io](https://news.routley.io/). The code itself is non-generic and personalised to my use case, but it might serve as interesting inspiration.
 
+I've also [written a blog post about this](https://routley.io/posts/bespoke-software-rss-aggregator/).
+
 ## How does it work?
 
 ### Building the website
