@@ -8,10 +8,15 @@ import (
 	"os"
 	"path"
 	"sort"
+	"sync"
 	"text/template"
 	"time"
 
 	"github.com/mmcdole/gofeed"
+)
+
+var (
+	wg sync.WaitGroup
 )
 
 type TemplateData struct {
@@ -65,7 +70,7 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	posts := getPosts(ctx, feeds)
+	posts := getAllPosts(ctx, feeds)
 
 	if err := os.MkdirAll(outputDir, 0700); err != nil {
 		return err
@@ -88,36 +93,26 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-// getPosts returns all posts from all feeds from the last `relevantDuration`
+// getAllPosts returns all posts from all feeds from the last `relevantDuration`
 // time period. Posts are sorted chronologically descending.
-func getPosts(ctx context.Context, feeds []string) []*Post {
-	var posts []*Post
+func getAllPosts(ctx context.Context, feeds []string) []*Post {
+	numFeeds := len(feeds)
+	postChan := make(chan *Post, numFeeds)
+
 	for _, feed := range feeds {
-		parser := gofeed.NewParser()
-		feed, err := parser.ParseURLWithContext(feed, ctx)
-		if err != nil {
-			log.Println(err)
-		}
-		for _, item := range feed.Items {
-			published := item.PublishedParsed
-			if published == nil {
-				published = item.UpdatedParsed
-			}
-			if published.Before(time.Now().Add(-relevantDuration)) {
-				continue
-			}
-			parsedLink, err := url.Parse(item.Link)
-			if err != nil {
-				log.Println(err)
-			}
-			posts = append(posts, &Post{
-				Link:      item.Link,
-				Title:     item.Title,
-				Published: *published,
-				Host:      parsedLink.Host,
-			})
-		}
+		wg.Add(1)
+		go getPosts(ctx, feed, postChan)
 	}
+
+	var posts []*Post
+	go func() {
+		for post := range postChan {
+			posts = append(posts, post)
+		}
+	}()
+
+	wg.Wait()
+	close(postChan)
 
 	// Sort items chronologically descending
 	sort.Slice(posts, func(i, j int) bool {
@@ -125,6 +120,36 @@ func getPosts(ctx context.Context, feeds []string) []*Post {
 	})
 
 	return posts
+}
+
+func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
+	parser := gofeed.NewParser()
+	feed, err := parser.ParseURLWithContext(feedURL, ctx)
+	if err != nil {
+		log.Println(err)
+	}
+
+	for _, item := range feed.Items {
+		published := item.PublishedParsed
+		if published == nil {
+			published = item.UpdatedParsed
+		}
+		if published.Before(time.Now().Add(-relevantDuration)) {
+			continue
+		}
+		parsedLink, err := url.Parse(item.Link)
+		if err != nil {
+			log.Println(err)
+		}
+		post := &Post{
+			Link:      item.Link,
+			Title:     item.Title,
+			Published: *published,
+			Host:      parsedLink.Host,
+		}
+		posts <- post
+	}
+	wg.Done()
 }
 
 func executeTemplate(writer io.Writer, templateData *TemplateData) error {
