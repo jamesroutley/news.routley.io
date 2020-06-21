@@ -47,6 +47,7 @@ var (
 		"https://commoncog.com/blog/rss/",
 		"https://highgrowthengineering.substack.com/feed",
 		"http://tonsky.me/blog/atom.xml",
+		"https://www.benkuhn.net/index.xml",
 	}
 
 	// Show up to 60 days of posts
