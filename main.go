@@ -53,8 +53,6 @@ var (
 	// Show up to 60 days of posts
 	relevantDuration = 60 * 24 * time.Hour
 
-	timeFormat = "on 02 January 2006 at 15:04 MST"
-
 	outputDir  = "docs" // So we can host the site on GitHub Pages
 	outputFile = "index.html"
 
@@ -97,11 +95,10 @@ func run(ctx context.Context) error {
 // getAllPosts returns all posts from all feeds from the last `relevantDuration`
 // time period. Posts are sorted chronologically descending.
 func getAllPosts(ctx context.Context, feeds []string) []*Post {
-	numFeeds := len(feeds)
-	postChan := make(chan *Post, numFeeds)
+	postChan := make(chan *Post)
 
+	wg.Add(len(feeds))
 	for _, feed := range feeds {
-		wg.Add(1)
 		go getPosts(ctx, feed, postChan)
 	}
 
@@ -124,6 +121,7 @@ func getAllPosts(ctx context.Context, feeds []string) []*Post {
 }
 
 func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
+	defer wg.Done()
 	parser := gofeed.NewParser()
 	feed, err := parser.ParseURLWithContext(feedURL, ctx)
 	if err != nil {
@@ -150,7 +148,6 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 		}
 		posts <- post
 	}
-	wg.Done()
 }
 
 func executeTemplate(writer io.Writer, templateData *TemplateData) error {
