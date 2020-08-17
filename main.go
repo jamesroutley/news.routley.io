@@ -48,6 +48,8 @@ var (
 		"https://highgrowthengineering.substack.com/feed",
 		"http://tonsky.me/blog/atom.xml",
 		"https://www.benkuhn.net/index.xml",
+
+		"https://hnrss.org/frontpage?points=100",
 	}
 
 	// Show up to 60 days of posts
