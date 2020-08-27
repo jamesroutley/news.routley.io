@@ -49,7 +49,7 @@ var (
 		"http://tonsky.me/blog/atom.xml",
 		"https://www.benkuhn.net/index.xml",
 
-		"https://hnrss.org/frontpage?points=100",
+		"https://hnrss.org/frontpage?points=50",
 	}
 
 	// Show up to 60 days of posts
