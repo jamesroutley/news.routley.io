@@ -50,6 +50,7 @@ var (
 		"https://www.benkuhn.net/index.xml",
 
 		"https://hnrss.org/frontpage?points=50",
+		"https://solar.lowtechmagazine.com/feeds/all-en.atom.xml",
 	}
 
 	// Show up to 60 days of posts
