@@ -51,6 +51,7 @@ var (
 
 		"https://hnrss.org/frontpage?points=50",
 		"https://solar.lowtechmagazine.com/feeds/all-en.atom.xml",
+		"https://www.slowernews.com/rss.xml",
 	}
 
 	// Show up to 60 days of posts
