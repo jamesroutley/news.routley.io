@@ -52,6 +52,7 @@ var (
 		"https://hnrss.org/frontpage?points=50",
 		"https://solar.lowtechmagazine.com/feeds/all-en.atom.xml",
 		"https://www.slowernews.com/rss.xml",
+		"https://samstarling.co.uk/weeknotes/index.xml",
 	}
 
 	// Show up to 60 days of posts
@@ -130,6 +131,7 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 	feed, err := parser.ParseURLWithContext(feedURL, ctx)
 	if err != nil {
 		log.Println(err)
+		return
 	}
 
 	for _, item := range feed.Items {
