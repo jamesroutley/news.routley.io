@@ -53,6 +53,7 @@ var (
 		"https://solar.lowtechmagazine.com/feeds/all-en.atom.xml",
 		"https://www.slowernews.com/rss.xml",
 		"https://samstarling.co.uk/weeknotes/index.xml",
+		"https://macwright.com/rss.xml",
 	}
 
 	// Show up to 60 days of posts
