@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net/url"
@@ -131,7 +132,7 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 	parser := gofeed.NewParser()
 	feed, err := parser.ParseURLWithContext(feedURL, ctx)
 	if err != nil {
-		log.Println(err)
+		log.Println(fmt.Errorf("error parsing %s: %w", feedURL, err))
 		return
 	}
 
@@ -177,6 +178,21 @@ func executeTemplate(writer io.Writer, templateData *TemplateData) error {
 				padding: 0 12px 0;
 				height: 100%;
 			}
+
+		  @media (prefers-color-scheme: dark) {
+			body {
+			  background-color: hsl(238.6, 53.1%, 15.9%);
+			  color: hsl(0, 0%, 86.7%);
+			}
+
+			a {
+			  color: hsl(208, 96.8%, 75.3%);
+			}
+
+			a:visited {
+			  color: hsl(284.1, 96.1%, 80%);
+			}
+		  }
 
 			li {
 				padding-bottom: 16px;
