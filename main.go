@@ -2,33 +2,47 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
-	"text/template"
 	"time"
 
+	"github.com/cixtor/readability"
 	"github.com/mmcdole/gofeed"
 )
 
 var (
-	wg sync.WaitGroup
+	wg              sync.WaitGroup
+	reader          = readability.New()
+	nonAlphanumeric = regexp.MustCompile(`([^\w\d])`)
 )
 
-type TemplateData struct {
-	Posts []*Post
-}
+//go:embed index.template.html
+var indexTmpl string
+
+//go:embed post.template.html
+var postTmpl string
+
+//go:embed styles.css
+var styles string
 
 type Post struct {
 	Link      string
 	Title     string
 	Published time.Time
 	Host      string
+	Content   template.HTML
+	Filename  string
 }
 
 var (
@@ -53,12 +67,12 @@ var (
 		"https://hnrss.org/frontpage?points=50",
 		"https://solar.lowtechmagazine.com/feeds/all-en.atom.xml",
 		"https://www.slowernews.com/rss.xml",
-		"https://samstarling.co.uk/weeknotes/index.xml",
 		"https://macwright.com/rss.xml",
 	}
 
 	// Show up to 60 days of posts
-	relevantDuration = 60 * 24 * time.Hour
+	// TODO
+	relevantDuration = 7 * 24 * time.Hour
 
 	outputDir  = "docs" // So we can host the site on GitHub Pages
 	outputFile = "index.html"
@@ -82,17 +96,50 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	if err := os.RemoveAll(path.Join(outputDir, "posts")); err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(path.Join(outputDir, "posts"), 0700); err != nil {
+		return err
+	}
+
+	for _, post := range posts {
+		if post.Filename == "" {
+			continue
+		}
+		f, err := os.Create(path.Join(outputDir, "posts", post.Filename))
+		if err != nil {
+			return err
+		}
+
+		tmpl, err := template.New("webpage").Parse(postTmpl)
+		if err != nil {
+			return err
+		}
+		data := map[string]interface{}{
+			"Styles":   template.CSS(styles),
+			"Content":  post.Content,
+			"Original": post.Link,
+		}
+		if err := tmpl.Execute(f, data); err != nil {
+			return err
+		}
+
+		f.Close()
+	}
+
 	f, err := os.Create(path.Join(outputDir, outputFile))
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	templateData := &TemplateData{
-		Posts: posts,
+	data := map[string]interface{}{
+		"Posts":  posts,
+		"Styles": template.CSS(styles),
 	}
-
-	if err := executeTemplate(f, templateData); err != nil {
+	if err := executeTemplate(f, data); err != nil {
 		return err
 	}
 
@@ -121,6 +168,9 @@ func getAllPosts(ctx context.Context, feeds []string) []*Post {
 
 	// Sort items chronologically descending
 	sort.Slice(posts, func(i, j int) bool {
+		if posts[i].Published.Equal(posts[j].Published) {
+			return posts[i].Title < posts[j].Title
+		}
 		return posts[i].Published.After(posts[j].Published)
 	})
 
@@ -148,73 +198,59 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 		if err != nil {
 			log.Println(err)
 		}
+
 		post := &Post{
 			Link:      item.Link,
 			Title:     item.Title,
 			Published: *published,
 			Host:      parsedLink.Host,
+			Content:   template.HTML(item.Content),
 		}
+
+		// If content isn't available from RSS, try to pull it from the webpage
+		// itself
+		if post.Content == "" {
+			rsp, err := http.Get(item.Link)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+
+			// Don't try an parse non-HTML
+			contentType := rsp.Header.Get("content-type")
+			if contentType != "" && !strings.HasPrefix(contentType, "text/html") {
+				fmt.Println(rsp.Header.Get("content-type"))
+				continue
+			}
+
+			article, err := reader.Parse(rsp.Body, item.Link)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+
+			post.Content = template.HTML(article.Content)
+			post.Filename = titleToFilename(item.Title)
+
+			rsp.Body.Close()
+		}
+
 		posts <- post
 	}
 }
 
-func executeTemplate(writer io.Writer, templateData *TemplateData) error {
-	htmlTemplate := `
-<!DOCTYPE html>
-<html>
-	<head>
-		<meta charset="utf-8">
-		<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
-		<meta name="viewport" content="width=device-width, initial-scale=1">
-		<title>James Routley | Feed</title>
-		<style>
-			@import url("https://fonts.googleapis.com/css2?family=Nanum+Myeongjo&display=swap");
+func titleToFilename(s string) string {
+	s = nonAlphanumeric.ReplaceAllLiteralString(s, " ")
+	s = strings.ToLower(s)
+	fields := strings.Fields(s)
+	s = strings.Join(fields, "-") + ".html"
+	s = strings.TrimPrefix(s, "show-hn-")
+	s = strings.TrimPrefix(s, "ask-hn-")
+	return s
+}
 
-			body {
-				font-family: "Nanum Myeongjo", serif;
-				line-height: 1.7;
-				max-width: 600px;
-				margin: 50px auto 50px;
-				padding: 0 12px 0;
-				height: 100%;
-			}
-
-		  @media (prefers-color-scheme: dark) {
-			body {
-			  background-color: hsl(238.6, 53.1%, 15.9%);
-			  color: hsl(0, 0%, 86.7%);
-			}
-
-			a {
-			  color: hsl(208, 96.8%, 75.3%);
-			}
-
-			a:visited {
-			  color: hsl(284.1, 96.1%, 80%);
-			}
-		  }
-
-			li {
-				padding-bottom: 16px;
-			}
-		</style>
-	</head>
-	<body>
-		<h1>News</h1>
-
-		<ol>
-			{{ range .Posts }}<li><a href="{{ .Link }}">{{ .Title }}</a> ({{ .Host }})</li>
-			{{ end }}
-		</ol>
-
-		<footer>
-			<p><a href="https://github.com/jamesroutley/news.routley.io">What is this?</a></p>
-		</footer>
-	</body>
-</html>
-`
-
-	tmpl, err := template.New("webpage").Parse(htmlTemplate)
+func executeTemplate(writer io.Writer, templateData map[string]interface{}) error {
+	tmpl, err := template.New("webpage").Parse(indexTmpl)
 	if err != nil {
 		return err
 	}
