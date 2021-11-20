@@ -68,6 +68,7 @@ var (
 		"https://solar.lowtechmagazine.com/feeds/all-en.atom.xml",
 		"https://www.slowernews.com/rss.xml",
 		"https://macwright.com/rss.xml",
+		"https://mikehudack.substack.com/feed",
 	}
 
 	// Show up to 60 days of posts
