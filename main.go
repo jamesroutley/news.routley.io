@@ -70,6 +70,7 @@ var (
 		"https://macwright.com/rss.xml",
 		"https://mikehudack.substack.com/feed",
 		"https://www.wildlondon.org.uk/blog/all/rss.xml",
+		"https://blaggregator.recurse.com/atom.xml?token=4c4c4e40044244aab4a36e681dfb8fb0",
 	}
 
 	// Show up to 60 days of posts
