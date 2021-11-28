@@ -69,6 +69,7 @@ var (
 		"https://www.slowernews.com/rss.xml",
 		"https://macwright.com/rss.xml",
 		"https://mikehudack.substack.com/feed",
+		"https://www.wildlondon.org.uk/blog/all/rss.xml",
 	}
 
 	// Show up to 60 days of posts
