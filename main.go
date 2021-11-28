@@ -75,7 +75,7 @@ var (
 
 	// Show up to 60 days of posts
 	// TODO
-	relevantDuration = 14 * 24 * time.Hour
+	relevantDuration = 7 * 24 * time.Hour
 
 	outputDir  = "docs" // So we can host the site on GitHub Pages
 	outputFile = "index.html"
@@ -94,6 +94,11 @@ func main() {
 
 func run(ctx context.Context) error {
 	posts := getAllPosts(ctx, feeds)
+
+	start := time.Now()
+	defer func() {
+		log.Printf("Templated %d posts, took %s", len(posts), time.Since(start))
+	}()
 
 	if err := os.MkdirAll(outputDir, 0700); err != nil {
 		return err
@@ -182,6 +187,10 @@ func getAllPosts(ctx context.Context, feeds []string) []*Post {
 }
 
 func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
+	start := time.Now()
+	defer func() {
+		log.Printf("Fetched posts from %s, took %s", feedURL, time.Since(start))
+	}()
 	defer wg.Done()
 	parser := gofeed.NewParser()
 	feed, err := parser.ParseURLWithContext(feedURL, ctx)
