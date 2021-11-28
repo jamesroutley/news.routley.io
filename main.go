@@ -107,7 +107,7 @@ func run(ctx context.Context) error {
 	}
 
 	for _, post := range posts {
-		if post.Filename == "" {
+		if string(post.Content) == "" {
 			continue
 		}
 		f, err := os.Create(path.Join(outputDir, "posts", post.Filename))
@@ -115,7 +115,7 @@ func run(ctx context.Context) error {
 			return err
 		}
 
-		tmpl, err := template.New("webpage").Parse(postTmpl)
+		tmpl, err := template.New("post").Parse(postTmpl)
 		if err != nil {
 			return err
 		}
@@ -123,6 +123,7 @@ func run(ctx context.Context) error {
 			"Styles":   template.CSS(styles),
 			"Content":  post.Content,
 			"Original": post.Link,
+			"Title":    post.Title,
 		}
 		if err := tmpl.Execute(f, data); err != nil {
 			return err
@@ -207,6 +208,7 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 			Published: *published,
 			Host:      parsedLink.Host,
 			Content:   template.HTML(item.Content),
+			Filename:  titleToFilename(item.Title),
 		}
 
 		// If content isn't available from RSS, try to pull it from the webpage
@@ -221,7 +223,6 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 			// Don't try an parse non-HTML
 			contentType := rsp.Header.Get("content-type")
 			if contentType != "" && !strings.HasPrefix(contentType, "text/html") {
-				fmt.Println(rsp.Header.Get("content-type"))
 				continue
 			}
 
@@ -252,7 +253,7 @@ func titleToFilename(s string) string {
 }
 
 func executeTemplate(writer io.Writer, templateData map[string]interface{}) error {
-	tmpl, err := template.New("webpage").Parse(indexTmpl)
+	tmpl, err := template.New("index").Parse(indexTmpl)
 	if err != nil {
 		return err
 	}
