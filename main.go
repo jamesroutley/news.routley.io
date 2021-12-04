@@ -118,6 +118,7 @@ func run(ctx context.Context) error {
 
 	for _, post := range posts {
 		if string(post.Content) == "" {
+			log.Printf("Skipping writing post, no content: %s", post.Link)
 			continue
 		}
 		f, err := os.Create(path.Join(outputDir, "posts", post.Filename))
@@ -237,7 +238,16 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 		// If content isn't available from RSS, try to pull it from the webpage
 		// itself
 		if post.Content == "" {
-			rsp, err := http.Get(item.Link)
+			req, err := http.NewRequestWithContext(ctx, "GET", item.Link, nil)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			req.Header["User-Agent"] = []string{
+				"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+			}
+
+			rsp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				log.Println(err)
 				continue
@@ -246,6 +256,7 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 			// Don't try an parse non-HTML
 			contentType := rsp.Header.Get("content-type")
 			if contentType != "" && !strings.HasPrefix(contentType, "text/html") {
+				log.Printf("Not HTML: %s\n", item.Link)
 				continue
 			}
 
@@ -256,7 +267,10 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 			}
 
 			post.Content = template.HTML(article.Content)
-			post.Filename = titleToFilename(item.Title)
+
+			if post.Content == "" {
+				log.Printf("Content still empty after HTML reader: %s", item.Link)
+			}
 
 			rsp.Body.Close()
 		}
