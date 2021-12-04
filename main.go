@@ -84,6 +84,10 @@ var (
 	timeout = time.Minute
 )
 
+var blocklist = map[string]bool{
+	"www.metafilter.com": true,
+}
+
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -210,6 +214,10 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 		parsedLink, err := url.Parse(item.Link)
 		if err != nil {
 			log.Println(err)
+		}
+
+		if blocklist[parsedLink.Host] {
+			continue
 		}
 
 		post := &Post{
