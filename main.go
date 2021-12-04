@@ -184,11 +184,6 @@ func getAllPosts(ctx context.Context, feeds []string) []*Post {
 	wg.Wait()
 	close(postChan)
 
-	// Dedupe posts
-	// seen := map[string]bool{}
-	// var deduped []*Post
-	// for _, post := range posts
-
 	// Sort items chronologically descending
 	sort.Slice(posts, func(i, j int) bool {
 		if posts[i].Published.Equal(posts[j].Published) {
