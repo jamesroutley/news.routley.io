@@ -170,14 +170,24 @@ func getAllPosts(ctx context.Context, feeds []string) []*Post {
 	}
 
 	var posts []*Post
+	seen := map[string]bool{}
 	go func() {
 		for post := range postChan {
+			if seen[post.Link] {
+				continue
+			}
 			posts = append(posts, post)
+			seen[post.Link] = true
 		}
 	}()
 
 	wg.Wait()
 	close(postChan)
+
+	// Dedupe posts
+	// seen := map[string]bool{}
+	// var deduped []*Post
+	// for _, post := range posts
 
 	// Sort items chronologically descending
 	sort.Slice(posts, func(i, j int) bool {
