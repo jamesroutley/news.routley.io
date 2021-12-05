@@ -79,6 +79,7 @@ var (
 
 	outputDir  = "docs" // So we can host the site on GitHub Pages
 	outputFile = "index.html"
+	logFile    = path.Join(outputDir, "log.txt")
 
 	// Error out if fetching feeds takes longer than a minute
 	timeout = time.Minute
@@ -97,6 +98,16 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	if err := os.MkdirAll(outputDir, 0700); err != nil {
+		return err
+	}
+
+	logF, err := os.Create(logFile)
+	if err != nil {
+		return err
+	}
+	log.SetOutput(logF)
+
 	posts := getAllPosts(ctx, feeds)
 
 	start := time.Now()
@@ -104,9 +115,6 @@ func run(ctx context.Context) error {
 		log.Printf("Templated %d posts, took %s", len(posts), time.Since(start))
 	}()
 
-	if err := os.MkdirAll(outputDir, 0700); err != nil {
-		return err
-	}
 
 	if err := os.RemoveAll(path.Join(outputDir, "posts")); err != nil {
 		return err
