@@ -17,6 +17,1606 @@
     <a href="https://github.com/ytdl-org/youtube-dl/commit/21b759057502c6e70d51011cfb3fb86d84055182">Original</a>
     <h1>Move myself to inactive</h1>
     
-    <div id="readability-page-1" class="page"><i><b><a href="https://patreon.com/danluu">I&#39;m trying some experimental tiers on Patreon</a></b> to see if I can get to <a href="https://twitter.com/danluu/status/1456346963691991041">substack-like levels of financial support for this blog without moving to substack</a>!</i> <hr/> <strong>The container throttling problem</strong> <p><i>This is an excerpt from an internal document <b>David Mackey</b> and I co-authored in April 2019. The document is excerpted since much of the original doc was about comparing possible approaches to increasing efficency at Twitter, which is mostly information that&#39;s meaningless outside of Twitter without a large amount of additional explanation/context.</i></p> <p>At Twitter, most CPU bound services start falling over at around 50% reserved container CPU utilization and almost all services start falling over at not much more CPU utilization even though CPU bound services should, theoretically, be able to get higher CPU utilizations. Because load isn&#39;t, in general, evenly balanced across shards and the shard-level degradation in performance is so severe when we exceed 50% CPU utilization, this makes the practical limit much lower than 50% even during peak load events.</p> <p>This document will describe potential solutions to this problem. We&#39;ll start with describing why we should expect this problem given how services are configured and how the Linux scheduler we&#39;re using works. We&#39;ll then look into case studies on how we can fix this with config tuning for specific services, which can result in a 1.5x to 2x increase in capacity, which can translate into $[redacted]M/yr to $[redacted]M/yr in savings for large services. While this is worth doing and we might get back $[redacted]M/yr to $[redacted]M/yr in <a href="https://en.wikipedia.org/wiki/Total_cost_of_ownership">TCO</a> by doing this for large services. Manually fixing services one at a time isn&#39;t really scalable, so we&#39;ll also look at how we can make changes that can recapture some of the value for most services.</p> <h3 id="the-problem-in-theory">The problem, in theory</h3> <p>Almost all services at Twitter run on Linux with <a href="https://en.wikipedia.org/wiki/Completely_Fair_Scheduler">the CFS scheduler</a>, using quotas for isolation, with default parameters. For jobs running on mesos, this means that the number of cores requested doesn&#39;t limit how many cores the job can use at any given moment. Instead, if a job &#34;wants to&#34; use more than that many cores over a quota timeslice, it will use more cores than its quota for a short period of time and then get throttled, i.e., basically get put to sleep, in order to keep its amortized core usage below the quota, which is disastrous for <a href="https://danluu.com/latency-pitfalls/">tail latency</a><sup id="fnref:S"><a rel="footnote" href="#fn:S">1</a></sup>.</p> <p>Since the vast majority of services at Twitter use thread pools that are much larger than their mesos core reservation, when jobs have heavy load, they end up requesting and then using more cores than their reservation and then throttling. This causes services that are provisioned based on load test numbers or observed latency under load to over provision CPU to avoid violating their <a href="https://en.wikipedia.org/wiki/Service-level_objective">SLO</a>s. They either have to ask for more CPUs per shard than they actually need or they have to increase the number of shards they use.</p> <p>An old example of this problem was the JVM Garbage Collector. Prior to work on the JVM to make the JVM container aware, each JVM would default the GC parallel thread pool size to the number of cores on the machine. During a GC, all these GC threads would run simultaneously, exhausting the cpu quota rapidly causing throttling. The resulting effect would be that a subsecond stop-the-world GC pause could take many seconds of wallclock time to complete. While the GC issue has been fixed, the issue still exists at the application level for virtually all services that run on mesos.</p> <h3 id="the-problem-in-practice-case-study">The problem, in practice [case study]</h3> <p>As a case study, let&#39;s look at <code>service-1</code>, the largest and most expensive service at Twitter.</p> <p>Below is the CPU utilization histogram for this service just as it starts failing its load test, i.e., when it&#39;s just above the peak load the service can handle before it violates its SLO. The x-axis is the number of CPUs used at a given point in time and the y-axis is (relative) time spent at that utilization. The service is provisioned for 20 cores and we can see that the utilization is mostly significantly under that, even when running at nearly peak possible load:</p> <p><img src="https://danluu.com/images/cgroup-throttling/cpu-histogram-1.png" alt="Histogram for service with 20 CPU quota showing that average utilization is much lower but peak utilization is significantly higher when the service is overloaded and violates its SLO" width="1266" height="658"/></p> <p>The problem is the little bars above 20. These spikes caused the job to use up its CPU quota and then get throttled, which caused latency to drastically increase, which is why the SLO was violated even though average utilization is about 8 cores, or 40% of quota. One thing to note is that the sampling period for this graph was 10ms and the quota period is 100ms, so it&#39;s technically possible to see an excursion above 20 in this graph without throttling, but on average, if we see a lot of excursions, especially way above 20, we&#39;ll likely get throttling.</p> <p>After reducing the thread pool sizes to avoid using too many cores and then throttling, we got the following CPU utilization histogram under a load test:</p> <p><img src="https://danluu.com/images/cgroup-throttling/cpu-histogram-2.png" alt="Histogram for service with 20 CPU quota showing that average utilization is much lower but peak utilization is significantly higher when the service is overloaded and violates its SLO" width="1216" height="548"/></p> <p>This is at 1.6x the load (request rate) of the previous histogram. In that case, the load test harness was unable to increase load enough to determine peak load for <code>service-1</code> because the service was able to handle so much load before failure that the service that&#39;s feeding it during the load test couldn&#39;t keep it and send more load (although that&#39;s fixable, I didn&#39;t have the proper permissions to quickly fix it). [later testing showed that the service was able to handle about 2x the capacity after tweaking the thread pool sizes]</p> <p>This case study isn&#39;t an isolated example — Andy Wilcox has looked at the same thing for <code>service-2</code> and found similar gains in performance under load for similar reasons.</p> <p>For services that are concerned about latency, we can get significant latency gains if we prefer to get latency gains instead of cost reduction. For <code>service-1</code>, if we leave the provisioned capacity the same instead of cutting by 2x, we see a 20% reduction in latency.</p> <p>The gains for doing this for individual large services are significant (in the case of <code>service-1</code>, it&#39;s [mid 7 figures per year] for the service and [low 8 figures per year] including services that are clones of it, but tuning every service by hand isn&#39;t scalable. That raises the question: how many services are impacted?</p> <h3 id="thread-usage-across-the-fleet">Thread usage across the fleet</h3> <p>If we look at the number of active threads vs. number of reserved cores for moderate sized services (&gt;= 100 shards), we see that almost all services have many more threads that want to execute than reserved cores. It&#39;s not uncommon to see tens of <a href="https://access.redhat.com/sites/default/files/attachments/processstates_20120831.pdf">runnable threads</a> per reserved core. This makes the <code>service-1</code> example, above, look relatively tame, at 1.5 to 2 runnable threads per reserved core under load.</p> <p>If we look at where these threads are coming from, it&#39;s common to see that a program has multiple thread pools where each thread pool is sized to either twice the number of reserved cores or twice the number of logical cores on the host machine. Both inside and outside of Twitter, It&#39;s common to see advice that thread pool size should be 2x the number of logical cores on the machine. This advice probably comes from a workload like picking how many threads to use for something like a gcc compile, where we don&#39;t want to have idle resources when we could have something to do. Since threads will sometimes get blocked and have nothing to do, going to 2x can increase throughput over 1x by decreasing the odds that any core is every idle, and 2x is a nice, round, number.</p> <p>However, there are a few problems with applying this to Twitter applications:</p> <ol> <li>Most applications have multiple, competing, thread pools</li> <li>Exceeding the reserved core limit is extremely bad</li> <li>Having extra threads working on computations can increase latency</li> </ol> <p>The &#34;we should provision 2x the number of logical cores&#34; model assumes that we have only one main thread pool doing all of the work and that there&#39;s little to no downside to having threads that could do work sit and do nothing and that we have a throughput oriented workload where we don&#39;t care about the deadline of any particular unit of work.</p> <p>With the CFS scheduler, threads that have active work that are above the core reservation won&#39;t do nothing, they&#39;ll get scheduled and run, but this will cause throttling, which negatively impacts tail latency.</p> <h3 id="potential-solutions">Potential Solutions</h3> <p>Given that we see something similar looking to our case study on many services and that it&#39;s difficult to push performance fixes to a lot of services (because service owners aren&#39;t really incentivized to take performance improvements), what can we do to address this problem across the fleet and just on a few handpicked large services? We&#39;re going to look at a list of potential solutions and then discuss each one in more detail, below.</p> <ul> <li>Better defaults for cross-fleet threadpools (eventbus, netty, etc.)</li> <li>Negotiating ThreadPool sizes via a shared library</li> <li>CFS period tuning</li> <li>CFS bandwidth slice tuning</li> <li>Other scheduler tunings</li> <li>CPU pinning and isolation</li> <li>Overprovision at the mesos scheduler level</li> </ul> <h4 id="better-defaults-for-cross-fleet-threadpools">Better defaults for cross-fleet threadpools</h4> <p><b>Potential impact</b>: some small gains in efficiency</p> <p>Many defaults are too large. Netty default threadpool size is 2x the reserved cores. In some parts of [an org], they use a library that spins up <a href="https://news.ycombinator.com/item?id=26643392">eventbus</a> and allocates a threadpool that&#39;s 2x the number of logical cores on the host (resulting in [over 100] eventbus threads) when 1-2 threads is sufficient for most of their eventbus use cases.</p> <p>Adjusting these default sizes won&#39;t fix the problem, but it will reduce the impact of the problem and this should be much less work than the solutions below, so this can be done while we work on a more comprehensive solution.</p>  <p>[this section was written by <i>Vladimir Kostyukov</i>]</p> <p><b>Potential impact</b>: can mostly mitigate the problem for most services.</p> <p>CSL’s util library has a package that bridges in some integration points between an application and a JVM (util-jvm), which could be a good place to host a new API for negotiating the sizes of the thread pools required by the application.</p> <p>The look and feel of such API is effectively dictated by how granular the negotiation is needed to be. Simply contending on a total number of allowed threads allocated per process, while being easy to implement, doesn’t allow distinguishing between application and IO threads. Introducing a notion of QoS for threads in the thread pool (i.e., “IO thread; can not block”, “App thread; can block”), on the other hand, could make the negotiation fine grained.</p> <h4 id="cfs-period-tuning">CFS Period Tuning</h4> <p><b>Potential impact</b>: small reduction tail latencies by shrinking the length of the time period before the process group’s CFS runtime quota is refreshed.</p> <p>To limit CPU usage, CFS operates over a time window known as the CFS period. Processes in a scheduling group take time from the CFS quota assigned to the cgroup and this quota is consumed over the cfs_period_us in CFS bandwidth slices. By shrinking the CFS period, the worst case time between quota exhaustion causing throttling and the process group being able to run again is reduced proportionately. Taking the default values of a CFS bandwidth slice of 5ms and CFS period of 100ms, in the worst case, a highly parallel application could exhaust all of its quota in the first bandwidth slice leaving 95ms of throttled time before any thread could be scheduled again.</p> <p>It&#39;s possible that total throttling would increase because the scheduled time over 100ms might not exceed the threshold even though there are (for example) 5ms bursts that exceed the threshold.</p> <h4 id="cfs-bandwidth-slice-tuning">CFS Bandwidth Slice Tuning</h4> <p><b>Potential impact</b>: small reduction in tail latencies by allowing applications to make better use of the allocated quota.</p> <p>When CFS goes to schedule a process it will transfer run-time between a global pool and CPU local pool to reduce global accounting pressure on large systems.The amount transferred each time is called the &#34;slice&#34;. A larger bandwidth slice is more efficient from the scheduler’s perspective but a smaller bandwidth slice allows for more fine grained execution. In debugging issues in [link to internal JIRA ticket] it was determined that if a scheduled process fails to consume its entire bandwidth slice, the default slice size being 5ms, because it has completed execution or blocked on another process, this time is lost to the process group reducing its ability to consume all available resources it has requested.</p> <p>The overhead of tuning this value is expected to be minimal, but should be measured. Additionally, it is likely not a one size fits all tunable, but exposing this to the user as a tunable has been rejected in the past in Mesos. Determining a heuristic for tuning this value and providing a per application way to set it may prove infeasible.</p> <h4 id="other-scheduler-tunings">Other Scheduler Tunings</h4> <p><b>Potential Impact</b>: small reduction in tail latencies and reduced throttling.</p> <p>The kernel has numerous auto-scaling and auto-grouping features whose impact to scheduling performance and throttling is currently unknown. <code>kernel.sched_tunable_scaling</code> can adjust <code>kernel.sched_latency_ns</code> underneath our understanding of its value. <code>kernel.sched_min_granularity_ns</code> and <code>kernel.sched_wakeup_granularity_ns</code> can be tuned to allow for preempting sooner, allowing better resource sharing and minimizing delays. <code>kernel.sched_autogroup_enabled</code> may currently not respect <code>kernel.sched_latency_ns</code>leading to more throttling challenges and scheduling inefficiencies. These tunables have not been investigated significantly and the impact of tuning them is unknown.</p> <h4 id="cfs-scheduler-improvements">CFS Scheduler Improvements</h4> <p><b>Potential impact</b>: better overall cpu resource utilization and minimized throttling due to CFS inefficiencies.</p> <p>How the CFS scheduler deals with unused slack time from the CFS bandwidth slice has shown to be ineffective. The kernel team has a patch to ensure that this unused time is returned back to the global pool for other processes to use, <a href="https://lore.kernel.org/patchwork/patch/907450/">https://lore.kernel.org/patchwork/patch/907450/</a> to ensure better overall system resource utilization. There are some additional avenues to explore that could provide further enhancements. Another of many recent discussions in this area that fell out of a k8s throttling issue(<a href="https://github.com/kubernetes/kubernetes/issues/67577">https://github.com/kubernetes/kubernetes/issues/67577</a>) is <a href="https://lkml.org/lkml/2019/3/18/706">https://lkml.org/lkml/2019/3/18/706</a>.</p> <p>Additionally, CFS may lose efficiency due to bugs such as [link to internal JIRA ticket] and <a href="http://www.ece.ubc.ca/~sasha/papers/eurosys16-final29.pdf">http://www.ece.ubc.ca/~sasha/papers/eurosys16-final29.pdf</a>. However, we haven&#39;t spent much time looking at the CFS performance for Twitter’s particular use cases. A closer look at CFS may find ways to improve efficiency.</p> <p>Another change which has more upside and downside potential would be to use a scheduler other than CFS.</p> <h4 id="cpu-pinning-and-isolation">CPU Pinning and Isolation</h4> <p><b>Potential impact</b>: removes the concept of throttling from the system by making the application developer’s mental model of a CPU map to a physical one. </p> <p>The fundamental issue that allows throttling to occur is that a heavily threaded application can have more threads executing in parallel than the “number of CPUs” it requested resulting in an early exhaustion of available runtime. By restricting the number of threads executing simultaneously to the number of CPUs an application requested there is now a 1:1 mapping and an application’s process group is free to consume the logical CPU thread unimpeded by the scheduler. Additionally, by dedicating a CPU thread rather than a bandwidth slice to the application, the application is now able to take full advantage of CPU caching benefits without having to contend with other applications being scheduled on the same CPU thread while it is throttled or context switched away.</p> <p>In Mesos, implementing CPU pinning has proven to be quite difficult. However, in k8s there is existing hope in the form of a project from Intel known as the k8s CPU Manager. The CPU Manager was added as an alpha feature to k8s in 1.8 and has been enabled as a beta feature since 1.10. It has somewhat stalled in beta as few people seem to be using it but the core functionality is present. The performance improvements promoted by the CPU Manager project are significant as shown in examples such as <a href="https://kubernetes.io/blog/2018/07/24/feature-highlight-cpu-manager/">https://kubernetes.io/blog/2018/07/24/feature-highlight-cpu-manager/</a> and <a href="https://builders.intel.com/docs/networkbuilders/cpu-pin-and-isolation-in-kubernetes-app-note.pdf">https://builders.intel.com/docs/networkbuilders/cpu-pin-and-isolation-in-kubernetes-app-note.pdf</a> While these benchmarks should be looked at with some skepticism, it does provide promising hope for exploring this avenue. A cursory inspection of the project highlights a few <a href="https://github.com/kubernetes/kubernetes/issues/70585">areas</a> where work may still be needed but it is already in a usable state for validating the approach. Underneath, the k8s CPU Manager leverages the cpuset cgroup functionality that is present in the kernel.</p> <p>Potentially, this approach does reduce the ability to oversubscribe the machines. However, the efficiency gains from minimized cross-pod interference, CPU throttling, a more deterministic execution profile and more may offset the need to oversubscribe. Currently, the k8s CPU Manager does allow for minor oversubscription in the form of allowing system level containers and the daemonset to be oversubscribed, but on a pod scheduling basis the cpus are reserved for that pod’s use.</p> <p>Experiments by Brian Martin and others have shown significant performance benefits from CPU pinning that are almost as large as our oversubscription factor.</p> <p>Longer term, oversubscription could be possible through a multitiered approach of wherein a primary class of pods is scheduled using CPU pinning but a secondary class of pods that is not as latency sensitive is allowed to float across all cores consuming slack resources from the primary pods. The work on the CPU Manager side would be extensive. However, recently <a href="https://lwn.net/ml/linux-kernel/20190408214539.2705660-1-songliubraving@fb.com/">Facebook has been doing some work</a> on the kernel scheduler side to further enable this concept in a way that minimally impacts the primary pod class that we can expand upon or evolve.</p> <h4 id="oversubscription-at-the-cluster-scheduler-level">Oversubscription at the cluster scheduler level</h4> <p><b>Potential impact</b>: can bring machine utilization up to an arbitrarily high level and overprovisioning &#34;enough&#34;.</p> <h4 id="disable-cfs-quotas">Disable CFS quotas</h4> <p><b>Potential impact</b>: prevents throttling and allows services to use all available cores on a box by relying on the S&#34;shares&#34; mechanism instead of quota.</p> <p>This solution is what was used before we enabled quotas and most service owners found it too difficult to estimate performance under load for this to be practical. At least one company has tried this solution to fix their throttling problem and has had severe incidents under load because of it. If we switched back to this today, we&#39;d be no better off than we were before we were before we enabled quotes.</p> <p>Given how we allocate capacity, two ingredients that would make this work better than it did before include having a more carefully controlled request rate to individual shards and a load testing setup that allowed service owners to understand what things would really look like during a load spike, as opposed to our system, which only allows injection of unrealistic load to individual shards, which both has the problem that the request mix isn&#39;t the same as it is under a real load spike and that the shard with injected load isn&#39;t seeing elevated load from other services running on the same box. Per [another internal document], we know that one of the largest factors impacting shard-level performance is overall load on the box and that the impact on latency is non-linear and difficult to predict, so there&#39;s not really a good way to predict performance under actual load from performance under load tests with the load testing framework we have today.</p> <p>Although these missing ingredients are important, high impact, issues, addressing either of these issues is beyond the scope of this doc; [Team X] owns load testing and is working on load testing.</p> <h3 id="results">Results</h3> <p><i>This section was not in the original document from April 2019; it was written in December 2021 and describes work that happened as a result of the original document.</i></p> <p>The suggestion of changing default thread pool sizes was taken and resulted in minor improvements. More importantly, two major efforts came out of the document. Vladimir Kostyukov (from the <a href="https://finagle.github.io/blog/2021/03/31/quarterly/">CSL team</a>) and Flavio Brasil (from the JVM team) created <a href="https://github.com/twitter/finagle/blob/develop/finagle-core/src/main/scala/com/twitter/finagle/filter/OffloadFilter.scala">Finagle Offload Filter</a> and Xi Yang (my intern<sup id="fnref:I"><a rel="footnote" href="#fn:I">2</a></sup> at the time and now a full-time employee for my team) created a kernel patch which eliminates container throttling (the patch is still internal, but will hopefully eventually upstreamed).</p> <p>Almost all applications that run on mesos at Twitter run on top of <a href="https://kostyukov.net/posts/finagle-101/">Finagle</a>. The Finagle Offload Filter makes it trivial for service owners to put application work onto a different thread pool than IO (which was often not previously happening). In combination with sizing thread pools properly, this resulted in, ceteris paribus, applications having <a href="https://mobile.twitter.com/fbrasisil/status/1163974576511995904">drastically reduced latency</a>, enabling them to reduce their provisioned capacity and therefore their cost while meeting their SLO. Depending on the service, this resulted in a 15% to 60% cost reduction for the service.</p> <p>The kernel patch implements the obvious idea of preventing containers from using more cores than a container&#39;s quota at every moment instead of allowing a container to use as many cores as are available on the machine and then putting the container to sleep if it uses too many cores to bring its amortized core usage down.</p> <p>In experiments on hosts running major services at Twitter, this has the expected impact of eliminating issues related to throttling, giving a roughly 50% cost reduction for a typical service with untuned thread pool sizes. And it turns out the net impact is larger than we realized when we wrote this document due to the reduction in interference caused by preventing services from using &#34;too many&#34; cores and then throttling<sup id="fnref:M"><a rel="footnote" href="#fn:M">3</a></sup>. Also, although this was realized at the time, we didn&#39;t note in the document that the throttling issue causes shards to go from &#34;basically totally fine&#34; to &#34;throttling death spiral&#34; with only a small amount of additional load, which increases the difficulty of operating systems reliably. Morever, operating in a regime where throttling can cause a death spiral is <a href="https://twitter.com/copyconstruct/status/1399766443596472320">an inherently metastable state</a>. Removing both of these issues is arguably as large an impact as the cost reduction we see from eliminating throttling.</p> <p>Xi Yang has experimented with variations on the naive kernel scheduler change mentioned above, but even the naive change seems to be quite effective compared to no change, even though the naive change does mean that services will often not be able to hit their full CPU allocation when they ask for it, e.g., if a service requests no CPU for the first half a period and then requests infinite CPU for the second half of the period, under the old system, it would get its allocated amount of CPU for the period, but under the new system, it would only get half. Many of Xi&#39;s variant patches address this issue in one way or another, but that has a relatively small impact compared to preventing throttling in the first place.</p> <h3 id="appendix-other-container-throttling-related-work">Appendix: other container throttling related work</h3> <ul> <li><a href="https://engineering.indeedblog.com/blog/2019/12/cpu-throttling-regression-fix/">https://engineering.indeedblog.com/blog/2019/12/cpu-throttling-regression-fix/</a></li> <li><a href="https://lkml.org/lkml/2019/11/26/196">https://lkml.org/lkml/2019/11/26/196</a></li> <li><a href="https://lwn.net/Articles/840595/">https://lwn.net/Articles/840595/</a> <ul> <li>This is a different approach to mitigating the issue, from Alibaba. A container that exceeds its allocation will still throttle, but the idea of &#34;burst capacity&#34; is added, allowing more margin before throttling while keeping basically the same average core utilization <ul> <li>Allowing burstiness is independent of our fix, which prevents throttling and, in principle, both ideas could be applied at the same time</li> <li>Given how Twitter handles requests, Alibaba&#39;s fix wouldn&#39;t be sufficient for us, but may be for them</li> </ul></li> </ul></li> </ul> <p><i>Thanks to Xi Yang, Ilya Pronin, Ian Downes, Rebecca Isaacs, Brian Martin, Vladimir Kotsyukov, Moses Nakamura, Flavio Brasil, Laurence Tratt, Julian Squires, Michael Greenberd and Miguel Angel Corral for comments/corrections/discussion</i></p>   </div>
+    <div id="readability-page-1" class="page"><div>
+  <div id="repo-content-pjax-container">
+
+    
+
+
+    
+      
+  <p><a href="https://github.com/ytdl-org/youtube-dl/commit/21b759057502c6e70d51011cfb3fb86d84055182" data-hotkey="y">Permalink</a></p>
+
+<div>
+  <p><a href="https://github.com/ytdl-org/youtube-dl/tree/21b759057502c6e70d51011cfb3fb86d84055182" title="Browse the repository at this point in the history" rel="nofollow">Browse files</a>
+
+    <span>
+        
+<batch-deferred-content data-url="/ytdl-org/youtube-dl/commits/checks-statuses-rollups">
+  
+
+    
+    
+
+  
+
+  
+
+</batch-deferred-content>
+    </span></p><p>
+      Move myself to inactive
+    </p>
+
+
+  <div>
+  <include-fragment src="/ytdl-org/youtube-dl/branch_commits/21b759057502c6e70d51011cfb3fb86d84055182" id="async-branches-list">
+    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true">
+    <path fill-rule="evenodd" d="M11.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122V6A2.5 2.5 0 0110 8.5H6a1 1 0 00-1 1v1.128a2.251 2.251 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.492 2.492 0 016 7h4a1 1 0 001-1v-.628A2.25 2.25 0 019.5 3.25zM4.25 12a.75.75 0 100 1.5.75.75 0 000-1.5zM3.5 3.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0z"></path>
+</svg>
+    <ul>
+      <li>Loading branch information<span></span></li>
+    </ul>
+</include-fragment></div>
+
+
+  <div>
+    
+<div>
+  <p><a data-skip-pjax="true" data-test-selector="commits-avatar-stack-avatar-link" data-hovercard-type="user" data-hovercard-url="/users/dstftw/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/dstftw">
+        <img data-test-selector="commits-avatar-stack-avatar-image" src="https://avatars.githubusercontent.com/u/1908898?s=40&amp;v=4" width="20" height="20" alt="@dstftw"/>
+</a>  </p>
+</div>
+
+    
+    <p><span data-pjax="#repo-content-pjax-container">
+        1 parent
+          
+          <a data-hotkey="p" href="https://github.com/ytdl-org/youtube-dl/commit/f298ae88024235b975964cf56a64eb598f397e0d">f298ae8</a>
+      </span>
+      <span>commit <span>21b759057502c6e70d51011cfb3fb86d84055182</span></span>
+    </p>
+  </div>
+</div>
+
+
+  
+
+
+    <div id="toc">
+  
+
+
+  <div>
+    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true">
+    <path fill-rule="evenodd" d="M2.75 1.5a.25.25 0 00-.25.25v12.5c0 .138.112.25.25.25h10.5a.25.25 0 00.25-.25V4.664a.25.25 0 00-.073-.177l-2.914-2.914a.25.25 0 00-.177-.073H2.75zM1 1.75C1 .784 1.784 0 2.75 0h7.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0113.25 16H2.75A1.75 1.75 0 011 14.25V1.75zm7 1.5a.75.75 0 01.75.75v1.5h1.5a.75.75 0 010 1.5h-1.5v1.5a.75.75 0 01-1.5 0V7h-1.5a.75.75 0 010-1.5h1.5V4A.75.75 0 018 3.25zm-3 8a.75.75 0 01.75-.75h4.5a.75.75 0 010 1.5h-4.5a.75.75 0 01-.75-.75z"></path>
+</svg><p>
+    Showing
+      
+    with
+    <strong>1 addition</strong>
+    and <strong>1 deletion</strong>.
+  </p></div>
+
+  <ol>
+    <li>
+      <span>
+          <span>
+            +1
+          </span>
+          <span>
+            −1
+          </span>
+          <a href="#diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968" aria-label="2 lines changed">
+            <span></span><span></span><span></span><span></span><span></span>
+          </a>
+      </span>
+      <svg title="modified" aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true">
+    <path fill-rule="evenodd" d="M2.75 2.5h10.5a.25.25 0 01.25.25v10.5a.25.25 0 01-.25.25H2.75a.25.25 0 01-.25-.25V2.75a.25.25 0 01.25-.25zM13.25 1H2.75A1.75 1.75 0 001 2.75v10.5c0 .966.784 1.75 1.75 1.75h10.5A1.75 1.75 0 0015 13.25V2.75A1.75 1.75 0 0013.25 1zM8 10a2 2 0 100-4 2 2 0 000 4z"></path>
+</svg>
+      <a href="#diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968">about.html</a>
+    </li>
+  </ol>
+</div>
+
+  
+<div id="files">
+    
+
+
+
+  
+
+  <div>
+    
+<div id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968" data-details-container-group="file" data-file-type=".html" data-file-deleted="false" data-tagsearch-path="about.html" data-tagsearch-lang="HTML">
+  
+  <div data-hydro-view="{&#34;event_type&#34;:&#34;pull_request.select_diff_range&#34;,&#34;payload&#34;:{&#34;actor_id&#34;:null,&#34;pull_request_id&#34;:null,&#34;repository_id&#34;:null,&#34;diff_type&#34;:&#34;UNIFIED&#34;,&#34;whitespace_ignored&#34;:false,&#34;originating_url&#34;:&#34;https://github.com/ytdl-org/youtube-dl/commit/21b759057502c6e70d51011cfb3fb86d84055182&#34;,&#34;user_id&#34;:null}}" data-hydro-view-hmac="88b1705a88fc1c6a908fb28cd7c6b5efbf8d7107a234869c7fc3844b46d4f922">
+        <div>
+          <template>
+  <div data-view-component="true">
+  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true">
+    <path fill-rule="evenodd" d="M8.22 1.754a.25.25 0 00-.44 0L1.698 13.132a.25.25 0 00.22.368h12.164a.25.25 0 00.22-.368L8.22 1.754zm-1.763-.707c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0114.082 15H1.918a1.75 1.75 0 01-1.543-2.575L6.457 1.047zM9 11a1 1 0 11-2 0 1 1 0 012 0zm-.25-5.25a.75.75 0 00-1.5 0v2.5a.75.75 0 001.5 0v-2.5z"></path>
+</svg>
+  
+    <p><span>
+      This file contains bidirectional Unicode text that may be interpreted or compiled differently than what appears below. To review, open the file in an editor that reveals hidden Unicode characters.
+      <a href="https://github.co/hiddenchars" target="_blank">Learn more about bidirectional Unicode characters</a>
+    </span></p>
+</div></template>
+<template>
+  <span aria-label="This line has hidden Unicode characters" data-view-component="true">
+    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true">
+    <path fill-rule="evenodd" d="M8.22 1.754a.25.25 0 00-.44 0L1.698 13.132a.25.25 0 00.22.368h12.164a.25.25 0 00.22-.368L8.22 1.754zm-1.763-.707c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0114.082 15H1.918a1.75 1.75 0 01-1.543-2.575L6.457 1.047zM9 11a1 1 0 11-2 0 1 1 0 012 0zm-.25-5.25a.75.75 0 00-1.5 0v2.5a.75.75 0 001.5 0v-2.5z"></path>
+</svg>
+</span></template>
+
+          <table data-tab-size="8" data-diff-anchor="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968" data-paste-markdown-skip="">
+
+                
+      <tbody><tr data-position="0">
+    <td colspan="2">
+          <a href="#diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968" title="Expand Up" aria-label="Expand Up" data-url="/ytdl-org/youtube-dl/blob_excerpt/93af12e474f31e706934525a16e22be6734ab985?diff=unified&amp;direction=up&amp;in_wiki_context=&amp;last_left=&amp;last_right=&amp;left=22&amp;left_hunk_size=7&amp;mode=100644&amp;path=about.html&amp;right=22&amp;right_hunk_size=6" data-left-range="1-21" data-right-range="1-21">
+            <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true">
+    <path d="M7.823 1.677L4.927 4.573A.25.25 0 005.104 5H7.25v3.236a.75.75 0 101.5 0V5h2.146a.25.25 0 00.177-.427L8.177 1.677a.25.25 0 00-.354 0zM13.75 11a.75.75 0 000 1.5h.5a.75.75 0 000-1.5h-.5zm-3.75.75a.75.75 0 01.75-.75h.5a.75.75 0 010 1.5h-.5a.75.75 0 01-.75-.75zM7.75 11a.75.75 0 000 1.5h.5a.75.75 0 000-1.5h-.5zM4 11.75a.75.75 0 01.75-.75h.5a.75.75 0 010 1.5h-.5a.75.75 0 01-.75-.75zM1.75 11a.75.75 0 000 1.5h.5a.75.75 0 000-1.5h-.5z"></path>
+</svg>
+          </a>
+    </td>
+    <td>@@ -22,7 +22,6 @@ &lt;h1&gt;Authors&lt;/h1&gt;</td>
+  </tr>
+
+    <tr data-hunk="ef10a9e9c8617317f8ad07ff2941b975a1908eafe731556130bb76f3ca021b10">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L22" data-line-number="22"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R22" data-line-number="22"></td>
+
+  <td>
+    <span data-code-marker=" "><br/></span></td>
+</tr>
+
+
+
+    <tr data-hunk="ef10a9e9c8617317f8ad07ff2941b975a1908eafe731556130bb76f3ca021b10">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L23" data-line-number="23"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R23" data-line-number="23"></td>
+
+  <td>
+    <span data-code-marker=" "><span>&lt;</span><span>ul</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+    <tr data-hunk="ef10a9e9c8617317f8ad07ff2941b975a1908eafe731556130bb76f3ca021b10">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L24" data-line-number="24"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R24" data-line-number="24"></td>
+
+  <td>
+    <span data-code-marker=" "><span>&lt;</span><span>li</span><span>&gt;</span><span>&lt;</span><span>a</span> <span>href</span>=&#34;<span>https://github.com/remitamine</span>&#34;<span>&gt;</span>Remita Amine<span>&lt;/</span><span>a</span><span>&gt;</span>: core developer.<span>&lt;/</span><span>li</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+    <tr data-hunk="ef10a9e9c8617317f8ad07ff2941b975a1908eafe731556130bb76f3ca021b10">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L25" data-line-number="25"></td>
+
+    <td></td>
+
+  <td>
+    <span data-code-marker="-"><span>&lt;</span><span>li</span><span>&gt;</span><span>&lt;</span><span>a</span> <span>href</span>=&#34;<span>https://github.com/dstftw</span>&#34;<span>&gt;</span>Sergey M.<span>&lt;/</span><span>a</span><span>&gt;</span>: core developer, maintainer since 2016.<span>&lt;/</span><span>li</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+    <tr data-hunk="ef10a9e9c8617317f8ad07ff2941b975a1908eafe731556130bb76f3ca021b10">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L26" data-line-number="26"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R25" data-line-number="25"></td>
+
+  <td>
+    <span data-code-marker=" "><span>&lt;/</span><span>ul</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+    <tr data-hunk="ef10a9e9c8617317f8ad07ff2941b975a1908eafe731556130bb76f3ca021b10">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L27" data-line-number="27"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R26" data-line-number="26"></td>
+
+  <td>
+    <span data-code-marker=" "><br/></span></td>
+</tr>
+
+
+
+    <tr data-hunk="ef10a9e9c8617317f8ad07ff2941b975a1908eafe731556130bb76f3ca021b10">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L28" data-line-number="28"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R27" data-line-number="27"></td>
+
+  <td>
+    <span data-code-marker=" "><span>&lt;</span><span>p</span><span>&gt;</span>Core team (inactive):<span>&lt;/</span><span>p</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+      <tr data-position="8">
+    <td colspan="2">
+        <a href="#diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968" title="Expand All" aria-label="Expand All" data-url="/ytdl-org/youtube-dl/blob_excerpt/93af12e474f31e706934525a16e22be6734ab985?diff=unified&amp;in_wiki_context=&amp;last_left=28&amp;last_right=27&amp;left=35&amp;left_hunk_size=6&amp;mode=100644&amp;path=about.html&amp;right=34&amp;right_hunk_size=7" data-left-range="29-30" data-right-range="28-29">
+          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true">
+    <path d="M8.177.677l2.896 2.896a.25.25 0 01-.177.427H8.75v1.25a.75.75 0 01-1.5 0V4H5.104a.25.25 0 01-.177-.427L7.823.677a.25.25 0 01.354 0zM7.25 10.75a.75.75 0 011.5 0V12h2.146a.25.25 0 01.177.427l-2.896 2.896a.25.25 0 01-.354 0l-2.896-2.896A.25.25 0 015.104 12H7.25v-1.25zm-5-2a.75.75 0 000-1.5h-.5a.75.75 0 000 1.5h.5zM6 8a.75.75 0 01-.75.75h-.5a.75.75 0 010-1.5h.5A.75.75 0 016 8zm2.25.75a.75.75 0 000-1.5h-.5a.75.75 0 000 1.5h.5zM12 8a.75.75 0 01-.75.75h-.5a.75.75 0 010-1.5h.5A.75.75 0 0112 8zm2.25.75a.75.75 0 000-1.5h-.5a.75.75 0 000 1.5h.5z"></path>
+</svg>
+        </a>
+    </td>
+    <td>@@ -35,6 +34,7 @@ &lt;h1&gt;Authors&lt;/h1&gt;</td>
+  </tr>
+
+    <tr data-hunk="bc4d3cab1eca4c31167e489f181045ed0c7f44b283a5d9d2d0559a00bee6d916">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L35" data-line-number="35"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R34" data-line-number="34"></td>
+
+  <td>
+    <span data-code-marker=" "><span>&lt;</span><span>li</span><span>&gt;</span><span>&lt;</span><span>a</span> <span>href</span>=&#34;<span>https://github.com/yan12125</span>&#34;<span>&gt;</span>Yen Chi Hsuan<span>&lt;/</span><span>a</span><span>&gt;</span>: core developer.<span>&lt;/</span><span>li</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+    <tr data-hunk="bc4d3cab1eca4c31167e489f181045ed0c7f44b283a5d9d2d0559a00bee6d916">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L36" data-line-number="36"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R35" data-line-number="35"></td>
+
+  <td>
+    <span data-code-marker=" "><span>&lt;</span><span>li</span><span>&gt;</span><span>&lt;</span><span>a</span> <span>href</span>=&#34;<span>https://github.com/naglis</span>&#34;<span>&gt;</span>Naglis Jonaitis<span>&lt;/</span><span>a</span><span>&gt;</span>: core developer.<span>&lt;/</span><span>li</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+    <tr data-hunk="bc4d3cab1eca4c31167e489f181045ed0c7f44b283a5d9d2d0559a00bee6d916">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L37" data-line-number="37"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R36" data-line-number="36"></td>
+
+  <td>
+    <span data-code-marker=" "><span>&lt;</span><span>li</span><span>&gt;</span><span>&lt;</span><span>a</span> <span>href</span>=&#34;<span>https://github.com/pulpe</span>&#34;<span>&gt;</span>pulpe<span>&lt;/</span><span>a</span><span>&gt;</span>: core developer.<span>&lt;/</span><span>li</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+    <tr data-hunk="bc4d3cab1eca4c31167e489f181045ed0c7f44b283a5d9d2d0559a00bee6d916">
+    <td></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R37" data-line-number="37"></td>
+
+  <td>
+    <span data-code-marker="+"><span>&lt;</span><span>li</span><span>&gt;</span><span>&lt;</span><span>a</span> <span>href</span>=&#34;<span>https://github.com/dstftw</span>&#34;<span>&gt;</span>Sergey M.<span>&lt;/</span><span>a</span><span>&gt;</span>: core developer, maintainer 2016-2021.<span>&lt;/</span><span>li</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+    <tr data-hunk="bc4d3cab1eca4c31167e489f181045ed0c7f44b283a5d9d2d0559a00bee6d916">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L38" data-line-number="38"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R38" data-line-number="38"></td>
+
+  <td>
+    <span data-code-marker=" "><span>&lt;/</span><span>ul</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+    <tr data-hunk="bc4d3cab1eca4c31167e489f181045ed0c7f44b283a5d9d2d0559a00bee6d916">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L39" data-line-number="39"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R39" data-line-number="39"></td>
+
+  <td>
+    <span data-code-marker=" "><br/></span></td>
+</tr>
+
+
+
+    <tr data-hunk="bc4d3cab1eca4c31167e489f181045ed0c7f44b283a5d9d2d0559a00bee6d916">
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968L40" data-line-number="40"></td>
+
+    <td id="diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968R40" data-line-number="40"></td>
+
+  <td>
+    <span data-code-marker=" "><span>&lt;</span><span>p</span><span>&gt;</span>Many <span>&lt;</span><span>a</span> <span>href</span>=&#34;<span>https://github.com/ytdl-org/youtube-dl/blob/master/AUTHORS</span>&#34;<span>&gt;</span>other people<span>&lt;/</span><span>a</span><span>&gt;</span> contributing patches, code, ideas and kind messages. <span>&lt;</span><span>a</span> <span>href</span>=&#34;<span>https://github.com/ytdl-org/youtube-dl/graphs/contributors</span>&#34;<span>&gt;</span>Too many<span>&lt;/</span><span>a</span><span>&gt;</span> to be listed here. You know who you are. Thank you very much.<span>&lt;/</span><span>p</span><span>&gt;</span></span></td>
+</tr>
+
+
+
+  <tr data-position="">
+    <td colspan="2">
+          <a href="#diff-2212b84a2a6ffe239872c76d266680d86f2438391034b2eb19604f17104f6968" title="Expand Down" aria-label="Expand Down" data-url="/ytdl-org/youtube-dl/blob_excerpt/93af12e474f31e706934525a16e22be6734ab985?diff=unified&amp;direction=down&amp;in_wiki_context=&amp;last_left=40&amp;last_right=40&amp;left=51&amp;left_hunk_size=&amp;mode=100644&amp;path=about.html&amp;right=51&amp;right_hunk_size=" data-left-range="41-50" data-right-range="41-50">
+            <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true">
+    <path d="M8.177 14.323l2.896-2.896a.25.25 0 00-.177-.427H8.75V7.764a.75.75 0 10-1.5 0V11H5.104a.25.25 0 00-.177.427l2.896 2.896a.25.25 0 00.354 0zM2.25 5a.75.75 0 000-1.5h-.5a.75.75 0 000 1.5h.5zM6 4.25a.75.75 0 01-.75.75h-.5a.75.75 0 010-1.5h.5a.75.75 0 01.75.75zM8.25 5a.75.75 0 000-1.5h-.5a.75.75 0 000 1.5h.5zM12 4.25a.75.75 0 01-.75.75h-.5a.75.75 0 010-1.5h.5a.75.75 0 01.75.75zm2.25.75a.75.75 0 000-1.5h-.5a.75.75 0 000 1.5h.5z"></path>
+</svg>
+          </a>
+    </td>
+    <td></td>
+  </tr>
+
+
+          </tbody></table>
+        </div>
+
+  </div>
+</div>
+
+  </div>
+
+
+</div>
+
+<svg aria-hidden="true" width="320px" height="84px" viewBox="0 0 340 84" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <defs>
+    <clipPath id="diff-placeholder">
+      <rect x="0" y="0" width="67.0175439" height="11.9298746" rx="2"></rect>
+      <rect x="18.9473684" y="47.7194983" width="100.701754" height="11.9298746" rx="2"></rect>
+      <rect x="0" y="71.930126" width="37.8947368" height="11.9298746" rx="2"></rect>
+      <rect x="127.017544" y="48.0703769" width="53.3333333" height="11.9298746" rx="2"></rect>
+      <rect x="187.719298" y="48.0703769" width="72.9824561" height="11.9298746" rx="2"></rect>
+      <rect x="76.8421053" y="0" width="140.350877" height="11.9298746" rx="2"></rect>
+      <rect x="17.8947368" y="23.8597491" width="140.350877" height="11.9298746" rx="2"></rect>
+      <rect x="166.315789" y="23.8597491" width="173.684211" height="11.9298746" rx="2"></rect>
+    </clipPath>
+
+    <linearGradient id="animated-diff-gradient" x1="0" x2="0" y1="0" y2="1" spreadMethod="reflect">
+      <stop offset="0" stop-color="#eee"></stop>
+      <stop offset="0.2" stop-color="#eee"></stop>
+      <stop offset="0.5" stop-color="#ddd"></stop>
+      <stop offset="0.8" stop-color="#eee"></stop>
+      <stop offset="1" stop-color="#eee"></stop>
+      <animateTransform attributeName="y1" values="0%; 100%; 0" dur="1s" repeatCount="3"></animateTransform>
+      <animateTransform attributeName="y2" values="100%; 200%; 0" dur="1s" repeatCount="3"></animateTransform>
+    </linearGradient>
+  </defs>
+</svg>
+
+
+
+<div id="all_commit_comments" data-quote-markdown=".js-comment-body">
+
+  <div>
+    
+<div id="partial-visible-comments-header">
+  <h4>
+    28 comments
+    on commit <code>21b7590</code>
+  </h4>
+
+  
+</div>
+
+  </div>
+
+  <div id="comments">
+    
+
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/garoto/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/garoto"><img height="40" width="40" alt="@garoto" src="https://avatars.githubusercontent.com/u/11768175?s=88&amp;u=3571e13320f17a638643fb1784cd0a28a3ab6e16&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62064047">
+    <div>
+      
+
+  
+
+<details data-body-version="538c123ab3144436491a264240826f511abfff52a6d1b739e7200c4762c6db94">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="538c123ab3144436491a264240826f511abfff52a6d1b739e7200c4762c6db94">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Plans on archiving the GH repo?</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/Ashish0804/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/Ashish0804"><img height="40" width="40" alt="@Ashish0804" src="https://avatars.githubusercontent.com/u/39122144?s=88&amp;u=c97a75e1420737e0ba795eaaa9929512c6a0e7b1&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62080914">
+    <div>
+      
+
+  
+
+<details data-body-version="143a88c5ba1637e1cf5789b0c27b83ef6cfb071373ee94232892a2773e5f53ce">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="143a88c5ba1637e1cf5789b0c27b83ef6cfb071373ee94232892a2773e5f53ce">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto"><a target="_blank" rel="noopener noreferrer" href="https://user-images.githubusercontent.com/39122144/146498431-d74e0278-f12c-4e9a-90b2-fd6935b97c94.gif"><img src="https://user-images.githubusercontent.com/39122144/146498431-d74e0278-f12c-4e9a-90b2-fd6935b97c94.gif" alt="ağlayan-adam"/></a></p>
+<p dir="auto">Thanks for your contributions mate.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/pukkandan/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/pukkandan"><img height="40" width="40" alt="@pukkandan" src="https://avatars.githubusercontent.com/u/6623388?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62092679">
+    <div>
+      
+
+  
+
+<details data-body-version="e7052b4313c5f2670696afde27649a17b4074c24f7bb902f35eb7d1efcc6206c">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="e7052b4313c5f2670696afde27649a17b4074c24f7bb902f35eb7d1efcc6206c">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thank you for maintaining this project for all these years <g-emoji alias="heart" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/2764.png">❤️</g-emoji>. Wish you the best in your future endeavors.</p>
+<p dir="auto">Does this mean <a data-hovercard-type="user" data-hovercard-url="/users/remitamine/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/remitamine">@remitamine</a> is the sole maintainer now? Considering they have also been inactive for a while, it is a shame that you were never able to add more maintainers to this project.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/angentanewbe/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/angentanewbe"><img height="40" width="40" alt="@angentanewbe" src="https://avatars.githubusercontent.com/u/68432791?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62100132">
+    <div>
+      
+
+  
+
+<details data-body-version="2b687db6298b629d3bcb482f16aa774a55eb5ae768407b8fba9982387b6c6f81">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/jayzalowitz/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/jayzalowitz"><img height="40" width="40" alt="@jayzalowitz" src="https://avatars.githubusercontent.com/u/598844?s=88&amp;u=3c821e8d04bd65a086147bcaa4b393d58164c0a5&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62113288">
+    <div>
+      
+
+  
+
+<details data-body-version="c1a1279faab2171ac7ba4344a2266c1ea001671d88fa9f0fa9dc143e057d6fa8">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="c1a1279faab2171ac7ba4344a2266c1ea001671d88fa9f0fa9dc143e057d6fa8">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Can I raise a DAO for yall? I know yall did this out of the kindness of your heart, but the bus factor issue with one developer is now an issue, and yall are awesome.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/andyncake/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/andyncake"><img height="40" width="40" alt="@andyncake" src="https://avatars.githubusercontent.com/u/57820250?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62148548">
+    <div>
+      
+
+  
+
+<details data-body-version="ccce75b2b19f1112bd5c51479955d6ed5ad3d1e42e985f37f034732b1ab1023a">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="ccce75b2b19f1112bd5c51479955d6ed5ad3d1e42e985f37f034732b1ab1023a">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thank you for the years-long contribution.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/michealespinola/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/michealespinola"><img height="40" width="40" alt="@michealespinola" src="https://avatars.githubusercontent.com/u/7757052?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62156785">
+    <div>
+      
+
+  
+
+<details data-body-version="900f1533f10b95f8485f086404cdd18b7f4a31fc9f63bae60af70037d69dd8e4">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="900f1533f10b95f8485f086404cdd18b7f4a31fc9f63bae60af70037d69dd8e4">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto"><a data-hovercard-type="user" data-hovercard-url="/users/dstftw/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/dstftw">@dstftw</a>, many thanks for your time and effort over the long run of this project! Life changes or eventually catches up with us, and we almost inevitably have to move on from our past and current endeavors onto new ones,</p>
+<p dir="auto">I wish you the very best on yours.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/L33Tech/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/L33Tech"><img height="40" width="40" alt="@L33Tech" src="https://avatars.githubusercontent.com/u/36166244?s=88&amp;u=402ae9936c8fbb10005a41a21f9bd957874af9d6&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62157304">
+    <div>
+      
+
+  
+
+<details data-body-version="b9e6d81f4fdef5db86228e54cf4f10372bba45d534f91ae28c0bfcd3749c2bbf">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="b9e6d81f4fdef5db86228e54cf4f10372bba45d534f91ae28c0bfcd3749c2bbf">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thank you for all of your amazing work, wishing you the best in life!</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/Colorfag/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/Colorfag"><img height="40" width="40" alt="@Colorfag" src="https://avatars.githubusercontent.com/u/6005225?s=88&amp;u=6ec5d4386eac172ae369f3a32698b3e80bc926d7&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62157936">
+    <div>
+      
+
+  
+
+<details data-body-version="676b0e739d7ffcc6a8902d1d51d74feb3656ca100e35fa7d1021c972c804bda5">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/glubsy/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/glubsy"><img height="40" width="40" alt="@glubsy" src="https://avatars.githubusercontent.com/u/12895548?s=88&amp;u=47070c5d97fbf68f0324cc4e027809a035bf409e&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62157987">
+    <div>
+      
+
+  
+
+<details data-body-version="3cd895618bc831ced9eb274fe41f3e46cd5ce7161837468bb989d4cc8e102daf">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="3cd895618bc831ced9eb274fe41f3e46cd5ce7161837468bb989d4cc8e102daf">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thanks for the hard work, much appreciated.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/wolfkin/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/wolfkin"><img height="40" width="40" alt="@wolfkin" src="https://avatars.githubusercontent.com/u/6678474?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62159931">
+    <div>
+      
+
+  
+
+<details data-body-version="70117cf1ab1454ccad9f1af5e416c4cd07f83b855056db44e2e12395927ef5a4">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="70117cf1ab1454ccad9f1af5e416c4cd07f83b855056db44e2e12395927ef5a4">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thanks for your work. It changed my life. Stay safe.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/Archer2011/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/Archer2011"><img height="40" width="40" alt="@Archer2011" src="https://avatars.githubusercontent.com/u/75739334?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62160012">
+    <div>
+      
+
+  
+
+<details data-body-version="8aa008db3c7111bb97f805a3c0e4146c136a849553196798523fba1fb25181a2">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/a8underscore/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/a8underscore"><img height="40" width="40" alt="@a8underscore" src="https://avatars.githubusercontent.com/u/60801647?s=88&amp;u=53511cd89b645ad9926f70728308304906df0260&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62164576">
+    <div>
+      
+
+  
+
+<details data-body-version="2b4d868fb59660e2db7e4a30bc0e469f6aa73ecc3bb3d1c495003306ebef6d06">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/nshaff3r/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/nshaff3r"><img height="40" width="40" alt="@nshaff3r" src="https://avatars.githubusercontent.com/u/67517313?s=88&amp;u=9439215779176cc2d3ec7fa0f91cd27d5f79567e&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62166102">
+    <div>
+      
+
+  
+
+<details data-body-version="348573af84ef230d238f6120808f7ee75068f4a222cad72f60a3c422a697d48f">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/piyh/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/piyh"><img height="40" width="40" alt="@piyh" src="https://avatars.githubusercontent.com/u/10518137?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62166676">
+    <div>
+      
+
+  
+
+<details data-body-version="f66934fbc346d891169ba81b80b4796fa046ac5ce426bb2b3ab9c13afefe6a41">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="f66934fbc346d891169ba81b80b4796fa046ac5ce426bb2b3ab9c13afefe6a41">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">You&#39;ve enabled me to do so much Sergey, thank you.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/zhichucode/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/zhichucode"><img height="40" width="40" alt="@zhichucode" src="https://avatars.githubusercontent.com/u/43780800?s=88&amp;u=f40b5d5a457282d3cac59a9ec387707d403fc67a&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62167093">
+    <div>
+      
+
+  
+
+<details data-body-version="d9b29b35eeab12b4d6589de5cbd9103049185b3b3ec5a5f18043300c43e136c7">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="d9b29b35eeab12b4d6589de5cbd9103049185b3b3ec5a5f18043300c43e136c7">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thank you for your contribution.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/ebelliveau/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/ebelliveau"><img height="40" width="40" alt="@ebelliveau" src="https://avatars.githubusercontent.com/u/779960?s=88&amp;u=903f2a1bb8b94e9fbdf0e46653c311c4ffd08e42&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62167464">
+    <div>
+      
+
+  
+
+<details data-body-version="a2e311a40a4871818b07957c4a88b8843906b51802bfee4b2a075d96b913b8ed">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/rebane2001/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/rebane2001"><img height="40" width="40" alt="@rebane2001" src="https://avatars.githubusercontent.com/u/6316541?s=88&amp;u=cf281778c50611e18fbd64b4092c8f5efb0f3efa&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62168381">
+    <div>
+      
+
+  
+
+<details data-body-version="90111a9263abd0ca4e0fb1ad65bfcdcb9e0e1ffd4b9763cde02a965608aeb020">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="90111a9263abd0ca4e0fb1ad65bfcdcb9e0e1ffd4b9763cde02a965608aeb020">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thank you, the youtube-dl project has significantly changed my life <g-emoji alias="heart" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/2764.png">❤️</g-emoji></p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/Narmi87/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/Narmi87"><img height="40" width="40" alt="@Narmi87" src="https://avatars.githubusercontent.com/u/51853241?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62168515">
+    <div>
+      
+
+  
+
+<details data-body-version="bf17c2ce8101143001d84b1c56068165e0945a0417cc62cebe55b17a6310fc2a">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="bf17c2ce8101143001d84b1c56068165e0945a0417cc62cebe55b17a6310fc2a">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thank you, and best of luck on your future endeavors.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/billmetangmo/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/billmetangmo"><img height="40" width="40" alt="@billmetangmo" src="https://avatars.githubusercontent.com/u/25366207?s=88&amp;u=b84b53b673bf5ee52b6039f09055efc1ed67c896&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62170319">
+    <div>
+      
+
+  
+
+<details data-body-version="268bc1833e83306f48ae6203eefb86e7a39dedb1d3d6df99c18ef70aa61ef84d">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/artemetra/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/artemetra"><img height="40" width="40" alt="@artemetra" src="https://avatars.githubusercontent.com/u/48987557?s=88&amp;u=fa0496f6f54963b6cba0131b4863eef5435cf225&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62170327">
+    <div>
+      
+
+  
+
+<details data-body-version="a2e311a40a4871818b07957c4a88b8843906b51802bfee4b2a075d96b913b8ed">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/sk8tz/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/sk8tz"><img height="40" width="40" alt="@sk8tz" src="https://avatars.githubusercontent.com/u/1549164?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62171825">
+    <div>
+      
+
+  
+
+<details data-body-version="c9735db20d0fe1ae78576484fcb6ba08a2e0d1d7bb9625a90a40264062122dbb">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/kaifresh/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/kaifresh"><img height="40" width="40" alt="@kaifresh" src="https://avatars.githubusercontent.com/u/8577170?s=88&amp;u=c16182841d437ee44243fbb2f468259536200945&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62172215">
+    <div>
+      
+
+  
+
+<details data-body-version="47ad4e1d28564216c0ba410e131db19aa630958373f5535bd218cee12c43c3dd">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/Volker-Weissmann/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/Volker-Weissmann"><img height="40" width="40" alt="@Volker-Weissmann" src="https://avatars.githubusercontent.com/u/39418860?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62174062">
+    <div>
+      
+
+  
+
+<details data-body-version="268bc1833e83306f48ae6203eefb86e7a39dedb1d3d6df99c18ef70aa61ef84d">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/LinuxPanda/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/LinuxPanda"><img height="40" width="40" alt="@LinuxPanda" src="https://avatars.githubusercontent.com/u/4928620?s=88&amp;u=9aac9d8d9efeb69375c9e032420be99762396424&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62174874">
+    <div>
+      
+
+  
+
+<details data-body-version="c86bb68045d068e52af248ca06ab685abc2dcc9af2563e4b606f10015fe955ff">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="c86bb68045d068e52af248ca06ab685abc2dcc9af2563e4b606f10015fe955ff">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thank you very much for building one of the greatest tool ever. Good luck!</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/robbiedobbie1/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/robbiedobbie1"><img height="40" width="40" alt="@robbiedobbie1" src="https://avatars.githubusercontent.com/u/55464596?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62176263">
+    <div>
+      
+
+  
+
+<details data-body-version="f3dcc1e0281132eaa17dc50ca66b0c9961bea0b0aaa6affb3c65b49efb1b12c3">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="f3dcc1e0281132eaa17dc50ca66b0c9961bea0b0aaa6affb3c65b49efb1b12c3">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thank you Sergey for all the work.  I don&#39;t know why you have removed self, but please be well and safe.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/starise/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/starise"><img height="40" width="40" alt="@starise" src="https://avatars.githubusercontent.com/u/2684482?s=88&amp;u=286b02c534156e69f00bdff11ef9410818bcc7c2&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62176670">
+    <div>
+      
+
+  
+
+<details data-body-version="a86da5d92b0096d94ea93bbae25ce88536e7a5bb69c27ae253171f8f41be5821">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    <div data-body-version="a86da5d92b0096d94ea93bbae25ce88536e7a5bb69c27ae253171f8f41be5821">
+
+      
+
+
+
+      <div>
+
+        
+<task-lists disabled="" sortable="">
+<div>
+          <p dir="auto">Thank you very much for your work.</p>
+      </div>
+</task-lists>
+
+
+          
+      </div>
+
+      <!-- '"` --><!-- </textarea></xmp> -->    </div>
+</div>
+
+  </div>
+  <div>
+
+
+    
+<p><a data-hovercard-type="user" data-hovercard-url="/users/stef/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/stef"><img height="40" width="40" alt="@stef" src="https://avatars.githubusercontent.com/u/13735?s=88&amp;v=4"/></a>
+
+</p>
+
+    <div id="commitcomment-62176727">
+    <div>
+      
+
+  
+
+<details data-body-version="002de1b50400f4879227214752be513ece6f4ac2e480153411cebe07b334ec58">
+    <summary>
+      <div>
+        <h3>
+              This comment has been minimized.
+
+        </h3>
+        
+      </div>
+    </summary>
+</details>
+
+
+    </div>
+    
+</div>
+
+  </div>
+
+  <!-- Rendered timeline since 2021-12-19 04:57:42 -->
+  
+
+  </div><p>
+
+  
+
+    Please
+  <a rel="nofollow" data-hydro-click="{&#34;event_type&#34;:&#34;authentication.click&#34;,&#34;payload&#34;:{&#34;location_in_page&#34;:&#34;commit comment&#34;,&#34;repository_id&#34;:1039520,&#34;auth_type&#34;:&#34;LOG_IN&#34;,&#34;originating_url&#34;:&#34;https://github.com/ytdl-org/youtube-dl/commit/21b759057502c6e70d51011cfb3fb86d84055182&#34;,&#34;user_id&#34;:null}}" data-hydro-click-hmac="59b923df7d84137769d9ad5db02689f176c2fb1f9afe90a37bbdb4f77a111246" href="https://github.com/login?return_to=%2Fytdl-org%2Fyoutube-dl%2Fcommit%2F21b759057502c6e70d51011cfb3fb86d84055182">sign in</a> to comment.
+
+</p></div>
+
+
+
+
+  </div>
+</div></div>
   </body>
 </html>
