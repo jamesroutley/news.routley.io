@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://spacelift.io/blog/tricking-postgres-into-using-query-plan">Original</a>
+    <h1>Tricking PostgreSQL into using an insane – but 200x faster – query plan</h1>
+    
+    <div id="readability-page-1" class="page"><div><div><div data-gapsize="normal"><div><div><div><p><span>At Spacelift, we use PostgreSQL (specifically Aurora Serverless) for most of our primary database needs. Our application query patterns are mostly small transactions that touch a few rows – a typical scenario that PostgreSQL handles without breaking a sweat.</span></p>
+<p><span>We also use Datadog as a monitoring solution. Their agent has a handy feature to create metrics based on periodically executed SQL queries, allowing us to build smart and highly contextual monitors and alerts. Occasionally, such queries might be slow and dominate the processing time of the database. After hooking up Datadog Database monitoring, we identified a lot of slow queries and moved most of them to a separate Redshift cluster. There they execute once per day on a periodic snapshot of the database.</span></p>
+<p><span>However, a number of these queries need to happen at a more frequent interval as they can detect alertable conditions. We couldn’t move these queries to Redshift because of the staleness of the data there. Aurora Serverless also doesn’t support read replicas to offload analytical queries to them, so no luck there either. Thus, we had to optimize, add indices, optimize, and again optimize until we cut the database usage of these metric-creating queries by 1-2 orders of magnitude.</span></p>
+<p><span>This article will show you one such optimization story, which is interesting because both the before and after query plans will look somewhat ridiculous (in terms of cost). Moreover, it shows how PostgreSQL row count estimation can go very wrong. In this case, domain knowledge will help us trick PostgreSQL into a different query plan which will be waaay faster, without adding any additional indices.</span></p>
+</div></div><div><div><p><span>Spacelift is a CI/CD platform specializing in Infrastructure as Code. Users create Runs (executions of, i.e., Terraform) which will be executed on Worker Pools. There is a public shared Worker Pool managed by Spacelift and private Worker Pools that users can host for themselves. </span></p>
+<p><span>Each Run belongs to a Stack, which can be thought of as a single environment, managing a bunch of infrastructure resources. If you know Terraform or CloudFormation, a single Stack maps to a single Terraform state file or a CloudFormation root stack, respectively.</span></p>
+<p><span>A Run can have one of many types: Tracked, Proposed, and others. That type determines what the overall workflow will look like.</span></p>
+</div></div><div><p><span>The query is supposed to notify us when the public Worker Pool cannot handle demand – user Runs are waiting too long to be handled by a Worker.</span></p></div><div><pre><code><span>SELECT COUNT</span><span>(</span><span>*</span><span>)</span><span>                                                                  as </span><span>&#34;count&#34;</span><span>,
+</span><span>       COALESCE</span><span>(</span><span>MAX</span><span>(</span><span>EXTRACT</span><span>(</span><span>EPOCH FROM age</span><span>(</span><span>now</span><span>(</span><span>)</span><span>, runs.created_at</span><span>))</span><span>)</span><span>::bigint, </span><span>0</span><span>)</span><span> AS </span><span>&#34;max_age&#34;</span><span>
+</span>FROM runs
+<span>  JOIN stacks ON runs.stack_id </span><span>=</span><span> stacks.id
+</span><span>  JOIN worker_pools ON worker_pools.id </span><span>=</span><span> stacks.worker_pool_id
+</span><span>  JOIN accounts ON stacks.account_id </span><span>=</span><span> accounts.id
+</span><span>WHERE worker_pools.is_public </span><span>=</span><span> </span><span>true</span><span>
+</span><span>  AND runs.type IN </span><span>(</span><span>1</span><span>, </span><span>4</span><span>)</span><span>
+</span><span>  AND runs.state </span><span>=</span><span> </span><span>1</span><span>
+</span>  AND runs.worker_id IS NULL
+<span>  AND accounts.max_public_parallelism / </span><span>2</span><span> </span><span>&gt;</span><span> </span><span>(</span><span>SELECT COUNT</span><span>(</span><span>*</span><span>)</span><span>
+</span>                                             FROM accounts accounts_other
+<span>                                               JOIN stacks stacks_other ON accounts_other.id </span><span>=</span><span> stacks_other.account_id
+</span><span>                                               JOIN runs runs_other ON stacks_other.id </span><span>=</span><span> runs_other.stack_id
+</span><span>                                             WHERE accounts_other.id </span><span>=</span><span> accounts.id
+</span><span>                                               AND </span><span>(</span><span>stacks_other.worker_pool_id IS NULL OR
+</span><span>                                                    stacks_other.worker_pool_id </span><span>=</span><span> worker_pools.id</span><span>)</span><span>
+</span><span>                                               AND runs_other.worker_id IS NOT NULL</span><span>)</span></code></pre></div><div><div><p><span>That’s a big query! What’s happening here?</span></p>
+<p><span>We’re interested in the number of Runs (as well as the age of the oldest one) which are of the Proposed or Testing type (can be scheduled right away – other Run types require exclusiveness), are in the Queued state (which means they’re not yet being processed) and don’t have a Worker attached to them (are still waiting for one).</span></p>
+<p><span>We only want Runs on Accounts that are far from their parallelism limit to reduce the number of false positives caused by users being correctly limited. So for each Run, we count the number of active Runs on its account and check if it’s under 50% of the parallelism limit, and only then do we count this Run as properly pending.</span></p>
+<p><span>Unfortunately, that query lasts 20 seconds and consumes 50% of our database’s processing time. That’s pretty bad.</span></p>
+</div></div><div><p><span>Let’s take a look at the query plan. I’ll be using </span><a href="https://explain.dalibo.com" target="_blank" rel="noopener"><span>https://explain.dalibo.com</span></a><span> to visualize query plans. To get the query plan, I’m executing it prefixed with EXPLAIN (FORMAT JSON, ANALYZE) … so we can also see information about the query’s actual execution (ANALYZE).</span></p></div><p><span><span><img src="https://spaceliftio.wpcomstaging.com/wp-content/uploads/2021/12/image5-4.png" alt="visualization of query plans" loading="lazy" width="1999" height="704"/></span></span></p><div><div><p><span>What can we see here?</span></p>
+<p><span>On the left side, we’re joining Worker Pools with Stacks. We also calculate the number of active Runs for each Account using the SubPlan. We do a three-way hash join on the (Worker Pool, Stack) tuples, the Accounts, and the SubPlan results based on the Account ID. Then we loop over all those triples and get the pending Runs for each, finally counting all the pending Runs found.</span></p>
+<p><span>The SubPlan goes over all Stacks in an Account, and for each Stack gets the active Runs for it (the ones where worker_id is not NULL).</span></p>
+<p><span>Let’s look at the time distribution of the plan nodes.</span></p>
+</div></div><p><span><span><img src="https://spaceliftio.wpcomstaging.com/wp-content/uploads/2021/12/image4-3.png" alt="time distribution of the plan nodes" loading="lazy" width="650" height="634"/></span></span></p><div><div><p><span>We can see that the most expensive part of this query is the </span><b>Bitmap Index Scan</b><span> which looks for Runs whose worker_id is not NULL, so let’s take a closer look at that part of the query plan.</span></p>
+<p><span>For each Stack in the SubPlan, we look for active Runs on it. How do we do that?</span></p>
+</div></div><p><span><span><img src="https://spaceliftio.wpcomstaging.com/wp-content/uploads/2021/12/image1-3.png" alt="Bitmap" loading="lazy" width="1234" height="1244"/></span></span></p><div><p><span>We scan the runs_worker_id index for storage pages containing Runs with a non-empty worker_id and the run_stack_id index for the pages containing Runs for the current Stack. Then we </span><i><span>AND</span></i><span> these together – we only want pages present in both of these scans. Finally, we scan the actual Runs from the pages and only take the ones that satisfy the predicates (pages found by the index may contain both relevant and irrelevant Runs).</span></p></div><p><span><span><img src="https://spaceliftio.wpcomstaging.com/wp-content/uploads/2021/12/image2-3.png" alt="bitmap index scan" loading="lazy" width="618" height="384"/></span></span></p><div><div><p><span>In a different tab of the left Index Scan, we can see the root of the problem. We made 531358 loops over this, </span><b>and</b><span> we expected to scan 120 mil Runs over the whole processing of the query here, but we scanned 800 mils. That’s much more.</span></p>
+<p><span>But later in the Heap Scan of the </span><i><span>AND</span></i><span>ed pages, we see a gross overestimation.</span></p>
+</div></div><p><span><span><img src="https://spaceliftio.wpcomstaging.com/wp-content/uploads/2021/12/image6.png" alt="bitmap heap scan" loading="lazy" width="620" height="356"/></span></span></p><div><div><p><span>We expected to scan 2 mil rows but scanned 42 overall, which means no Runs were executing on most Stacks at this instant.</span></p>
+<p><span>Overall, it’s mostly this subquery being very expensive:</span></p>
+</div></div><div><pre><code><span>SELECT COUNT</span><span>(</span><span>*</span><span>)</span><span>
+</span>FROM accounts accounts_other
+<span>  JOIN stacks stacks_other ON accounts_other.id </span><span>=</span><span> stacks_other.account_id
+</span><span>  JOIN runs runs_other ON stacks_other.id </span><span>=</span><span> runs_other.stack_id
+</span><span>WHERE accounts_other.id </span><span>=</span><span> accounts.id
+</span><span>  AND </span><span>(</span><span>stacks_other.worker_pool_id IS NULL OR
+</span><span>       stacks_other.worker_pool_id </span><span>=</span><span> worker_pools.id</span><span>)</span><span>
+</span>  AND runs_other.worker_id IS NOT NULL
+</code></pre></div><div><div><p><span>Now comes the domain knowledge. Is there something we know the optimizer seems not to…? </span><b>Yes!</b></p>
+<p><span>Only a minuscule part of the Runs in the database are active at any given time. Most Stacks stay dormant most of the time. Whenever a user makes a commit, only the affected Stacks will execute Runs. There will obviously be Stacks that are constantly in use, but most won’t. Moreover, intensive users will usually use private Worker Pools. The public shared Worker Pool is predominantly utilized by smaller users, so that’s another reason for not seeing many Runs here.</span></p>
+<p><span>Right now, we’re iterating over all existing Stacks attached to the public worker pool and getting relevant Runs for each. How about we flipped that? We know there are at most as many active Runs as there are public Workers – orders of magnitude fewer than there are Stacks. Overall active Runs (not just the ones on the public Worker Pool) are also way less numerous, at most as many as there are Workers overall (and since the number of private Workers is the main dimension we currently base our Enterprise tier pricing on, query processing time being linearly correlated with the number of Workers is OK). Thus, we could get all active Runs and filter to just those whose Stack uses the public Worker Pool.</span></p>
+<p><span>The only problem is, we’re working with a fairly opaque query optimizer, and PostgreSQL doesn’t have any way to give hints to it – like forcing a join strategy. So we’ll have to do that differently. We’ll create a query that scans the active Runs and then uses another subquery to filter them to just the ones related to a relevant Stack. Then we’ll have to hope the query is opaque enough for Postgres not to get too clever with it.</span></p>
+</div></div><div><pre><code><span>SELECT COUNT</span><span>(</span><span>*</span><span>)</span><span>
+</span>FROM runs runs_other
+<span>WHERE </span><span>(</span><span>SELECT COUNT</span><span>(</span><span>*</span><span>)</span><span>
+</span>      FROM stacks
+<span>      WHERE stacks.id </span><span>=</span><span> runs_other.stack_id
+</span><span>        AND stacks.account_id </span><span>=</span><span> accounts.id
+</span><span>        AND stacks.worker_pool_id </span><span>=</span><span> worker_pools.id</span><span>)</span><span> </span><span>&gt;</span><span> </span><span>0</span><span>
+</span> AND runs_other.worker_id IS NOT NULL
+</code></pre></div><div><div><p><span>This query does exactly what we described. Scan active Runs, filter to just those with more than 0 Stacks in the current account and connected to the public Worker Pool. There would be either 1 or 0 such Stacks for each Run.</span></p>
+<p><span>Executing this query, we </span><b>get down to 100ms instead of the original 20s. </b><span>That’s a </span><b>vast</b><span> improvement. What does the query plan say? (apologies for the long vertical picture)</span></p>
+</div></div><p><span><span><img src="https://spaceliftio.wpcomstaging.com/wp-content/uploads/2021/12/image3-2.png" alt="What does the query plan say?" loading="lazy" width="686" height="1706"/></span></span></p><div><div><p><span>Exactly what we wanted! It scans active Runs, and for each of them, checks (using a primary key index lookup – fast!) whether the Stack it belongs to is relevant.</span></p>
+<p><span>That’s it! The whole optimized query now looks like this:</span></p>
+</div></div><div><pre><code><span>SELECT COUNT</span><span>(</span><span>*</span><span>)</span><span>                                                                  as </span><span>&#34;count&#34;</span><span>,
+</span><span>       COALESCE</span><span>(</span><span>MAX</span><span>(</span><span>EXTRACT</span><span>(</span><span>EPOCH FROM age</span><span>(</span><span>now</span><span>(</span><span>)</span><span>, runs.created_at</span><span>))</span><span>)</span><span>::bigint, </span><span>0</span><span>)</span><span> AS </span><span>&#34;max_age&#34;</span><span>
+</span>FROM runs
+<span>  JOIN stacks ON runs.stack_id </span><span>=</span><span> stacks.id
+</span><span>  JOIN worker_pools ON worker_pools.id </span><span>=</span><span> stacks.worker_pool_id
+</span><span>  JOIN accounts ON stacks.account_id </span><span>=</span><span> accounts.id
+</span><span>WHERE worker_pools.is_public </span><span>=</span><span> </span><span>true</span><span>
+</span><span>  AND runs.type IN </span><span>(</span><span>1</span><span>, </span><span>4</span><span>)</span><span>
+</span><span>  AND runs.state </span><span>=</span><span> </span><span>1</span><span>
+</span>  AND runs.worker_id IS NULL
+<span>  AND accounts.max_public_parallelism / </span><span>2</span><span> </span><span>&gt;</span><span> </span><span>(</span><span>SELECT COUNT</span><span>(</span><span>*</span><span>)</span><span>
+</span>                                             FROM runs runs_other
+<span>                                             WHERE </span><span>(</span><span>SELECT COUNT</span><span>(</span><span>*</span><span>)</span><span>
+</span>                                                    FROM stacks
+<span>                                                    WHERE stacks.id </span><span>=</span><span> runs_other.stack_id
+</span><span>                                                      AND stacks.account_id </span><span>=</span><span> accounts.id
+</span><span>                                                      AND stacks.worker_pool_id </span><span>=</span><span> worker_pools.id</span><span>)</span><span> </span><span>&gt;</span><span> </span><span>0</span><span>
+</span><span>                                               AND runs_other.worker_id IS NOT NULL</span><span>)</span></code></pre></div><div><p><span>Thanks for reading! The moral of this story is that query plans aren’t that hard to interpret with the right tools. Using your domain knowledge, you can rewrite your queries to achieve substantial performance boosts without adding unnecessary indices or denormalizing the data model.</span></p></div></div></div></div></div></div>
+  </body>
+</html>
