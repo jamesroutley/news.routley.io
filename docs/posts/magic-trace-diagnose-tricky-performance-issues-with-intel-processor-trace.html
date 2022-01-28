@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://blog.janestreet.com/magic-trace/">Original</a>
+    <h1>Magic-trace: Diagnose tricky performance issues with Intel Processor Trace</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      <p>Intel Processor Trace is a hardware technology that can record all
+program execution flow along with timing information accurate to
+around 30ns. As far as I can tell <a href="https://engineering.fb.com/2021/04/27/developer-tools/reverse-debugging/">a</a><a href="https://easyperf.net/blog/2019/08/23/Intel-Processor-Trace">l</a><a href="https://github.com/nyx-fuzz/libxdc">m</a><a href="https://blog.trailofbits.com/2021/03/19/un-bee-lievable-performance-fast-coverage-guided-fuzzing-with-honeybee-and-intel-processor-trace/">o</a><a href="http://halobates.de/blog/p/410">s</a><a href="https://dl.acm.org/doi/10.1145/3029806.3029830">t</a>
+nobody uses it, seemingly because capturing the data is tricky and,
+without any visualization tools, you’re forced to read enormous text
+dumps.</p>
+
+<p>Magic-trace is a tool we built and <a href="https://github.com/janestreet/magic-trace">open-sourced</a> to make it easy to
+capture a trace of around 10ms <em>leading up to</em> a function call you
+chose to instrument, and then visualize the call stack on a timeline
+where you can zoom in and see <em>every</em> function call and how long it
+took. Here’s a captured trace of 5ms of OCaml program startup:</p>
+
+<p><a href="https://blog.janestreet.com/magic-trace/example-ocaml-startup.png"><img src="https://blog.janestreet.com/magic-trace/example-ocaml-startup.png" alt="5ms of OCaml startup"/></a></p>
+
+<p>And here’s the same trace zoomed in to an arbitrary 500 nanoseconds.
+The thin red events are 1-3 nanoseconds:</p>
+
+<p><a href="https://blog.janestreet.com/magic-trace/example-trace-500ns.png"><img src="https://blog.janestreet.com/magic-trace/example-trace-500ns.png" alt="500ns of OCaml startup"/></a></p>
+
+<p>Recently we’ve been using this tool to diagnose performance issues that
+would be very difficult to solve with other tools. Using it is as easy
+as adding a <code>Magic_trace.take_snapshot</code> call to your code (or using a
+fuzzy-finder to select any existing function), then running
+<code>magic-trace attach</code> and using the fuzzy-finder to select your process.
+It’ll spit out a trace you can view in <a href="https://perfetto.dev/">Google’s Perfetto trace
+viewer</a>.</p>
+
+<p>In this post we’ll go over why Processor Trace is so special, the
+difficulties of building something on top of a hardware technology
+almost nobody uses, how we were beset by a kernel bug <em>and</em> a hardware
+bug, and the kinds of problems we’ve been able to solve with the
+tool.</p>
+
+<h2 id="why-intel-processor-trace-and-why-not">Why Intel Processor Trace, and why not?</h2>
+
+<p>Let’s look at the major types of performance analysis tools and why
+magic-trace serves a different niche:</p>
+
+<p><strong>Sampling profilers</strong> interrupt the program every 250 microseconds or
+so, sample the current call stack, and then summarize them all
+together. These are great for giving you a sense of where your program
+is spending its time. However, at Jane Street we have lots of
+high-performance trading systems that spend nearly all of their time
+waiting for network packets that we want to respond to in far less
+than the 250-microsecond sampling interval. Sampling profilers are
+approximately useless for diagnosing latency issues on that scale:
+you’d be lucky to get one sample in the code you care about!</p>
+
+<p>Even in more traditional systems, you may want to diagnose short but
+rare tail latency events, or notice the difference between a function
+being called 10 times more than you expected or one call to it taking
+10 times longer than expected, which a sampling profiler can’t tell
+you.</p>
+
+<p><strong>Instrumentation-based tracing</strong> either patches or compiles probes
+into a program that record when certain functions start and end, then
+typically visualizes them on an interactive timeline UI. We re-use the
+UI from the <a href="https://perfetto.dev/">Perfetto tracing system</a> for magic-trace, although we
+needed to fork it to better handle events at the scale of single
+nanoseconds. High-performance tracing systems like <a href="https://github.com/wolfpld/tracy">tracy</a> even
+manage to get the overhead down to around 2ns per call (we built a
+similar system for OCaml and <a href="https://github.com/janestreet/tracing">open-sourced it</a>). However,
+instrumenting every single function is risky (e.g. you might triple the
+cost of a 1ns function that’s called everywhere) so typically they
+require manual instrumentation, and sometimes your performance problems
+are in an app or function you haven’t annotated.</p>
+
+<p><strong>Hardware tracing</strong> like Intel Processor Trace (IPT) has the
+advantages of tracing but doesn’t require any instrumentation, and can
+have much lower overhead than instrumenting everything. They use a very
+efficient format that only encodes just enough info to reconstruct the
+control flow – for example conditional branches take one bit. Time
+overhead for IPT varies from 2-20% depending on the program, with every
+one of our programs I’ve benchmarked experiencing less than a 10%
+slowdown and usually under 5%.</p>
+
+<p>There are a few downsides to Processor Trace though:</p>
+
+<ul>
+  <li>Many VMs don’t support it and it needs a post-Skylake Intel processor
+(some other vendors have similar tech; AMD doesn’t yet).</li>
+  <li>You have no choice but the full 1GB/s firehose (with the exception of
+some limited filtering options) so it’s difficult to store and
+analyze longer traces. With instrumentation you can manually pick the
+important functions and economize on trace size.</li>
+  <li>Decoding is slow because it needs to follow along with disassembled
+instructions from the binary and reconstruct the flow. Other than
+specialized decoders for fuzzing, the fastest decoder is 60x slower
+than real time.</li>
+</ul>
+
+<h2 id="a-minimum-viable-product">A minimum viable product</h2>
+
+<p>During Jane Street’s <a href="https://blog.janestreet.com/what-the-interns-have-wrought-2021/">2021 summer internship</a>, I was talking to
+some colleagues about our issues profiling very short interesting time
+segments. I noted that Intel Processor Trace would be great for this
+but that it was really hard to use. Then I realized that with the
+trace visualization library I had just written, and some features from
+the Processor Trace documentation I had just read, I could see a path
+to a user-friendly tool. So I drafted a new intern project document,
+and for the second half of his internship, Chris Lambert and I worked
+on putting it together.</p>
+
+<p>The key idea behind quickly making a useful tool was to limit the
+scope:</p>
+
+<ul>
+  <li>We’d focus on the circular buffer mode, where it overwrites old data
+until you snapshot it after something interesting happens. Processor
+Trace can save <em>all</em> data, but doing so creates 1GB of trace file
+per second.</li>
+  <li>We’d trigger the snapshots based on a function call in the target
+program. There are lots of other possibilities for deciding when to
+snapshot, but calling a function is very flexible, especially if you
+put it behind custom logic waiting for tail latency events or
+something.</li>
+  <li>We’d only visualize function calls and returns, and only on a trace
+timeline. Processor Trace gives you full control-flow data and in
+theory you could visualize down to individual lines, but that ends up
+being too much data to deal with.</li>
+</ul>
+
+<p>The first stage was to implement the tool as a wrapper around the
+Linux <code>perf</code> tool’s Processor Trace functionality, and Chris blazed
+through it in under a week. Sending the <code>SIGUSR2</code> signal to <code>perf</code>
+caused it to take a snapshot, so Chris wrote a
+<code>Magic_trace.take_snapshot</code> function that sent <code>SIGUSR2</code> to the parent
+pid. Then he wrote a parser and call-stack reconstructor to turn the
+<code>perf script</code> text dump of all branches into a trace that handled
+OCaml features like tail-calls and some exceptions.</p>
+
+<p>It was pretty exciting looking through the first traces and being able
+to zoom in and see the smallest details, and immediately noticing
+things like that OCaml program startup time was mostly composed of
+module initializers page faulting in random parts of the binary.</p>
+
+<h2 id="directly-using-kernel-apis-and-libipt">Directly using kernel APIs and libipt</h2>
+
+<p>Then we embarked on something harder. Parsing the output of the <code>perf</code>
+tool was slow and couldn’t do the instruction-level decoding needed for
+properly handling pushes and pops to the OCaml exception handler stack.
+We decided to try directly using the kernel <a href="https://man7.org/linux/man-pages/man2/perf_event_open.2.html">perf_event_open</a> API
+and Intel’s <a href="https://github.com/intel/libipt">libipt</a> decoding library.</p>
+
+<p>This turned out to be quite tricky, as we couldn’t find any evidence
+anyone had ever tried directly integrating <code>perf_event_open</code> with
+<code>libipt</code> before. I ended up spending my days poring over documentation
+and source code of <code>libipt</code> and the <code>perf</code> tool to figure out how to
+do things we hadn’t understood yet and handing answers and example
+links over to Chris, who wrote and debugged the C code to interface
+with the APIs and with OCaml.</p>
+
+<p>After lots of research and debugging, by the end of his internship we’d
+managed to get a trace of events out of our from-scratch
+implementation. After Chris left I debugged the remaining issues and
+plumbed it in fully. Hopefully now that we’ve published a reference
+codebase, anyone else attempting this will have an easier time.</p>
+
+<h2 id="hardware-breakpoints-for-seamless-triggering">Hardware breakpoints for seamless triggering</h2>
+
+<p>After Chris left and things were working, the biggest feature that we
+needed to make useful and easy was the ability to attach to existing
+processes.  Unfortunately this broke our parent-<code>SIGUSR2</code>-based
+snapshot signalling. I wanted <code>Magic_trace.take_snapshot</code> to have close
+to zero overhead while <code>magic-trace</code> wasn’t attached, and low overhead
+even when it did trigger a snapshot. I thought I might have to have
+every process host a tiny <a href="https://en.wikipedia.org/wiki/Inter-process_communication">IPC</a> server or use <a href="https://man7.org/linux/man-pages/man2/ptrace.2.html">ptrace</a>, but I
+wasn’t happy with those solutions.</p>
+
+<p>I spent a bunch of time looking for a better solution and eventually I
+found a really satisfying one in the <a href="https://man7.org/linux/man-pages/man2/perf_event_open.2.html">perf_event_open</a> docs. It
+turns out that <code>perf_event_open</code> can use hardware breakpoints and
+notify you when a memory address is executed or accessed.</p>
+
+<p>The cool thing about this approach is that it requires no cooperation
+from the target, no overhead when not attached, and can actually be
+used on any function we want, not just a special
+<code>Magic_trace.take_snapshot</code> function. When we do use it on a special
+function, we can sample registers so we can see the arguments it was
+called with, allowing the user to include metadata with their
+snapshot.</p>
+
+<p>I think it says something interesting about my programming aesthetic
+that I spent a whole day researching alternatives to adding a tiny IPC
+server and ended up using a niche kernel API and hardware feature. I
+knew the hardware allowed a design which didn’t require recompiling or
+adding extra bloat to processes that weren’t being traced, and I really
+wanted to make first-time use as smooth as possible and avoid bloating
+everyone else’s programs. If I did go the IPC route, I was at least
+going to use less-obscure-but-still-rare Linux-only abstract domain
+sockets (named by the PID) to avoid having to clean up files or deal
+with ports. Sometimes standard approaches can’t get you to an ideal
+user experience, but they’re easier for your coworkers to maintain, you
+run into fewer issues, and need to do less research. This tradeoff
+leaves low-hanging fruit for people who enjoy diving deep into obscure
+documentation and debugging weird issues, which can tip the balance.
+Hardware breakpoints, the whole <code>magic-trace</code> project, and <a href="https://github.com/janestreet/perfetto">other
+projects of mine</a> are all the result of delighting in asking myself
+“could I obliterate this problem by being willing to do cursed things?”</p>
+
+<h2 id="kernel-bugs-and-hardware-bugs-the-perils-of-being-early">Kernel bugs and hardware bugs, the perils of being early</h2>
+
+<p>People have sometimes used Processor Trace, and it mostly works, but
+I’ve learned that when using niche and complicated new hardware, I
+can’t have the same low priors as I usually do about bugs being due to
+the kernel or hardware.</p>
+
+<p>I was excited to be able to try my hand at kernel debugging for the
+first time when I discovered a way to crash the kernel using a
+specific unusual combination of Processor Trace features. I used info
+from the kernel core dump, and read through control flow paths and
+recent patches in the kernel, to figure out the reason for the null
+pointer access. It turns out a patch added a flag that made one piece
+of state invalid to access, but missed guarding it with an if
+statement in one place. Exactly the kind of bug that algebraic data
+types in OCaml/Rust/etc help you avoid :)</p>
+
+<p>Another bug was much more mysterious and difficult. On exactly one
+program out of any I tried, Processor Trace would mysteriously stop
+adding events to the trace buffer before it reached the snapshot
+point. I spent 2 weeks adding various sorts of observability and
+fixing other issues that got in the way (so at least <code>magic-trace</code>
+ended up better regardless), and couldn’t find any sensible software
+cause, e.g. a context switch that lined up with when the recording
+stopped. Finally I tried running it on a newer generation of Intel
+processors and the problem went away. I suspect it may be Intel
+erratum SKL171 “Intel® PT May Drop All Packets After an Internal
+Buffer Overflow” which happens under a “rare microarchitectural
+condition”, although it still might be some race condition kernel bug
+that’s very consistent only in the older hardware.</p>
+
+<h2 id="solving-tricky-problems">Solving tricky problems</h2>
+
+<p>People have only been using <code>magic-trace</code> internally for about a month
+but we’ve already made good use of it.</p>
+
+<p>The original design goal was to help with performance problems in
+high-performance trading system that sampling profilers are hopeless
+for, and that’s panned out. It helped identify a 100ns performance
+regression caused by a patch that turned out to cause a function call
+not to be inlined. It also helped diagnose why a new compiler version
+made a trading system slower, which also turned out to come down to an
+inlining decision.</p>
+
+<p>But after we built magic-trace, we realized it could help with another
+kind of difficult performance problem that people at Jane Street
+encounter frequently. We use <a href="https://opensource.janestreet.com/async/">Async</a> to cooperatively handle many
+concurrent tasks. The “cooperatively” part means that if one task
+takes too long then all other tasks have to wait for it. If you have
+an issue that causes a task to handle way more work than usual, it can
+cause a “long async cycle”. These can be really tricky to debug if
+they only happen occasionally, since you don’t get any info about what
+code was too slow. Previously people have resorted to capturing
+enormous long <code>perf</code> profiles and then using logged monotonic
+timestamps to filter the profile to the relevant region.</p>
+
+<p>Now with <code>magic-trace</code> people can just add a snippet of code that
+calls <code>Magic_trace.take_snapshot</code> after cycles over a certain length,
+and then attach <code>magic-trace</code> and wait for it to capture. Even if a
+long cycle is 15 seconds, the last 10 milliseconds of the job are
+normally the same uniform large batch of work, so you can just look
+back in the trace to see which code is doing too much work. We’ve
+already used this to solve one tricky issue where there were way more
+items in a certain collection than expected and a loop was spending
+seconds working over them. Sampling profile filtering would’ve been
+harder and wouldn’t have been able to tell whether the function was
+looping too many times instead of, say, taking a really long time once
+or just always being somewhat slow.</p>
+
+<p>Even if <code>magic-trace</code> is only indispensable for certain
+high-performance code, as a user-friendly performance tool in a
+toolbox it can be useful for all sorts of debugging and performance
+problems just by being quicker and easier to use than alternatives.</p>
+
+<h2 id="how-you-can-use-magic-trace">How you can use magic-trace</h2>
+
+<p>We designed magic-trace for our own OCaml code but now <a href="https://github.com/janestreet/magic-trace">you can use
+it</a> on any native executable with symbol names (e.g. a C++ or Rust
+program) as long as you have a new enough Intel Linux machine. Here’s
+how:</p>
+
+<div><pre><code><span># If this prints 1 your machine supports Processor Trace with precise timing</span>
+cat /sys/bus/event_source/devices/intel_pt/caps/psb_cyc
+<span># Install Opam (https://opam.ocaml.org/doc/Install.html), then OCaml 4.12.1</span>
+opam switch create 4.12.1
+opam switch 4.12.1
+<span># Add the Jane Street pre-release repo, magic-trace isn&#39;t on public Opam yet</span>
+opam repo add janestreet-bleeding https://ocaml.janestreet.com/opam-repository
+<span># Install the magic-trace command line tool</span>
+opam install magic-trace
+<span># This lets you fuzzy-search a process to attach to and a symbol to snapshot on</span>
+magic-trace attach -symbol <span>&#39;&#39;</span> -output magic.ftf
+<span># Go to https://ui.perfetto.dev/ and open the trace file</span>
+</code></pre>
+</div>
+
+<p>Nobody else has used Perfetto for traces like this before so we also
+needed to leave our OCaml and C extensions to the land of Typescript
+and <a href="https://github.com/janestreet/perfetto">patch Perfetto to support zooming to nanosecond-levels</a>. The
+<a href="https://ui.perfetto.dev/">main Perfetto UI</a> works, and we hope to upstream some patches to
+it, but for the best experience you can <a href="https://github.com/janestreet/perfetto/blob/jane-public-patches/docs/contributing/build-instructions.md#ui-development">build the UI</a> from our
+fork.</p>
+
+<h2 id="lets-use-more-processor-trace">Let’s use more Processor Trace!</h2>
+
+<p>Intel Processor Trace is an incredibly powerful and cool technology, and
+it’s an absolute shame that more people don’t use it. I hope that
+<code>magic-trace</code> shows people how useful Processor Trace and technologies
+like it can be, and makes it easier to use Processor Trace by providing
+an example codebase.</p>
+
+<p>One way to build tools on top of Processor Trace that I haven’t
+mentioned yet is <a href="https://man7.org/linux/man-pages/man1/perf-dlfilter.1.html">perf-dlfilter</a>, which allows you to consume
+<code>perf</code> events using an efficient C API with a shared library rather
+than parsing text output. We didn’t use it because it was just being
+submitted to the kernel as we were writing magic-trace; we didn’t
+learn about it until I stumbled upon it months later. I’d recommend
+that tools try to start with <code>perf</code> and <code>dlfilter</code> rather than
+<code>perf_event_open</code> and <code>libipt</code>, as it just implements tons of stuff
+you’ll otherwise need to reimplement.</p>
+
+<p>At the end of his internship, Chris even suggested that with hindsight
+we should have forked <code>perf</code> to add a C interface rather than
+embarking on the <code>libipt</code> route – and luckily someone else did, with
+the specific goal of efficiently reading Processor Trace events! You
+don’t even need a super new kernel, because you can compile the <code>perf</code>
+tool from a newer kernel tree and use it on an older kernel.</p>
+
+<p>Here are some more ideas we’ve thought of for Processor Trace tooling
+that nobody’s built yet and that we might build into <code>magic-trace</code>:</p>
+
+<ul>
+  <li>Visualizing control flow at the level of individual lines of code,
+perhaps with a custom trace viewer designed for Processor Trace
+which lazily decodes the lowest levels again as you zoom in.</li>
+  <li>Feedback Directed Optimization of low-latency systems by optimizing
+based on recorded control flow in the latency-critical case.</li>
+  <li>Using Processor Trace to evaluate compiler optimizations by counting
+the number of actually executed register spills, page faults,
+etc. on benchmarks.</li>
+  <li>Building efficient instrumentation-based tracing on top of the
+<code>PTWRITE</code> instruction in the latest processors, which allows adding
+data into the trace.</li>
+  <li>Using the “PEBS via PT” feature on very new processors to sample cache
+misses or branch mispredicts and add them to the trace so you can
+notice why your function is slow.</li>
+  <li>Using root permissions to record every process on every core plus the
+kernel and combining it with task switch information to visualize
+literally everything the processor was doing during a time slice so
+mysterious performance problems have nowhere left to hide.</li>
+</ul>
+
+<p>If more people use Processor Trace, more VM hypervisors will support
+it, Intel will hopefully invest more in it as a differentiating factor,
+and perhaps AMD will try to catch up. And if you want to use Processor
+Trace today, try <code>magic-trace</code> on your own problems, or apply to Jane
+Street and come try it on ours: we’re always hiring!</p>
+
+    </div></div>
+  </body>
+</html>
