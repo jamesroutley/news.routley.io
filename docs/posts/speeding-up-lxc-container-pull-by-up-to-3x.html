@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://databricks.com/blog/2022/01/26/creating-a-faster-tar-extractor.html">Original</a>
+    <h1>Speeding up LXC container pull by up to 3x</h1>
+    
+    <div id="readability-page-1" class="page"><div itemprop="text">
+			<p>Tarballs are used industry-wide for packaging and distributing files, and this is no different at Databricks. Every day we launch millions of VMs across multiple cloud providers. One of the first steps on every one of these VMs is extracting a fairly sizable tar.lz4 file containing a specific Apache Spark™ runtime. As part of an effort to help bring down bootstrap times, we wanted to see what could be done to help speed up the process of extracting this large tarball.</p>
+<h2>Existing methods</h2>
+<p>Right now, the most common method for extracting tarballs is to invoke some command (e.g. curl, wget, or even their browser) to download the raw tarball locally, and then use tar to extract the contents to their final location on disk. There are two general methods that exist right now to improve upon this.</p>
+<h3>Piping the download directly to tar</h3>
+<p>Tar uses a sequential file format, which means that extraction always starts at the beginning of the file and makes its way towards the end. A side effect of this is that you don’t need the entire file present to begin extraction. Indeed tar can take in “-“ as the input file and it will read from standard input. Couple this with a downloader dumping to standard output (wget -O -) and you can effectively start untarring the file in parallel as the rest is still being downloaded. If both the download phase and the extraction phase take approximately the same time, this can theoretically halve the total time needed.</p>
+<h3>Parallel download</h3>
+<p>Single stream downloaders often don’t maximize the full bandwidth of a machine due to bottlenecks in the I/O path (e.g., bandwidth caps set per download stream from the download source). Existing tools like <a href="https://github.com/aria2/aria2" rel="noopener" target="_blank">aria2c</a> help mitigate this by downloading with parallel streams from one or more sources to the same file on disk. This can offer significant speedups, both by utilizing multiple download streams and by writing them in parallel to disk.</p>
+<h2>What fastar does different</h2>
+<h3>Parallel downloads + piping</h3>
+<p>The first goal of fastar was to combine the benefits of piping downloads directly to tar with the increased speed of parallel download streams. Unfortunately aria2c is designed for writing directly to disk. It doesn’t have the necessary synchronization mechanisms needed for converting the multiple download streams to a single logical stream for standard output.</p>
+<p>Fastar employs a group of worker threads that are all responsible for downloading their own slices of the overall file. Similar to other parallel downloaders, it takes advantage of the HTTP RANGE header to make sure each worker only downloads the chunk it’s responsible for. The main difference is that these workers make use of golang channels and a shared io.Writer object to synchronize and merge the different download streams. This allows for multiple workers to be constantly pulling data in parallel while the eventual consumer only sees a sequential, in-order stream of bytes.</p>
+<p>Assuming 4 worker threads (this number is user configurable), the high-level logic is as follows:</p>
+<ol>
+<li>Kick off threads (T1 – T4), which start downloading chunks in parallel starting at the beginning of the file. T1 starts immediately writing to stdout while threads T2-T4 save to in-memory buffers until it’s their turn.</li>
+</ol>
+<p><img loading="lazy" src="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-1.jpg" alt="" width="551" height="143" srcset="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-1.jpg 551w, https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-1-300x78.jpg 300w" sizes="(max-width: 551px) 100vw, 551px"/></p>
+<ol start="2">
+<li>Once T1 is finished writing its current chunk to stdout, it signals T2 that it’s their turn, and starts downloading the next chunk it’s responsible for (right after T4’s current chunk). T2 starts writing the data they saved in their buffer to stdout while the rest of the threads continue with their downloads. This process continues for the whole file.</li>
+</ol>
+<p><img loading="lazy" src="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-2.jpg" alt="" width="552" height="146" srcset="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-2.jpg 552w, https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-2-300x79.jpg 300w" sizes="(max-width: 552px) 100vw, 552px"/></p>
+<h3>Multithreaded tar extraction</h3>
+<p>The other big area for improvement was actual extraction of files to disk by tar itself. As alluded to earlier, one of the reasons aria2c is such a fast file downloader is that it writes to disk with multiple streams. Keeping a high queue depth when writing ensures that the disk always has work to do and isn’t sitting idle waiting for the next command. It also allows the disk to constantly rearrange write operations to maximize throughput. This is especially important when, for example, untarring many small files. The built in tar command is single threaded, extracting all files from the archive in a single hot loop.</p>
+<p>To get around this, fastar also utilizes multiple threads for writing individual extracted files to disk. For each file in the stream, fastar will copy the file data to a buffer, which is then passed to a thread to write to disk in the background. Some file types need to be handled differently here for correctness. Folders are written synchronously to ensure they exist before any subfiles are written to disk. Another special case here is hard links. Since they require the dependent file to exist unlike symlinks, we need to take care to synchronize file creation around them.</p>
+<h3>Quality of life features</h3>
+<p>Fastar also includes a few features to improve ease of use:</p>
+<ul>
+<li>S3 hosted download support. Fastar also supports downloading from S3 buckets using the s3://bucket/key format</li>
+<li>Compression support. Fastar internally handles decompression of gzip and lz4 compressed tarballs. It can even automatically infer which compression schema is used by sniffing the first few bytes for a <a href="https://en.wikipedia.org/wiki/List_of_file_signatures" target="_blank" rel="noopener">magic number</a>.</li>
+</ul>
+<h2>Performance numbers</h2>
+<p>To test locally, we used an lz4 compressed tarball of a container filesystem (2.6GB compressed, 4.3GB uncompressed). This was hosted on a local HTTP server serving from an in-memory file system. The tarball was then downloaded and extracted to the same in-memory file system. This should represent a theoretical best case scenario as we aren’t IO bound with the memory backed file system.</p>
+<p><a href="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-3.jpg" data-lightbox=""><img loading="lazy" src="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-3.jpg" alt="Fastar is 3 times faster than wget and tar." width="1200" height="671" srcset="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-3.jpg 1200w, https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-3-300x168.jpg 300w, https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-3-1024x573.jpg 1024w, https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-3-768x429.jpg 768w" sizes="(max-width: 1200px) 100vw, 1200px"/></a></p>
+<p>For production impact, the following shows the speed difference when extracting one of the largest images we support on a live cluster (7.6GB compressed, 16.1GB uncompressed). Pre-fastar, we used aria2c on Azure and boto3 on AWS to download the image before extracting it with tar.</p>
+<p><a href="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-4.jpg" data-lightbox=""><img loading="lazy" src="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-4.jpg" alt="Fastar provides a 2x speedup on AWS" width="1200" height="671" srcset="https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-4.jpg 1200w, https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-4-300x168.jpg 300w, https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-4-1024x573.jpg 1024w, https://databricks.com/wp-content/uploads/2022/01/creating-faster-tar-extractor-blog-img-4-768x429.jpg 768w" sizes="(max-width: 1200px) 100vw, 1200px"/></a></p>
+<p>From the tests above, fastar can offer significant speed improvements, both in synthetic and real-world benchmarks. In synthetic workloads we achieve a nearly 3x improvement over naively calling wget &amp;&amp; tar and double the performance compared to using the already fast aria2c &amp;&amp; tar. Finally in production workloads we see a 1.3x improvement in Azure Databricks and over a 2x improvement in Databricks on AWS.</p>
+<p>Interested in working on problems like this? Consider <a href="https://databricks.com/company/careers" rel="noopener" target="_blank">applying</a> to Databricks!</p>
+<p>Also let us know if you would find this tool useful and we can look into open sourcing it!</p>
+		</div></div>
+  </body>
+</html>
