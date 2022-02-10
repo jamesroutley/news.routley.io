@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://ketansingh.me/posts/how-postgres-stores-rows/">Original</a>
+    <h1>How PostgreSQL stores rows</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>Out of curiosity, I was trying to understand how PostgreSQL stores the data onto the disk and there are a few interesting things that I have noticed that might be useful for application developers. In this post, I will try to go into the implementation level details and map out how PostgreSQL row storage really works.</p><p>Just to be clear, PostgreSQL stores a lot of files on disk such as transaction commit data, subtransaction status data, write ahead logs (WAL), etc. I will only be exploring heap files. Now what the heck is a heap file? A heap file is just a file of records. Note that the heap file has got nothing to do with heap memory. Although their use case is very similar, which is storing dynamic data.</p><h2 id="how-rows-are-organized-in-files">How rows are organized in files?</h2><p>PostgreSQL stores the actual data into segment files (more generally called heap files). Typically its fixed to 1GB size but you can configure that at compile time using <code>--with-segsize</code>. When a table or index exceeds 1 GB, it is divided into gigabyte-sized <em>segments</em>. This arrangement avoids problems on platforms that have file size limitations but 1GB is very conservative choice for any modern platform.</p><p>These segment files contain data in fixed size pages which is usually 8Kb, although a different page size can be selected when compiling the server with <code>--with-blocksize</code> option but this size usually falls in ideal size when considering performance and reliability tradeoffs. If the page size is too small, rows won’t fit inside the page and if it’s too large there is risk of write failure because hardware generally can only guarantee atomicity for a fixed size blocks which can vary disk to disk (usually ranges from 512 bytes to 4096 bytes).</p><p>Pages themselves are organized in a layout something like following:</p><p><img src="https://i.imgur.com/RCnRkeV.png" alt="https://i.imgur.com/RCnRkeV.png"/></p><p><strong>lp(1..N)</strong> is line pointer array. It points to a logical offset within that page. Since these are arrays, elements are fixed sized but the number of elements can vary.</p><p><strong>row(1..N)</strong> represents actual SQL rows. They are added in reverse order within a page. They are generally variable sized and in order to reach to a specific tuple we use line pointer. Since there can be variable number of rows inside a page, items are added backward while line pointer is added to front. </p><p><strong>special space</strong> is typically used when storing indexes in these page, usually sibling nodes in a B-Tree for example. For table data this is not used.</p><p><strong>lower</strong> and <strong>upper</strong> pointer mark the locations that have already been used in a page. Thus, <code>(upper - lower)</code> determines if a page has already been used.</p><p><strong>page header</strong> itself is not that interesting, it just contains book-keeping stuff related a page including lower and upper pointer. It’s structure looks like this:</p><table><thead><tr><th>field              </th><th>size    </th><th>description                                                              </th></tr></thead><tbody><tr><td>pd_lsn              </td><td>8 bytes</td><td>LSN: next byte after last byte of WAL record for last change to this page</td></tr><tr><td>pd_checksum        </td><td>2 bytes</td><td>Page checksum                                                            </td></tr><tr><td>pd_flags            </td><td>2 bytes</td><td>Flag bits                                                                </td></tr><tr><td>pd_lower            </td><td>2 bytes</td><td>Offset to start of free space                                            </td></tr><tr><td>pd_upper            </td><td>2 bytes</td><td>Offset to end of free space                                              </td></tr><tr><td>pd_special          </td><td>2 bytes</td><td>Offset to start of special space                                          </td></tr><tr><td>pd_pagesize_version</td><td>2 bytes</td><td>Page size and layout version number information                          </td></tr><tr><td>pd_prune_xid        </td><td>4 bytes</td><td>Oldest unpruned XMAX on page, or zero if none                            </td></tr></tbody></table><p>Now, this method of storage has few implications. </p><ul><li><p>Firstly, tuples cannot span multiple pages. Therefore, it is not possible to store very large field values directly. Large field values are compressed and/or broken up into multiple physical rows. </p></li><li><p>Secondly, the maximum number of columns is limited between 250 and 1600 depending on column types. </p></li><li><p>Thirdly, if you have a table with multiple columns and naively assume that querying for selected column will be faster because of lower disk I/O, that is not going to be the case. Although it can help with network saturation if there’s too much traffic between the application and the database. </p></li><li><p>This kind of storage is not optimized for analytical workloads because you have to bring in data from disk which would be irrelevant for your queries. This is why most analytical based databases (OLAP) such as vertica use columnar storage.</p></li></ul><h2 id="peeking-into-pages">Peeking into pages</h2><p>Let’s try to peek into pages and see what tools PostgreSQL provides to inspect pages. We will start by creating a database, a table inside it and populating the table with some dummy data.</p><div><pre><code data-lang="SQL">
+<span>postgres</span>=# \<span>c</span> <span>hail_mary</span> ;
+
+<span>You</span> <span>are</span> <span>now</span> <span>connected</span> <span>to</span> <span>database</span> <span>&#34;hail_mary&#34;</span> <span>as</span> <span>user</span> <span>&#34;postgres&#34;</span>.
+
+<span>hail_mary</span>=# 
+
+<span>hail_mary</span>=# <span>create</span> <span>table</span> <span>users</span>(<span>id</span> <span>int</span>, <span>name</span> <span>text</span>);
+
+<span>CREATE</span> <span>TABLE</span>
+
+<span>hail_mary</span>=# <span>insert</span> <span>into</span> <span>users</span>(<span>id</span>, <span>name</span>)
+
+<span>select</span> <span>i</span>,<span>md5</span>(<span>i</span>::<span>text</span>)::<span>text</span> <span>from</span> <span>generate_series</span>(<span>1</span>, <span>50000</span>, <span>1</span>) <span>as</span> <span>i</span>;
+
+<span>INSERT</span> <span>0</span> <span>50000</span>
+
+<span>hail_mary</span>=# <span>select</span> * <span>from</span> <span>users</span> <span>limit</span> <span>5</span>;
+
+ <span>id</span> |               <span>name</span>               
+
+<span>----+----------------------------------
+</span><span></span>
+  <span>1</span> | <span>c4ca4238a0b923820dcc509a6f75849b</span>
+
+  <span>2</span> | <span>c81e728d9d4c2f636f067f89cc14862c</span>
+
+  <span>3</span> | <span>eccbc87e4b5ce2fe28308fd9f2a7baf3</span>
+
+  <span>4</span> | <span>a87ff679a2f3e71d9181a67b7542122c</span>
+
+  <span>5</span> | <span>e4da3b7fbbce2345d7772b0674a318d5</span>
+
+(<span>5</span> <span>rows</span>)
+
+</code></pre></div><p>Internally PostgreSQL maintains a unique row id for our data which is usually opaque to users. We can query it explicitly to see its value.</p><div><pre><code data-lang="SQL">
+<span>hail_mary</span>=# <span>select</span> <span>ctid</span>, * <span>from</span> <span>users</span> <span>limit</span> <span>5</span>;
+
+ <span>ctid</span>  | <span>id</span> |               <span>name</span>               
+
+<span>-------+----+----------------------------------
+</span><span></span>
+ (<span>0</span>,<span>1</span>) |  <span>1</span> | <span>c4ca4238a0b923820dcc509a6f75849b</span>
+
+ (<span>0</span>,<span>2</span>) |  <span>2</span> | <span>c81e728d9d4c2f636f067f89cc14862c</span>
+
+ (<span>0</span>,<span>3</span>) |  <span>3</span> | <span>eccbc87e4b5ce2fe28308fd9f2a7baf3</span>
+
+ (<span>0</span>,<span>4</span>) |  <span>4</span> | <span>a87ff679a2f3e71d9181a67b7542122c</span>
+
+ (<span>0</span>,<span>5</span>) |  <span>5</span> | <span>e4da3b7fbbce2345d7772b0674a318d5</span>
+
+(<span>5</span> <span>rows</span>)
+
+
+
+
+</code></pre></div><p>In <code>ctid</code> First digit stand for the page number and the second digit stands for the tuple number. PostgreSQL moves around these tuples when <code>VACUUM</code> is run to defragment the page. We can actually see it in action. </p><div><pre><code data-lang="SQL">
+<span>hail_mary</span>=# <span>select</span> <span>ctid</span>, * <span>from</span> <span>users</span> <span>OFFSET</span> <span>49995</span> <span>limit</span> <span>5</span>;
+
+   <span>ctid</span>   |  <span>id</span>   |               <span>name</span>               
+
+<span>----------+-------+----------------------------------
+</span><span></span>
+ (<span>416</span>,<span>76</span>) | <span>49996</span> | <span>2</span><span>acfa04df8cc1e5b051866c32f9eb072</span>
+
+ (<span>416</span>,<span>77</span>) | <span>49997</span> | <span>87</span><span>aa98d07ec242cc4d8f685f0299257b</span>
+
+ (<span>416</span>,<span>78</span>) | <span>49998</span> | <span>12775</span><span>d2a4498f0ec748a4beed90e5ad2</span>
+
+ (<span>416</span>,<span>79</span>) | <span>49999</span> | <span>c703af5c89b1d0bc2e99f540f553f182</span>
+
+ (<span>416</span>,<span>80</span>) | <span>50000</span> | <span>1017</span><span>bfd4673955ffee4641ad3d481b1c</span>
+
+(<span>5</span> <span>rows</span>)
+
+<span>hail_mary</span>=# 
+
+<span>hail_mary</span>=# <span>delete</span> <span>from</span> <span>users</span> <span>where</span> <span>name</span> = <span>&#39;c703af5c89b1d0bc2e99f540f553f182&#39;</span>;
+
+<span>DELETE</span> <span>1</span>
+
+<span>hail_mary</span>=# <span>insert</span> <span>into</span> <span>users</span> <span>VALUES</span>(<span>9999999</span>, <span>&#39;ryland grace&#39;</span>);
+
+<span>INSERT</span> <span>0</span> <span>1</span>
+
+<span>hail_mary</span>=# <span>select</span> <span>ctid</span>, * <span>from</span> <span>users</span> <span>OFFSET</span> <span>49995</span> <span>limit</span> <span>5</span>;
+
+   <span>ctid</span>   |   <span>id</span>    |               <span>name</span>               
+
+<span>----------+---------+----------------------------------
+</span><span></span>
+ (<span>416</span>,<span>76</span>) |   <span>49996</span> | <span>2</span><span>acfa04df8cc1e5b051866c32f9eb072</span>
+
+ (<span>416</span>,<span>77</span>) |   <span>49997</span> | <span>87</span><span>aa98d07ec242cc4d8f685f0299257b</span>
+
+ (<span>416</span>,<span>78</span>) |   <span>49998</span> | <span>12775</span><span>d2a4498f0ec748a4beed90e5ad2</span>
+
+ (<span>416</span>,<span>80</span>) |   <span>50000</span> | <span>1017</span><span>bfd4673955ffee4641ad3d481b1c</span>
+
+ (<span>416</span>,<span>81</span>) | <span>9999999</span> | <span>ryland</span> <span>grace</span>
+
+(<span>5</span> <span>rows</span>)
+
+</code></pre></div><p>What we can see here is that PostgreSQL left tuple with name <code>c703af5c89b1d0bc2e99f540f553f182</code> (which is now deleted) as is and decided to add new data into a new physical tuple instead of reusing it. What if we run <code>VACCUM</code> ?</p><div><pre><code data-lang="SQL">
+<span>hail_mary</span>=# <span>VACUUM</span> <span>FULL</span>;
+
+<span>hail_mary</span>=# <span>select</span> <span>ctid</span>, * <span>from</span> <span>users</span> <span>OFFSET</span> <span>49995</span> <span>limit</span> <span>5</span>;
+
+   <span>ctid</span>   |   <span>id</span>    |               <span>name</span>               
+
+<span>----------+---------+----------------------------------
+</span><span></span>
+ (<span>416</span>,<span>76</span>) |   <span>49996</span> | <span>2</span><span>acfa04df8cc1e5b051866c32f9eb072</span>
+
+ (<span>416</span>,<span>77</span>) |   <span>49997</span> | <span>87</span><span>aa98d07ec242cc4d8f685f0299257b</span>
+
+ (<span>416</span>,<span>78</span>) |   <span>49998</span> | <span>12775</span><span>d2a4498f0ec748a4beed90e5ad2</span>
+
+ (<span>416</span>,<span>79</span>) |   <span>50000</span> | <span>1017</span><span>bfd4673955ffee4641ad3d481b1c</span>
+
+ (<span>416</span>,<span>80</span>) | <span>9999999</span> | <span>ryland</span> <span>grace</span>
+
+(<span>5</span> <span>rows</span>)
+
+</code></pre></div><p><code>VACCUM</code> as expected defragmented page by moving the tuples around.</p><p>Visually it can be understood as following</p><p><img src="https://i.imgur.com/VlTs2pM.png" alt="before"/></p><p><em>Before deleting</em></p><p><img src="https://i.imgur.com/MYccJ8m.png" alt="after-delete"/></p><p><em>After deleting and inserting</em></p><p><img src="https://i.imgur.com/VlTs2pM.png" alt="after-vaccum"/></p><p><em>After Vacuum</em></p><p>We can also look inside actual pages with the help of an extention called <code>pageinspect</code> which provides <code>X-ray for heap files</code></p><div><pre><code data-lang="SQL">
+<span>hail_mary</span>=# <span>create</span> <span>extension</span> <span>pageinspect</span>;
+
+<span>CREATE</span> <span>EXTENSION</span>
+
+</code></pre></div><p>Let’s take a look at last page (416)</p><div><pre><code data-lang="SQL">
+<span>hail_mary</span>=# <span>select</span> * <span>from</span> <span>page_header</span>(<span>get_raw_page</span>(<span>&#39;users&#39;</span>, <span>416</span>));
+
+    <span>lsn</span>    | <span>checksum</span> | <span>flags</span> | <span>lower</span> | <span>upper</span> | <span>special</span> | <span>pagesize</span> | <span>version</span> | <span>prune_xid</span> 
+
+<span>-----------+----------+-------+-------+-------+---------+----------+---------+-----------
+</span><span></span>
+ <span>0</span>/<span>428</span><span>E4F0</span> |        <span>0</span> |     <span>0</span> |   <span>344</span> |  <span>3088</span> |    <span>8192</span> |     <span>8192</span> |       <span>4</span> |         <span>0</span>
+
+</code></pre></div><p><code>lower</code> is <code>344</code>  and <code>upper</code> is <code>3088</code> which means free space in this page is <code>2744</code> bytes</p><p><code>special</code> points to 8192 which means it points to end of page and is storing nothing.</p><p>We look at previous page, we expect that page not to contain enough space for our row data</p><div><pre><code data-lang="SQL">
+<span>hail_mary</span>=# <span>select</span> * <span>from</span> <span>page_header</span>(<span>get_raw_page</span>(<span>&#39;users&#39;</span>, <span>415</span>));
+
+    <span>lsn</span>    | <span>checksum</span> | <span>flags</span> | <span>lower</span> | <span>upper</span> | <span>special</span> | <span>pagesize</span> | <span>version</span> | <span>prune_xid</span> 
+
+<span>-----------+----------+-------+-------+-------+---------+----------+---------+-----------
+</span><span></span>
+ <span>0</span>/<span>428</span><span>CF58</span> |        <span>0</span> |     <span>0</span> |   <span>504</span> |   <span>512</span> |    <span>8192</span> |     <span>8192</span> |       <span>4</span> |         <span>0</span>
+
+(<span>1</span> <span>row</span>)
+
+</code></pre></div><p>As expected, <code>8</code> bytes are not enough to store <code>id</code> + <code>name</code></p><p>We can also peek inside page items using the following query:</p><div><pre><code data-lang="SQL">
+<span>hail_mary</span>=# <span>select</span> * <span>from</span> <span>heap_page_items</span>(<span>get_raw_page</span>(<span>&#39;users&#39;</span>, <span>416</span>)) <span>offset</span> <span>78</span> <span>limit</span> <span>2</span>;
+
+ <span>lp</span> | <span>lp_off</span> | <span>lp_flags</span> | <span>lp_len</span> | <span>t_xmin</span> | <span>t_xmax</span> | <span>t_field3</span> |  <span>t_ctid</span>  | <span>t_infomask2</span> | <span>t_infomask</span> | <span>t_hoff</span> | <span>t_bits</span> | <span>t_oid</span> |                                    <span>t_data</span>                                    
+
+<span>----+--------+----------+--------+--------+--------+----------+----------+-------------+------------+--------+--------+-------+------------------------------------------------------------------------------
+</span><span></span>
+ <span>79</span> |   <span>3136</span> |        <span>1</span> |     <span>61</span> |  <span>11780</span> |      <span>0</span> |        <span>0</span> | (<span>416</span>,<span>79</span>) |           <span>2</span> |       <span>2818</span> |     <span>24</span> |        |       | \<span>x50c30000433130313762666434363733393535666665653436343161643364343831623163</span>
+
+ <span>80</span> |   <span>3088</span> |        <span>1</span> |     <span>41</span> |  <span>11783</span> |      <span>0</span> |        <span>0</span> | (<span>416</span>,<span>80</span>) |           <span>2</span> |       <span>2818</span> |     <span>24</span> |        |       | \<span>x7f9698001b72796c616e64206772616365</span>
+
+</code></pre></div><h3 id="references">References</h3><ul><li><p>Database Physical Storage - <a href="https://www.postgresql.org/docs/9.5/storage.html">https://www.postgresql.org/docs/9.5/storage.html</a></p></li><li><p>PageInspect - <a href="https://www.postgresql.org/docs/12/pageinspect.html">https://www.postgresql.org/docs/12/pageinspect.html</a></p></li><li><p>Row storage in PostgreSQL, heap file page layout - <a href="https://www.youtube.com/watch?v=L-dw1yRFYVg">https://www.youtube.com/watch?v=L-dw1yRFYVg</a></p></li><li><p>Database Storage I (CMU Databases Systems / Fall 2019) - <a href="https://www.youtube.com/watch?v=1D81vXw2T_w">https://www.youtube.com/watch?v=1D81vXw2T_w</a></p></li></ul></div></div>
+  </body>
+</html>
