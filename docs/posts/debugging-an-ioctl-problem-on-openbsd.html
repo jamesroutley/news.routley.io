@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://jcs.org/2022/02/16/ioctl">Original</a>
+    <h1>Debugging an Ioctl Problem on OpenBSD</h1>
+    
+    <div id="readability-page-1" class="page"><article>
+	<header>
+			
+		
+		
+	</header>
+
+	
+	<p>I was trying to use a <abbr title="Video4Linux 2">V4L2</abbr>
+<a href="https://github.com/kwgt/v4l2-ruby">Ruby module</a>
+on my OpenBSD laptop but ran into a problem where sending the V4L2 <code>ioctl</code>s from
+this module would fail, while other V4L2 programs on OpenBSD worked fine.</p>
+
+<p>Since I got a few
+<a href="https://jcs.org/2022/01/14/q&amp;a">questions</a>
+recently about kernel development and debugging, I thought I’d write up how I
+finally tracked it down and fixed it.
+(Spoiler: it was not an OpenBSD problem.)</p>
+
+
+
+<h2 id="table-of-contents">Table of Contents</h2>
+
+<ol id="markdown-toc">
+  <li><a href="#the-issue" id="markdown-toc-the-issue">The Issue</a></li>
+  <li><a href="#enabling-debugging-in-the-kernel-driver" id="markdown-toc-enabling-debugging-in-the-kernel-driver">Enabling Debugging in the Kernel Driver</a></li>
+  <li><a href="#the-bug" id="markdown-toc-the-bug">The Bug</a></li>
+</ol>
+
+<h2 id="the-issue">The Issue</h2>
+
+<p>After first
+<a href="https://github.com/jcs/v4l2-ruby/commit/34e000d5cccf29b1a7703c13d313477b94ae2cea">getting the module to compile on OpenBSD</a>,
+I ran some simple Ruby code to set the parameters and start fetching data from
+my camera:</p>
+
+<div><div><pre><code>camera = Video4Linux2::Camera.open(&#34;/dev/video1&#34;)
+camera.image_width  = 640
+camera.image_height = 480
+camera.framerate    = 10/1r
+camera.format       = :YUYV
+camera.start
+</code></pre></div></div>
+
+<p>But this failed with an <code>ENOTTY</code> error from <code>ioctl</code>:</p>
+
+<div><div><pre><code>ioctl(VIDIOC_S_FMT): Inappropriate ioctl for device
+</code></pre></div></div>
+
+<p>The Ruby
+<a href="https://github.com/jcs/v4l2-ruby/blob/114bfec39f748b46149426513824b5e7055c436b/ext/v4l2/camera.c#L142-L166">C code</a>
+that does this looks pretty straightforward:</p>
+
+<div><div><pre><code>...
+  struct v4l2_format fmt;
+...
+
+  BZERO(fmt);
+
+  fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  fmt.fmt.pix.width       = wd;
+  fmt.fmt.pix.height      = ht;
+  fmt.fmt.pix.pixelformat = fcc;
+  fmt.fmt.pix.field       = V4L2_FIELD_INTERLACED;
+
+  err = xioctl(fd, VIDIOC_S_FMT, &amp;fmt);
+  if (err &lt; 0) {
+	perror(&#34;ioctl(VIDIOC_S_FMT)&#34;);
+	...
+</code></pre></div></div>
+
+<p>The module is using a macro for <code>BZERO</code> that just calls <code>bzero</code>, and an <code>xioctl</code>
+wrapper that retries <code>ioctl</code> when it fails with <code>errno == EINTR</code>.</p>
+
+<p>If I look at the code for OpenBSD’s
+<a href="https://github.com/openbsd/xenocara/blob/master/app/video/video.c"><code>video(1)</code></a>
+utility, it
+<a href="https://github.com/openbsd/xenocara/blob/59a8bd4e1af52eebd80e85417dbcebbbbd89ac1d/app/video/video.c#L1236-L1245">sets the
+format</a>
+pretty similarly:</p>
+
+<div><div><pre><code>	bzero(&amp;fmt, sizeof(struct v4l2_format));
+	fmt.type = d-&gt;buf_type;
+	fmt.fmt.pix.width = vid-&gt;width;
+	fmt.fmt.pix.height = vid-&gt;height;
+	fmt.fmt.pix.pixelformat = encs[vid-&gt;enc].id;
+	fmt.fmt.pix.field = V4L2_FIELD_ANY;
+	if (ioctl(d-&gt;fd, VIDIOC_S_FMT, &amp;fmt) &lt; 0) {
+		warn(&#34;VIDIOC_S_FMT&#34;);
+		return 0;
+	}
+</code></pre></div></div>
+
+<p>I tried changing the field to <code>V4L2_FIELD_ANY</code> to match the OpenBSD utility, but
+it still failed with <code>ENOTTY</code>.</p>
+
+<p>I usually turn to
+<a href="https://man.openbsd.org/ktrace.1"><code>ktrace</code></a>
+to diagnose syscall issues, but in this case it just showed that it was calling
+<code>ioctl</code> on a filehandle 14, sending it <code>VIDIOC_S_FMT</code>, and passing some data (a
+<code>v4l2_format</code> struct).</p>
+
+<div><div><pre><code>90052 ruby27   CALL  ioctl(14,VIDIOC_S_FMT,0x7f7ffffd47c0)
+90052 ruby27   RET   ioctl -1 errno 25 Inappropriate ioctl for device
+</code></pre></div></div>
+
+<h2 id="enabling-debugging-in-the-kernel-driver">Enabling Debugging in the Kernel Driver</h2>
+
+<p>The <code>ioctl</code> is sent through <code>/dev/video1</code>, which arrives at the
+<a href="https://github.com/openbsd/src/blob/master/sys/dev/video.c#L233"><code>video(4)</code></a>
+driver’s <code>videoioctl</code> function.
+It then does some error checking and
+<a href="https://github.com/openbsd/src/blob/master/sys/dev/video.c#L296-L302">passes it along</a>
+to the USB-specific
+<a href="https://github.com/openbsd/src/blob/master/sys/dev/usb/uvideo.c#L3112"><code>uvideo(4)</code></a>
+driver’s <code>uvideo_s_fmt</code> function.</p>
+
+<p>There are already some debugging <code>printf</code>s in <code>uvideo_s_fmt</code>, which are done
+through a <code>DPRINTF</code> macro which actually prints only when <code>UVIDEO_DEBUG</code> is
+enabled:</p>
+
+<div><div><pre><code>#ifdef UVIDEO_DEBUG
+int uvideo_debug = 1;
+#define DPRINTF(l, x...) do { if ((l) &lt;= uvideo_debug) printf(x); } while (0)
+#else
+#define DPRINTF(l, x...)
+#endif
+</code></pre></div></div>
+
+<p>I added a <code>#define UVIDEO_DEBUG</code> above that block, recompiled the kernel and
+booted to it.
+Running the <code>video</code> utility makes the kernel print out a line, but it prints
+nothing from my Ruby code.</p>
+
+<div><div><pre><code>uvideo1: uvideo_s_fmt: requested width=640, height=480
+</code></pre></div></div>
+
+<p>Since the <code>DPRINTF</code> that prints that is pretty high in the function, I’m
+guessing it’s not even reaching <code>uvideo</code>, so let’s go back to the <code>video</code>
+driver.</p>
+
+<div><div><pre><code>	DPRINTF(3, &#34;video_ioctl(%zu, &#39;%c&#39;, %zu)\n&#34;,
+	    IOCPARM_LEN(cmd), (int) IOCGROUP(cmd), cmd &amp; 0xff);
+
+	error = EOPNOTSUPP;
+	switch (cmd) {
+	...
+	case VIDIOC_S_FMT:
+		if (!(flags &amp; FWRITE))
+			return (EACCES);
+		if (sc-&gt;hw_if-&gt;s_fmt)
+			error = (sc-&gt;hw_if-&gt;s_fmt)(sc-&gt;hw_hdl,
+			    (struct v4l2_format *)data);
+		break;
+</code></pre></div></div>
+
+<p>Similarly, we can enable debugging <code>printf</code>s in the <code>video</code> driver by defining
+<code>VIDEO_DEBUG</code> at the top, compiling, and rebooting.
+Now when I run my Ruby code, I get:</p>
+
+
+
+<p>Looking at <code>/usr/src/sys/sys/videoio.h</code>, I can see that it does appear to be the
+correct <code>ioctl</code> in the group <code>V</code>, number 5, and a proper size of that
+<code>v4l2_format</code> struct:</p>
+
+<div><div><pre><code>#define VIDIOC_S_FMT            _IOWR(&#39;V&#39;,  5, struct v4l2_format)
+</code></pre></div></div>
+
+<p>The <code>_IOWR</code> macro is a
+<a href="https://github.com/openbsd/src/blob/master/sys/sys/ioccom.h#L43-L66">series of macros</a>
+that build up an <code>unsigned long</code> that corresponds to every possible <code>ioctl</code> in
+the kernel.</p>
+
+<p>So the <code>ioctl</code> is reaching the <code>video</code> driver, appears to be recognized as
+<code>VIDIOC_S_FMT</code>, but is not actually reaching the <code>uvideo</code> driver’s <code>s_fmt</code>
+function by way of the big <code>switch</code>.
+Is it even getting into the <code>case VIDIOC_S_FMT</code>?
+Let’s add our own debugging <code>printf</code> to show that we reached that, and the path
+it’s taking inside of the function.</p>
+
+<p>When running the <code>video</code> utility, it now prints:</p>
+
+<div><div><pre><code>video_ioctl(208, &#39;V&#39;, 5)
+uvideo1: uvideo_s_fmt: requested width=640, height=480
+uvideo1: uvideo_s_fmt: offered width=640, height=480
+S_FMT: returned 0
+videoioctl: final ret 0
+</code></pre></div></div>
+
+<p>But when running my Ruby code, it only prints the first line, indicating that
+it’s not even reaching the <code>case VIDIOC_S_FMT</code>.
+Since the <code>switch</code> is on the entire <code>cmd</code>, not just the number (5) or on the
+group (<code>V</code>), it must match all of the <code>ioctl</code> parameters.
+Let’s print out the whole thing:</p>
+
+<div><div><pre><code>video_ioctl(208, &#39;V&#39;, 5) (3234878981 vs s_fmt 3234878981)
+uvideo1: uvideo_s_fmt: requested width=640, height=480
+uvideo1: uvideo_s_fmt: offered width=640, height=480
+S_FMT: returned 0
+videoioctl: final ret 0
+</code></pre></div></div>
+
+<p>And from my Ruby code:</p>
+
+<div><div><pre><code>video_ioctl(208, &#39;V&#39;, 5) (18446744072649463301 vs s_fmt 3234878981)
+videoioctl: final ret 25
+</code></pre></div></div>
+
+<h2 id="the-bug">The Bug</h2>
+
+<p>At this point I went back to the Ruby C code.
+How is it passing the <code>ioctl</code> request parameter?</p>
+
+<div><div><pre><code>static int xioctl(int fh, int request, void *arg)
+{
+  int r;
+
+  do {
+	r = ioctl(fh, request, arg);
+  } while (r == -1 &amp;&amp; EINTR == errno);
+
+  return r;
+}
+</code></pre></div></div>
+
+<p>Have you spotted it yet?</p>
+
+<p>Let’s look at the OpenBSD
+<a href="https://man.openbsd.org/ioctl.2"><code>ioctl</code></a>
+man page:</p>
+
+<div><div><pre><code>SYNOPSIS
+    #include &lt;sys/ioctl.h&gt;
+
+    int
+    ioctl(int d, unsigned long request, ...);
+</code></pre></div></div>
+
+<p>Of course, <code>request</code> must be an <code>unsigned long</code>, but this Ruby module’s <code>xioctl</code>
+wrapper is truncating it to a <code>signed int</code> before passing it to the kernel.</p>
+
+<p>A
+<a href="https://github.com/kwgt/v4l2-ruby/pull/1/files">quick fix</a>
+to change the <code>xioctl</code> wrapper’s definition and the problem is solved.</p>
+
+<p>The <code>ioctl</code> function on Linux
+<a href="https://man7.org/linux/man-pages/man2/ioctl.2.html">also requires</a>
+an <code>unsigned long</code>, so this fix is not specific to OpenBSD but presumably
+the V4L2 <code>ioctl</code> values on Linux don’t exceed the size of a 32-bit integer and
+so this never caused issues for anyone on Linux.</p>
+
+</article></div>
+  </body>
+</html>
