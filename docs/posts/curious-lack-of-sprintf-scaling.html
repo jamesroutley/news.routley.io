@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://aras-p.info/blog/2022/02/25/Curious-lack-of-sprintf-scaling/">Original</a>
+    <h1>Curious lack of sprintf scaling</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    <div>
+      <div>
+
+<article>
+  <header>
+    
+    
+  </header>
+  <section>
+    <p>Some days ago I noticed that on a Mac, doing <code>snprintf</code> calls from multiple threads shows
+curious lack of scaling (<a href="https://twitter.com/aras_p/status/1496489672373063682">see tweet</a>).
+Replacing <code>snprintf</code> with <a href="https://fmt.dev/">{fmt}</a> library can speed up the OBJ exporter
+in Blender 3.2 by 3-4 <em>times</em>. This could have been the end of the story, filed under a
+“eh, sprintf is bad!” drawer, but I started to wonder <em>why</em> it shows this lack of scaling.</p>
+<h3 id="test-case">Test case</h3>
+<p>A simple test: convert two million integers into strings. And then try to do the same on multiple
+threads at once, i.e. each thread converts the same two million integers. If the number of threads
+is below the number of CPU cores, this <em>should</em> take about the same time – each thread would just
+happily be converting their own numbers, and not interfere with the other threads.</p>
+<blockquote>
+<p>Yes the reality is more complicated, with CPU thermals, shared caches and whatnot coming into play,
+but we’re interested in broad patterns, not exact science here!</p>
+</blockquote>
+<p>And here’s what happens on an Apple M1 Max laptop <em>(vertical axis is log scale)</em>:
+<a href="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-snprintf.png"><img src="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-snprintf.png" title="" alt=""/></a></p>
+<p>Converting two million numbers into strings takes 100 milliseconds when one CPU core is doing it.
+When all eight “performance” cores are doing it, it takes 1.8 seconds, or <strong>18 times as long</strong>.
+That’s, <em>like</em>, not great!</p>
+<h3 id="yo-dude-you-should-not-use-sprintf">Yo dude, you should not use sprintf</h3>
+<p><em>“Well duh”</em> you say, <em>“obviously you should not use sprintf, you should use C++ iostreams”</em>. Okay.
+Here’s converting integers into strings via a <code>std::stringstream &lt;&lt;</code>.</p>
+<p><a href="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-snprintf-std.png"><img src="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-snprintf-std.png" title="" alt=""/></a></p>
+<p>Same scaling issue, except iostreams are two times slower. “Zero cost abstractions”, you know :)</p>
+<h3 id="whats-going-on">What’s going on?</h3>
+<p><a href="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-profile.png"><img src="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-profile.png" title="" alt=""/></a></p>
+<p><a href="https://help.apple.com/instruments">Instruments</a> shows that with 8 threads, each thread spends over 90%
+of the time in something called <code>localeconv_l</code>, where it is mostly mutex locks.</p>
+<p>At this point you might be thinking, <em>“ah-ha! well this is related to a locale, and a locale is global, so of
+course some time spent on some mutex lock is expected”</em>, which is <em>“mmmaybe? but this amount of time feels
+excessive?&#34;</em>. Given that this is an Apple operating system, we might know it has a
+<a href="https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/snprintf_l.3.html"><code>snprintf_l</code> function</a>
+which takes an explicit locale, and hope that this would make it scale. Just pass NULL which means
+“use C locale”:
+<a href="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-snprintf_l.png"><img src="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-snprintf_l.png" title="" alt=""/></a></p>
+<p>…aaand, nope. It is a <em>tiny</em> bit faster, but does not really address the issue.</p>
+<p>But! Large parts of macOS Darwin kernel and system libraries have source code available, so
+let’s look at what’s going on. Here’s the latest <code>localeconv_l</code> at the time of writing:
+<a href="https://github.com/apple-oss-distributions/Libc/blob/d0bbfb749/locale/FreeBSD/localeconv.c#L121">github link</a>.
+It’s basically a:</p>
+<pre><code>lconv* localeconv_v(locale_t loc)
+{
+    lock_on(loc);
+    if (loc-&gt;something_changed)
+    {
+        // do some stuff
+    }
+    unlock_on(loc);
+    // ...
+}
+</code></pre>
+<p>and the lock used internally is just a <code>os_unfair_lock</code> macOS primitive. What is curious, is that this code
+has <em>very recently</em> <a href="https://github.com/apple-oss-distributions/Libc/commit/d0bbfb749a6116512756d9c65922d725e9863495#diff-083c7c975ba1dc50e8c14c44653f54f61b1a8cda32bd596d0fb570211e54fdccR121">changed</a>; before 2022 February
+it was like:</p>
+<pre><code>lconv* localeconv_v(locale_t loc)
+{
+    if (loc-&gt;something_changed)
+    {
+        lock_on(loc);
+        if (loc-&gt;something_changed)
+        {
+            // do some stuff
+        }
+        unlock_on(loc);        
+    }
+    // ...
+}
+</code></pre>
+<p>Which to me <em>feels like</em> the previous code was trying to do a “<a href="https://en.wikipedia.org/wiki/Double-checked_locking">double checked locking</a>”
+pattern, but without using actual atomic memory reads. Which <em>probably</em> happens to work just fine on Intel CPUs, but <em>might</em> be more problematic
+elsewhere, like maybe on Apple’s own CPUs? And then someone decided to just always take that mutex lock, instead of investigating
+possible use of atomic operations.</p>
+<p>Now, Apple’s OS is BSD-based, so we can check what other BSD based systems do.</p>
+<ul>
+<li><a href="https://en.wikipedia.org/wiki/FreeBSD">FreeBSD</a> does not have any mutexes there, and before 2021 September was just checking a flag.
+Since then, the flag check <a href="https://github.com/freebsd/freebsd-src/commit/7eb138a9e5363">was changed</a> to use atomic operations.</li>
+<li><a href="https://en.wikipedia.org/wiki/OpenBSD">OpenBSD</a> does not use any atomics or mutexes at all, and the “has something changed?” flag is
+not even per-locale, it’s just a <a href="https://github.com/openbsd/src/blob/558b4987cd/lib/libc/locale/localeconv.c#L26">global variable</a>. YOLO!</li>
+</ul>
+<p>So given all this knowledge, presumably, if each thread used a <em>physically different</em> locale object <em>and</em> <code>snprintf_l</code>, then it
+would scale fine. And it does:
+<a href="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-snprintf_l-uniq.png"><img src="https://aras-p.info/img/blog/2022/sprint-fuuu-mac-snprintf_l-uniq.png" title="" alt=""/></a></p>
+<h3 id="what-else-can-we-do">What else can we do?</h3>
+<p>Now, besides the old <code>snprintf</code> and <code>std::stringstream</code>, there are other things we can do. For example:</p>
+<ul>
+<li><a href="https://github.com/nothings/stb/blob/master/stb_sprintf.h">stb_sprintf</a>, a trivial to integrate, public domain C library
+that is a full sprintf replacement, but without any locale specific stuff. It’s also presumably faster, smaller and works the
+same across different compilers/platforms.</li>
+<li><a href="https://fmt.dev/">{fmt}</a>, a MIT-licensed C++ library “providing a fast and safe alternative to C stdio and C++ iostreams”. {fmt}
+was a base for C++20 formatting additions.</li>
+<li>Not a general replacement, but if we only need to turn numbers into strings, C++17 has
+<a href="https://en.cppreference.com/w/cpp/utility/to_chars">to_chars</a>.</li>
+</ul>
+<p><a href="https://aras-p.info/img/blog/2022/sprint-fuuu-mac.png"><img src="https://aras-p.info/img/blog/2022/sprint-fuuu-mac.png" title="" alt=""/></a></p>
+<p>All of those scale with increased thread usage just fine, and all of them are way faster in single threaded case too.
+{fmt} looks very impressive. Yay!</p>
+<h3 id="is-this-all-applemac-specific">Is this all Apple/Mac specific?</h3>
+<p>Let’s try all the above things on Windows with Visual Studio 2022. This one supports more things compared to clang 13 that I have
+on a Mac:</p>
+<ul>
+<li>There is C++20 <a href="https://en.cppreference.com/w/cpp/utility/format">formatting library</a> with <code>format_to_n</code>. This uses the same
+type safe syntax as {fmt} library, and we can hope it would be of a similar performance and scaling.</li>
+<li>Similar to BSD-specific <code>snprintf_l</code>, Visual Studio has its own
+<a href="https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/snprintf-snprintf-snprintf-l-snwprintf-snwprintf-l?view=msvc-170"><code>_snprintf_l</code></a>.</li>
+<li>Speaking of not-so-general solutions, Visual Studio also has <code>itoa</code> to convert integers into strings.</li>
+</ul>
+<p><a href="https://aras-p.info/img/blog/2022/sprint-fuuu-win-vs2022.png"><img src="https://aras-p.info/img/blog/2022/sprint-fuuu-win-vs2022.png" title="" alt=""/></a></p>
+<ul>
+<li>Unlike the Mac case, just the regular <code>snprintf</code> does not have the multi-threaded scaling issue! It takes around 100 milliseconds
+for two million integers, no matter how many threads are doing it at the same time.</li>
+<li>C++ <code>stringstream</code> performance and scaling is <em>really bad</em>. It starts being 4x slower than snprintf at one thread, and goes up
+to be <strong>hundred times slower</strong> at 8 threads.</li>
+<li>The new, hot, C++20 based formatting functionality using <code>format_to_n</code> is <em>really bad</em> too! It <em>starts</em> being 10x slower than snprintf (!),
+and goes to be 40x slower at 8 threads.</li>
+</ul>
+<p>Ok, what is going on <em>here</em>?! <a href="https://superluminal.eu/">Superluminal profiler</a> to the rescue, and here’s what it says:</p>
+<p>The <code>stringstream</code>, in one thread case, ends up spending most of the time in the infamous “zero-cost abstractions” of C++ :) A bunch of
+function calls, a tiny bit of work here and there, and then somewhere deep inside it ends up calling <code>snprintf</code> anyway. Just all around
+that, tiny bits and pieces of cost all add up. In the 8 threads case, it ends up spending all the time inside mutex locks, quite
+similar to how Mac/Apple case was doing. Just here it’s C++, so it ends up being <em>worse</em> - there’s not a single mutex lock, but rather
+what looks like three mutex locks on various parts of the locale object (via <code>std::use_facet</code> of different bits), <em>and</em> then there’s
+also reference counting, with atomic increase/decrease operations smashing the same locale object.</p>
+<p>The <code>format_to_n</code>, in one thread case, ends up spending all the time in… 🥁… Loading resource files.
+<em><a href="https://www.destroyallsoftware.com/talks/wat">:WAT:</a></em> Each and every call
+<em>“plz turn this integer into a string”</em> ends up doing:</p>
+<ul>
+<li>Create something called a <code>_Fmt_codec</code> object, which</li>
+<li>Calls <code>__std_get_cvt</code>, which</li>
+<li>Figures out “information about installed or available code page” via <a href="https://docs.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-getcpinfoexw"><code>GetCPInfoExW</code></a>, which</li>
+<li>Ends up calling <code>FindResourceExW</code> and <code>LoadResource</code> on something. Which then call <code>LdrpLoadResourceFromAlternativeModule</code> and <code>LdrpAccessResourceDataNoMultipleLanguage</code> and so on and so on.</li>
+</ul>
+<p>In the 8 threads case, that is all the same, except all that resource loading is presumably on the same “thing”, so it ends up
+spending a ton of time deep inside the OS kernel doing <code>MiLockVadShared</code>, and <code>MiUnlockAndDereferenceVadShared</code>, and
+<code>LOCK_ADDRESS_SPACE_SHARED</code> and so on.</p>
+<p>So <em>that</em> is something I would not have expected to see, to be honest. Curiously enough, there is a similar sounding
+issue on Github of Microsoft’s STL, which is <a href="https://github.com/microsoft/STL/issues/1825">marked resolved</a> since 2021 April.</p>
+<p>And no, usual Internet advice of “MSVC sucks, use Clang” does not help in this particular case.
+Using Clang 13, the C++20 formatting library is not available
+yet, but otherwise all other options look pretty much the same, including the disappointing performance of stringstream:</p>
+<p><a href="https://aras-p.info/img/blog/2022/sprint-fuuu-win-clang.png"><img src="https://aras-p.info/img/blog/2022/sprint-fuuu-win-clang.png" title="" alt=""/></a></p>
+<h3 id="what-about-linux">What about Linux?</h3>
+<p>I only have an Ubuntu 20 install via WSL2 here to test, and using the default compilers there (clang 10 and gcc 9.3),
+things look pretty nice:</p>
+<p>C++20 format library is not available in either of these compilers to test, but everything else scales really well with increased
+thread count. {fmt} continues to be impressive there as well.</p>
+<h3 id="conclusion">Conclusion</h3>
+<p>Would you have expected a “turn an integer into a string” routine to be loading resource file information blocks from some library,
+for <em>each and every call</em>? Yeah, me neither.</p>
+<p>Technically, there are no <em>bugs</em> anywhere above - all the functions work <em>correctly</em>, as far as standard is concerned. But some of them
+have interesting (lack of) multi-core scaling behavior, some others have just regular performance overheads compared to others, etc.</p>
+<p>If you need to target multiple different compilers &amp; platforms, <em>and</em> want consistent performance characteristics, then avoiding
+some parts of C or C++ standard libraries might be one way. Or at least, <em>do not assume anything</em> about performance (and especially about
+multi-thread scaling) characteristics of the standard libraries.</p>
+<p>If you need to do string formatting in C++, I can highly recommend using <a href="https://fmt.dev/">{fmt}</a>.</p>
+
+  </section>
+  
+</article>
+
+    </div>
+    
+    </div>
+  </div></div>
+  </body>
+</html>
