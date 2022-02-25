@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://gist.github.com/jcoleman/1e6ad1bf8de454c166da94b67537758b">Original</a>
+    <h1>PostgreSQL Schema Change Guide</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+  <div id="file-blog-md">
+      
+      <div id="file-blog-md-readme">
+    <article itemprop="text"><p dir="auto">Braintree Payments uses PostgreSQL as its primary datastore. We rely heavily on the data safety and consistency guarantees a traditional relational database offers us, but these guarantees come with certain operational difficulties. To make things even more interesting, we allow zero scheduled functional downtime for our main payments processing services.</p>
+<p dir="auto">Several years ago we <a href="https://www.braintreepayments.com/blog/safe-operations-for-high-volume-postgresql/" rel="nofollow">published a blog post</a> detailing some of the things we had learned about how to safely run DDL operations without interrupting our production API traffic.</p>
+<p dir="auto">Since that time PostgreSQL has gone through quite a few major upgrade cycles -- several of which have added improved support for concurrent DDL. We&#39;ve also further refined our processes. Given how much has changed, we figured it was time for a blog post redux.</p>
+<p dir="auto">In this post we&#39;ll address the following topics:</p>
+<ul dir="auto">
+<li><a href="#transactionality">Transactional DDL</a></li>
+<li><a href="#locking">Locking</a></li>
+<li><a href="#table-operations">Table Operations</a></li>
+<li><a href="#column-operations">Column Operations</a></li>
+<li><a href="#index-operations">Index Operations</a></li>
+<li><a href="#constraints">Constraints</a></li>
+<li><a href="#enum-types">Enum Types</a></li>
+<li><a href="#announcing-pg-ha-migrations-for-ruby-on-rails">Bonus: Library for Ruby on Rails</a></li>
+</ul>
+
+<p dir="auto">For all code and database changes, we require that:</p>
+<ul dir="auto">
+<li>Live code and schemas be forward-compatible with updated code and schemas: this allows us to roll out deploys gradually across a fleet of application servers and database clusters.</li>
+<li>New code and schemas be backward-compatible with live code and schemas: this allows us to roll back any change to the previous version in the event of unexpected errors.</li>
+</ul>
+<p dir="auto">For all DDL operations we require that:</p>
+<ul dir="auto">
+<li>Any exclusive locks acquired on tables or indexes be held for at most ~2 seconds.</li>
+<li>Rollback strategies do not involve reverting the database schema to its previous version.</li>
+</ul>
+
+<p dir="auto">PostgreSQL supports transactional DDL. In most cases, you can execute multiple DDL statements inside an explicit database transaction and take an &#34;all or nothing&#34; approach to a set of changes. However, running multiple DDL statements inside a transaction has one serious downside: if you alter multiple objects, you&#39;ll need to acquire exclusive locks on all of those objects in a single transactions. Because locks on multiple tables creates the possibility of deadlock and increases exposure to long waits, we do not combine multiple DDL statements into a single transaction. PostgreSQL will still execute each separate DDL statement transactionally; each statement will be either cleanly applied or fail and the transaction rolled back.</p>
+<p dir="auto"><em>Note</em>: Concurrent index creation is a special case. Postgres disallows executing <code>CREATE INDEX CONCURRENTLY</code> inside an explicit transaction; instead Postgres itself manages the transactions. If for some reason the index build fails before completion, you may need to drop the index before retrying, though the index will still never be used for regular queries if it did not finish building successfully.</p>
+
+<p dir="auto">PostgreSQL has <a href="https://www.postgresql.org/docs/current/explicit-locking.html" rel="nofollow">many different levels of locking</a>. We&#39;re concerned primarily with the following table-level locks since DDL generally operates at these levels:</p>
+<ul dir="auto">
+<li><code>ACCESS EXCLUSIVE</code>: blocks all usage of the locked table.</li>
+<li><code>SHARE ROW EXCLUSIVE</code>: blocks concurrent DDL against and row modification (allowing reads) in the locked table.</li>
+<li><code>SHARE UPDATE EXCLUSIVE</code>: blocks concurrent DDL against the locked table.</li>
+</ul>
+<p dir="auto"><em>Note</em>: &#34;Concurrent DDL&#34; for these purposes includes <code>VACUUM</code> and <code>ANALYZE</code> operations.</p>
+<p dir="auto">All DDL operations generally necessitate acquiring one of these locks on the object being manipulated. For example, when you run:</p>
+<p dir="auto"><a href="https://gist.github.com/cf70beba4a16e05840396ad129a04d85">https://gist.github.com/cf70beba4a16e05840396ad129a04d85</a></p>
+<p dir="auto">PostgreSQL attempts to acquire an <code>ACCESS EXCLUSIVE</code> lock on the table <code>foos</code>. Atempting to acquire this lock <strong>causes all subsequent queries on this table to queue until the lock is released</strong>. In practice your DDL operations can cause other queries to back up for as long as your longest running query takes to execute. Because arbitrarily long queueing of incoming queries is indistinguishable from an outage, we try to avoid any long-running queries in databases supporting our payments processing applications.</p>
+<p dir="auto">But sometimes a query takes longer than you expect. Or maybe you have a few special case queries that you already know will take a long time. PostgreSQL offers some additional runtime configuration options that allow us to guarantee query queueing backpressure doesn&#39;t result in downtime.</p>
+<p dir="auto">Instead of relying on Postgres to lock an object when executing a DDL statement, we acquire the lock explicitly ourselves. This allows us to carefully control the time the queries may be queued. Additionally when we fail to acquire a lock within several seconds, we pause before trying again so that any queued queries can be executed without significantly increasing load. Finally, before we attempt lock acquisition, we check (<a href="https://gist.github.com/jcoleman/%5Elocks-held">query here</a>) for any currently long running queries to avoid unnecessarily queueing queries for several seconds when it is unlikely that lock acquisition is going to succeed.</p>
+<p dir="auto">Starting with Postgres 9.3, you adjust the <a href="https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-LOCK-TIMEOUT" rel="nofollow"><code>lock_timeout</code></a> parameter to control how long Postgres will allow for lock acquisition before returning without acquiring the lock. If you happen to be using 9.2 or earlier (and those are unsupported; you should upgrade!), then you can simulate this behavior by using the <a href="https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-STATEMENT-TIMEOUT" rel="nofollow"><code>statement_timeout</code></a> parameter around an explicit <code>LOCK &lt;table&gt;</code> statement.</p>
+<p dir="auto">In many cases an <code>ACCESS EXCLUSIVE</code> lock need only be held for a very short period of time, i.e., the amount of time it takes Postgres to update its &#34;catalog&#34; (think metadata) tables. Below we&#39;ll discuss the cases where a lower lock level is sufficient or alternative approaches for avoiding long-held locks that block <code>SELECT/INSERT/UPDATE/DELETE</code>.</p>
+<p dir="auto"><em>Note</em>: Sometimes holding even an <code>ACCESS EXCLUSIVE</code> lock for something more than a catalog update (e.g., a full table scan or even rewrite) can be functionally acceptable when the table size is relatively small. We recommend testing your specific use case against realistic data sizes and hardware to see if a particular operation will be &#34;fast enough&#34;. On good hardware with a table easily loaded into memory, a full table scan or rewrite for thousands (possibly even 100s of thousands) of rows may be &#34;fast enough&#34;.</p>
+
+<h2 dir="auto"><a id="user-content-create-table" aria-hidden="true" href="#create-table"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Create table</h2>
+<p dir="auto">In general, adding a table is one of the few operations we don&#39;t have to think too hard about since, by definition, the object we&#39;re &#34;modifying&#34; can&#39;t possibly be in use yet. :D</p>
+<p dir="auto">While most of the attributes involved in creating a table do not involve other database objects, including a foreign key in your initial table definition will cause Postgres to acquire a <code>SHARE ROW EXCLUSIVE</code> lock against the referenced table blocking any concurrent DDL or row modifications. While this lock should be short-lived, it nonetheless requires the same caution as any other operation acquiring such a lock. We prefer to split these into two separate operations: create the table and then <a href="#foreign-keys">add the foreign key</a>.</p>
+<h2 dir="auto"><a id="user-content-drop-table" aria-hidden="true" href="#drop-table"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Drop table</h2>
+<p dir="auto">Dropping a table requires an exclusive lock on that table. As long as the table isn&#39;t in current use you can safely drop the table. Before allowing a <code>DROP TABLE ...</code> to make its way into our production environments we require documentation showing when all references to the table were removed from the codebase. To double check that this is the case you can <a href="https://gist.github.com/jcoleman/%5Etable-statistics-query">query PostgreSQL&#39;s table statistics view <code>pg_stat_user_tables</code></a> confirming that the returned statistics don&#39;t change over the course of a reasonable length of time.</p>
+<h2 dir="auto"><a id="user-content-rename-table" aria-hidden="true" href="#rename-table"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Rename table</h2>
+<p dir="auto">While it&#39;s unsurprising that a table rename requires acquiring an <code>ACCESS EXCLUSIVE</code> lock on the table, that&#39;s far from our biggest concern. Unless the table is not being read from or written to, it&#39;s very unlikely that your application code could safely handle a table being renamed underneath it.</p>
+<p dir="auto">We avoid table renames almost entirely. But if a rename is an absolute must, then a safe approach might look something like the following:</p>
+<ol dir="auto">
+<li>Create a new table with the same schema as the old one.</li>
+<li>Backfill the new table with a copy of the data in the old table.</li>
+<li>Use INSERT and UPDATE triggers on the old table to maintain parity in the new table.</li>
+<li>Begin using the new table.</li>
+</ol>
+<p dir="auto">Other approaches involving views and/or RULEs may also be viable depending on the performance characteristics required.</p>
+
+<p dir="auto"><em>Note</em>: For column constraints (e.g., <code>NOT NULL</code>) or other constraints (e.g., <code>EXCLUDES</code>), see <a href="#constraints">Constraints</a>.</p>
+<h2 dir="auto"><a id="user-content-add-column" aria-hidden="true" href="#add-column"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Add column</h2>
+<p dir="auto">Adding a column to an existing table generally requires holding a short <code>ACCESS EXCLUSIVE</code> lock on the table while catalog tables are updated. But there are several potential gotchas:</p>
+<p dir="auto"><strong>Default values</strong>: Introducing a default value at the same time of adding the column will cause the table to be locked while the default value in propogated for all rows in the table. Instead, you should:</p>
+<ol dir="auto">
+<li>Add the new column (without the default value).</li>
+<li>Set the default value on the column.</li>
+<li>Backfill all existing rows separately.</li>
+</ol>
+<p dir="auto"><em>Note</em>: In the recently release PostgreSQL 11, this is no longer the case for non-volatile default values. Instead adding a new column with a default value only requires updating catalog tables, and any reads of rows without a value for the new column will <a href="https://www.depesz.com/2018/04/04/waiting-for-postgresql-11-fast-alter-table-add-column-with-a-non-null-default/" rel="nofollow">magically have it &#34;filled in&#34; on the fly</a>.</p>
+<p dir="auto"><strong>Not-null constraints</strong>: Adding a column with a not-constraint is only possible if there are no existing rows or a <code>DEFAULT</code> is also provided. If there are no existing rows, then the change is effectively equivalent to a catalog only change. If there are existing rows and you are also specifying a default value, then the same caveats apply as above with respect to default values.</p>
+<p dir="auto"><em>Note</em>: Adding a column will cause all <code>SELECT * FROM ...</code> style queries referencing the table to begin returning the new column. It is important to ensure that all currently running code safely handles new columns. To avoid this gotcha in our applications we require queries to avoid <code>*</code> expansion in favor of explicit column references.</p>
+<h2 dir="auto"><a id="user-content-change-column-type" aria-hidden="true" href="#change-column-type"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Change column type</h2>
+<p dir="auto">In the general case changing a column&#39;s type requires holding an exclusive lock on a table while the entire table is rewritten with the new type.</p>
+<p dir="auto">There are a few exceptions:</p>
+<ul dir="auto">
+<li>Changing <code>VARCHAR</code> to <code>TEXT</code> [9.1+] (more specifically: <a href="https://www.postgresql.org/message-id/flat/E1PoFlG-0005Et-J1%40gemulon.postgresql.org" rel="nofollow">&#34;when the old type is binary coercible to the new type and the using clause does not change the column contents&#34;</a>).</li>
+<li><a href="https://www.postgresql.org/message-id/flat/E1PpCi5-0005St-N1%40gemulon.postgresql.org" rel="nofollow">&#34;When the new type is an unconstrained domain over the old type&#34;</a> [9.1+].</li>
+<li><a href="https://www.depesz.com/2012/02/14/waiting-for-9-2-more-rewrite-less-alter-table-alter-types/" rel="nofollow">When increasing or removing a length or precision limit</a>, e.g., <code>VARCHAR(5)</code> to <code>VARCHAR(10)</code> and <code>VARCHAR(5)</code> to <code>VARCHAR</code> [9.2+]].</li>
+</ul>
+<p dir="auto"><em>Note</em>: Even though one of the exceptions above was added in 9.1, changing the type of an indexed column would always rewrite the index even if a table rewrite was avoided. In 9.2 any column data type that avoids a table rewrite also <a href="https://www.postgresql.org/message-id/E1QipNf-0002ob-0f@gemulon.postgresql.org" rel="nofollow">avoids rewriting the associated indexes</a>. If you&#39;d like to confirm that your change won&#39;t rewrite the table or any indexes, you can <a href="https://gist.github.com/jcoleman/%5Erelation-rewritten">query <code>pg_class</code></a> and verify the <code>relfilenode</code> column doesn&#39;t change.</p>
+<p dir="auto">If you need to change the type of a column and one of the above exceptions doesn&#39;t apply, then the safe alternative is:</p>
+<ul dir="auto">
+<li>Add a new column <code>new_&lt;column&gt;</code>.</li>
+<li>Dual write to both columns (e.g., with a <code>BEFORE INSERT/UPDATE</code> trigger).</li>
+<li>Backfill the new column with a copy of the old column&#39;s values.</li>
+<li>Rename <code>&lt;column&gt;</code> to <code>old_&lt;column&gt;</code> and <code>new_&lt;column&gt;</code> inside a single transaction and explicit <code>LOCK &lt;table&gt;</code> statement.</li>
+<li>Drop the old column.</li>
+</ul>
+<h2 dir="auto"><a id="user-content-drop-column" aria-hidden="true" href="#drop-column"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Drop column</h2>
+<p dir="auto">It goes without saying that dropping a column is something that should be done with great care. Dropping a column requires an exclusive lock on the table to update the catalog but <strong>does not rewrite the table</strong>. As long as the column isn&#39;t in current use you can safely drop the column. It&#39;s also important to confirm that the column is not referenced by any dependent objects that could be unsafe to drop. In particular, any indexes using the column should be dropped separately and safely with <a href="#drop-index"><code>DROP INDEX CONCURRENTLY</code></a> since otherwise they will be automatically dropped along with the column under an <code>ACCESS EXCLUSIVE</code> lock. You can <a href="https://gist.github.com/jcoleman/%5Edependent-objects">query <code>pg_depend</code></a> for any dependent objects.</p>
+<p dir="auto">Before allowing a <code>ALTER TABLE ... DROP COLUMN ...</code> to make its way into our production environments we require documentation showing when all references to the column were removed from the codebase. This process allows us to safely roll back to the release prior to the one that dropped the column.</p>
+<p dir="auto"><em>Note</em>: Dropping a column will require that you update all views, triggers, function, etc. that rely on that column.</p>
+
+<h2 dir="auto"><a id="user-content-create-index" aria-hidden="true" href="#create-index"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Create index</h2>
+<p dir="auto">The standard form of <code>CREATE INDEX ...</code> acquires an <code>ACCESS EXCLUSIVE</code> lock against the table being indexed while building the index using a single table scan. In contrast, the form <code>CREATE INDEX CONCURRENTLY ...</code> acquires an <code>SHARE UPDATE EXCLUSIVE</code> lock but must complete two table scans (and hence is somewhat slower). This lower lock level allows reads and writes to continue against the table while the index is built.</p>
+<p dir="auto"><strong>Caveats</strong>:</p>
+<ul dir="auto">
+<li>Multiple concurrent index creations on a single table will not return from either <code>CREATE INDEX CONCURRENTLY ...</code> statement until the slowest one completes.</li>
+<li><code>CREATE INDEX CONCURRENTLY ...</code> may not be executed inside of a transaction but does maintain transactions internally. This holding open a transaction means that no auto-vacuums (against any table in the system) will be able to cleanup dead tuples introduced after the index build begins until it finishes. If you have a table with a large volume of updates (particularly bad if to a very small table) this could result in extremely unoptimal query execution.</li>
+<li><code>CREATE INDEX CONCURRENTLY ...</code> must wait for all transactions using the table to complete before returning.</li>
+</ul>
+<h2 dir="auto"><a id="user-content-drop-index" aria-hidden="true" href="#drop-index"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Drop index</h2>
+<p dir="auto">The standard form of <code>DROP INDEX ...</code> acquires an <code>ACCESS EXCLUSIVE</code> lock against the table with the index while removing the index. For small indexes this may be a short operation. For large indexes, however, file system unlinking and disk flushing can take a significant amount of time. In contrast, the form <code>DROP INDEX CONCURRENTLY ...</code> acquires a <code>SHARE UPDATE EXCLUSIVE</code> lock to perform these operations allowing reads and writes to continue against the table while the index is dropped.</p>
+<p dir="auto"><strong>Caveats</strong>:</p>
+<ul dir="auto">
+<li><code>DROP INDEX CONCURRENTLY ...</code> cannot be used to drop any index that supports a constraint (e.g., <code>PRIMARY KEY</code> or <code>UNIQUE</code>).</li>
+<li><code>DROP INDEX CONCURRENTLY ...</code> may not be executed inside of a transaction but does maintain transactions internally. This holding open a transaction means that no auto-vacuums (against any table in the system) will be able to cleanup dead tuples introduced after the index build begins until it finishes. If you have a table with a large volume of updates (particularly bad if to a very small table) this could result in extremely unoptimal query execution.</li>
+<li><code>DROP INDEX CONCURRENTLY ...</code> must wait for all transactions using the table to complete before returning.</li>
+</ul>
+<p dir="auto"><em>Note</em>: <code>DROP INDEX CONCURRENTLY ...</code> was <a href="https://git.postgresql.org/gitweb/?p=postgresql.git;a=commitdiff;h=8cb53654dbdb4c386369eb988062d0bbb6de725e" rel="nofollow">added in Postgres 9.2</a>. If you&#39;re still running 9.1 or prior, you can achieve somewhat similar results by marking the index as invalid and not ready for writes, flushing buffers with the pgfincore extension, and the dropping the index.</p>
+<h2 dir="auto"><a id="user-content-rename-index" aria-hidden="true" href="#rename-index"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Rename index</h2>
+<p dir="auto"><code>ALTER INDEX ... RENAME TO ...</code> requires an <code>ACCESS EXCLUSIVE</code> lock on the index blocking reads from and writes to the underlying table. However a <a href="https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=1b5d797cd4f7133ff0d18e123fcf41c67a5a7b0b" rel="nofollow">recent commit</a> expected to be a part of Postgres 12 lowers that requirement to <code>SHARE UPDATE EXCLUSIVE</code>.</p>
+<h2 dir="auto"><a id="user-content-reindex" aria-hidden="true" href="#reindex"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Reindex</h2>
+<p dir="auto"><code>REINDEX INDEX ...</code> requires an <code>ACCESS EXCLUSIVE</code> lock on the index blocking reads from and writes to the underlying table. Instead we use the following procedure:</p>
+<ul dir="auto">
+<li>Create a new index <a href="#create-index">concurrently</a> that duplicates the existing index definition.</li>
+<li>Drop the old index <a href="#drop-index">concurrently</a>.</li>
+<li><a href="#rename-index">Rename</a> the new index to match the original index&#39;s name.</li>
+</ul>
+<p dir="auto"><em>Note</em>: If the index you need to rebuild backs a constraint, remember to re-add the constraint as well (subject to all of the <a href="#constraints">caveats we&#39;ve documented</a>.</p>
+
+<h2 dir="auto"><a id="user-content-not-null-constraints" aria-hidden="true" href="#not-null-constraints"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a><code>NOT NULL</code> Constraints</h2>
+<p dir="auto">Removing an existing not-null constraint from a column requires an exclusive lock on the table while a simple catalog update is performed.</p>
+<p dir="auto">In constrast, adding a not-null constraint to an existing column requires an exclusive lock on the table while a full table scan verifies that no <code>null</code> values exist. Instead you should:</p>
+<ol dir="auto">
+<li>Add a <a href="https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-CHECK-CONSTRAINTS" rel="nofollow">CHECK constraint</a> requiring the column be not-null with <code>ALTER TABLE &lt;table&gt; ADD CONSTRAINT &lt;name&gt; CHECK (&lt;column&gt; IS NOT NULL) NOT VALID;</code>. The <code>NOT VALID</code> tells Postgres that it doesn&#39;t need to scan the entire table to verify that all rows satisfy the condition.</li>
+<li>Manually verify that all rows have non-null values in your column.</li>
+<li>Validate the constraint with <code>ALTER TABLE &lt;table&gt; VALIDATE CONSTRAINT &lt;name&gt;;</code>. With this statement PostgreSQL will block acquisition of other EXCLUSIVE locks for the table, but will not block reads or writes.</li>
+</ol>
+<p dir="auto"><em>Bonus</em>: There is currently a <a href="https://www.postgresql.org/message-id/flat/7a6a8eb5-a36c-239a-1724-9fc8a2f29115%40postgrespro.ru#40ee6caa2479b5750490e456bec91165" rel="nofollow">patch in the works</a> (and possibly it will make it into Postgres 12) that will allow you to create a <code>NOT NULL</code> constraint without a full table scan if a CHECK constraint (like we created above) already exists.</p>
+<h2 dir="auto"><a id="user-content-foreign-keys" aria-hidden="true" href="#foreign-keys"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Foreign keys</h2>
+<p dir="auto"><code>ALTER TABLE ... ADD FOREIGN KEY</code> requires a <code>SHARE ROW EXCLUSIVE</code> lock (<a href="https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=0ef0396ae1687bf738d4703773d55467c36b2bcd" rel="nofollow">as of 9.5</a>) <em>on both the altered and referenced tables</em>. While this won&#39;t block <code>SELECT</code> queries, blocking row modification operations for a long period of time is equally unacceptable for our transaction processing applications.</p>
+<p dir="auto">To avoid that long-held lock you can use the following process:</p>
+<ul dir="auto">
+<li><code>ALTER TABLE ... ADD FOREIGN KEY ... NOT VALID</code>: Adds the foreign key and begins enforcing the constraint for all new <code>INSERT/UPDATE</code> statements but does not validate that all existing rows conform to the new constraint. This operation still requires <code>SHARE ROW EXCLUSIVE</code> locks, but the locks are only briefly held.</li>
+<li><code>ALTER TABLE ... VALIDATE CONSTRAINT &lt;constraint&gt;</code>: This operation checks all existing rows to verify they conform to the specified constraint. Validation requires a <code>SHARE UPDATE EXCLUSIVE</code> so may run concurrently with row reading and modification queries.</li>
+</ul>
+<h2 dir="auto"><a id="user-content-check-constraints" aria-hidden="true" href="#check-constraints"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Check constraints</h2>
+<p dir="auto"><code>ALTER TABLE ... ADD CONSTRAINT ... CHECK (...)</code> requires an <code>ACCESS EXCLUSIVE</code> lock. However, as with foreign keys, Postgres supports breaking the operation into two steps:</p>
+<ul dir="auto">
+<li><code>ALTER TABLE ... ADD CONSTRAINT ... CHECK (...) NOT VALID</code>: Adds the check constraint and begins enforcing it for all new <code>INSERT/UPDATE</code> statements but does not validate that all existing rows conform to the new constraint. This operation still requires an <code>ACCESS EXCLUSIVE</code> lock.</li>
+<li><code>ALTER TABLE ... VALIDATE CONSTRAINT &lt;constraint&gt;</code>: This operation checks all existing rows to verify they conform to the specified constraint. Validation requires a <code>SHARE UPDATE EXCLUSIVE</code> on the altered table so may run concurrently with row reading and modification queries. A <code>ROW SHARE</code> lock is held on the reference table which will block any operaitons requiring exclusive locks while validating the constraint.</li>
+</ul>
+<h2 dir="auto"><a id="user-content-uniqueness-constraints" aria-hidden="true" href="#uniqueness-constraints"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Uniqueness constraints</h2>
+<p dir="auto"><code>ALTER TABLE ... ADD CONSTRAINT ... UNIQUE (...)</code> requires an <code>ACCESS EXCLUSIVE</code> lock. However, Postgres supports breaking the operation into two steps:</p>
+<ul dir="auto">
+<li>Create a unique index <a href="#create-index">concurrently</a>. This step will immediately enforce uniquesness, but if you need a declared constraint (or a primary key), then continue to add the constraint separately.</li>
+<li>Add the constraint using the already existing index with <code>ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX &lt;index&gt;</code>. Adding the constraint still requires an <code>ACCESS EXCLUSIVE</code> lock, but the lock will only be held for fast catalog operations.</li>
+</ul>
+<p dir="auto"><em>Note</em>: If you specify <code>PRIMARY KEY</code> instead of <code>UNIQUE</code> then any non-null columns in the index will be made <code>NOT NULL</code>. This requires a full table scan which currently can&#39;t be avoided. See <a href="#not-null-constraints">NOT NULL Constraints</a> for more details.</p>
+<h2 dir="auto"><a id="user-content-exclusion-constraints" aria-hidden="true" href="#exclusion-constraints"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Exclusion constraints</h2>
+<p dir="auto"><code>ALTER TABLE ... ADD CONSTRAINT ... EXCLUDE USING ...</code> requires an <code>ACCESS EXCLUSIVE</code> lock. Adding an exclusion constraint builds the supporting index, and, unfortunately, there is currently no support for using an existing index (as you can do with a <a href="#uniqueness-constraints">unique constraint</a>).</p>
+
+<h2 dir="auto"><a id="user-content-creatingdropping-enum-types" aria-hidden="true" href="#creatingdropping-enum-types"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Creating/dropping enum types</h2>
+<p dir="auto"><code>CREATE TYPE &lt;name&gt; AS (...)</code> and <code>DROP TYPE &lt;name&gt;</code> (after verifying there are no existing usages in the database) can both be done safely without unexpected locking.</p>
+<h2 dir="auto"><a id="user-content-modifying-enum-values" aria-hidden="true" href="#modifying-enum-values"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Modifying enum values</h2>
+<p dir="auto"><code>ALTER TYPE &lt;enum&gt; RENAME VALUE &lt;old&gt; TO &lt;new&gt;</code> was <a href="https://git.postgresql.org/gitweb/?p=postgresql.git;a=commitdiff;h=0ab9c56d0fe3acc9d4717a9cbac6ef3369275b90" rel="nofollow">added in Postgres 10</a>. This statement does not require locking tables which use the enum type.</p>
+<h2 dir="auto"><a id="user-content-deleting-enum-values" aria-hidden="true" href="#deleting-enum-values"><svg viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path fill-rule="evenodd" d="M7.775 3.275a.75.75 0 001.06 1.06l1.25-1.25a2 2 0 112.83 2.83l-2.5 2.5a2 2 0 01-2.83 0 .75.75 0 00-1.06 1.06 3.5 3.5 0 004.95 0l2.5-2.5a3.5 3.5 0 00-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 010-2.83l2.5-2.5a2 2 0 012.83 0 .75.75 0 001.06-1.06 3.5 3.5 0 00-4.95 0l-2.5 2.5a3.5 3.5 0 004.95 4.95l1.25-1.25a.75.75 0 00-1.06-1.06l-1.25 1.25a2 2 0 01-2.83 0z"></path></svg></a>Deleting enum values</h2>
+<p dir="auto">Enums are stored internally as integers and there is no support for gaps in the valid range, removing a value would currently shifting values and rewriting all rows using those values. PostgreSQL does not currently support removing values from an existing enum type.</p>
+
+<p dir="auto"><strong>We&#39;re also excited to announce</strong> that we have open-sourced our internal library <a href="https://github.com/braintreeps/pg_ha_migrations">pg_ha_migrations</a>. This Ruby gem enforces DDL safety in projects using Ruby on Rails and/or ActiveRecord with an emphasis on explicitly choosing tradeoffs and avoiding unnecessary magic (and the corresponding surprises). You can read more in the project&#39;s <a href="https://github.com/braintreeps/pg_ha_migrations/blob/master/README.md">README</a>.</p>
+
+<p dir="auto">[^table-statistics-query] You can see PostgreSQL&#39;s internal statistics about table accesses with the following query:
+<a href="https://gist.github.com/6f5e78ccf32fb232d1e733fe96d6d8f3">https://gist.github.com/6f5e78ccf32fb232d1e733fe96d6d8f3</a></p>
+<p dir="auto">[^locks-held] You can find active long-running queries and the tables they lock with the following query:
+<a href="https://gist.github.com/30b4779cb101c133859a1a11247233f1">https://gist.github.com/30b4779cb101c133859a1a11247233f1</a></p>
+<p dir="auto">[^relation-rewritten] You can see if DDL causes a relation to be rewritten by seeing if the <code>relfilenode</code> value changes after running the statement:
+<a href="https://gist.github.com/67687738c11f1f5ba8a04a7198d92715">https://gist.github.com/67687738c11f1f5ba8a04a7198d92715</a></p>
+<p dir="auto">[^dependent-objects] You can find objects (e.g., indexes) that depend on a specific column by running the statement:
+<a href="https://gist.github.com/5fac44d798bbce1d5d4f9c0bd57abb21">https://gist.github.com/5fac44d798bbce1d5d4f9c0bd57abb21</a></p>
+</article>
+  </div>
+
+  </div>
+</div></div>
+  </body>
+</html>
