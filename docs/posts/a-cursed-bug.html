@@ -14,112 +14,35 @@
   </head>
   <body>
     <a href="/index.html">Back</a>
-    <a href="https://blog.nelhage.com/post/a-cursed-bug/">Original</a>
+    <a href="https://joy.recurse.com/posts/1458-a-cursed-bug">Original</a>
     <h1>A Cursed Bug</h1>
     
-    <div id="readability-page-1" class="page"><div>
-  <p>In my day job at <a href="http://anthropic.com/">Anthropic</a>, we run relatively large distributed systems to train large language models. One of the joys of using a lot of computing resources, especially on somewhat niche software stacks, is that you spend a lot of time running into the long-tail of bugs which only happen rarely or in very unusual configurations, which you happen to be the first to encounter.</p>
-<p>These bugs are frustrating, but I also often enjoy them. They’re the opportunity for a good murder mystery, and they make for great stories if you ever track them down. This is the story of a bug we recently put to rest; a bug which, from our very first inklings of its existence, I repeatedly described as “<strong>cursed</strong>.” Now that we understand it, I want to share just how delightfully cursed it was.</p>
-<p>Usually I like to tell these debugging stories in the “murder mystery” style, where I walk through the story of identifying and debugging the bug. In this case, I think the bug is more interesting than the debugging, so I want to focus in on the bug itself.</p>
-<h2 id="why-was-this-bug-cursed">Why was this bug “cursed”? <a href="#why-was-this-bug-cursed"><i>	🔗︎</i></a> </h2>
-<p>To begin with: Why do I call this bug “cursed”? I use that term as shorthand to refer to some combination of the following facts about this bug:</p>
-<ul>
-<li>It manifested as “this should never happen” failures extremely far-removed from the underlying bug — both in terms of happening long after the buggy code had executed, and in terms of the manifesting showing up many layers of abstraction higher in the stack than the cause.</li>
-<li>It manifested nondeterministically, and rarely – it manifested symptomatically only in around 0.1% of affected processes.</li>
-<li>It only manifested at all on our very largest distributed jobs, resulting in a very slow (and expensive!) debugging cycle.</li>
-<li>The bug (we eventually discovered) originated in the <a href="https://en.wikipedia.org/wiki/Remote_direct_memory_access">RDMA</a> software stack we use. RDMA is always a bit spooky — the whole point being to allow (certain) memory to be transparently manipulated from a remote host without local intervention. And the RDMA software stack is complex and many-layered and has, in my experience, a checkered reputation for quality, at best.</li>
-</ul>
+    <div class="post">
 
-<p>The bug manifested as follows: In our very largest distributed training jobs, sometimes — on less than 1% of nodes  — attempts to launch subprocesses would fail in very strange ways. These failures sometimes manifested as Python exceptions, something like so:</p>
-<pre><code>  …
-  File &#34;utils/command.py&#34;, line 89, in call
-    proc = subprocess.run(
-  File &#34;lib/python3.8/subprocess.py&#34;, line 493, in run
-    with Popen(*popenargs, **kwargs) as process:
-  File &#34;lib/python3.8/subprocess.py&#34;, line 858, in __init__
-    self._execute_child(args, executable, preexec_fn, close_fds,
-  File &#34;lib/python3.8/subprocess.py&#34;, line 1704, in _execute_child
-    raise child_exception_type(errno_num, err_msg, err_filename)
-OSError: [Errno 14] Bad address: &#39;s5cmd&#39;
-</code></pre>
-<p>And sometimes as segmentation faults coming from the child process in between <code>fork</code> and <code>exec</code>, with stack traces something like:</p>
-<pre><code>#0  __malloc_fork_unlock_child () at arena.c:193
-#1  0x00007fe2a996fab5 in __libc_fork () at ../sysdeps/nptl/fork.c:188
-#2  0x00007fe2aa6e3941 in subprocess_fork_exec (self=&lt;optimized out&gt;, args=&lt;optimized out&gt;) at /usr/local/src/conda/python-3.8.10/Modules/_posixsubprocess.c:693
-#3  0x0000559a764598cf in cfunction_call_varargs (kwargs=&lt;optimized out&gt;, args=&lt;optimized out&gt;, func=0x7fe2a9704810) at /home/builder/ktietz/cos6/ci_cos6/python_1622837047642/work/Objects/call.c:758
-#4  PyCFunction_Call () at /home/builder/ktietz/cos6/ci_cos6/python_1622837047642/work/Objects/call.c:773
-#5  0x0000559a7641ada8 in _PyObject_MakeTpCall.localalias.6 () at /home/builder/ktietz/cos6/ci_cos6/python_1622837047642/work/Objects/call.c:159
-#6  0x0000559a764796f8 in _PyObject_Vectorcall (kwnames=0x0, nargsf=&lt;optimized out&gt;, args=0x559a773b7ff8, callable=&lt;optimized out&gt;) at /home/builder/ktietz/cos6/ci_cos6/python_1622837047642/work/Include/cpython/abstract.h:125
-</code></pre>
-<p>In either case, upon further inspection, we discovered that seemingly-random individual pages of memory were <strong>just missing</strong> from the heap in the <code>fork</code>ed child! The bad address was a perfectly-reasonable pointer, and the next and previous pages of memory existed, but one page was just … gone.</p>
-<h3 id="aside-errno-14-bad-address">Aside: <code>[Errno 14] Bad address</code> <a href="#aside-errno-14-bad-address"><i>	🔗︎</i></a> </h3>
-<p>The errno (“error number”) 14 in that first stack trace is <a href="https://github.com/torvalds/linux/blob/f40ddce8/include/uapi/asm-generic/errno-base.h#L18"><code>EFAULT</code></a>. The Linux kernel returns <code>EFAULT</code> if you pass an invalid userspace address to a system call. In that way, it can sometimes indicate a similar failure mode as a segmentation fault, except that where a segmentation fault arises from trying to directly read or write to a bad pointer, <code>EFAULT</code> arises from trying to pass a similarly bad pointer to the OS kernel.</p>
-<h3 id="aside-__malloc_fork_unlock_child">Aside: <code>__malloc_fork_unlock_child</code> <a href="#aside-__malloc_fork_unlock_child"><i>	🔗︎</i></a> </h3>
-<p>What’s the deal with <code>__malloc_fork_unlock_child</code>? As mentioned above, <code>fork()</code> creates a new process with an exact copy of the memory image of the calling process. The <code>fork</code> system call predates multithreading in UNIX, and the introduction of multithreading posed some nasty challenges.</p>
-<p>If a process is multi-threaded, all threads share the same memory. If one thread makes a copy of the entire memory image using <code>fork</code>, it has no way — in general — of making any guarantees about what the other threads are doing at the moment. They could be in the middle of mutating any data structures, or could be holding locks, which will then forever be held in the forked copy.</p>
-<p>One of the most core bits of global shared state in most Linux processes is the memory allocator, generally referred to by the name of its main entry point — <code>malloc</code>. If we were to <code>fork</code> while another thread held a <code>malloc</code>-related lock, there would be no safe way to ever perform memory allocation again in the child. Thus, the C library, in its userspace wrapper around <code>fork</code>, walks the <code>malloc</code> heap metadata and (approximately speaking) takes out locks on every single bit of shared data. Then, after the <code>fork</code>, both the parent and the child release all of those locks, guaranteeing that the child sees a consistent snapshot of the allocator metadata.</p>
-<p>Among other side effects, this means that <code>fork</code>, of necessity, looks at the metadata header for every region of memory (called “arenas” in glib) managed by <code>malloc</code>. When the child segfaulted in <code>__malloc_fork_unlock_child</code>, it was because the page of memory containing one of those headers had vanished in the child.</p>
-<h3 id="aside-forkexec">Aside: <code>fork</code>/<code>exec</code>? <a href="#aside-forkexec"><i>	🔗︎</i></a> </h3>
-<p>If you’re not familiar with how creating subprocesses works on UNIX, it’s an odd two-part dance under the hood. The only<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup> way to create a new process on Linux is with the <code>fork</code> system call, which creates a (near-)identical <strong>copy</strong> of the current process, including its entire memory image (<code>fork</code> uses virtual memory tricks and copy-on-write to make this reasonably efficient). If you want to start an external process, you then arrange for the child to call <code>execve</code> (colloquially referred to as just <code>exec</code>), which then <strong>replaces</strong> the entire memory and state of the child process with the new binary loaded from disk.</p>
-<p>This two-step results in a (brief) window where the child process is running code in between <code>fork</code> returning and <code>exec</code> nuking the entire state. This window is fraught in a number of ways, and it is during this window that we were seeing these failures arise.</p>
-<h2 id="why-were-the-pages-gone">Why were the pages gone? <a href="#why-were-the-pages-gone"><i>	🔗︎</i></a> </h2>
-<p>These pages were missing because of an interaction between <a href="https://github.com/aws/aws-ofi-nccl">aws-ofi-nccl</a>, an AWS plugin which lets NVIDIA’s <a href="https://developer.nvidia.com/nccl">NCCL</a> GPU communication library use Amazon’s <a href="https://aws.amazon.com/hpc/efa/">EFA</a> for high-performance communication between EC2 instances, and the <a href="https://github.com/linux-rdma/rdma-core/tree/master/libibverbs"><code>libiverbs</code></a> userspace library for RDMA on Linux.</p>
-<p>In particular, <code>libiverbs</code> marks any memory segments which have been registered for use with RDMA using <code>madvise(…, MADV_DONTFORK)</code>, to ask the kernel not to copy them into the child on <code>fork</code>.</p>
-<p><code>aws-ofi-nccl</code> <a href="https://github.com/nzmsv/aws-ofi-nccl/blob/0ac4a5175cd038268927dc819e753b00b449e908/src/nccl_ofi_net.c#L1752-L1758">registered a 4-byte region</a> in the middle of a <code>malloc</code> ed buffer as an RDMA target. Instead of rejecting the request (since there is no way to manipulate <code>madvise</code> flags at a granularity of smaller than a page), <code>libiverbs</code> would “helpfully” <a href="https://github.com/linux-rdma/rdma-core/blob/3ff453edb8ce0e0e63e0d7de602577bd0a31aaee/libibverbs/memory.c#L638-L639">round up</a> to the nearest full page, which resulted in an effectively random page vanishing from the child’s heap for each NCCL communicator! Most of the time, these pages would go unused in between <code>fork</code> and <code>exec</code> and so this behavior would go unnoticed; but sometimes they would contain part of glibc’s <code>malloc</code> metadata, or would contain string data used by Python between the <code>fork</code> and <code>exec</code>, manifesting in the two failure patterns described above!</p>
-<p>In the process of debugging the issue, we were able to catch a “live” process in the broken state (where <code>fork</code>ing would fail). By looking at the address of the missing malloc arena and inspecting the parent’s address space in <code>/proc/pid/smaps</code>, we could observe the problematic state:</p>
-<pre><code>7f5e20000000-7f5e20001000 rw-p 00000000 00:00 0
-Size:                  4 kB
-KernelPageSize:        4 kB
-MMUPageSize:           4 kB
-Rss:                   4 kB
-Pss:                   4 kB
-Shared_Clean:          0 kB
-Shared_Dirty:          0 kB
-Private_Clean:         0 kB
-Private_Dirty:         4 kB
-Referenced:            4 kB
-Anonymous:             4 kB
-LazyFree:              0 kB
-AnonHugePages:         0 kB
-ShmemPmdMapped:        0 kB
-FilePmdMapped:         0 kB
-Shared_Hugetlb:        0 kB
-Private_Hugetlb:       0 kB
-Swap:                  0 kB
-SwapPss:               0 kB
-Locked:                0 kB
-THPeligible:            0
-ProtectionKey:         0
-VmFlags: rd wr mr mw me dc nr sd
-</code></pre>
-<p>Looking at this mapping, we notice two salient facts:</p>
-<ul>
-<li>This is a 1-page (4k) range of memory. A page is the smallest region of memory that can be managed independently by the hardware virtual memory system. Most of the surrounding regions were much larger than a single page, because memory tends to get managed in much larger chunks on today’s large systems. The <code>madvise</code> call forced the kernel to split off a one-page region to track the effects of the <code>madvise</code> call.</li>
-<li>The <code>VmFlags</code> field includes the <code>dc</code> flag. Searching for <code>smaps</code> in <a href="https://man7.org/linux/man-pages/man5/proc.5.html"><code>man 5 proc</code></a>, we find that <code>dc</code> means “do not copy area on fork” — the internal flag set by <code>madvise(…, MADV_DONTFORK)</code>.</li>
-</ul>
-<h3 id="aside-why-does-libiverbs-use-madv_dontfork">Aside: Why does <code>libiverbs</code> use <code>MADV_DONTFORK</code>? <a href="#aside-why-does-libiverbs-use-madv_dontfork"><i>	🔗︎</i></a> </h3>
-<p><code>libiverbs</code> exists to interact with RDMA hardware.  RDMA hardware, like most forms of DMA, accesses memory in terms of <strong>physical</strong> memory addresses, unlike the <strong>virtual</strong> addresses code running on the CPU uses. This means, in order for things to go well, that any page of memory involved in RDMA needs to be pinned to a specific location in physical memory as long as it might be written to by a remote RDMA peer.</p>
-<p>RDMA drivers “pin” memory pages, which prevents them from being relocated or swapped by the kernel. However, <code>fork</code> calls are now problematic. Following a <code>fork</code>, the kernel usually marks both processes’ entire address space as read-only; on an attempt to write to memory, it copies the underlying page so that neither process sees any modifications by the other.</p>
-<p>Specifically, the first process to attempt to write to a copy-on-write (“CoW”) page will make a copy, leaving the original page (still visible to one or more other processes) intact.</p>
-<p>This (potentially) interacts poorly with RDMA; If a process using RDMA <code>fork</code>s, any future attempts to write to pages used for RDMA would result in the parent copying the page, which would mean it would no longer see any remote writes to that page by RDMA peers.</p>
-<p>Historically, to avoid this problem, the RDMA user-space would handle this case by explicitly requesting that any pages which are RDMA targets not get copied into the child at all. This ensures the parent process continues functioning properly, and (assuming the child then <code>execve</code>s to replace its address space) should normally be harmless in the child.</p>
-<h2 id="the-future-eager-copying">The future: eager copying <a href="#the-future-eager-copying"><i>	🔗︎</i></a> </h2>
-<p>While doing this writeup, I discovered that the previous section is no longer accurate for recent kernels! As of <a href="https://github.com/torvalds/linux/commit/4eae4efa2c299f85b7ebfbeeda56c19c5eba2768">this commit (released as part of Linux 5.12)</a>, Linux will <strong>eagerly</strong> copy pages which are marked as pinned on a <code>fork</code> call. This has the result that the parent process gets to hold on to the same physical page, but the child gets a copy and has its address space intact. <code>rdma-core</code>, as of version v35, has support for <a href="https://github.com/linux-rdma/rdma-core/pull/975">checking whether or not a kernel is sufficiently new</a> to support this feature. Confusingly to me, this check takes the form of a new API call — <a href="https://www.mankier.com/3/ibv_is_fork_initialized"><code>ibv_is_fork_initialized</code></a> — and the existing call to request “fork support”, <a href="https://www.mankier.com/3/ibv_fork_init"><code>ibv_fork_init</code></a>, was unmodified. Thus, on newer kernels, callers are able to detect that <code>MADV_DONTFORK</code> is unneeded and avoid enabling; but if someone explicitly enables, including by <a href="https://github.com/linux-rdma/rdma-core/blob/ba3689ce1a5d01cd56219fa372e829fe83ac5f9e/libibverbs/init.c#L670-L673">setting the</a> <a href="https://github.com/linux-rdma/rdma-core/blob/ba3689ce1a5d01cd56219fa372e829fe83ac5f9e/libibverbs/init.c#L670-L673"><code>RDMAV_FORK_SAFE</code></a> <a href="https://github.com/linux-rdma/rdma-core/blob/ba3689ce1a5d01cd56219fa372e829fe83ac5f9e/libibverbs/init.c#L670-L673">environment variable</a> (as we were), they will get the legacy (and buggy) <code>MADV_DONTFORK</code> behavior even if it is unneeded.</p>
-<p>It turns out our kernels were too old to have this support, but even if they weren’t, the fact that our startup scripts set <code>RDMAV_FORK_SAFE</code> (presumably blindly copy-pasted on advice of some historical reference), it would not have shielded us from this bug.</p>
+  <header class="post__header">
+      <div class="post__published-at">
+        Monday, Feb 28
+      </div>
 
-<h2 id="the-workaround">The workaround <a href="#the-workaround"><i>	🔗︎</i></a> </h2>
-<p>Once we realized the problem was related to <code>fork</code>, one natural workaround was to attempt spawning new processes via <a href="https://man7.org/linux/man-pages/man3/posix_spawn.3.html"><code>posix_spawn</code></a>, instead of <code>fork</code>. <code>posix_spawn</code> is a (relatively) new API that attempts to encapsulate the creation of a subprocess into a single API call, instead of the <code>fork</code>/[setup code]/<code>exec</code> combination traditionally used. Under the hood, <code>posix_spawn</code> is implemented in most <code>libc</code>s I know of using the <a href="https://man7.org/linux/man-pages/man2/vfork.2.html"><code>vfork</code></a> system call. <code>vfork</code> is a call similar to <code>fork</code>, but instead of actually copying memory, it pauses the parent until the child calls <code>execve</code> or exits. This creates the risk of memory corruption if the child attempts to write to essentially any memory whatsoever; but if the child is properly-implemented, <code>vfork</code>+<code>exec</code> can be substantially more performant that the traditional <code>fork</code>+<code>exec</code> combination.</p>
-<p>We were launching subprocesses using Python’s <a href="https://docs.python.org/3/library/subprocess.html"><code>subprocess</code></a> module. As of Python 3.8 (which we were running), <code>subprocess</code> supports <code>posix_spawn</code>, so we were actually a little bit surprised to discover it wasn’t being used. It turns out that <code>subprocess</code> only hits the <code>posix_spawn</code> path if <a href="https://github.com/python/cpython/blob/4844abdd700120120fc76c29d911bcb547700baf/Lib/subprocess.py#L1584-L1598">a long list of conditions</a> holds on process creation. Notably, among other conditions, it requires that <code>subprocess.Popen</code> be given an absolute path to the program to execute, and that the <code>close_fds</code> flag be set to false. Since <code>close_fds=True</code> by default, virtually every Python program in existence is skipping the <code>posix_spawn</code> path!</p>
-<p>Once we realized this (by reading <code>subprocess.py</code> — we found no documentation of this gotcha), we were able to modify our subprocess creation code to meet those conditions, and the bug stopped manifesting! We were able to deploy this workaround several days before we actually identified the root bug, and resume training stably.</p>
-<h2 id="the-actual-fix">The actual fix <a href="#the-actual-fix"><i>	🔗︎</i></a> </h2>
-<p>Once we had identified the fix was related to <code>fork</code> and <code>MADV_DONTFORK</code>, our AWS support contacts were able to (impressively quickly!) identify the troublesome registration in <code>aws-ofi-nccl</code>, <a href="https://github.com/aws/aws-ofi-nccl/pull/77">and fairly quickly pushed a fix</a> that resolved the problem.</p>
-<p>I also <a href="https://lore.kernel.org/linux-rdma/CAPSG9dZ-dkWPcbXECQeZyvOHu7M+vfrX+jJDe+fxY6_iSnQyKw@mail.gmail.com/">reported a bug</a> to the rdma-core project asking that they error (or warn) on these registrations instead of blithely trashing the processes’ address space, but I received a (frankly) <a href="https://lore.kernel.org/linux-rdma/20220107150655.GZ6467@ziepe.ca/">kind of baffling response</a>. In light of my note above about eager copying in <code>fork</code>, I think they may be referring to the fact that <code>ibv_fork_init</code> is no longer needed on recent systems, but in light of the fact that that mode is still supported and is fairly easy to unintentionally enable, it still seems clear to me that there’s a bug worth fixing.</p>
+    <h3 class="post__title">
+      <a class="post__link" href="https://blog.nelhage.com/post/a-cursed-bug/">A Cursed Bug</a>
 
-<p>I don’t feel like I have any great takeaways here. This was a very satisfying bug to finally track down and fix; it was the kind of bug that can linger, rarely triggered, never diagnosed, for years, worked around or tolerated, but never debugged. We got lucky, in a way, that we were able to track it down; a completely unrelated update in a library we used caused us to start shelling out early on in every training process’ lifetime, which was sufficient to increase the rate of incidence of this bug high enough that it became unbearable; but that also meant it was high enough to be reproducible and debuggable. For months prior to that we’d just tolerated occasional incidences, working around with retry loops at various levels.</p>
-<p>The experience also feels like a vindication of a sorts for my conviction that <a href="https://blog.nelhage.com/post/computers-can-be-understood/">computers can be understood</a>. When you start dealing with large distributed systems, you see a <strong>lot</strong> of intermittent weird bugs, and it’s basically inevitable that you’ll never track down or diagnose all of them. But it turns out that sometimes, with a bit of luck and persistence, even the hairiest ones can sometimes be tracked down.</p>
+        <span class="post__meta">(<a href="/posts/1458-a-cursed-bug">permalink</a>)</span>
 
+    </h3>
 
+    <div class="post__made-by">
+      made by <a href="https://joy.recurse.com/~nelhage">nelhage</a>, submitted by <a href="https://joy.recurse.com/~Mai">Mai</a>
+    </div>
+  </header>
 
-</div></div>
+  <div class="post__description">
+    What makes a bug cursed? A blog post about tracking down a particularly satisfying one.
+    <span class="post__meta">
+      —&nbsp;<a href="https://joy.recurse.com/~Mai">Mai</a>
+    </span>
+  </div>
+
+</div>
   </body>
 </html>
