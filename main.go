@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	_ "embed"
-	"flag"
 	"fmt"
 	"html/template"
 	"io"
@@ -72,6 +71,8 @@ var (
 		"https://mikehudack.substack.com/feed",
 		"https://www.wildlondon.org.uk/blog/all/rss.xml",
 		"https://blaggregator.recurse.com/atom.xml?token=4c4c4e40044244aab4a36e681dfb8fb0",
+
+		"https://blog.golang.org/feed.atom?format=xml",
 	}
 
 	// Show up to 60 days of posts
@@ -91,23 +92,8 @@ var blocklist = map[string]bool{
 }
 
 func main() {
-	var testGetURL string
-	flag.StringVar(&testGetURL, "test-get", "", "Fetch and format the specified URL")
-	flag.Parse()
-
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-
-	if testGetURL != "" {
-		content, err := fetchHTMLContent(ctx, testGetURL)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		fmt.Println(content)
-		return
-	}
-
 	if err := run(ctx); err != nil {
 		log.Fatal(err)
 	}
@@ -261,64 +247,45 @@ func getPosts(ctx context.Context, feedURL string, posts chan *Post) {
 		// If content isn't available from RSS, try to pull it from the webpage
 		// itself
 		if post.Content == "" {
-
-			content, err := fetchHTMLContent(ctx, item.Link)
+			req, err := http.NewRequestWithContext(ctx, "GET", item.Link, nil)
 			if err != nil {
-				log.Print(err)
+				log.Println(err)
+				continue
+			}
+			req.Header["User-Agent"] = []string{
+				"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+			}
+
+			rsp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				log.Println(err)
 				continue
 			}
 
-			post.Content = template.HTML(content)
+			// Don't try an parse non-HTML
+			contentType := rsp.Header.Get("content-type")
+			if contentType != "" && !strings.HasPrefix(contentType, "text/html") {
+				log.Printf("Not HTML: %s\n", item.Link)
+				continue
+			}
+
+			article, err := reader.Parse(rsp.Body, item.Link)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+
+			post.Content = template.HTML(article.Content)
 
 			if post.Content == "" {
 				log.Printf("Content still empty after HTML reader: %s", item.Link)
 			}
+
+			rsp.Body.Close()
 		}
 
 		posts <- post
 	}
-}
-
-func fetchHTMLContent(ctx context.Context, url string) (content string, err error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header["User-Agent"] = []string{
-		"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-	}
-
-	rsp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer rsp.Body.Close()
-
-	// Some websites block us if we specify the googlebot user agent. Retry
-	// without
-	if rsp.StatusCode >= 400 {
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-		if err != nil {
-			return "", err
-		}
-		rsp, err = http.DefaultClient.Do(req)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	// Don't try an parse non-HTML
-	contentType := rsp.Header.Get("content-type")
-	if contentType != "" && !strings.HasPrefix(contentType, "text/html") {
-		return "", fmt.Errorf("not HTML: %s", url)
-	}
-
-	article, err := reader.Parse(rsp.Body, url)
-	if err != nil {
-		return "", err
-	}
-
-	return article.Content, nil
 }
 
 func titleToFilename(s string) string {
