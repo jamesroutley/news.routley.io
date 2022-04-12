@@ -73,6 +73,7 @@ var (
 		"https://blaggregator.recurse.com/atom.xml?token=4c4c4e40044244aab4a36e681dfb8fb0",
 
 		"https://blog.golang.org/feed.atom?format=xml",
+		"https://anewsletter.alisoneroman.com/feed",
 	}
 
 	// Show up to 60 days of posts
