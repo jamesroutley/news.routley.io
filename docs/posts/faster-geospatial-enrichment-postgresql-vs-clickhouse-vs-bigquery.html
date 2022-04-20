@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://tech.marksblogg.com/faster-geospatial-enrichment.html">Original</a>
+    <h1>Faster Geospatial Enrichment: PostgreSQL vs. ClickHouse vs. BigQuery</h1>
+    
+    <div id="readability-page-1" class="page"><div id="article_text">
+            <p>Earlier this year I signed a consulting agreement with <a href="https://open5g.com/">Open5G</a>. Based in Atherton, California, the company builds and manages fiber-optic networks. At present, they have a handful of networks in the Bay Area but have plans to expand across the US.</p>
+<p>The act of planning out how a fiber-optic network will be deployed across a city has many constraints to consider. The process is capital-intensive so you want the network to archive uptake as soon as possible. My team at Open5G builds network roll-out plans. This is done by blending over 20 data sources together and weighing their metrics against a number of business goals. The following is an illustrative example of a roll-out plan.</p>
+<p><a href="https://tech.marksblogg.com/theme/images/bins.gif"><img alt="Illustrative order of deployment" src="https://tech.marksblogg.com/theme/images/bins.gif"/></a></p><p>In the above visualisation, there is a hexagonal grid overlaid across a city. The hexagons appear in the order of fiber being deployed. Darker hexagons represent higher densities of potential customers. Several factors beyond projected revenue make up how a network is deployed. It&#39;s not as simple as the richest and most internet-deprived first.</p>
+<p>The 20-odd datasets all contain latitude and longitude columns across every row of data. These are often either a single point or a polygon that is converted into a centroid. The points are then converted into groups of hexagons making them easier to aggregate. The following is an example conversion.</p>
+<div><pre><span></span>$ h3 latLngToCell <span>\</span>
+    --resolution <span>10</span> <span>\</span>
+    --latitude   <span>40</span>.689167 <span>\</span>
+    --longitude -74.044444
+</pre></div>
+<p>This is the resulting 64-bit identifier for the hexagon the above parameters fall into.</p>
+
+<p>The hexagons we&#39;re using are from <a href="https://eng.uber.com/h3/">H3</a>, Uber&#39;s Hexagonal Hierarchical Spatial Index, which was first publicly announced in 2018. This system uses a <a href="https://en.wikipedia.org/wiki/Dymaxion_map">Gray-Fuller</a> icosahedral projection of the Earth and lays out a series of hexagons on top of it. The use of this projection system means that any hexagon over land will suffer from a minimal amount of distortion and should generally keep its natural shape.</p>
+<p>When <a href="https://h3geo.org/docs/core-library/restable/">zoomed out</a> at level 0, a hexagon covers 4,250,546 km², a little more than half the size of Australia. At Zoom level 7, an area of ~5 km² will be filled by any individual hexagon. The 64-bit identifier for the hexagon at zoom level 0 that covers most of California is <tt>8029fffffffffff</tt>. The more you zoom in, the fewer trailing Fs will be present in any given identifier. Matthias Feist, a Senior Engineering Manager at Spotify, built an excellent <a href="https://what-the-h3index.vercel.app/">H3 exploration</a> tool to help rationalise these identifiers over the surface of the Earth.</p>
+<p>When converting latitude and longitude pairs into H3 identifiers, I found that different tools perform this task at very different rates. In this post, I&#39;m going to benchmark PostgreSQL, ClickHouse and BigQuery against one another and see which can convert a set of coordinates into H3 identifiers the fastest.</p>
+<div id="postgresql-up-running">
+<h2>PostgreSQL, Up &amp; Running</h2>
+<p>I&#39;ll be using a virtual machine on Google Cloud. It&#39;s an <tt><span>e2-standard-4</span></tt> with 4 vCPUs, 16 GB of RAM, 300 GB of SSD-backed, <a href="https://cloud.google.com/compute/docs/disks">pd-balanced</a> storage capacity running Ubuntu 20.04 LTS in their <tt><span>us-west2-a</span></tt> zone in Los Angeles, California.</p>
+<p>The following will install some build tools, Python 3 and PostgreSQL 14 with the PostGIS extension.</p>
+<div><pre><span></span>$ wget -qO- <span>\</span>
+    https://www.postgresql.org/media/keys/ACCC4CF8.asc <span>\</span>
+        <span>|</span> sudo apt-key add -
+$ <span>echo</span> <span>&#34;deb http://apt.postgresql.org/pub/repos/apt/ focal-pgdg main 14&#34;</span> <span>\</span>
+    <span>|</span> sudo tee /etc/apt/sources.list.d/pgdg.list
+
+$ sudo apt update
+$ sudo apt install <span>\</span>
+    build-essential <span>\</span>
+    python3-pip <span>\</span>
+    python3-virtualenv <span>\</span>
+    postgresql-14-postgis-3 <span>\</span>
+    postgresql-14-postgis-3-scripts <span>\</span>
+    postgresql-client-14 <span>\</span>
+    postgresql-server-dev-14 <span>\</span>
+    postgis
+</pre></div>
+<p>I&#39;ll then set up a user account with PostgreSQL.</p>
+<div><pre><span></span>$ sudo -u postgres <span>\</span>
+    bash -c <span>&#34;psql -c \&#34;CREATE USER mark</span>
+<span>                       WITH PASSWORD &#39;test&#39;</span>
+<span>                       SUPERUSER;\&#34;&#34;</span>
+</pre></div>
+<p>The following will set up PostGIS and then the <tt>h3db</tt> database I&#39;ll be using.</p>
+<div><pre><span></span>$ createdb template_postgis
+
+$ psql -d postgres -c <span>&#34;UPDATE pg_database SET datistemplate=&#39;true&#39; WHERE datname=&#39;template_postgis&#39;;&#34;</span>
+$ psql template_postgis -c <span>&#34;create extension postgis&#34;</span>
+$ psql template_postgis -c <span>&#34;create extension postgis_topology&#34;</span>
+$ psql template_postgis -f /usr/share/postgresql/14/contrib/postgis-3.2/legacy.sql
+
+$ psql -d template_postgis -c <span>&#34;GRANT ALL ON geometry_columns TO PUBLIC;&#34;</span>
+$ psql -d template_postgis -c <span>&#34;GRANT ALL ON geography_columns TO PUBLIC;&#34;</span>
+$ psql -d template_postgis -c <span>&#34;GRANT ALL ON spatial_ref_sys TO PUBLIC;&#34;</span>
+
+$ createdb -T template_postgis h3db
+</pre></div>
+<p>Uber&#39;s H3 library requires at a minimum CMake v3.20 and Ubuntu 20 only ships with v3.16. Below I&#39;ll build and install version 3.20.</p>
+<div><pre><span></span>$ <span>cd</span> ~
+$ wget -c https://github.com/Kitware/CMake/releases/download/v3.20.0/cmake-3.20.0.tar.gz
+$ tar -xzf cmake-3.20.0.tar.gz
+$ <span>cd</span> cmake-3.20.0
+$ ./bootstrap
+$ make -j4
+$ sudo make install
+</pre></div>
+<p>The following will build Uber&#39;s H3 library. It was written primarily by <a href="https://www.linkedin.com/in/isaacbrodsky/">Isaac Brodsky</a> and <a href="https://www.linkedin.com/in/ellisdf/">David Ellis</a>. It&#39;s made up of 13K lines of C code &amp; headers.</p>
+<div><pre><span></span>$ git clone https://github.com/uber/h3 ~/h3
+$ mkdir -p ~/h3/build
+$ <span>cd</span> ~/h3/build
+$ cmake ..
+$ make -j4
+$ sudo make install
+$ sudo ldconfig
+</pre></div>
+<p>I&#39;ll then build a PostgreSQL extension that adds support for H3. It was written by <a href="https://www.linkedin.com/in/zachariasdyna/">Zacharias Dyna Knudsen</a> and is made up of 1,210 lines of C code and 1,237 lines of SQL.</p>
+<div><pre><span></span>$ git clone https://github.com/bytesandbrains/h3-pg ~/h3-pg
+$ <span>cd</span> ~/h3-pg
+$ make -j4
+$ sudo make install
+</pre></div>
+<p>I&#39;ll then set up the above extension in PostgreSQL.</p>
+
+<div><pre><span></span><span>CREATE</span> <span>EXTENSION</span> <span>h3</span><span>;</span>
+
+<span>SELECT</span> <span>H3_GEO_TO_H3</span><span>(</span><span>POINT</span><span>(</span><span>37</span><span>.</span><span>769377</span><span>,</span> <span>-</span><span>122</span><span>.</span><span>388903</span><span>),</span> <span>9</span><span>);</span>
+</pre></div>
+<p>The above should return the following:</p>
+<div><pre><span></span>  h3_geo_to_h3
+-----------------
+ 89e35ad6d87ffff
+</pre></div>
+</div>
+<div id="importing-opencellid">
+<h2>Importing OpenCelliD</h2>
+<p><a href="https://www.opencellid.org/">OpenCelliD</a> is a community project that collects GPS positions and network coverage patterns from cell towers around the globe. They produce a 45M-record dataset that is refreshed daily. This dataset is delivered as a GZIP-compressed CSV file. Below I&#39;ll download and import the dataset into PostgreSQL. Please replace the token in the URL with your own if you want to try this as well.</p>
+<div><pre><span></span>$ <span>cd</span> ~
+$ wget <span>&#34;https://opencellid.org/ocid/downloads?token=...&amp;type=full&amp;file=cell_towers.csv.gz&#34;</span>
+$ gunzip cell_towers.csv.gz
+$ psql h3db
+</pre></div>
+<div><pre><span></span><span>CREATE</span> <span>TABLE</span> <span>open_cell_towers</span> <span>(</span>
+    <span>radio</span>         <span>VARCHAR</span><span>,</span>
+    <span>mcc</span>           <span>INTEGER</span><span>,</span>
+    <span>net</span>           <span>INTEGER</span><span>,</span>
+    <span>area</span>          <span>INTEGER</span><span>,</span>
+    <span>cell</span>          <span>BIGINT</span><span>,</span>
+    <span>unit</span>          <span>INTEGER</span><span>,</span>
+    <span>lon</span>           <span>FLOAT</span><span>,</span>
+    <span>lat</span>           <span>FLOAT</span><span>,</span>
+    <span>range</span>         <span>INTEGER</span><span>,</span>
+    <span>samples</span>       <span>INTEGER</span><span>,</span>
+    <span>changeable</span>    <span>INTEGER</span><span>,</span>
+    <span>created</span>       <span>INTEGER</span><span>,</span>
+    <span>updated</span>       <span>INTEGER</span><span>,</span>
+    <span>averageSignal</span> <span>INTEGER</span><span>);</span>
+</pre></div>
+<div><pre><span></span><span>\</span><span>copy</span> <span>open_cell_towers</span> <span>FROM</span> <span>&#39;cell_towers.csv&#39;</span> <span>DELIMITER</span> <span>&#39;,&#39;</span> <span>CSV</span> <span>HEADER</span>
+</pre></div>
+<p>The above imported 45,214,074 records in 2 minutes and 40 seconds and consumes ~3.8 GB in PostgreSQL&#39;s internal format. Here is an example of one of the records:</p>
+<div><pre><span></span><span>\</span><span>x</span> <span>on</span>
+<span>SELECT</span> <span>*</span> <span>FROM</span> <span>open_cell_towers</span> <span>LIMIT</span> <span>1</span><span>;</span>
+</pre></div>
+<div><pre><span></span>radio         | UMTS
+mcc           | 262
+net           | 2
+area          | 801
+cell          | 86355
+unit          | 0
+lon           | 13.285512
+lat           | 52.522202
+range         | 1000
+samples       | 7
+changeable    | 1
+created       | 1282569574
+updated       | 1300155341
+averagesignal | 0
+</pre></div>
+<p>I&#39;m now going to add H3 identifiers for each record. I&#39;ll do this for zoom levels 7 - 9.</p>
+<div><pre><span></span><span>ALTER</span> <span>TABLE</span> <span>open_cell_towers</span>
+<span>ADD</span> <span>COLUMN</span> <span>IF</span> <span>NOT</span> <span>EXISTS</span> <span>h3_7</span> <span>VARCHAR</span><span>(</span><span>15</span><span>);</span>
+<span>UPDATE</span> <span>open_cell_towers</span>
+<span>SET</span> <span>h3_7</span> <span>=</span> <span>H3_GEO_TO_H3</span><span>(</span><span>POINT</span><span>(</span><span>lat</span><span>,</span> <span>lon</span><span>),</span> <span>7</span><span>);</span>
+
+<span>ALTER</span> <span>TABLE</span> <span>open_cell_towers</span>
+<span>ADD</span> <span>COLUMN</span> <span>IF</span> <span>NOT</span> <span>EXISTS</span> <span>h3_8</span> <span>VARCHAR</span><span>(</span><span>15</span><span>);</span>
+<span>UPDATE</span> <span>open_cell_towers</span>
+<span>SET</span> <span>h3_8</span> <span>=</span> <span>H3_GEO_TO_H3</span><span>(</span><span>POINT</span><span>(</span><span>lat</span><span>,</span> <span>lon</span><span>),</span> <span>8</span><span>);</span>
+
+<span>ALTER</span> <span>TABLE</span> <span>open_cell_towers</span>
+<span>ADD</span> <span>COLUMN</span> <span>IF</span> <span>NOT</span> <span>EXISTS</span> <span>h3_9</span> <span>VARCHAR</span><span>(</span><span>15</span><span>);</span>
+<span>UPDATE</span> <span>open_cell_towers</span>
+<span>SET</span> <span>h3_9</span> <span>=</span> <span>H3_GEO_TO_H3</span><span>(</span><span>POINT</span><span>(</span><span>lat</span><span>,</span> <span>lon</span><span>),</span> <span>9</span><span>);</span>
+</pre></div>
+<p>The above was completed in 18 minutes and 3 seconds.</p>
+<p>Since this post was originally published it was suggested to build a new table while running enrichment. The following out-performed the above by 2.1x completing in 8 minutes and 14 seconds.</p>
+<div><pre><span></span><span>CREATE</span> <span>TABLE</span> <span>test</span> <span>AS</span> <span>SELECT</span>
+    <span>radio</span><span>,</span>
+    <span>mcc</span><span>,</span>
+    <span>net</span><span>,</span>
+    <span>area</span><span>,</span>
+    <span>cell</span><span>,</span>
+    <span>unit</span><span>,</span>
+    <span>lon</span><span>,</span>
+    <span>lat</span><span>,</span>
+    <span>range</span><span>,</span>
+    <span>samples</span><span>,</span>
+    <span>changeable</span><span>,</span>
+    <span>created</span><span>,</span>
+    <span>updated</span><span>,</span>
+    <span>averageSignal</span><span>,</span>
+    <span>H3_GEO_TO_H3</span><span>(</span><span>POINT</span><span>(</span><span>lat</span><span>,</span> <span>lon</span><span>),</span> <span>7</span><span>)</span> <span>as</span> <span>h3_7</span><span>,</span>
+    <span>H3_GEO_TO_H3</span><span>(</span><span>POINT</span><span>(</span><span>lat</span><span>,</span> <span>lon</span><span>),</span> <span>8</span><span>)</span> <span>as</span> <span>h3_8</span><span>,</span>
+    <span>H3_GEO_TO_H3</span><span>(</span><span>POINT</span><span>(</span><span>lat</span><span>,</span> <span>lon</span><span>),</span> <span>9</span><span>)</span> <span>as</span> <span>h3_9</span>
+<span>FROM</span> <span>open_cell_towers</span><span>;</span>
+</pre></div>
+</div>
+<div id="clickhouse-up-running">
+<h2>ClickHouse, Up &amp; Running</h2>
+<p>ClickHouse is a database I&#39;ve <a href="https://tech.marksblogg.com/category/clickhouse.html">covered</a> many times on this blog. It has always performed well in <a href="https://tech.marksblogg.com/benchmarks.html">benchmarks</a> I&#39;ve run against it. The following will install ClickHouse version 22.2.2.1.</p>
+<div><pre><span></span>$ sudo apt-key adv <span>\</span>
+    --keyserver hkp://keyserver.ubuntu.com:80 <span>\</span>
+    --recv E0C56BD4
+$ <span>echo</span> <span>&#34;deb http://repo.yandex.ru/clickhouse/deb/stable/ main/&#34;</span> <span>\</span>
+    <span>|</span> sudo tee /etc/apt/sources.list.d/clickhouse.list
+$ sudo apt update
+$ sudo apt install <span>\</span>
+    clickhouse-client <span>\</span>
+    clickhouse-server
+</pre></div>
+<p>The following will launch the server.</p>
+<div><pre><span></span>$ sudo service clickhouse-server start
+</pre></div>
+<p>The following will save the password I set for the server so it doesn&#39;t need to be typed in each time the client connects.</p>
+<div><pre><span></span>$ mkdir -p ~/.clickhouse-client
+$ vi ~/.clickhouse-client/config.xml
+</pre></div>
+<div><pre><span></span><span>&lt;config&gt;</span>
+    <span>&lt;password&gt;</span>test<span>&lt;/password&gt;</span>
+<span>&lt;/config&gt;</span>
+</pre></div>
+<p>I&#39;ll create a table that sources the cell tower dataset in PostgreSQL.</p>
+
+<div><pre><span></span><span>CREATE</span> <span>TABLE</span> <span>open_cell_towers</span> <span>(</span>
+    <span>radio</span>         <span>String</span><span>,</span>
+    <span>mcc</span>           <span>Int32</span><span>,</span>
+    <span>net</span>           <span>Int32</span><span>,</span>
+    <span>area</span>          <span>Int32</span><span>,</span>
+    <span>cell</span>          <span>Int64</span><span>,</span>
+    <span>unit</span>          <span>Int32</span><span>,</span>
+    <span>lon</span>           <span>Float64</span><span>,</span>
+    <span>lat</span>           <span>Float64</span><span>,</span>
+    <span>range</span>         <span>Int32</span><span>,</span>
+    <span>samples</span>       <span>Int32</span><span>,</span>
+    <span>changeable</span>    <span>Int32</span><span>,</span>
+    <span>created</span>       <span>Int32</span><span>,</span>
+    <span>updated</span>       <span>Int32</span><span>,</span>
+    <span>averagesignal</span> <span>Int32</span><span>)</span>
+<span>ENGINE</span> <span>=</span> <span>PostgreSQL</span><span>(</span><span>&#39;localhost:5432&#39;</span><span>,</span>
+                    <span>&#39;h3db&#39;</span><span>,</span>
+                    <span>&#39;open_cell_towers&#39;</span><span>,</span>
+                    <span>&#39;mark&#39;</span><span>,</span>
+                    <span>&#39;test&#39;</span><span>);</span>
+</pre></div>
+<p>I will then import the data from PostgreSQL into a Log Engine table. This means the data is now located in ClickHouse&#39;s local storage using one of its native formats.</p>
+<div><pre><span></span><span>CREATE</span> <span>TABLE</span> <span>open_cell_towers2</span> <span>ENGINE</span> <span>=</span> <span>Log</span><span>()</span> <span>AS</span>
+<span>SELECT</span> <span>radio</span><span>,</span>
+       <span>mcc</span><span>,</span>
+       <span>net</span><span>,</span>
+       <span>area</span><span>,</span>
+       <span>cell</span><span>,</span>
+       <span>unit</span><span>,</span>
+       <span>lon</span><span>,</span>
+       <span>lat</span><span>,</span>
+       <span>range</span><span>,</span>
+       <span>samples</span><span>,</span>
+       <span>changeable</span><span>,</span>
+       <span>created</span><span>,</span>
+       <span>updated</span><span>,</span>
+       <span>averagesignal</span>
+<span>FROM</span> <span>open_cell_towers</span><span>;</span>
+</pre></div>
+<p>I can&#39;t add columns to an existing Log Engine table in ClickHouse so I&#39;ll create a new table and add the h3 identifiers during that process.</p>
+<div><pre><span></span><span>CREATE</span> <span>TABLE</span> <span>open_cell_towers3</span> <span>ENGINE</span> <span>=</span> <span>Log</span><span>()</span> <span>AS</span>
+<span>SELECT</span> <span>*</span><span>,</span>
+       <span>geoToH3</span><span>(</span><span>toFloat64</span><span>(</span><span>lat</span><span>),</span> <span>toFloat64</span><span>(</span><span>lon</span><span>),</span> <span>materialize</span><span>(</span><span>7</span><span>))</span> <span>AS</span> <span>h3_7</span><span>,</span>
+       <span>geoToH3</span><span>(</span><span>toFloat64</span><span>(</span><span>lat</span><span>),</span> <span>toFloat64</span><span>(</span><span>lon</span><span>),</span> <span>materialize</span><span>(</span><span>8</span><span>))</span> <span>AS</span> <span>h3_8</span><span>,</span>
+       <span>geoToH3</span><span>(</span><span>toFloat64</span><span>(</span><span>lat</span><span>),</span> <span>toFloat64</span><span>(</span><span>lon</span><span>),</span> <span>materialize</span><span>(</span><span>9</span><span>))</span> <span>AS</span> <span>h3_9</span>
+<span>FROM</span> <span>open_cell_towers2</span><span>;</span>
+</pre></div>
+<p>The above was completed in 70 seconds and produced a table that is 1.8 GB in size. This is a little over 7x faster than what I saw with the fastest PostgreSQL method.</p>
+</div>
+<div id="benchmarking-bigquery">
+<h2>Benchmarking BigQuery</h2>
+<p>The following loaded the dataset into a US-based BigQuery table in 65 seconds.</p>
+<div><pre><span></span>$ bq load --autodetect <span>\</span>
+    geodata.h3speedtest <span>\</span>
+    ~/cell_towers.csv
+</pre></div>
+<p>This is the resulting schema:</p>
+<div><pre><span></span>$ bq show geodata.h3speedtest
+</pre></div>
+<div><pre><span></span>  Last modified             Schema             Total Rows   Total Bytes   Expiration   Time Partitioning   Clustered Fields   Labels
+----------------- --------------------------- ------------ ------------- ------------ ------------------- ------------------ --------
+ 19 Apr 13:52:44   |- radio: string            45214074     4949843619
+                   |- mcc: integer
+                   |- net: integer
+                   |- area: integer
+                   |- cell: integer
+                   |- unit: integer
+                   |- lon: float
+                   |- lat: float
+                   |- range: integer
+                   |- samples: integer
+                   |- changeable: integer
+                   |- created: integer
+                   |- updated: integer
+                   |- averageSignal: integer
+</pre></div>
+<p>I then ran the following to add 3 columns to the table. It took less than 2 seconds to complete.</p>
+<div><pre><span></span><span>ALTER</span> <span>TABLE</span> <span>geodata</span><span>.</span><span>h3speedtest</span> <span>ADD</span> <span>COLUMN</span> <span>h3_7</span> <span>STRING</span><span>;</span>
+<span>ALTER</span> <span>TABLE</span> <span>geodata</span><span>.</span><span>h3speedtest</span> <span>ADD</span> <span>COLUMN</span> <span>h3_8</span> <span>STRING</span><span>;</span>
+<span>ALTER</span> <span>TABLE</span> <span>geodata</span><span>.</span><span>h3speedtest</span> <span>ADD</span> <span>COLUMN</span> <span>h3_9</span> <span>STRING</span><span>;</span>
+</pre></div>
+<p>I&#39;ve used CARTO&#39;s publicly available <a href="https://carto.com/blog/spatial-functions-bigquery-uber/">H3 library</a> for BigQuery to perform the enrichment.</p>
+<div><pre><span></span>UPDATE geodata.h3speedtest
+SET <span>h3_7</span> <span>=</span> jslibs.h3.ST_H3<span>(</span>ST_GEOGPOINT<span>(</span>lon, lat<span>)</span>, <span>7</span><span>)</span>,
+    <span>h3_8</span> <span>=</span> jslibs.h3.ST_H3<span>(</span>ST_GEOGPOINT<span>(</span>lon, lat<span>)</span>, <span>8</span><span>)</span>,
+    <span>h3_9</span> <span>=</span> jslibs.h3.ST_H3<span>(</span>ST_GEOGPOINT<span>(</span>lon, lat<span>)</span>, <span>9</span><span>)</span>
+WHERE True<span>;</span>
+</pre></div>
+<p>The above was completed in 23 minutes and 9 seconds while processing 4.61 GB. This is 2.8x slower than PostgreSQL and 19.8x slower than ClickHouse.</p>
+</div>
+
+        </div><div id="support_text"><p>
+            Thank you for taking the time to read this post. I offer both consulting and hands-on development services to clients in North America and Europe. If you&#39;d like to discuss how my offerings can help your business please contact me via <a href="https://uk.linkedin.com/in/marklitwintschik/">LinkedIn</a>.
+            </p></div></div>
+  </body>
+</html>
