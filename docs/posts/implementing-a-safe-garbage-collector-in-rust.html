@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://coredumped.dev/2022/04/11/implementing-a-safe-garbage-collector-in-rust/">Original</a>
+    <h1>Implementing a safe garbage collector in Rust</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    <p>In my <a href="https://coredumped.dev/2021/10/21/building-an-emacs-lisp-vm-in-rust/">last post</a> I introduced an Emacs Lisp VM I was <a href="https://github.com/CeleritasCelery/rune">writing in Rust</a>. My stated goal at the time was to complete a garbage collector. I think Rust has some really interesting properties that will make building garbage collectors easier and safer. Many of the techniques used in my GC are not original and have been developed by other Rustaceans in previous projects.</p>
+<h2 id="why-use-garbage-collection">
+    <a href="#why-use-garbage-collection">
+      Why use garbage collection?
+    </a>
+</h2>
+<p>virtually all non-trivial programs need some way to reuse memory. Rust does this by tracking every allocation statically to determine when it’s no longer in use. However, this system is not flexible enough for some applications. In these cases Rust gives you <a href="https://doc.rust-lang.org/std/rc/struct.Rc.html">Rc</a>, the reference counting cell. This cell tracks the number of owners of a piece of memory at runtime. Reference counting has the advantage that is relatively easy to implement and integrates seamlessly with non-rc code. However, it also has two big downsides: It’s slower<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup> and it can’t detect cyclic data (which lisp is full of). For these reasons (and others) dynamic languages often use garbage collection (GC) to manage data.</p>
+<h2 id="why-is-gc-hard">
+    <a href="#why-is-gc-hard">
+      Why is GC hard?
+    </a>
+</h2>
+<p>In his book <em>crafting interpreters</em> Robert Nystrom has a whole <a href="http://craftinginterpreters.com/garbage-collection.html#garbage-collection-bugs">section</a> dedicated to some of the “nasty bugs” you can have in a garbage collector. The problem lies in identifying all objects that are accessible in the heap. Once you have an object you know is live, it’s fairly easy to trace through anything it points to and find other live data. But how do you find the pointers that don’t have anything pointing to them? These pointers are problematically scattered across the stack or stored in machine registers. If you miss even one you open yourself up to memory unsafety.</p>
+<h3 id="how-does-emacs-solve-this-problem">
+    <a href="#how-does-emacs-solve-this-problem">
+      How does Emacs solve this problem?
+    </a>
+</h3>
+<p>Emacs (and many C based GC implementations) solves this by recognizing that the stack is just a block of memory<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup>. If an object can’t be reach from the stack, it can’t be reached at all. So when garbage collection is triggered, they will dump all registers to the stack and scan the it for anything that “looks like” a pointer. I say looks like because we can’t <em>actually</em> know if something is pointer or a number in range of a pointer. There is no type information in the hardware. So anything that might be a pointer is treated as a pointer and traced. However because we aren’t sure, we can’t move any of the gc data. In my implementation we are building a “precise” collector that knows exactly what’s a pointer and what’s not. That rules out blind stack scanning.</p>
+<h3 id="let-s-start-from-the-beginning">
+    <a href="#let-s-start-from-the-beginning">
+      Let’s start from the beginning
+    </a>
+</h3>
+<p>When we allocate a new object, we know that it is unaliased (nothing has a pointer to it). But as soon as we give that pointer to user code, it becomes exposed. Problem is, we need to know when it safe to call <code>drop</code> and release the memory.  In C, it is up to the user to call <code>free</code> when they are done with it. But Rust tracks the liveness of the data with the type system. The Rust rule is this: There can be many immutable references to an object or one mutable reference (but not both). If you have immutable references, they get invalidated as soon as a mutable reference is used.</p>
+<h3 id="affine-types">
+    <a href="#affine-types">
+      Affine types
+    </a>
+</h3>
+<p>This key property of Rust (called affine types) is what is used in the gc library <a href="https://docs.rs/josephine/latest/josephine/">Jospehine</a>. They use Rust’s borrow checker to ensure no references are live after collection. We do the same. All pointers into the GC heap borrowed from our allocator (called <code>Arena</code>) via a immutable reference. When we call <code>garbage_collect</code>, we take a <code>&amp;mut Arena</code>, ensuring that all heap references are no longer accessible.</p>
+<div><pre tabindex="0"><code data-lang="rust"><span><span><span>let</span> <span>arena</span>: <span>&amp;</span><span>&#39;</span><span>ob</span> <span>Arena</span> <span>=</span> <span>..</span><span>.;</span>
+</span></span><span><span><span>let</span> <span>object</span>: <span>Object</span><span>&lt;&#39;</span><span>ob</span><span>&gt;</span> <span>=</span> <span>arena</span><span>.</span><span>add</span><span>(</span><span>&#34;foo&#34;</span><span>);</span>
+</span></span><span><span><span>use_object</span><span>(</span><span>object</span><span>);</span>
+</span></span><span><span><span>arena</span><span>.</span><span>garbage_collect</span><span>();</span> <span>// Object is no longer accessible
+</span></span></span></code></pre></div><p>However, If we  invalidate all references to the GC heap when we call <code>garbage_collect</code>, we can’t access our data at all afterwards. We obviously need something more here.</p>
+<h2 id="rooting">
+    <a href="#rooting">
+      Rooting
+    </a>
+</h2>
+<p>What we really want is to have some pointers <em>preserved</em> across calls to <code>garbage_collect</code>. But we need to make sure the gc knows about these special pointers, or it will free the data they point to. We call these special pointers roots.</p>
+<p>We have a similar problem with normal data structures. We need to get a reference to a value after we mutate something. How do we solve this problem in that case? Take the example below:</p>
+<div><pre tabindex="0"><code data-lang="rust"><span><span><span>let</span> <span>mut</span> <span>map</span> <span>=</span> <span>HashMap</span>::<span>new</span><span>();</span>
+</span></span><span><span><span>let</span> <span>key</span> <span>=</span> <span>&#34;my key&#34;</span><span>;</span>
+</span></span><span><span><span>map</span><span>.</span><span>insert</span><span>(</span><span>key</span><span>,</span> <span>13</span><span>);</span> <span>// insert at key
+</span></span></span><span><span><span></span><span>let</span> <span>value1</span> <span>=</span> <span>map</span><span>.</span><span>get</span><span>(</span><span>key</span><span>).</span><span>unwrap</span><span>();</span> <span>// get a reference to our item
+</span></span></span><span><span><span></span><span>let</span> <span>_</span> <span>=</span> <span>&amp;</span><span>mut</span> <span>map</span><span>;</span> <span>// take a mutable reference, invalidating our value1
+</span></span></span><span><span><span></span><span>let</span> <span>value2</span> <span>=</span> <span>map</span><span>.</span><span>get</span><span>(</span><span>key</span><span>).</span><span>unwrap</span><span>();</span> <span>// Use key to get our data back again
+</span></span></span></code></pre></div><p>Here we are storing our data inside the map and using some unique token (the key) to keep track of our value inside the data structure when we loose access to our reference. We can do the same thing with our gc <code>Arena</code>. We store the roots inside before we garbage collect.</p>
+<div><pre tabindex="0"><code data-lang="rust"><span><span><span>struct</span> <span>Arena</span> <span>{</span>
+</span></span><span><span>    <span>roots</span>: <span>HashMap</span><span>&lt;</span><span>Token</span><span>,</span> <span>Object</span><span>&gt;</span><span>,</span>
+</span></span><span><span>    <span>..</span><span>.</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>However we have at least two problems with this:</p>
+<p>First, what do we use for a token? Everytime we need to root something we need a token that is unique. Even if we generated something random there is still a chance we could have two roots with the same <code>Token</code>, which would lead to memory unsafety.</p>
+<p>Which leads to the second problem: once something is no longer rooted, how do we remove it from the <code>Arena</code>? We could require the user to manually call <code>remove</code> when they no longer need a root, but any failure to do so would result in leaking memory. That is not a good API.</p>
+<h3 id="standing-on-the-shoulders-of-boats">
+    <a href="#standing-on-the-shoulders-of-boats">
+      Standing on the shoulders of boats
+    </a>
+</h3>
+<p>Thankfully, I am not the first person to think about this problem. Saoirse has a <a href="https://without.boats/blog/shifgrethor-iii/">blog post</a> about some novel observations on rooting in Rust. This was implemented in his gc library <a href="https://github.com/withoutboats/shifgrethor">shifgrethor</a>. I will summarize this approach below.</p>
+<p>The first observation is that if you don’t drop or move a type on the stack, then its lifetime is perfectly stack-like. Shocking I know, but the really cool part about this is that we can use it to define the way we store the roots in <code>Arena</code>. What if instead of storing them as a map, we store them as a stack instead? When something is rooted, it is pushed on the stack. When it drops, it is popped from the stack. This also solves our problem of creating a unique <code>Token</code> to find our object, because when we drop we know that our item will always be the top of the root stack. So no <code>Token</code> needed.</p>
+<p>In order for this to work we have to make sure the object can’t move. This sounds just like the pinning! We define a new macro <code>root!</code> that works similarly to <a href="https://docs.rs/pin-utils/0.1.0/pin_utils/macro.pin_mut.html">pin_mut!</a>. This ensure our objects behaves in a stack-like manner, greatly simplifying the implementation.</p>
+<p>As far as keeping our references around post garbage collection, we know that so long as our object is rooted it will be valid. We can keep a reference into the Gc heap until we unroot (i.e. the root goes out of scope). Our <code>root!</code> macro will change our reference from borrowing from <code>Arena</code> to a borrowing from the root. So long as the root is live, our reference is valid; Even if we garbage collect.</p>
+<div><pre tabindex="0"><code data-lang="rust"><span><span><span>let</span> <span>object</span> <span>=</span> <span>arena</span><span>.</span><span>add</span><span>(</span><span>&#34;new&#34;</span><span>);</span>
+</span></span><span><span><span>// add the object to the root stack, enabling it to live past collection
+</span></span></span><span><span><span></span><span>root</span><span>!</span><span>(</span><span>object</span><span>,</span> <span>arena</span><span>);</span>
+</span></span><span><span><span>arena</span><span>.</span><span>garbage_collect</span><span>();</span> <span>// gc will mark the object as live
+</span></span></span><span><span><span></span><span>println!</span><span>(</span><span>&#34;{object}&#34;</span><span>);</span> <span>// Object is still accessible
+</span></span></span></code></pre></div><h3 id="returning-from-functions">
+    <a href="#returning-from-functions">
+      Returning from functions
+    </a>
+</h3>
+<p>There is one more ergonomic problem we want to solve here. Suppose we have the function below:</p>
+<div><pre tabindex="0"><code data-lang="rust"><span><span><span>fn</span> <span>foo</span><span>&lt;&#39;</span><span>a</span><span>&gt;</span><span>(</span><span>arena</span>: <span>&amp;</span><span>&#39;</span><span>a</span> <span>mut</span> <span>Arena</span><span>)</span> -&gt; <span>Object</span><span>&lt;&#39;</span><span>a</span><span>&gt;</span> <span>{</span>
+</span></span><span><span>    <span>..</span><span>.</span>
+</span></span><span><span>    <span>arena</span><span>.</span><span>add</span><span>(</span><span>5</span><span>);</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>The function takes a <code>&amp;mut Arena</code>, and at the end it returns an <code>Object</code> with the same lifetime. <a href="https://github.com/pretzelhammer/rust-blog/blob/master/posts/common-rust-lifetime-misconceptions.md#9-downgrading-mut-refs-to-shared-refs-is-safe">Seems fine</a> right? Not so. The Rust lifetime rules <a href="https://doc.rust-lang.org/nomicon/lifetime-mismatch.html">require</a> that the <em>mutable borrow</em> of <code>Arena</code> now lasts for the lifetime <code>&#39;a</code>! This means we can’t reuse <code>Arena</code> while the <code>Object</code> is borrowed from it. We could just <code>root!</code> the object, but that adds overhead to every call. In my interpreter, nearly every method takes <code>&amp;mut Arena</code>, so that would get expensive fast.</p>
+<p>To work around this we create a new macro <code>rebind!</code></p>
+<p>This macro releases the <em>mutable</em> borrow and reborrows the object with an <em>immutable</em> borrow. This frees <code>Arena</code> to be used by other code while still being <a href="https://github.com/CeleritasCelery/rune/issues/2">sound</a>.</p>
+<h3 id="preventing-escapes">
+    <a href="#preventing-escapes">
+      Preventing escapes
+    </a>
+</h3>
+<p>This approach works fine for rooting a single object, but what if we have a whole collection of objects? You might be tempted to think that would be an non-issue, but consider the problem below:</p>
+<div><pre tabindex="0"><code data-lang="rust"><span><span><span>let</span> <span>rooted</span>: <span>&amp;</span><span>mut</span> <span>Vec</span><span>&lt;</span><span>Object</span><span>&lt;&#39;</span><span>root</span><span>&gt;&gt;</span> <span>=</span> <span>..</span><span>.;</span> <span>// we have a vec of root objects
+</span></span></span><span><span><span></span><span>let</span> <span>object</span>: <span>Object</span><span>&lt;&#39;</span><span>arena</span><span>&gt;</span> <span>=</span> <span>arena</span><span>.</span><span>add</span><span>(</span><span>&#34;new&#34;</span><span>);</span> <span>// object is bound to arena
+</span></span></span><span><span><span></span><span>rooted</span><span>.</span><span>push</span><span>(</span><span>object</span><span>);</span> <span>// object is now bound to rooted
+</span></span></span><span><span><span></span><span>arena</span><span>.</span><span>garbage_collect</span><span>();</span> <span>// Object is marked as live and not freed
+</span></span></span><span><span><span></span>
+</span></span><span><span><span>// Object is no longer rooted, but still bound to the root lifetime
+</span></span></span><span><span><span></span><span>let</span> <span>escape</span>: <span>Object</span><span>&lt;&#39;</span><span>root</span><span>&gt;</span> <span>=</span> <span>rooted</span><span>.</span><span>pop</span><span>().</span><span>unwrap</span><span>();</span>
+</span></span><span><span><span>arena</span><span>.</span><span>garbage_collect</span><span>();</span> <span>// Object is freed
+</span></span></span><span><span><span></span><span>println!</span><span>(</span><span>&#34;{escape}&#34;</span><span>);</span> <span>// Oh No! Use after Free!
+</span></span></span></code></pre></div><p>We cannot move references out without some way of making sure they stay rooted. Thankfully shifgrethor comes to the rescue here again with it’s <code>Gc</code> type.</p>
+<p>Once again we can model after the <code>pin</code> API, since we are trying to solve a similar problem. If you have a <code>Pin&lt;P&gt;</code> you know that the data point to by <code>P</code> will not move. Similarly, we create a <code>Root&lt;T&gt;</code> type that guarantees <code>T</code> will not move <strong>and</strong> it’s rooted. We use the <code>struct_root!</code> macro to take a data structure <code>T</code> and returns a <code>&amp;mut Root&lt;T&gt;</code> to it.</p>
+<div><pre tabindex="0"><code data-lang="rust"><span><span><span>let</span> <span>arean</span>: <span>Arena</span> <span>=</span> <span>..</span><span>.;</span>
+</span></span><span><span><span>struct_root</span><span>!</span><span>(</span><span>my_struct</span><span>,</span> <span>arena</span><span>);</span>
+</span></span><span><span><span>let</span> <span>_</span>: <span>&amp;</span><span>mut</span> <span>Root</span><span>&lt;</span><span>Vec</span><span>&lt;</span><span>Object</span><span>&gt;&gt;</span> <span>=</span> <span>my_struct</span><span>;</span>
+</span></span><span><span><span>// get a reference to vec from root
+</span></span></span><span><span><span></span><span>let</span> <span>len</span> <span>=</span> <span>my_struct</span><span>.</span><span>len</span><span>();</span>
+</span></span><span><span><span>// use a special function to mutate
+</span></span></span><span><span><span></span><span>my_struct</span><span>.</span><span>root_push</span><span>(</span><span>object</span><span>);</span>
+</span></span><span><span><span>// use projection
+</span></span></span><span><span><span></span><span>let</span> <span>slice</span>: <span>&amp;</span><span>[</span><span>Root</span><span>&lt;</span><span>Object</span><span>&gt;</span><span>]</span> <span>=</span> <span>my_struct</span><span>.</span><span>as_slice</span><span>();</span>
+</span></span><span><span><span>// Object with lifetime bound to root
+</span></span></span><span><span><span></span><span>let</span> <span>object</span>: <span>Object</span><span>&lt;&#39;</span><span>_</span><span>&gt;</span> <span>=</span> <span>slice</span><span>[</span><span>0</span><span>].</span><span>as_obj</span><span>();</span>
+</span></span></code></pre></div><p>With this API, we can safely get a <code>&amp;T</code> out when we need to. But mutating the <code>T</code> requires unsafe methods (like <a href="https://doc.rust-lang.org/std/pin/struct.Pin.html#method.map_unchecked_mut">map_unchecked_mut</a>) to ensure we don’t expose roots as in the example above. Using a similar approach to <a href="https://doc.rust-lang.org/std/pin/index.html#projections-and-structural-pinning">pin projection</a> you can get a <code>Root</code> to the fields of rooted struct. For example if you have a <code>&amp;Root&lt;(T, U)&gt;</code> it is safe get a <code>&amp;Root&lt;T&gt;</code> or <code>&amp;Root&lt;U&gt;</code>. For some the std lib types (vec, hashmap, option, etc) I have already implemented some safe mutation methods like <code>push</code>. If you have a structure that is just built out of these stdlib data structures, you could use a proc macro to derive the “root projection” methods for it.</p>
+<h2 id="the-problem-with-aliasing">
+    <a href="#the-problem-with-aliasing">
+      The problem with aliasing
+    </a>
+</h2>
+<p>There is still one subtle problem here. You see, we now have a <code>&amp;mut Root&lt;T&gt;</code>, and when we garbage collect, we will trace through <code>T</code> with <code>&amp;T</code>. However <code>&amp;mut T</code> guarantees that that it is unique. To break this invariant means undefined behavior. Shifgrethor does not handle this, instead requiring that all roots be immutable (even forbidding interior mutability). Ugh.</p>
+<p>How about we use <code>UnsafeCell</code>? It is full of dark magic that lets us do thing we couldn’t normally do.</p>
+<p><em>* reads documentation *</em></p>
+<blockquote>
+<p>Note that only the immutability guarantee for shared references is affected by UnsafeCell. The uniqueness guarantee for mutable references is unaffected. There is no legal way to obtain aliasing &amp;mut, not even with UnsafeCell&lt;T&gt;.</p>
+</blockquote>
+<p>Oh, biscuits. What other options do we have? I am sure Rust has an <code>AliasCell</code> that let’s us work around this, right?</p>
+<p><em>* googles frantically *</em></p>
+<p>Nope. Though apparently we not the only ones who need this. The std lib created a <a href="https://github.com/rust-lang/rust/pull/82834">hack</a> to avoid miscompilations with aliasing mutable references that is used in <a href="https://github.com/tokio-rs/tokio/pull/3654">Tokio</a> as well. We could take that route (and I was really tempted to) but let’s see if there is another way we could fix this.</p>
+<h3 id="can-we-approach-the-problem-from-the-other-side">
+    <a href="#can-we-approach-the-problem-from-the-other-side">
+      Can we approach the problem from the other side?
+    </a>
+</h3>
+<p>Actually there is a way <code>UnsafeCell</code> can help us here. There is one legal way in which you can have aliasing <code>&amp;mut T</code>. By design, a <code>&amp;mut T</code> can alias with a <code>&amp;UnsafeCell&lt;T&gt;</code>, (but not the other way around). So long as we don’t have any <code>&amp;T</code> at the same time; this is sound. But this of course means interior mutability. We could try just putting <code>RefCell</code>’s everywhere, but that means we are going have to debug runtime panics instead of compile time errors. We <em>really</em> don’t want that.</p>
+<h3 id="qcell-to-the-rescue">
+    <a href="#qcell-to-the-rescue">
+      Qcell to the rescue
+    </a>
+</h3>
+<p><a href="https://docs.rs/qcell/latest/qcell/index.html">Qcell</a> is a crate trying to design a compile time <code>RefCell</code>. It makes a bunch of different cell types, each with their own set of trade off, that give you exactly that. We are going to use <a href="https://docs.rs/qcell/latest/qcell/struct.LCell.html">LCell</a>, which is zero cost and perfect for our use case. With this type, multiple cells have a shared owner that control when a cell can be borrowed mutable or immutable. To make this safe we define the following conditions:</p>
+<ol>
+<li>We can borrow a <code>Root</code> as immutable if we have a <code>&amp;RootOwner</code>.</li>
+<li>We can borrow a <code>Root</code> as mutable if we have a <code>&amp;mut RootOwner</code> <strong>and</strong> we have a <code>&amp;Arena</code>. This ensures that we can never call garbage collect while our mutable reference is live, because garbage collect requires a mutable borrow of <code>Arena</code>!</li>
+</ol>
+<!-- raw HTML omitted -->
+<div><pre tabindex="0"><code data-lang="rust"><span><span><span>impl</span><span>&lt;&#39;</span><span>id</span><span>,</span> <span>T</span><span>&gt;</span> <span>Root</span><span>&lt;&#39;</span><span>id</span><span>,</span> <span>T</span><span>&gt;</span> <span>{</span>
+</span></span><span><span>    <span>pub</span><span>(</span><span>crate</span><span>)</span> <span>fn</span> <span>borrow</span><span>&lt;&#39;</span><span>a</span><span>&gt;</span><span>(</span>
+</span></span><span><span>        <span>&amp;&#39;</span><span>a</span> <span>self</span><span>,</span>
+</span></span><span><span>        <span>owner</span>: <span>&amp;</span><span>&#39;</span><span>a</span> <span>RootOwner</span><span>&lt;&#39;</span><span>id</span><span>&gt;</span>
+</span></span><span><span>    <span>)</span> -&gt; <span>&amp;</span><span>&#39;</span><span>a</span> <span>RootRef</span><span>&lt;</span><span>T</span><span>&gt;</span> <span>{</span><span>..</span><span>.}</span>
+</span></span><span><span>
+</span></span><span><span>    <span>pub</span><span>(</span><span>crate</span><span>)</span> <span>fn</span> <span>borrow_mut</span><span>&lt;&#39;</span><span>a</span><span>&gt;</span><span>(</span>
+</span></span><span><span>        <span>&amp;&#39;</span><span>a</span> <span>self</span><span>,</span>
+</span></span><span><span>        <span>owner</span>: <span>&amp;</span><span>&#39;</span><span>a</span> <span>mut</span> <span>RootOwner</span><span>&lt;&#39;</span><span>id</span><span>&gt;</span><span>,</span>
+</span></span><span><span>        <span>_</span>: <span>&amp;</span><span>&#39;</span><span>a</span> <span>Arena</span>
+</span></span><span><span>    <span>)</span> -&gt; <span>&amp;</span><span>&#39;</span><span>a</span> <span>mut</span> <span>RootRef</span><span>&lt;</span><span>T</span><span>&gt;</span> <span>{</span><span>..</span><span>.}</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>Using compile-time interior mutability makes our code more verbose then it needs to be, but that is the price we pay sometimes for correctness. I would love for Rust to get an <code>AliasCell</code> that solves this problem for everyone. Either way, this is what the final API looks like:</p>
+<div><pre tabindex="0"><code data-lang="rust"><span><span><span>let</span> <span>root_owner</span>: <span>RootOwner</span><span>&lt;&#39;</span><span>id</span><span>&gt;</span> <span>=</span> <span>..</span><span>.;</span>
+</span></span><span><span><span>let</span> <span>arean</span>: <span>Arena</span> <span>=</span> <span>..</span><span>.;</span>
+</span></span><span><span><span>struct_root</span><span>!</span><span>(</span><span>my_struct</span><span>,</span> <span>arena</span><span>);</span>
+</span></span><span><span><span>let</span> <span>_</span>: <span>&amp;</span><span>Root</span><span>&lt;&#39;</span><span>id</span><span>,</span> <span>Vec</span><span>&lt;</span><span>Object</span><span>&gt;&gt;</span> <span>=</span> <span>my_struct</span><span>;</span>
+</span></span><span><span><span>// immutable borrow
+</span></span></span><span><span><span></span><span>let</span> <span>len</span> <span>=</span> <span>my_struct</span><span>.</span><span>borrow</span><span>(</span><span>&amp;</span><span>root_owner</span><span>).</span><span>len</span><span>();</span>
+</span></span><span><span><span>// mutable borrow
+</span></span></span><span><span><span></span><span>my_struct</span><span>.</span><span>borrow_mut</span><span>(</span><span>&amp;</span><span>mut</span> <span>root_owner</span><span>,</span> <span>&amp;</span><span>arena</span><span>).</span><span>push</span><span>(</span><span>object</span><span>);</span>
+</span></span></code></pre></div><h2 id="a-safe-gc">
+    <a href="#a-safe-gc">
+      A Safe GC
+    </a>
+</h2>
+<p>So there you have it! A safe, precise, garbage collector in stable Rust! Now, this comes with a few caveats. It is often said that solving a general problem is three times harder then solving a specific problem. I am solving the specific problem here; creating a GC for my VM. This not ready to ship as a general purpose library without more work. But I am confident it could be made into a library if needed. Right now the garbage collector is about as naive as possible. But future changes will be under-the-hood improvements that don’t change the API.</p>
+<p>What I think is really cool is that the API is <strong>safe</strong>! You can’t create this in C or C++; The type system is not powerful enough. Rust enables us to have “fearless garbage collection”, and no longer be scared of the “nasty bugs” that we might create. As an anecdote, I was pleasantly surprised to find that when I turned on reclaiming memory in my gc, everything just worked first time; No memory leaks, no use-after-free. The API just took care of it at compile time. Miri was satisfied as well.</p>
+<p>Overall, I am pretty happy with how it turned out. That being said, there is <strong>a lot</strong> of unsafe code behind the scenes. I am the only person that has reviewed it, and I am not smart enough to get everything right. I created a <a href="https://github.com/CeleritasCelery/rune/labels/unsound%3F">unsound?</a> Label on Github that tracks some of the code I have the least confidence in. If you are initiated in the dark arts of the <a href="https://doc.rust-lang.org/nomicon/">nomicon</a>, I would love for you to <a href="https://github.com/CeleritasCelery/rune/issues?q=is%3Aissue+label%3Aunsound%3F+">prove me wrong</a>.</p>
+<p>I am going to continue work on bootstrapping more elisp files to eventually bootstrap the elisp byte compiler and use that to test my VM. I was forced to take break from that effort and implement the garbage collector because I kept using too much memory! Implementing the garbage collector was a much bigger rabbit hole than I expected. Hopefully this will help move the community forward on the quest for a Rust GC.</p>
+
+<p>View the discussion on <a href="https://www.reddit.com/r/rust/comments/u21w97/implementing_a_safe_garbage_collector_in_rust/">Reddit</a> or <a href="https://news.ycombinator.com/item?id=31166368">Hacker News</a>, send me an <a href="mailto:troy.hinckley@dabrev.com">email</a>, or open an <a href="https://github.com/CeleritasCelery/rune/issues/new">issue</a>.</p>
+
+
+  </div></div>
+  </body>
+</html>
