@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://rosenzweig.io/blog/asahi-gpu-part-5.html">Original</a>
+    <h1>The Apple GPU and the impossible bug</h1>
+    
+    <div id="readability-page-1" class="page">
+<header><p>13 May 2022</p></header><p>In late 2020, Apple debuted the M1 with Apple’s GPU architecture, AGX, rumoured to be derived from Imagination’s PowerVR series. Since then, <a href="https://asahilinux.org">we’ve</a> been reverse-engineering AGX and building open source graphics drivers. Last January, I <a href="https://rosenzweig.io/blog/asahi-gpu-part-2.html">rendered a triangle</a> with my own code, but there has since been a heinous bug lurking:</p>
+<p>The driver fails to render large amounts of geometry.</p>
+<p>Spinning a cube is fine, low polygon geometry is okay, but detailed models won’t render. Instead, the GPU renders only part of the model and then faults.</p>
+<figure>
+<img src="https://rosenzweig.io/PartialPhong.webp" alt=""/><figcaption>Partially rendered bunny</figcaption>
+</figure>
+<p>It’s hard to pinpoint how much we can render without faults. It’s not just the geometry complexity that matters. The same geometry can render with simple shaders but fault with complex ones.</p>
+<p>That suggests rendering detailed geometry with a complex shader “takes too long”, and the GPU is timing out. Maybe it renders only the parts it finished in time.</p>
+<p>Given the hardware architecture, this explanation is unlikely.</p>
+<p>This hypothesis is easy to test, because we can control for timing with a shader that takes as long as we like:</p>
+<div id="cb1"><pre><code><span id="cb1-1"><a href="#cb1-1" aria-hidden="true"></a><span>for</span> (<span>int</span> i = <span>0</span>; i &lt; LARGE_NUMBER; ++i) {</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true"></a>    <span>/* some work to prevent the optimizer from removing the loop */</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true"></a>}</span></code></pre></div>
+<p>After experimenting with such a shader, we learn…</p>
+<ul>
+<li>If shaders have a time limit to protect against infinite loops, it’s astonomically high. There’s no way our bunny hits that limit.</li>
+<li>The symptoms of timing out differ from the symptoms of our driver rendering too much geometry.</li>
+</ul>
+<p>That theory is out.</p>
+<p>Let’s experiment more. Modifying the shader and seeing where it breaks, we find the only part of the shader contributing to the bug: the amount of data interpolated per vertex. Modern graphics APIs allow specifying “varying” data for each vertex, like the colour or the surface normal. Then, for each triangle the hardware renders, these “varyings” are interpolated across the triangle to provide smooth inputs to the fragment shader, allowing efficient implementation of common graphics techniques like Blinn-Phong shading.</p>
+<p>Putting the pieces together, what matters is the <em>product</em> of the number of vertices (geometry complexity) <em>times</em> amount of data per vertex (“shading” complexity). That product is “total amount of per-vertex data”. The GPU faults if we use too much <em>total</em> per-vertex data.</p>
+<p>Why?</p>
+<p>When the hardware processes each vertex, the vertex shader produces per-vertex data. That data has to <em>go</em> somewhere. How this works depends on the hardware architecture. Let’s consider common GPU architectures.<a href="#fn1" id="fnref1" role="doc-noteref"><sup>1</sup></a></p>
+<p>Traditional <strong>immediate mode renderers</strong> render directly into the framebuffer. They first run the vertex shader for each vertex of a triangle, then run the fragment shader for each pixel in the triangle. Per-vertex “varying” data is passed almost directly between the shaders, so immediate mode renderers are efficient for complex scenes.</p>
+<p>There is a drawback: rendering directly into the framebuffer requires tremendous amounts of memory access to constantly write the results of the fragment shader and to read out back results when blending. Immediate mode renderers are suited to discrete, power-hungry desktop GPUs with dedicated video RAM.</p>
+<p>By contrast, <strong>tile-based deferred renderers</strong> split rendering into two passes. First, the hardware runs all vertex shaders for the entire frame, not just for a single model. Then the framebuffer is divided into small tiles, and dedicated hardware called a <em>tiler</em> determines which triangles are in each tile. Finally, for each tile, the hardware runs all relevant fragment shaders and writes the final blended result to memory.</p>
+<p>Tilers reduce memory traffic required for the framebuffer. As the hardware renders a single tile at a time, it keeps a “cached” copy of that tile of the framebuffer (called the “tilebuffer”). The tilebuffer is small, just a few kilobytes, but tilebuffer access is <em>fast</em>. Writing to the tilebuffer is cheap, and unlike immediate renderers, blending is almost free. Because main memory access is expensive and mobile GPUs can’t afford dedicated video memory, tilers are suited to mobile GPUs, like Arm’s Mali, Imaginations’s PowerVR, and Apple’s AGX.</p>
+<p>Yes, AGX is a <em>mobile</em> GPU, designed for the iPhone. The M1 is a screaming fast desktop, but its unified memory and tiler GPU have roots in mobile phones. Tilers work well on the desktop, but there are some drawbacks.</p>
+<p>First, at the start of a frame, the contents of the tilebuffer are undefined. If the application needs to preserve existing framebuffer contents, the driver needs to load the framebuffer from main memory and store it into the tilebuffer. This is expensive.</p>
+<p>Second, because all vertex shaders are run before any fragment shaders, the hardware needs a buffer to store the outputs of all vertex shaders. In general, there is much more data required than space inside the GPU, so this buffer must be in main memory. This is also expensive.</p>
+<p><strong>Ah-ha</strong>. Because AGX is a tiler, it requires a buffer of <em>all</em> per-vertex data. We fault when we use too <em>much</em> total per-vertex data, overflowing the buffer.</p>
+<p>…So how do we allocate a larger buffer?</p>
+<p>On some tilers, like older versions of Arm’s Mali GPU, the userspace driver computes how large this “varyings” buffer should be and allocates it.<a href="#fn2" id="fnref2" role="doc-noteref"><sup>2</sup></a> To fix the faults, we can try increasing the sizes of all buffers we allocate, in the hopes that one of them contains the per-vertex data.</p>
+<p>No dice.</p>
+<p>It’s prudent to observe what Apple’s Metal driver does. We can cook up a Metal program drawing variable amounts of geometry and trace all GPU memory allocations that Metal performs while running our program. Doing so, we learn that increasing the amount of geometry drawn does <em>not</em> increase the sizes of any allocated buffers. In fact, it doesn’t change <em>anything</em> in the command buffer submitted to the kernel, except for the single “number of vertices” field in the draw command.</p>
+<p>We <em>know</em> that buffer exists. If it’s not allocated by userspace – and by now it seems that it’s not – it must be allocated by the kernel or firmware.</p>
+<p>Here’s a funny thought: maybe we don’t specify the size of the buffer at all. Maybe it’s <em>okay</em> for it to overflow, and there’s a way to handle the overflow.</p>
+<p>It’s time for a little reconnaissance. Digging through what little public documentation exists for AGX, we learn from one <a href="https://developer.apple.com/videos/play/wwdc2020/10602/">WWDC presentation</a>:</p>
+<blockquote>
+<p>The Tiled Vertex Buffer stores the Tiling phase output, which includes the post-transform vertex data…</p>
+<p>But it may cause a Partial Render if full. A Partial Render is when the GPU splits the render pass in order to flush the contents of that buffer.</p>
+</blockquote>
+<p>Bullseye. The buffer we’re chasing, the “tiled vertex buffer”, can overflow. To cope, the GPU stops accepting new geometry, renders the existing geometry, and restarts rendering.</p>
+<p>Since partial renders hurt performance, Metal application developers need to know about them to optimize their applications. There should be <em>performance counters</em> flagging this issue. Poking around, we find two:</p>
+<ul>
+<li>Number of partial renders.</li>
+<li>Number of bytes used of the parameter buffer.</li>
+</ul>
+<p>Wait, what’s a “parameter buffer”?</p>
+<p>Remember the rumours that AGX is derived from PowerVR? The public PowerVR <a href="https://docs.imgtec.com/Profiling_and_Optimisations/PerfRec/topics/c_PerfRec_parameter_buffer.html">optimization</a> <a href="https://github.com/powervr-graphics/WebGL_SDK/blob/4.0/Documentation/Architecture%20Guides/PowerVR.Performance%20Recommendations.pdf">guides</a> explain:</p>
+<blockquote>
+<p>[The] list containing pointers to each vertex passed in from the application… is called the <strong>parameter buffer</strong> (PB) and is stored in system memory along with the vertex data.</p>
+<p>Each varying requires additional space in the parameter buffer.</p>
+</blockquote>
+<p>The Tiled Vertex Buffer <em>is</em> the Parameter Buffer. PB is the PowerVR name, TVB is the public Apple name, and PB is still an internal Apple name.</p>
+<p>What happens when PowerVR overflows the parameter buffer?</p>
+<p>An old <a href="http://imgtec.eetrend.com/sites/imgtec.eetrend.com/files/download/201402/1458-2110-1385011428.pdf">PowerVR presentation</a> says that when the parameter buffer is full, the “render is flushed”, meaning “flushed data must be retrieved from the frame buffer as successive tile renders are performed”. In other words, it performs a partial render.</p>
+<p>Back to the Apple M1, it seems the hardware is failing to perform a partial render. Let’s revisit the broken render.</p>
+<figure>
+<img src="https://rosenzweig.io/PartialPhong.webp" alt=""/><figcaption>Partially rendered bunny, again</figcaption>
+</figure>
+<p>Notice <em>parts</em> of the model are correctly rendered. The parts that are not only have the black clear colour of the scene rendered at the start. Let’s consider the logical order of events.</p>
+<p>First, the hardware runs vertex shaders for the bunny until the parameter buffer overflows. This works: the partial geometry is correct.</p>
+<p>Second, the hardware rasterizes the partial geometry and runs the fragment shaders. This works: the shading is correct.</p>
+<p>Third, the hardware flushes the partial render to the framebuffer. This must work for us to see anything at all.</p>
+<p>Fourth, the hardware runs vertex shaders for the rest of the bunny’s geometry. This ought to work: the configuration is identical to the original vertex shaders.</p>
+<p>Fifth, the hardware rasterizes and shades the rest of the geometry, blending with the old partial render. Because AGX is a tiler, to preserve that existing partial render, the hardware needs to load it back into the tilebuffer. We have no idea how it does this.</p>
+<p>Finally, the hardware flushes the render to the framebuffer. This should work as it did the first time.</p>
+<p>The only problematic step is <em>loading the framebuffer back into the tilebuffer after a partial render</em>. Usually, the driver supplies two “extra” fragment shaders. One clears the tilebuffer at the start, and the other flushes out the tilebuffer contents at the end.</p>
+<p>If the application needs the existing framebuffer contents preserved, instead of writing a clear colour, the “load tilebuffer” program instead reads from the framebuffer to reload the contents. Handling this requires quite a bit of code, but it works in our driver.</p>
+<p>Looking closer, AGX requires more auxiliary programs.</p>
+<p>The “store” program is supplied <em>twice</em>. I noticed this when initially bringing up the hardware, but the reason for the duplication was unclear. Omitting each copy separately and seeing what breaks, the reason becomes clear: one program flushes the <em>final</em> render, and the other flushes a <em>partial render</em>.<a href="#fn3" id="fnref3" role="doc-noteref"><sup>3</sup></a></p>
+<p>…What about the program that loads the framebuffer into the tilebuffer?</p>
+<p>When a partial render is possible, there are two “load” programs. One writes the clear colour or loads the framebuffer, depending on the application setting. We understand this one. The other <em>always</em> loads the framebuffer.</p>
+<p>…Always loads the framebuffer, as in, for loading back with a partial render even if there is a clear at the start of the frame?</p>
+<p>If this program is the issue, we can confirm easily. Metal must require it to draw the same bunny, so we can write a Metal application drawing the bunny and stomp over its GPU memory to replace this auxiliary load program with one always loading with black.</p>
+<figure>
+<img src="https://rosenzweig.io/Metal-Artefacts.webp" alt=""/><figcaption>Metal drawing the bunny, stomping over its memory.</figcaption>
+</figure>
+<p>Doing so, Metal fails in a similar way. That means we’re at the root cause. Looking at our own driver code, we don’t specify <em>any</em> program for this partial render load. Up until now, that’s worked okay. If the parameter buffer is never overflowed, this program is unused. As soon as a partial render is required, however, failing to provide this program means the GPU dereferences a null pointer and faults. That explains our GPU faults at the beginning.</p>
+<p>Following Metal, we supply our own program to load back the tilebuffer after a partial render…</p>
+<figure>
+<img src="https://rosenzweig.io/BrokenDepth.webp" alt=""/><figcaption>Bunny with the fix</figcaption>
+</figure>
+<p>…which does <em>not</em> fix the rendering! Cursed, this GPU. The faults go away, but the render still isn’t quite right for the first few frames, indicating partial renders are still broken. Notice the weird artefacts on the feet.</p>
+<p>Curiously, the render “repairs itself” after a few frames, suggesting the parameter buffer stops overflowing. This implies the parameter buffer can be resized (by the kernel or by the firmware), and the system is growing the parameter buffer after a few frames in response to overflow. This mechanism makes sense:</p>
+<ul>
+<li>The hardware can’t allocate more parameter buffer space itself.</li>
+<li>Overflowing the parameter buffer is expensive, as partial renders require tremendous memory bandwidth.</li>
+<li>Overallocating the parameter buffer wastes memory for applications rendering simple geometry.</li>
+</ul>
+<p>Starting the parameter buffer small and growing in response to overflow provides a balance, reducing the GPU’s memory footprint and minimizing partial renders.</p>
+<p>Back to our misrendering. There are actually <em>two</em> buffers being used by our program, a colour buffer (framebuffer)… and a depth buffer. The depth buffer isn’t directly visible, but facilitates the “depth test”, which discards far pixels that are occluded by other close pixels. While the partial render mechanism discards geometry, the depth test discards pixels.</p>
+<p>That would explain the missing pixels on our bunny. The depth test is broken with partial renders. Why? The depth test depends on the depth buffer, so the depth buffer must <em>also</em> be stored after a partial render and loaded back when resuming. Comparing a trace from our driver to a trace from Metal, looking for any relevant difference, we eventually stumble on the configuration required to make depth buffer flushes work.</p>
+<p>And with that, we get our bunny.</p>
+<figure>
+<img src="https://rosenzweig.io/Final.webp" alt=""/><figcaption>The final Phong shaded bunny</figcaption>
+</figure>
+<p><a href="https://rosenzweig.io/">Back to home</a></p>
+
+</div>
+  </body>
+</html>
