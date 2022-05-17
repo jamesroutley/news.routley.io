@@ -1,0 +1,953 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://notes.eatonphil.com/distributed-postgres.html">Original</a>
+    <h1>Let&#39;s build a distributed Postgres proof of concept</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      <div>
+        <p>What is CockroachDB under the hood? Take a look at
+<a href="https://github.com/cockroachdb/cockroach/blob/master/go.mod">its go.mod</a>
+and notice a number of dependencies that do a lot of work: <a href="https://github.com/jackc/pgproto3">a
+PostgreSQL wire protocol
+implementation</a>, <a href="https://github.com/cockroachdb/pebble">a storage
+layer</a>, <a href="https://github.com/etcd-io/etcd">a Raft implementation
+for distributed consensus</a>. And not
+part of go.mod but still building on 3rd party code, <a href="https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y">PostgreSQL&#39;s
+grammar
+definition</a>.</p>
+<p>To be <em>absurdly</em> reductionist, CockroachDB is just the glue around these
+libraries. With that reductionist mindset, let&#39;s try building a
+distributed Postgres proof of concept ourselves! We&#39;ll use only four
+major external libraries: for parsing SQL, handling Postgres&#39;s wire
+protocol, handling Raft, and handling the storage of table metadata
+and rows themselves.</p>
+<p>
+  For a not-reductionist understanding of the CockroachDB internals, I
+  recommend following the
+  excellent <a href="https://www.cockroachlabs.com/blog/">Cockroach
+  Engineering blog</a>
+  and <a href="https://www.twitch.tv/large__data__bank">Jordan Lewis&#39;s
+  Hacking CockroachDB Twitch stream</a>.
+</p><p>By the end of this post, in around 600 lines of code, we&#39;ll have a
+distributed &#34;Postgres implementation&#34; that will accept writes
+(<code>CREATE TABLE</code>, <code>INSERT</code>) on the leader and accept reads (<code>SELECT</code>)
+on any node. All nodes will contain the same data.</p>
+<p>Here is a sample interaction against the leader:</p>
+<pre><code>$ psql -h localhost -p 6000
+psql -h 127.0.0.1 -p 6000
+psql (13.4, server 0.0.0)
+Type &#34;help&#34; for help.
+
+phil=&gt; create table x (age int, name text);
+CREATE ok
+phil=&gt; insert into x values(14, &#39;garry&#39;), (20, &#39;ted&#39;);
+could not interpret result from server: INSERT ok
+INSERT ok
+phil=&gt; select name, age from x;
+  name   | age 
+---------+-----
+ &#34;garry&#34; |  14
+ &#34;ted&#34;   |  20
+(2 rows)
+</code></pre>
+<p>And against a follower (note the different port):</p>
+<pre><code>$ psql -h 127.0.0.1 -p 6001
+psql (13.4, server 0.0.0)
+Type &#34;help&#34; for help.
+
+phil=&gt; select age, name from x;
+ age |  name
+-----+---------
+  20 | &#34;ted&#34;
+  14 | &#34;garry&#34;
+(2 rows)
+</code></pre>
+<p>All code for this post is <a href="https://github.com/eatonphil/waterbugdb">available on Github in the fondly named
+WaterbugDB repo</a>.</p>
+<h3 id="plan-of-attack">Plan of attack</h3><p>Influenced by <a href="https://youtu.be/rqO9PtBkiSQ?t=2332">Philip O&#39;Toole&#39;s talk on rqlite at Hacker
+Nights</a> we&#39;ll
+have a Postgres wire protocol server in front. As it receives queries
+it will respond immediately to <code>SELECT</code>s. Otherwise for <code>CREATE TABLE</code>s
+and <code>INSERT</code>s it will send the entire query string to the Raft
+cluster. Each process that is part of the Raft cluster will implement
+the appropriate functions for handling Raft messages. In this case the
+messages will just be to create a table or insert data.</p>
+<p>So every running process will run a Postgres wire protocol server, a
+Raft server, and an HTTP server that you&#39;ll see is an implementation
+detail about how processes join to the same Raft cluster.</p>
+<p>Every running process will have its own directory for storing data.</p>
+<h3 id="raft">Raft</h3><p>There is likely a difference between Raft, the paper, and Raft, the
+implementations. When I refer to Raft in the rest of this post I&#39;m
+going to be referring to an implementation.</p>
+<p>And although CockroachDB use&#39;s <a href="https://github.com/etcd-io/etcd">etcd&#39;s Raft
+implementation</a>, I didn&#39;t realize
+that when I started building this project. I used <a href="https://pkg.go.dev/github.com/hashicorp/raft">Hashicorp&#39;s Raft
+implementation</a>.</p>
+<p>Raft allows us to reliably keep multiple nodes in sync with a log of
+messages. Each node in the Raft cluster implements a finite state
+machine (FSM) with three operations: apply, snapshot, and restore. Our
+finite state machine will embed a postgres engine we&#39;ll build out
+after this to handle query execution.</p>
+<pre><code>package main
+
+import (
+    &#34;bytes&#34;
+    &#34;encoding/json&#34;
+    &#34;fmt&#34;
+    &#34;io&#34;
+    &#34;log&#34;
+    &#34;net&#34;
+    &#34;net/http&#34;
+    &#34;os&#34;
+    &#34;path&#34;
+    &#34;strings&#34;
+    &#34;time&#34;
+
+    &#34;github.com/google/uuid&#34;
+    &#34;github.com/hashicorp/raft&#34;
+    &#34;github.com/hashicorp/raft-boltdb&#34;
+    &#34;github.com/jackc/pgproto3/v2&#34;
+    pgquery &#34;github.com/pganalyze/pg_query_go/v2&#34;
+    bolt &#34;go.etcd.io/bbolt&#34;
+)
+
+type pgFsm struct {
+    pe *pgEngine
+}
+</code></pre>
+<p>From what I understand, the snapshot operation allows Raft to truncate
+logs. It is used in conjuction with restoring. On startup if there is
+a snapshot, restore is called so you can load the snapshot. Then
+afterwards all logs not yet snapshotted are replayed through the apply
+operation.</p>
+<p>To keep this implementation simple we&#39;ll just fail all snapshots so
+restore will never be called and all logs will be replayed every time
+on startup through the apply operation. This is of course inefficient
+but it keeps the code simpler.</p>
+<p>When we write the startup code we&#39;ll need to delete the database so
+that these apply calls happen fresh.</p>
+<pre><code>type snapshotNoop struct{}
+
+func (sn snapshotNoop) Persist(sink raft.SnapshotSink) error {
+    return sink.Cancel()
+}
+
+func (sn snapshotNoop) Release() {}
+
+func (pf *pgFsm) Snapshot() (raft.FSMSnapshot, error) {
+    return snapshotNoop{}, nil
+}
+
+func (pf *pgFsm) Restore(rc io.ReadCloser) error {
+    return fmt.Errorf(&#34;Nothing to restore&#34;)
+}
+</code></pre>
+<p>Finally, applying is receiving a single message and applying it for the
+node. In this project the message will be a <code>CREATE TABLE</code> or <code>INSERT</code>
+query. So we&#39;ll parse the query and pass it to the postgres engine for
+execution.</p>
+<pre><code>func (pf *pgFsm) Apply(log *raft.Log) interface{} {
+    switch log.Type {
+    case raft.LogCommand:
+        ast, err := pgquery.Parse(string(log.Data))
+        if err != nil {
+            panic(fmt.Errorf(&#34;Could not parse payload: %s&#34;, err))
+        }
+
+        err = pf.pe.execute(ast)
+        if err != nil {
+            panic(err)
+        }
+    default:
+        panic(fmt.Errorf(&#34;Unknown raft log type: %#v&#34;, log.Type))
+    }
+
+    return nil
+}
+</code></pre>
+<p>Panic-ing here is actually the <a href="https://github.com/hashicorp/raft/issues/307">advised
+behavior</a>.</p>
+<h4 id="raft-server">Raft server</h4><p>Now we can set up the actual Raft server and pass an instance of this
+FSM. This is a bunch of boilerplate that would matter in production
+installs but for us basically we just need to tell Raft where to run
+and how to store its own internal data, including its all-important
+message log.</p>
+<pre><code>func setupRaft(dir, nodeId, raftAddress string, pf *pgFsm) (*raft.Raft, error) {
+    os.MkdirAll(dir, os.ModePerm)
+
+    store, err := raftboltdb.NewBoltStore(path.Join(dir, &#34;bolt&#34;))
+    if err != nil {
+        return nil, fmt.Errorf(&#34;Could not create bolt store: %s&#34;, err)
+    }
+
+    snapshots, err := raft.NewFileSnapshotStore(path.Join(dir, &#34;snapshot&#34;), 2, os.Stderr)
+    if err != nil {
+        return nil, fmt.Errorf(&#34;Could not create snapshot store: %s&#34;, err)
+    }
+
+    tcpAddr, err := net.ResolveTCPAddr(&#34;tcp&#34;, raftAddress)
+    if err != nil {
+        return nil, fmt.Errorf(&#34;Could not resolve address: %s&#34;, err)
+    }
+
+    transport, err := raft.NewTCPTransport(raftAddress, tcpAddr, 10, time.Second*10, os.Stderr)
+    if err != nil {
+        return nil, fmt.Errorf(&#34;Could not create tcp transport: %s&#34;, err)
+    }
+
+    raftCfg := raft.DefaultConfig()
+    raftCfg.LocalID = raft.ServerID(nodeId)
+
+    r, err := raft.NewRaft(raftCfg, pf, store, store, snapshots, transport)
+    if err != nil {
+        return nil, fmt.Errorf(&#34;Could not create raft instance: %s&#34;, err)
+    }
+
+    // Cluster consists of unjoined leaders. Picking a leader and
+    // creating a real cluster is done manually after startup.
+    r.BootstrapCluster(raft.Configuration{
+        Servers: []raft.Server{
+            {
+                ID:      raft.ServerID(nodeId),
+                Address: transport.LocalAddr(),
+            },
+        },
+    })
+
+    return r, nil
+}
+</code></pre>
+<p>Every instance of this process will run this and will start off as a
+leader in a new cluster. We&#39;ll expose an HTTP server that allows
+leaders to talk to other leaders to tell them to follow it. This HTTP
+endpoint in the HTTP server is how we&#39;ll get from N process with N
+leaders and N clusters to N processes with 1 leader and 1 cluster.</p>
+<p>That&#39;s basically it for the core Raft bits. So let&#39;s build out that
+HTTP server and follow endpoint.</p>
+<h3 id="http-follow-endpoint">HTTP follow endpoint</h3><p>Our HTTP server will have just one endpoint that tells the process (a)
+to contact another process (b) so that process (b) joins the process
+(a) cluster.</p>
+<p>The HTTP server will need to have the process (a)&#39;s Raft instance
+to be able to start this join action. And in order for Raft to know
+how to contact the process (b) we&#39;ll need to tell it both the
+process (b)&#39;s unique Raft node id (we&#39;ll give it a unique id ourselves
+when we start the process) and the process (b)&#39;s Raft server port.</p>
+<pre><code>type httpServer struct {
+    r *raft.Raft
+}
+
+func (hs httpServer) addFollowerHandler(w http.ResponseWriter, r *http.Request) {
+    followerId := r.URL.Query().Get(&#34;id&#34;)
+    followerAddr := r.URL.Query().Get(&#34;addr&#34;)
+
+    if hs.r.State() != raft.Leader {
+        json.NewEncoder(w).Encode(struct {
+            Error string `json:&#34;error&#34;`
+        }{
+            &#34;Not the leader&#34;,
+        })
+        http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+        return
+    }
+
+    err := hs.r.AddVoter(raft.ServerID(followerId), raft.ServerAddress(followerAddr), 0, 0).Error()
+    if err != nil {
+        log.Printf(&#34;Failed to add follower: %s&#34;, err)
+        http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+}
+</code></pre>
+<p>That&#39;s it! Let&#39;s move on to the query engine.</p>
+<h3 id="query-engine">Query engine</h3><p>The query engine is a wrapper around a storage layer. We&#39;ll bring in
+<a href="https://github.com/etcd-io/bbolt">bbolt</a>.</p>
+<p>
+  I originally built this
+  with <a href="https://github.com/cockroachdb/pebble">Cockroach&#39;s pebble</a> but pebble has a
+  <a href="https://app.bountysource.com/issues/99017984-unable-to-build-xxhash-conflicts-with-other-package">transitive dependency on a C library that has function names that
+    conflict with function names in the C library that pg_query_go
+    wraps</a>.
+</p><pre><code>type pgEngine struct {
+    db         *bolt.DB
+    bucketName []byte
+}
+
+func newPgEngine(db *bolt.DB) *pgEngine {
+    return &amp;pgEngine{db, []byte(&#34;data&#34;)}
+}
+</code></pre>
+<p>
+  bbolt organizes data into buckets. Buckets might be a natural way to
+  store table rows (one bucket per table) but to keep the implementation
+  simple we&#39;ll put all table metadata and row data into a single `data`
+  bucket.
+</p><p>The entrypoint we called in the Raft apply implementation above was
+<code>execute</code>. It took a parsed list of statements. We&#39;ll iterate over the
+statements, figuring out the kind of each statement, and call out to a
+dedicated helper for each kind.</p>
+<pre><code>func (pe *pgEngine) execute(tree *pgquery.ParseResult) error {
+    for _, stmt := range tree.GetStmts() {
+        n := stmt.GetStmt()
+        if c := n.GetCreateStmt(); c != nil {
+            return pe.executeCreate(c)
+        }
+
+        if c := n.GetInsertStmt(); c != nil {
+            return pe.executeInsert(c)
+        }
+
+        if c := n.GetSelectStmt(); c != nil {
+            _, err := pe.executeSelect(c)
+            return err
+        }
+
+        return fmt.Errorf(&#34;Unknown statement type: %s&#34;, stmt)
+    }
+
+    return nil
+}
+</code></pre>
+<p>
+  The pg_query_go docs are not super helpful. I had to build a
+  <a href="https://github.com/eatonphil/waterbugdb/blob/main/astexplorer/main.go">separate
+  AST explorer program</a> to make it easier to understand this parser.
+</p><p>Let&#39;s start with creating a table.</p>
+<h3 id="create-table">Create table</h3><p>When a table is created, we&#39;ll need to store its metadata.</p>
+<pre><code>type tableDefinition struct {
+    Name        string
+    ColumnNames []string
+    ColumnTypes []string
+}
+</code></pre>
+<p>First we pull that metadata out of the AST.</p>
+<pre><code>func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) error {
+    tbl := tableDefinition{}
+    tbl.Name = stmt.Relation.Relname
+
+    for _, c := range stmt.TableElts {
+        cd := c.GetColumnDef()
+
+        tbl.ColumnNames = append(tbl.ColumnNames, cd.Colname)
+
+        // Names is namespaced. So `INT` is pg_catalog.int4. `BIGINT` is pg_catalog.int8.
+        var columnType string
+        for _, n := range cd.TypeName.Names {
+            if columnType != &#34;&#34; {
+                columnType += &#34;.&#34;
+            }
+            columnType += n.GetString_().Str
+        }
+        tbl.ColumnTypes = append(tbl.ColumnTypes, columnType)
+    }
+</code></pre>
+<p>Now we need to store this in the storage layer. The easiest/dumbest
+way to do this is to serialize its metadata to JSON and store it with
+key: <code>tables_${tableName}</code>.</p>
+<pre><code>
+    tableBytes, err := json.Marshal(tbl)
+    if err != nil {
+        return fmt.Errorf(&#34;Could not marshal table: %s&#34;, err)
+    }
+
+    err = pe.db.Update(func(tx *bolt.Tx) error {
+        bkt, err := tx.CreateBucketIfNotExists(pe.bucketName)
+        if err != nil {
+            return err
+        }
+
+        return bkt.Put([]byte(&#34;tables_&#34;+tbl.Name), tableBytes)
+    })
+
+    if err != nil {
+        return fmt.Errorf(&#34;Could not set key-value: %s&#34;, err)
+    }
+
+    return nil
+}
+</code></pre>
+<p>Next we&#39;ll build a helper to reverse that operation, pulling out table
+metadata from the storage layer by the table name:</p>
+<pre><code>
+func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
+    var tbl tableDefinition
+
+    err := pe.db.View(func(tx *bolt.Tx) error {
+        bkt := tx.Bucket(pe.bucketName)
+        if bkt == nil {
+            return fmt.Errorf(&#34;Table does not exist&#34;)
+        }
+
+        valBytes := bkt.Get([]byte(&#34;tables_&#34; + name))
+        err := json.Unmarshal(valBytes, &amp;tbl)
+        if err != nil {
+            return fmt.Errorf(&#34;Could not unmarshal table: %s&#34;, err)
+        }
+
+        return nil
+    })
+
+    return &amp;tbl, err
+}
+</code></pre>
+<p>That&#39;s it for our basic <code>CREATE TABLE</code> support! Let&#39;s do <code>INSERT</code> next.</p>
+<h3 id="insert-row">Insert row</h3><p>Our support for insert will only support literal/constant <code>VALUES</code>.</p>
+<pre><code>func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
+    tblName := stmt.Relation.Relname
+
+    slct := stmt.GetSelectStmt().GetSelectStmt()
+    for _, values := range slct.ValuesLists {
+        var rowData []any
+        for _, value := range values.GetList().Items {
+            if c := value.GetAConst(); c != nil {
+                if s := c.Val.GetString_(); s != nil {
+                    rowData = append(rowData, s.Str)
+                    continue
+                }
+
+                if i := c.Val.GetInteger(); i != nil {
+                    rowData = append(rowData, i.Ival)
+                    continue
+                }
+            }
+
+            return fmt.Errorf(&#34;Unknown value type: %s&#34;, value)
+        }
+</code></pre>
+<p>It would be better to abstract this <code>VALUES</code> code into a helper so it
+could be used by <code>SELECT</code>s too but out of laziness we&#39;ll just keep
+this here.</p>
+<p>Next we need to write the row to the storage layer. We&#39;ll serialize
+the row data to JSON (inefficient because we know the row structure,
+but JSON is easy). We&#39;ll store the row with a prefix including the
+table name and we&#39;ll give its key a unique UUID. When we&#39;re iterating
+over rows in the table we&#39;ll be able to do a prefix scan that will
+recover just the rows in this table.</p>
+<pre><code>
+        rowBytes, err := json.Marshal(rowData)
+        if err != nil {
+            return fmt.Errorf(&#34;Could not marshal row: %s&#34;, err)
+        }
+
+        id := uuid.New().String()
+        err = pe.db.Update(func(tx *bolt.Tx) error {
+            bkt, err := tx.CreateBucketIfNotExists(pe.bucketName)
+            if err != nil {
+                return err
+            }
+
+            return bkt.Put([]byte(&#34;rows_&#34;+tblName+&#34;_&#34;+id), rowBytes)
+        })
+        if err != nil {
+            return fmt.Errorf(&#34;Could not store row: %s&#34;, err)
+        }
+    }
+
+    return nil
+}
+</code></pre>
+<p>Finally we can move on to support <code>SELECT</code>!</p>
+<h3 id="select-rows">Select rows</h3><p>Unlike <code>CREATE TABLE</code> and <code>INSERT</code>, <code>SELECT</code> will need to return rows,
+column names, and because the Postgres wire protocol wants it, column
+types.</p>
+<pre><code>type pgResult struct {
+    fieldNames []string
+    fieldTypes []string
+    rows       [][]any
+}
+</code></pre>
+<p>First we pull out the table name and the fields selected, looking up
+field types in the table metadata.</p>
+<pre><code>func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
+    tblName := stmt.FromClause[0].GetRangeVar().Relname
+    tbl, err := pe.getTableDefinition(tblName)
+    if err != nil {
+        return nil, err
+    }
+
+    results := &amp;pgResult{}
+    for _, c := range stmt.TargetList {
+        fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().Str
+        results.fieldNames = append(results.fieldNames, fieldName)
+
+        fieldType := &#34;&#34;
+        for i, cn := range tbl.ColumnNames {
+            if cn == fieldName {
+                fieldType = tbl.ColumnTypes[i]
+            }
+        }
+
+        if fieldType == &#34;&#34; {
+            return nil, fmt.Errorf(&#34;Unknown field: %s&#34;, fieldName)
+        }
+
+        results.fieldTypes = append(results.fieldTypes, fieldType)
+    }
+</code></pre>
+<p>Finally, we do a prefix scan to grab all rows in the table from the
+storage layer.</p>
+<pre><code>    prefix := []byte(&#34;rows_&#34; + tblName + &#34;_&#34;)
+    pe.db.View(func(tx *bolt.Tx) error {
+        c := tx.Bucket(pe.bucketName).Cursor()
+
+        for k, v := c.Seek(prefix); k != nil &amp;&amp; bytes.HasPrefix(k, prefix); k, v = c.Next() {
+            var row []any
+            err = json.Unmarshal(v, &amp;row)
+            if err != nil {
+                return fmt.Errorf(&#34;Unable to unmarshal row: %s&#34;, err)
+            }
+
+            var targetRow []any
+            for _, target := range results.fieldNames {
+                for i, field := range tbl.ColumnNames {
+                    if target == field {
+                        targetRow = append(targetRow, row[i])
+                    }
+                }
+            }
+
+            results.rows = append(results.rows, targetRow)
+        }
+
+        return nil
+    })
+
+    return results, nil
+}
+</code></pre>
+<p>That&#39;s it for <code>SELECT</code>! The last function we&#39;ll implement is a
+helper for deleting all data in the storage layer. This will be called
+on startup before Raft logs are applied so the database always ends up
+in a consistent state.</p>
+<pre><code>func (pe *pgEngine) delete() error {
+    return pe.db.Update(func(tx *bolt.Tx) error {
+        bkt := tx.Bucket(pe.bucketName)
+        if bkt != nil {
+            return tx.DeleteBucket(pe.bucketName)
+        }
+
+        return nil
+    })
+}
+</code></pre>
+<p>And we&#39;re ready to move on to the final layer, the Postgres wire
+protocol.</p>
+<h3 id="postgres-wire-protocol-server">Postgres wire protocol server</h3><p><a href="https://github.com/jackc/pgproto3">jackc/pgproto3</a> is an
+implementation of the Postgres wire protocol for Go. It allows us to
+implement a server that can respond to requests by Postgres clients
+like <code>psql</code>.</p>
+<p>It works by wrapping a TCP connection. So we&#39;ll start by building a
+function that does the TCP serving loop.</p>
+<pre><code>
+func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
+    ln, err := net.Listen(&#34;tcp&#34;, &#34;localhost:&#34;+port)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            log.Fatal(err)
+        }
+
+        pc := pgConn{conn, db, r}
+        go pc.handle()
+    }
+}
+</code></pre>
+<p>The <code>pgConn</code> instance needs access to the database directly so it can
+respond to <code>SELECT</code>s. And it needs the Raft instance for all other
+queries.</p>
+<pre><code>type pgConn struct {
+    conn net.Conn
+    db   *bolt.DB
+    r    *raft.Raft
+}
+</code></pre>
+<p>The <code>handle</code> function we called above will grab the current message
+via the pgproto3 package and handle startup messages and regular
+messages.</p>
+<pre><code>func (pc pgConn) handle() {
+    pgc := pgproto3.NewBackend(pgproto3.NewChunkReader(pc.conn), pc.conn)
+    defer pc.conn.Close()
+
+    err := pc.handleStartupMessage(pgc)
+    if err != nil {
+        log.Println(err)
+        return
+    }
+
+    for {
+        err := pc.handleMessage(pgc)
+        if err != nil {
+            log.Println(err)
+            return
+        }
+    }
+}
+</code></pre>
+<p>Startup messages include authorization and SSL checks. We&#39;ll allow
+anything in the former and respond &#34;no&#34; to the latter.</p>
+<pre><code>
+func (pc pgConn) handleStartupMessage(pgconn *pgproto3.Backend) error {
+    startupMessage, err := pgconn.ReceiveStartupMessage()
+    if err != nil {
+        return fmt.Errorf(&#34;Error receiving startup message: %s&#34;, err)
+    }
+
+    switch startupMessage.(type) {
+    case *pgproto3.StartupMessage:
+        buf := (&amp;pgproto3.AuthenticationOk{}).Encode(nil)
+        buf = (&amp;pgproto3.ReadyForQuery{TxStatus: &#39;I&#39;}).Encode(buf)
+        _, err = pc.conn.Write(buf)
+        if err != nil {
+            return fmt.Errorf(&#34;Error sending ready for query: %s&#34;, err)
+        }
+
+        return nil
+    case *pgproto3.SSLRequest:
+        _, err = pc.conn.Write([]byte(&#34;N&#34;))
+        if err != nil {
+            return fmt.Errorf(&#34;Error sending deny SSL request: %s&#34;, err)
+        }
+
+        return pc.handleStartupMessage(pgconn)
+    default:
+        return fmt.Errorf(&#34;Unknown startup message: %#v&#34;, startupMessage)
+    }
+}
+</code></pre>
+<p>Within the main <code>handleMessage</code> logic we&#39;ll check the type of message.</p>
+<pre><code>func (pc pgConn) handleMessage(pgc *pgproto3.Backend) error {
+    msg, err := pgc.Receive()
+    if err != nil {
+        return fmt.Errorf(&#34;Error receiving message: %s&#34;, err)
+    }
+
+    switch t := msg.(type) {
+    case *pgproto3.Query:
+                // TODO
+    case *pgproto3.Terminate:
+        return nil
+    default:
+        return fmt.Errorf(&#34;Received message other than Query from client: %s&#34;, msg)
+    }
+
+    return nil
+}
+</code></pre>
+<p>If the message is a query we&#39;ll parse it and respond immediately to <code>SELECT</code>s.</p>
+<pre><code>    switch t := msg.(type) {
+    case *pgproto3.Query:
+        stmts, err := pgquery.Parse(t.String)
+        if err != nil {
+            return fmt.Errorf(&#34;Error parsing query: %s&#34;, err)
+        }
+
+        if len(stmts.GetStmts()) &gt; 1 {
+            return fmt.Errorf(&#34;Only make one request at a time.&#34;)
+        }
+
+        stmt := stmts.GetStmts()[0]
+
+        // Handle SELECTs here
+        s := stmt.GetStmt().GetSelectStmt()
+        if s != nil {
+            pe := newPgEngine(pc.db)
+            res, err := pe.executeSelect(s)
+            if err != nil {
+                return err
+            }
+
+            pc.writePgResult(res)
+            return nil
+        }
+</code></pre>
+<p>(We&#39;ll implement that <code>writePgResult</code> helper shortly below.) Otherwise
+we&#39;ll add the query to the Raft log and return a basic response.</p>
+<pre><code>        // Otherwise it&#39;s DDL/DML, raftify
+        future := pc.r.Apply([]byte(t.String), 500*time.Millisecond)
+        if err := future.Error(); err != nil {
+            return fmt.Errorf(&#34;Could not apply: %s&#34;, err)
+        }
+
+        e := future.Response()
+        if e != nil {
+            return fmt.Errorf(&#34;Could not apply (internal): %s&#34;, e)
+        }
+
+        pc.done(nil, strings.ToUpper(strings.Split(t.String, &#34; &#34;)[0])+&#34; ok&#34;)
+    case *pgproto3.Terminate:
+        return nil
+    default:
+        return fmt.Errorf(&#34;Received message other than Query from client: %s&#34;, msg)
+    }
+
+    return nil
+}
+</code></pre>
+<p><code>done</code> is an important helper that tells the Postgres connection that
+the query is done and ready for another. Without this response <code>psql</code>
+just hangs.</p>
+<pre><code>func (pc pgConn) done(buf []byte, msg string) {
+    buf = (&amp;pgproto3.CommandComplete{CommandTag: []byte(msg)}).Encode(buf)
+    buf = (&amp;pgproto3.ReadyForQuery{TxStatus: &#39;I&#39;}).Encode(buf)
+    _, err := pc.conn.Write(buf)
+    if err != nil {
+        log.Printf(&#34;Failed to write query response: %s&#34;, err)
+    }
+}
+</code></pre>
+<p>And now let&#39;s implement the <code>writePgResult</code> helper. This function
+needs to translate from our <code>pgResult</code> struct to the format require by
+pgproto3.</p>
+<pre><code>
+var dataTypeOIDMap = map[string]uint32{
+    &#34;text&#34;:            25,
+    &#34;pg_catalog.int4&#34;: 23,
+}
+
+func (pc pgConn) writePgResult(res *pgResult) {
+    rd := &amp;pgproto3.RowDescription{}
+    for i, field := range res.fieldNames {
+        rd.Fields = append(rd.Fields, pgproto3.FieldDescription{
+            Name:        []byte(field),
+            DataTypeOID: dataTypeOIDMap[res.fieldTypes[i]],
+        })
+    }
+    buf := rd.Encode(nil)
+    for _, row := range res.rows {
+        dr := &amp;pgproto3.DataRow{}
+        for _, value := range row {
+            bs, err := json.Marshal(value)
+            if err != nil {
+                log.Printf(&#34;Failed to marshal cell: %s\n&#34;, err)
+                return
+            }
+
+            dr.Values = append(dr.Values, bs)
+        }
+
+        buf = dr.Encode(buf)
+    }
+
+    pc.done(buf, fmt.Sprintf(&#34;SELECT %d&#34;, len(res.rows)))
+}
+</code></pre>
+<p>And we&#39;re done with everything but <code>func main()</code>!</p>
+<h3 id="main">Main</h3><p>On startup, each process must be assigned (by the parent process) a
+unique node id (any unique string is ok) and ports for the Raft
+server, Postgres server, and HTTP server. We&#39;ll build a short
+<code>getConfig</code> helper to grab these from arguments.</p>
+<pre><code>type config struct {
+    id       string
+    httpPort string
+    raftPort string
+    pgPort   string
+}
+
+func getConfig() config {
+    cfg := config{}
+    for i, arg := range os.Args[1:] {
+        if arg == &#34;--node-id&#34; {
+            cfg.id = os.Args[i+2]
+            i++
+            continue
+        }
+
+        if arg == &#34;--http-port&#34; {
+            cfg.httpPort = os.Args[i+2]
+            i++
+            continue
+        }
+
+        if arg == &#34;--raft-port&#34; {
+            cfg.raftPort = os.Args[i+2]
+            i++
+            continue
+        }
+
+        if arg == &#34;--pg-port&#34; {
+            cfg.pgPort = os.Args[i+2]
+            i++
+            continue
+        }
+    }
+
+    if cfg.id == &#34;&#34; {
+        log.Fatal(&#34;Missing required parameter: --node-id&#34;)
+    }
+
+    if cfg.raftPort == &#34;&#34; {
+        log.Fatal(&#34;Missing required parameter: --raft-port&#34;)
+    }
+
+    if cfg.httpPort == &#34;&#34; {
+        log.Fatal(&#34;Missing required parameter: --http-port&#34;)
+    }
+
+    if cfg.pgPort == &#34;&#34; {
+        log.Fatal(&#34;Missing required parameter: --pg-port&#34;)
+    }
+
+    return cfg
+}
+</code></pre>
+<p>Now in <code>main</code> we&#39;ll grab the config and set up this process&#39;s
+database. All processes will put their data in a top-level <code>data</code>
+directory to make managing the directories easier. But within that
+directory each process will have their own unique directories for data
+storage based on the unique node id.</p>
+<pre><code>func main() {
+    cfg := getConfig()
+
+    dataDir := &#34;data&#34;
+    err := os.MkdirAll(dataDir, os.ModePerm)
+    if err != nil {
+        log.Fatalf(&#34;Could not create data directory: %s&#34;, err)
+    }
+
+    db, err := bolt.Open(path.Join(dataDir, &#34;/data&#34;+cfg.id), 0600, nil)
+    if err != nil {
+        log.Fatalf(&#34;Could not open bolt db: %s&#34;, err)
+    }
+    defer db.Close()
+</code></pre>
+<p>We need to clean up the database.</p>
+<pre><code>    pe := newPgEngine(db)
+    // Start off in clean state
+    pe.delete()
+</code></pre>
+<p>Set up the Raft server.</p>
+<pre><code>    pf := &amp;pgFsm{pe}
+    r, err := setupRaft(path.Join(dataDir, &#34;raft&#34;+cfg.id), cfg.id, &#34;localhost:&#34;+cfg.raftPort, pf)
+    if err != nil {
+        log.Fatal(err)
+    }
+</code></pre>
+<p>Set up the HTTP server.</p>
+<pre><code>    hs := httpServer{r}
+    http.HandleFunc(&#34;/add-follower&#34;, hs.addFollowerHandler)
+    go func() {
+        err := http.ListenAndServe(&#34;:&#34;+cfg.httpPort, nil)
+        if err != nil {
+            log.Fatal(err)
+        }
+    }()
+</code></pre>
+<p>And finally, kick off the Postgres server.</p>
+<pre><code>
+    runPgServer(cfg.pgPort, db, r)
+}
+</code></pre>
+<p>Finally. Finally. Finally done. Let&#39;s give it a go. :)</p>
+<h3 id="what-hath-god-wrought">What hath god wrought</h3><p>First, initialize the go module and then build the app.</p>
+<pre><code>$ go mod init waterbugdb
+$ go mod tidy
+$ go build
+</code></pre>
+<p>Now in terminal 1 start an instance of the database,</p>
+<pre><code>$ ./waterbugdb --node-id node1 --raft-port 2222 --http-port 8222 --pg-port 6000
+</code></pre>
+<p>Then in terminal 2 start another instance.</p>
+<pre><code>$ ./waterbugdb --node-id node2 --raft-port 2223 --http-port 8223 --pg-port 6001
+</code></pre>
+<p>And in terminal 3, tell <code>node1</code> to have <code>node2</code> follow it.</p>
+<pre><code>$ curl &#39;localhost:8222/add-follower?addr=localhost:2223&amp;id=node2&#39;
+</code></pre>
+<p>And then open <code>psql</code> against port <code>6000</code>, the leader.</p>
+<pre><code>$ psql -h localhost -p 6000
+psql -h 127.0.0.1 -p 6000
+psql (13.4, server 0.0.0)
+Type &#34;help&#34; for help.
+
+phil=&gt; create table x (age int, name text);
+CREATE ok
+phil=&gt; insert into x values(14, &#39;garry&#39;), (20, &#39;ted&#39;);
+could not interpret result from server: INSERT ok
+INSERT ok
+phil=&gt; select name, age from x;
+  name   | age 
+---------+-----
+ &#34;garry&#34; |  14
+ &#34;ted&#34;   |  20
+(2 rows)
+</code></pre>
+<p>Now kill <code>node1</code> in terminal 1. Then start it up again. <code>node2</code> will
+now be the leader. So exit <code>psql</code> in terminal 3 and enter it again
+pointed at <code>node2</code>, port <code>6001</code>. Add new data.</p>
+<pre><code>$ psql -h 127.0.0.1 -p 6001
+psql (13.4, server 0.0.0)
+Type &#34;help&#34; for help.
+
+phil=&gt; insert into x values(19, &#39;ava&#39;), (18, &#39;ming&#39;);
+could not interpret result from server: INSERT ok
+phil=&gt; select age, name from x;
+ age |  name
+-----+---------
+  20 | &#34;ted&#34;
+  14 | &#34;garry&#34;
+  18 | &#34;ming&#34;
+  19 | &#34;ava&#34;
+</code></pre>
+<p>Exit <code>psql</code> in terminal 3 and start it up again against <code>node1</code> again,
+port <code>6000</code>.</p>
+<pre><code>$ psql -h 127.0.0.1 -p 6000
+psql (13.4, server 0.0.0)
+Type &#34;help&#34; for help.
+
+phil=&gt; select age, name from x;
+ age |  name
+-----+---------
+  20 | &#34;ted&#34;
+  14 | &#34;garry&#34;
+  18 | &#34;ming&#34;
+  19 | &#34;ava&#34;
+(2 rows)
+</code></pre>
+<p>Nifty stuff.</p>
+<h3 id="summary">Summary</h3><p>So on the one hand this was a more complex post than my usual. Each
+process needed three servers running. Two of those servers we managed
+directly and the Raft server was managed by the Raft library.</p>
+<p>On the other hand, we did this all in a really small amount of
+code. Yes many edge cases were unhandled and massive amount of SQL was
+unhandled. And yes there are tons of inefficiencies like using JSON,
+an unstructured format when every table has fixed structure. But
+hopefully now you have an idea of how a project like this <em>could be
+structured</em>. And there&#39;s the beginnings of a framework for filling in
+syntax/edge cases over time.</p>
+<p>Join the discussion on the <a href="https://discord.multiprocess.io/">Multiprocess Discord #hacking-dbs
+channel</a>,
+<a href="https://www.reddit.com/r/databasedevelopment">/r/databasedevelopment</a>,
+<a href="https://news.ycombinator.com/">Hacker News</a>,
+<a href="https://lobste.rs/">Lobsters</a> or
+<a href="https://twitter.com/phil_eaton">Twitter</a>.</p>
+<blockquote><p lang="en" dir="ltr">New blog post is up :) Let&#39;s build a distributed postgres proof of concept.<a href="https://t.co/Z8BDzF1bUw">https://t.co/Z8BDzF1bUw</a> <a href="https://t.co/aSkOjr9Yrh">pic.twitter.com/aSkOjr9Yrh</a></p>— Phil Eaton (@phil_eaton) <a href="https://twitter.com/phil_eaton/status/1526598365634605058?ref_src=twsrc%5Etfw">May 17, 2022</a></blockquote> 
+
+	<div>
+	  <h4>Feedback</h4>
+	  <p>As always,
+	  please <a href="mailto:phil@eatonphil.com">email</a>
+	  or <a href="https://twitter.com/phil_eaton">tweet me</a>
+	    with questions, corrections, or ideas!</p>
+	</div>
+      </div>
+    </div></div>
+  </body>
+</html>
