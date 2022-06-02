@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://mazzo.li/posts/fast-pipes.html">Original</a>
+    <h1>How fast are Linux pipes anyway?</h1>
+    
+    <div id="readability-page-1" class="page"><div id="wrapper">
+
+
+
+<div>
+<p>In this post, we will explore how Unix pipes are implemented in Linux by iteratively optimizing a test program that writes and reads data through a pipe.<a href="#fn1" id="fnref1" role="doc-noteref"><sup>1</sup></a></p>
+<p>We will begin with a simple program with a throughput of around 3.5GiB/s, and improve its performance twentyfold. The improvements will be informed by profiling the program using Linux’s <a href="https://en.wikipedia.org/wiki/Perf_(Linux)"><code>perf</code> tooling</a>.<a href="#fn2" id="fnref2" role="doc-noteref"><sup>2</sup></a> The code <a href="https://github.com/bitonic/pipes-speed-test">is available on GitHub</a>.</p>
+<div>
+<figure>
+<img src="https://mazzo.li/assets/images/fast-pipe-chart.svg" alt="Chart showing the performance of our pipe test programs."/><figcaption aria-hidden="true"><small>Chart showing the performance of our pipe test programs.</small></figcaption>
+</figure>
+</div>
+<!--
+This exercise won't be of much practical use --- we shouldn't be using pipes for high-performance inter-process communication anyway. However, it will shed some light on common themes when dealing with IO and the kernel, and on how one can go about identifying what's slow.
+-->
+<p>The post was inspired by reading <a href="https://codegolf.stackexchange.com/questions/215216/high-throughput-fizz-buzz/236630#236630">a highly optimized FizzBuzz program</a>, which pushes output to a pipe at a rate of ~35GiB/s on my laptop.<a href="#fn3" id="fnref3" role="doc-noteref"><sup>3</sup></a> Our first goal will be to match that speed, explaining every step as we go along. We’ll also add an additional performance-improving measure, which is not needed in FizzBuzz since the bottleneck is actually computing the output, not IO, at least on my machine.</p>
+<p>We will proceed as follows:</p>
+<ol type="1">
+<li><a href="#first-version">A first slow version of our pipe test bench;</a></li>
+<li><a href="#trouble-with-write">How pipes are implemented internally, and why writing and reading from them is slow;</a></li>
+<li><a href="#splicing">How the <code>vmsplice</code> and <code>splice</code> syscalls let us get around some (but not all!) of the slowness;</a></li>
+<li><a href="#paging">A description of Linux paging, leading up to a faster version using huge pages;</a></li>
+<li><a href="#busy-loop">The final optimization, replacing polling with busy looping;</a></li>
+<li><a href="#closing-thoughts">Some closing thoughts.</a></li>
+</ol>
+<p>Section 4 is the heaviest on Linux kernel internals, so it might be interesting even if you’re familiar with the other topics treated in the post. For readers not familiar with the topics treated, only basic knowledge of C is assumed.</p>
+<p>Let’s begin!</p>
+</div>
+
+<h2 id="first-version">The challenge, and a slow first version <a href="#first-version">#</a></h2>
+<div>
+<p>First of all, let’s start with measuring the performance of <a href="https://codegolf.stackexchange.com/questions/215216/high-throughput-fizz-buzz/236630#236630">the fabled FizzBuzz program</a>, following the rules laid down by the StackOverflow post:</p>
+<pre><code>% ./fizzbuzz | pv &gt;/dev/null
+ 422GiB 0:00:16 [36.2GiB/s]</code></pre>
+<p><code>pv</code> is “pipe viewer”, <a href="http://www.ivarch.com/programs/pv.shtml">a handy utility</a> to measure the throughput of data flowing through a pipe. So <code>fizzbuzz</code> is producing output at a rate of 36GiB/s.</p>
+<p><code>fizzbuzz</code> writes the output in blocks as big as the L2 cache, to strike a good balance between cheap access to memory and minimizing IO overhead.</p>
+</div>
+<div>
+<p>On my machine, the L2 cache is 256KiB. Throughout this post, we’ll also output blocks of 256KiB, but without “computing” anything. Essentially, we’ll try to measure the upper bound for programs writing to a pipe with a reasonable buffer size.<a href="#fn4" id="fnref4" role="doc-noteref"><sup>4</sup></a></p>
+<p>While <code>fizzbuzz</code> uses <code>pv</code> to measure speed, our setup will be slightly different: we’ll implement the programs on both ends of the pipe. This is so that we fully control the code involved in pushing and pulling data from the pipe.</p>
+</div>
+
+<div>
+<p>The code is available <a href="https://github.com/bitonic/pipes-speed-test">in my <code>pipes-speed-test</code> repo</a>. <code>write.cpp</code> implements the writing, and <code>read.cpp</code> the reading. <code>write</code> repeatedly writes the same 256KiB forever. <code>read</code> reads through 10GiB of data and terminates, printing the throughput in GiB/s. Both executables accept a variety of command line options to change their behavior.</p>
+<p>The first attempt at reading and writing from pipes will be using the <a href="https://linux.die.net/man/2/write"><code>write</code></a> and <a href="https://linux.die.net/man/2/read"><code>read</code></a> syscalls, using the same buffer size as <code>fizzbuzz</code>. Here’s a view of the writing end:</p>
+</div>
+<div id="cb2"><pre><code><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span>int</span> main<span>()</span> <span>{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span>size_t</span> buf_size <span>=</span> <span>1</span> <span>&lt;&lt;</span> <span>18</span><span>;</span> <span>// 256KiB</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span>char</span><span>*</span> buf <span>=</span> <span>(</span><span>char</span><span>*)</span> malloc<span>(</span>buf_size<span>);</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  memset<span>((</span><span>void</span><span>*)</span>buf<span>,</span> <span>&#39;X&#39;</span><span>,</span> buf_size<span>);</span> <span>// output Xs</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span>while</span> <span>(</span><span>true</span><span>)</span> <span>{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span>size_t</span> remaining <span>=</span> buf_size<span>;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span>while</span> <span>(</span>remaining <span>&gt;</span> <span>0</span><span>)</span> <span>{</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>      <span>// Keep invoking `write` until we&#39;ve written the entirety</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>      <span>// of the buffer. Remember that write returns how much</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>      <span>// it could write into the destination -- in this case,</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>      <span>// our pipe.</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>      <span>ssize_t</span> written <span>=</span> write<span>(</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>        STDOUT_FILENO<span>,</span> buf <span>+</span> <span>(</span>buf_size <span>-</span> remaining<span>),</span> remaining</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>      <span>);</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>      remaining <span>-=</span> written<span>;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span>}</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<div>
+<p>This snippet and following ones omit all error checking for brevity.<a href="#fn5" id="fnref5" role="doc-noteref"><sup>5</sup></a> The <code>memset</code> ensures that the output will be printable, but also plays another role, as we’ll discuss later.</p>
+<p>The work is all done by the <code>write</code> call, the rest is making sure that the whole buffer is written. The read end is very similar, but <code>read</code>ing data into <code>buf</code>, and terminating when enough has been read.</p>
+<p>After building, the code from the repo can be run as follows:</p>
+</div>
+
+<pre><code>% ./write | ./read
+3.7GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+<p>We’re writing the same 256KiB buffer filled with <code>&#39;X&#39;</code>s 40960 times, and measuring the throughput. What’s worrying is that we’re 10 times slower than <code>fizzbuzz</code>! And we’re not doing any work, just writing bytes to the pipe.</p>
+<p>It turns out that we can’t get much faster than this by using <code>write</code> and <code>read</code>.</p>
+<h2 id="trouble-with-write">The trouble with <code>write</code> <a href="#trouble-with-write">#</a></h2>
+<div>
+<p>To find out what our program is spending time on, we can use <a href="https://en.wikipedia.org/wiki/Perf_(Linux)"><code>perf</code></a>:<a href="#fn6" id="fnref6" role="doc-noteref"><sup>6</sup></a> <a href="#fn7" id="fnref7" role="doc-noteref"><sup>7</sup></a></p>
+<pre><code>% perf record -g sh -c &#39;./write | ./read&#39;
+3.2GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)
+[ perf record: Woken up 6 times to write data ]
+[ perf record: Captured and wrote 2.851 MB perf.data (21201 samples) ]</code></pre>
+<p>The <code>-g</code> instructs perf to record call graphs: this will allow us to take a top-down look at where time is being spent.</p>
+<p>We can take a look at where time is spent using <code>perf report</code>. Here is a lightly redacted excerpt, breaking down where <code>write</code> spends its time:<a href="#fn8" id="fnref8" role="doc-noteref"><sup>8</sup></a></p>
+<pre><code>% perf report -g --symbol-filter=write
+-   48.05%     0.05%  write    libc-2.33.so       [.] __GI___libc_write
+   - 48.04% __GI___libc_write
+      - 47.69% entry_SYSCALL_64_after_hwframe
+         - do_syscall_64
+            - 47.54% ksys_write
+               - 47.40% vfs_write
+                  - 47.23% new_sync_write
+                     - pipe_write
+                        + 24.08% copy_page_from_iter
+                        + 11.76% __alloc_pages
+                        + 4.32% schedule
+                        + 2.98% __wake_up_common_lock
+                          0.95% _raw_spin_lock_irq
+                          0.74% alloc_pages
+                          0.66% prepare_to_wait_event
+</code></pre>
+<p>47% of the time is spent in <code>pipe_write</code>, which is what <code>write</code> resolves to if we’re writing to a pipe. This is not surprising — we’re spending roughly half of the time writing, and the other half reading.</p>
+<p>Within <code>pipe_write</code>, 3/4 of the time is spent copying or allocating pages (<code>copy_page_from_iter</code> and <code>__alloc_pages</code>). If we already have an idea of how communication between the kernel and userspace works this might make some sense. Regardless, to fully understand what’s happening we must first understand how pipes work.</p>
+</div>
+
+<h3 id="what-are-pipes-made-of">What are pipes made of? <a href="#what-are-pipes-made-of">#</a></h3>
+<p>The data structure holding a pipe can be found in <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/include/linux/pipe_fs_i.h#L34"><code>include/linux/pipe_fs_i.h</code></a>, and the operations on it in <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c"><code>fs/pipe.c</code></a>.</p>
+<p>A Linux pipe is a <a href="https://en.wikipedia.org/wiki/Circular_buffer">ring buffer</a> holding references to pages where the data is written to and read from:</p>
+<p><img src="https://mazzo.li/assets/images/fast-pipes-pipe-ring.png"/></p>
+<p>In the image above the ring buffer has 8 slots, but we might have more or less, the default being 16. Each page is 4KiB on x86-64, but might be of different sizes on other architectures. In total, this pipe can hold at most 32KiB of data. This is a key point: every pipe has an upper bound on the total amount of data it can hold before it’s full.</p>
+<p>The shaded part of the diagram represents the current pipe data, the non-shaded part the empty space in the pipe.</p>
+<p>Somewhat counterintuitively, <code>head</code> stores the write-end of the pipe. That is, writers will write into the buffer pointed at by <code>head</code>, and increase <code>head</code> accordingly if they need to move onto the next buffer. Within the write buffer, <code>len</code> stores how much we’ve written in it.</p>
+<p>Conversely, <code>tail</code> stores the read-end of the pipe: readers will start consuming the pipe from there. <code>offset</code> indicates where to start reading from.</p>
+<p>Note that <code>tail</code> can appear <em>after</em> <code>head</code>, like in the picture, since we’re working with a circular/ring buffer. Also note that some slots might be unused when we haven’t filled the pipe completely — the <code>NULL</code> cells in the middle. If the pipe is full (no <code>NULL</code>s and no free space in the pages), <code>write</code> will block. If the pipe is empty (all <code>NULL</code>s), <code>read</code> will block.</p>
+<p>Here’s an abridged version of the C data structures in <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/include/linux/pipe_fs_i.h#L34"><code>pipe_fs_i.h</code></a>:</p>
+<div id="cb7"><pre><code><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span>struct</span> pipe_inode_info <span>{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span>unsigned</span> <span>int</span> head<span>;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span>unsigned</span> <span>int</span> tail<span>;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  <span>struct</span> pipe_buffer <span>*</span>bufs<span>;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span>};</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span>struct</span> pipe_buffer <span>{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>  <span>struct</span> page <span>*</span>page<span>;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>  <span>unsigned</span> <span>int</span> offset<span>,</span> len<span>;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span>};</span></span></code></pre></div>
+<p>We’re omitting many fields here, and we’re not explainining what <code>struct page</code> contains yet, but this is the key data structure to understanding how reading and writing from a pipe happens.</p>
+<h3 id="reading-and-writing-to-pipes">Reading and writing to pipes <a href="#reading-and-writing-to-pipes">#</a></h3>
+<p>Let’s now go to <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L416">the definition of <code>pipe_write</code></a>, to try and make sense of the <code>perf</code> output shown before.</p>
+<p>Here is a simplified explanation of how <code>pipe_write</code> works:</p>
+<ol type="1">
+<li>If the pipe is already full, <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L561">wait for space</a> and restart;</li>
+<li>If the buffer currently pointed at by <code>head</code> has space, <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L457">fill that space first</a>;</li>
+<li><a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L577">While there’s free slots</a>, and <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L542">there are remaining bytes to write</a>, <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L496">allocate new pages</a> and <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/fs/pipe.c#L532">fill them</a>, updating <code>head</code>.</li>
+</ol>
+<div>
+<figure>
+<img src="https://mazzo.li/assets/images/write-to-pipe.svg" alt="What happens to a pipe when we write to it."/><figcaption aria-hidden="true"><small>What happens to a pipe when we write to it.</small></figcaption>
+</figure>
+</div>
+<div>
+<p>The operations described above are protected by a lock, which <code>pipe_write</code> <a href="https://github.com/torvalds/linux/blob/2c85ebc57b3e1817b6ce1a6b703928e113a90442/fs/pipe.c#L416">acquires</a> and releases as necessary.</p>
+<p><code>pipe_read</code> is the mirror image of <code>pipe_write</code>, except that we consume pages, free them when we’ve fully read them, and update <code>head</code>.<a href="#fn9" id="fnref9" role="doc-noteref"><sup>9</sup></a></p>
+<p>So, we now have a quite unpleasant picture of what is going on:</p>
+<ul>
+<li>We copy each page twice, once from user memory to the kernel, and back again to the kernel to user memory;</li>
+<li>The copying is done one 4KiB page at a time, interspersed with other activity, such as the synchronization between read and write, and page allocation and freeing;</li>
+<li>We are working with memory that might not be contiguous, since we’re constantly allocating new pages;</li>
+<li>We’re acquiring and releasing the pipe lock.</li>
+</ul>
+<p>On this machine, sequential RAM reading clocks at around 16GiB/s:</p>
+</div>
+
+<pre><code>% sysbench memory --memory-block-size=1G --memory-oper=read --threads=1 run
+...
+102400.00 MiB transferred (15921.22 MiB/sec)</code></pre>
+<p>Given all the fiddliness listed above, a 4x slowdown compared to single-threaded sequential RAM speed is not that surprising.</p>
+<p>Tweaking the buffer size or the pipe size to reduce the amount of syscall and synchronization overhead, or tuning other parameters will not get us very far. Luckily, there is a way to get around the slowness of <code>write</code> and of <code>read</code> altogether.</p>
+<h2 id="splicing">Splicing to the rescue <a href="#splicing">#</a></h2>
+<p>This copying of buffers from user memory to the kernel and back is a frequent thorn in the side of people needing to do fast IO. One common solution is to just cut the kernel out of the picture and perform IO operations directly. For example we might interact directly with a network card and bypass the kernel for low-latency networking.</p>
+<p>In general when we write to a socket, or a file, or in our case a pipe, we’re first writing to a buffer somewhere in the kernel, and then let the kernel do its work. In the case of pipes, the pipe <em>is</em> a series of buffers in the kernel. All this copying is undesirable if we’re in the business of performance.</p>
+<div>
+<p>Luckily, Linux includes system calls to speed things up when we want to move data to and from pipes, without copying. Specifically:</p>
+<ul>
+<li><a href="https://man7.org/linux/man-pages/man2/splice.2.html"><code>splice</code></a> moves data from a pipe to a file descriptor, and vice-versa.</li>
+<li><a href="https://man7.org/linux/man-pages/man2/vmsplice.2.html"><code>vmsplice</code></a> moves data from user memory into a pipe.<a href="#fn10" id="fnref10" role="doc-noteref"><sup>10</sup></a></li>
+</ul>
+<p>Crucially, both operations work without copying anything.</p>
+<p>Now that we know how pipes work, we can already vaguely imagine how the two operations function: they just “grab” an existing buffer from somewhere and put it into the pipe ring buffer, or the reverse, rather than allocating new pages as needed:</p>
+<p><img src="https://mazzo.li/assets/images/vmsplice-intuition.svg"/></p>
+</div>
+
+<p>We’ll soon see exactly how this works.</p>
+<h3 id="splicing-in-practice">Splicing in practice <a href="#splicing-in-practice">#</a></h3>
+<p>Let’s replace <code>write</code> with <code>vmsplice</code>. This is the signature for <code>vmsplice</code>:</p>
+<div id="cb9"><pre><code><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span>struct</span> iovec <span>{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>  <span>void</span>  <span>*</span>iov_base<span>;</span> <span>// Starting address</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>  <span>size_t</span> iov_len<span>;</span>  <span>// Number of bytes</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span>};</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span>// Returns how much we&#39;ve spliced into the pipe</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span>ssize_t</span> vmsplice<span>(</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>  <span>int</span> fd<span>,</span> <span>const</span> <span>struct</span> iovec <span>*</span>iov<span>,</span> <span>size_t</span> nr_segs<span>,</span> <span>unsigned</span> <span>int</span> flags</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span>);</span></span></code></pre></div>
+<div>
+<p><code>fd</code> is the target pipe, <code>struct iovec *iov</code> is an array of buffers we’ll be moving to the pipe. Note that <code>vmsplice</code> returns how much was “spliced” into the pipe, which might not be the full amount, much like how <code>write</code> returns how much was written. Remember that pipes are bounded by how many slots they have in the ring buffer, and <code>vmsplice</code> is not exempt from this restriction.</p>
+<p>We also need to be a bit careful when using <code>vmsplice</code>. Since the user memory is moved to the pipe without copying, we must ensure that the read-end consumes it before we can reuse the spliced buffer.</p>
+<p>For this reason <code>fizzbuzz</code> uses a double buffering scheme, which works as follows:</p>
+<ol type="1">
+<li>Split the 256KiB buffer in two;</li>
+<li>Set the pipe size to 128KiB, this will have the effect of setting the pipe ring buffer to have 128KiB/4KiB = 32 slots;</li>
+<li>Alternate between writing to the first half-buffer and using <code>vmsplice</code> to move it to the pipe and doing the same with the other half.</li>
+</ol>
+<p>The fact that the pipe size is set to 128KiB, and that we wait for <code>vmsplice</code> to fully output one 128KiB buffer, ensures that by the time we’re done with one iteration of <code>vmsplice</code> we <em>know</em> that the the previous buffer has been fully read — otherwise we would not have been able to fully <code>vmsplice</code> the new 128KiB buffer into the 128KiB pipe.</p>
+<p>Now, we’re not actually writing anything to the buffers, but we’ll keep the double buffering scheme since a similar scheme would be required for any program actually writing content.</p>
+<p>Our write loop now looks something like this:</p>
+</div>
+<div id="cb10"><pre><code><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span>int</span> main<span>()</span> <span>{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  <span>size_t</span> buf_size <span>=</span> <span>1</span> <span>&lt;&lt;</span> <span>18</span><span>;</span> <span>// 256KiB</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span>char</span><span>*</span> buf <span>=</span> malloc<span>(</span>buf_size<span>);</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  memset<span>((</span><span>void</span><span>*)</span>buf<span>,</span> <span>&#39;X&#39;</span><span>,</span> buf_size<span>);</span> <span>// output Xs</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>  <span>char</span><span>*</span> bufs<span>[</span><span>2</span><span>]</span> <span>=</span> <span>{</span> buf<span>,</span> buf <span>+</span> buf_size<span>/</span><span>2</span> <span>};</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>  <span>int</span> buf_ix <span>=</span> <span>0</span><span>;</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>  <span>// Flip between the two buffers, splicing until we&#39;re done.</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>  <span>while</span> <span>(</span><span>true</span><span>)</span> <span>{</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    <span>struct</span> iovec bufvec <span>=</span> <span>{</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>      <span>.</span>iov_base <span>=</span> bufs<span>[</span>buf_ix<span>],</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>      <span>.</span>iov_len <span>=</span> buf_size<span>/</span><span>2</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    <span>};</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    buf_ix <span>=</span> <span>(</span>buf_ix <span>+</span> <span>1</span><span>)</span> <span>%</span> <span>2</span><span>;</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>    <span>while</span> <span>(</span>bufvec<span>.</span>iov_len <span>&gt;</span> <span>0</span><span>)</span> <span>{</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>      <span>ssize_t</span> ret <span>=</span> vmsplice<span>(</span>STDOUT_FILENO<span>,</span> <span>&amp;</span>bufvec<span>,</span> <span>1</span><span>,</span> <span>0</span><span>);</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>      bufvec<span>.</span>iov_base <span>=</span> <span>(</span><span>void</span><span>*)</span> <span>(((</span><span>char</span><span>*)</span> bufvec<span>.</span>iov_base<span>)</span> <span>+</span> ret<span>);</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>      bufvec<span>.</span>iov_len <span>-=</span> ret<span>;</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>    <span>}</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>Here are the results writing with <code>vmsplice</code>, rather than <code>write</code>:</p>
+<pre><code>% ./write --write_with_vmsplice | ./read
+12.7GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+<p>This reduces by half the amount of copying we need to do, and already improves our througput more than threefold — to 12.7GiB/s. Changing the read end to use <code>splice</code>, we eliminate all copying, and get another 2.5x speedup:</p>
+<pre><code>% ./write --write_with_vmsplice | ./read --read_with_splice
+32.8GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+<h2 id="paging">Fishing for pages <a href="#paging">#</a></h2>
+<p>What next? Let’s ask <code>perf</code>:</p>
+<pre><code>% perf record -g sh -c &#39;./write --write_with_vmsplice | ./read --read_with_splice&#39;
+33.4GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 0.305 MB perf.data (2413 samples) ]
+% perf report --symbol-filter=vmsplice
+-   49.59%     0.38%  write    libc-2.33.so       [.] vmsplice
+   - 49.46% vmsplice
+      - 45.17% entry_SYSCALL_64_after_hwframe
+         - do_syscall_64
+            - 44.30% __do_sys_vmsplice
+               + 17.88% iov_iter_get_pages
+               + 16.57% __mutex_lock.constprop.0
+                 3.89% add_to_pipe
+                 1.17% iov_iter_advance
+                 0.82% mutex_unlock
+                 0.75% pipe_lock
+        2.01% __entry_text_start
+        1.45% syscall_return_via_sysret</code></pre>
+<div>
+<p>The lion’s share of the time is taken by locking the pipe for writing (<code>__mutex_lock.constprop.0</code>), and by moving the pages into the pipe (<code>iov_iter_get_pages</code>). There isn’t so much we can do about the locking, but we <em>can</em> improve the performance of <code>iov_iter_get_pages</code>.</p>
+<p>As the name suggests, <code>iov_iter_get_pages</code> turns the <code>struct iovec</code>s we feed into <code>vmsplice</code> into <code>struct page</code>s to put into the pipe. To understand what this function actually does, and how to speed it up, we must first take a detour into how the CPU and Linux organize pages.</p>
+</div>
+<h3 id="a-whirlwind-tour-of-paging">A whirlwind tour of paging <a href="#a-whirlwind-tour-of-paging">#</a></h3>
+<div>
+<p>As you might be aware of, processes do not refer to locations in RAM directly: instead, the are assigned <em>virtual</em> memory addresses, which get resolved to <em>physical</em> addresses. This abstraction is known as <a href="https://en.wikipedia.org/wiki/Virtual_memory"><em>virtual memory</em></a>, and has all sorts of advantages we won’t cover here — the most obvious being that it significantly simplifies running multiple processes competing for the same physical memory.</p>
+<p>In any case, whenever we execute a program and we load/store from/to memory, the CPU needs to convert our virtual address to a physical address. Storing a mapping from every virtual address to every corresponding physical address would be impratical. Therefore memory is split up in uniformly sized chunks, called <em>pages</em>, and virtual pages are mapped to physical pages:<a href="#fn11" id="fnref11" role="doc-noteref"><sup>11</sup></a></p>
+<p><img src="https://mazzo.li/assets/images/virtual-phsyical.svg"/></p>
+<p>There’s nothing special about 4KiB: each architecture picks a size, based on various tradeoffs — some of which we’ll soon explore.</p>
+<p>To make this a bit more precise, let’s imagine allocating 10000 bytes using <code>malloc</code>:</p>
+<div id="cb14"><pre><code><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span>void</span><span>*</span> buf <span>=</span> malloc<span>(</span><span>10000</span><span>);</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>printf<span>(</span><span>&#34;%p</span><span>\n</span><span>&#34;</span><span>,</span> buf<span>);</span>          <span>// 0x6f42430</span></span></code></pre></div>
+</div>
+
+<div>
+<p>As we use them, our 10k bytes will look contiguous in virtual memory, but will be mapped to 3 not necessarily contiguous physical pages:<a href="#fn12" id="fnref12" role="doc-noteref"><sup>12</sup></a></p>
+<p><img src="https://mazzo.li/assets/images/example-allocation.svg"/></p>
+</div>
+
+<div>
+<p>One of the tasks of the kernel is to manage this mapping, which is embodied in a data structure called the <em>page table</em>. The CPU specifies how the page table looks (since it needs to understand it), and the kernel manipulates it as needed. On x86-64 the page table is a 4-level, 512-way tree, which itself lives in memory.<a href="#fn13" id="fnref13" role="doc-noteref"><sup>13</sup></a> Each node of this tree is (you guessed it!) 4KiB wide, with each entry within the node leading to the next level being 8 bytes (4KiB/8bytes = 512). The entries contain the address of the next node, along with other metadata.</p>
+<p>We have one page table per process — or in other words, each process has a reserved virtual address space. When the kernel context-switches to a process, it sets the special register CR3 to the <em>physical</em> address of the root of this tree.<a href="#fn14" id="fnref14" role="doc-noteref"><sup>14</sup></a> Then whenever a virtual address needs to be converted to a physical address, the CPU splits up the address in sections, and uses them to walk this tree and compute the physical address.</p>
+<p>To make these concepts less abstract, here’s a visual depiction of how the virtual address <code>0x0000f2705af953c0</code> might be resolved to a physical address:</p>
+<p><img src="https://mazzo.li/assets/images/virtual-address-resolution.svg"/></p>
+</div>
+
+<div>
+<p>The search starts from the first level, called the “page global directory”, or PGD, the physical location of which is stored in CR3. The first 16 bits of the address are unused.<a href="#fn15" id="fnref15" role="doc-noteref"><sup>15</sup></a> We use the next 9 bits the PGD entry, and traverse down to the second level, “page upper directory”, or PUD. The next 9 bits are used to select an entry from the PUD. The process repeats for the next two levels, PMD (“page middle directory”), and PTE (“page table entry”). The PTE tells where the actual physical page we’re looking for is, and then we use the last 12 bits to find the offset inside the page.</p>
+<p>The sparse structure of the page table allows the mapping to be gradually built up as new pages are needed. Whenever a process needs memory, the page table will be updated with a new entry by the kernel.</p>
+</div>
+
+<h3 id="the-role-of-struct-page">The role of <code>struct page</code> <a href="#the-role-of-struct-page">#</a></h3>
+<div>
+<p>The <code>struct page</code> data structure is a key piece of this machinery: it is what the kernel uses to refer to a single <em>physical</em> page, storing its physical address and all sorts of other metadata about it.<a href="#fn16" id="fnref16" role="doc-noteref"><sup>16</sup></a> For instance we can get a <code>struct page</code> from the information contained in the PTE (the last level of the page table described above). In general it is used pervasively in all code handling page-related matters.</p>
+<p>In the case of pipes, <code>struct page</code> is used to hold their data in the ring buffer, as we’re already seen:</p>
+<div id="cb15"><pre><code><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span>struct</span> pipe_inode_info <span>{</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>  <span>unsigned</span> <span>int</span> head<span>;</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>  <span>unsigned</span> <span>int</span> tail<span>;</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>  <span>struct</span> pipe_buffer <span>*</span>bufs<span>;</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span>};</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span>struct</span> pipe_buffer <span>{</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>  <span>struct</span> page <span>*</span>page<span>;</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>  <span>unsigned</span> <span>int</span> offset<span>,</span> len<span>;</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span>};</span></span></code></pre></div>
+</div>
+
+<p>However, <code>vmsplice</code> accepts <em>virtual</em> memory as input, while <code>struct page</code> refers to <em>physical</em> memory directly. It couldn’t be otherwise: pipes are data structures managed by the kernel, outside any process, and processes have virtual memory.</p>
+<p>Therefore we need turn arbitrary chunks of virtual memory into a bunch of <code>struct page</code>s. This is exactly what <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/lib/iov_iter.c#L1518"><code>iov_iter_get_pages</code></a> does, and where we’re spending half of our time:</p>
+<div id="cb16"><pre><code><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span>ssize_t</span> iov_iter_get_pages<span>(</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>  <span>struct</span> iov_iter <span>*</span>i<span>,</span>  <span>// input: a sized buffer in virtual memory</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>  <span>struct</span> page <span>**</span>pages<span>,</span> <span>// output: the list of pages which back the input buffers</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>  <span>size_t</span> maxsize<span>,</span>      <span>// maximum number of bytes to get</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>  <span>unsigned</span> maxpages<span>,</span>   <span>// maximum number of pages to get</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>  <span>size_t</span> <span>*</span>start        <span>// offset into first page, if the input buffer wasn&#39;t page-aligned</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span>);</span></span></code></pre></div>
+<p><code>struct iov_iter</code> is a Linux kernel data structure representing various ways of walking through chunks of memory, including <code>struct iovec</code>. In our case, it will point to a 128KiB buffer. <code>vmsplice</code> will use <code>iov_iter_get_pages</code> to turn the input buffer into a bunch of <code>struct page</code>s, and hold on to them. Now that you know how paging works, you might vaguely imagine how <code>iov_iter_get_pages</code> works as well, but we’ll explain it in detail in the next section.</p>
+<p>We’ve rapidly gone through a lot of new concepts, so to recap:</p>
+<ul>
+<li>Modern CPUs use virtual memory for their processes;</li>
+<li>Memory is organized in regularly-sized pages;</li>
+<li>The CPU translates virtual addresses into physical addresses using a page table mapping virtual pages to physical pages;</li>
+<li>The kernel adds and removes entries to the page table as necessary;</li>
+<li>Pipes are made out of references to physical pages, so <code>vmsplice</code> must convert virtual memory ranges into physical pages, and hold on to them.</li>
+</ul>
+<h3 id="the-cost-of-getting-pages">The cost of getting pages <a href="#the-cost-of-getting-pages">#</a></h3>
+<div>
+<p>The time spent in <code>iov_iter_get_pages</code> is really entirely spent in another function, <code>get_user_pages_fast</code>:</p>
+<pre><code>% perf report -g --symbol-filter=iov_iter_get_pages
+-   17.08%     0.17%  write    [kernel.kallsyms]  [k] iov_iter_get_pages
+   - 16.91% iov_iter_get_pages
+      - 16.88% internal_get_user_pages_fast
+           11.22% try_grab_compound_head
+</code></pre>
+<p><a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/mm/gup.c#L2944"><code>get_user_pages_fast</code></a> is a more bare-bones version of <code>iov_iter_get_pages</code>:</p>
+<div id="cb18"><pre><code><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span>int</span> get_user_pages_fast<span>(</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>  <span>// virtual address, page aligned</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>  <span>unsigned</span> <span>long</span> start<span>,</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>  <span>// number of pages to retrieve</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>  <span>int</span> nr_pages<span>,</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>  <span>// flags, the meaning of which we won&#39;t get into</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>  <span>unsigned</span> <span>int</span> gup_flags<span>,</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>  <span>// output physical pages</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>  <span>struct</span> page <span>**</span>pages</span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span>)</span></span></code></pre></div>
+<p>Here “user” (as opposed to “kernel”) refers to the fact that we’re turning virtual pages into references to physical pages.</p>
+<p>To get our <code>struct page</code>s, <code>get_user_pages_fast</code> does exactly what the CPU would do, but in software: it walks the page table to collect all the physical pages, storing the results in <code>struct page</code>s. In our case, we have a 128KiB buffer, and 4KiB pages, so we’ll have <code>nr_pages = 32</code>.<a href="#fn17" id="fnref17" role="doc-noteref"><sup>17</sup></a> <code>get_user_pages_fast</code> will need to walk the page table tree collecting 32 leaves, and storing the result in 32 <code>struct page</code>s.</p>
+<p><code>get_user_pages_fast</code> also needs to make sure that the physical page is not repurposed until the caller doesn’t need it anymore. This is achieved in the kernel using a reference count <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/include/linux/mm_types.h#L187">stored in <code>struct page</code></a>, which is used to know when a physical page can be released and repurposed in the future. The caller of <code>get_user_pages_fast</code> must, at some point, release the pages again with <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/include/linux/mm.h#L1222"><code>put_page</code></a>, which will decrease the reference count.</p>
+<p>Finally, <code>get_user_pages_fast</code> behaves differently depending on whether virtual addresses are already in the page table. This is where the <code>_fast</code> suffix comes from: the kernel will first try to get an already existing page table entry and corresponding <code>struct page</code> by just walking the page table, which is relatively cheap, and fall back to producing a <code>struct page</code> by other, more expensive means otherwise. The fact that we <code>memset</code> the memory at the beginning will ensure that we never end up in the “slow” path of <code>get_user_pages_fast</code>, since the page table entries will be created as our buffer is filled with <code>&#39;X&#39;</code>s.<a href="#fn18" id="fnref18" role="doc-noteref"><sup>18</sup></a></p>
+<p>Note that the <code>get_user_pages</code> family of functions is not only useful for pipes — in fact, it is central in many drivers. A typical use is related to the kernel bypass we mentioned: a driver for a network card might use it to turn some user memory region into a physical page, then communicate the physical page location to the network card, and have the network card interact directly with that memory region without kernel involvement.</p>
+</div>
+
+<h3 id="huge-pages">Huge pages <a href="#huge-pages">#</a></h3>
+<div>
+<p>Up to now we’ve presented pages as always being of the same size — 4KiB on x86-64. However, many CPU architectures, including x86-64, include larger page sizes. In the case of x86-64, we not only have 4KiB pages (the “standard” size), but also 2MiB and even 1GiB pages (“huge” pages). In the rest of the post we’ll only deal with 2MiB huge pages, since 1GiB pages are fairly uncommon, and overkill for our task anyway.</p>
+<div>
+<table>
+<thead>
+<tr>
+<th>Architecture</th>
+<th>Smallest page size</th>
+<th>Larger page sizes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>x86</td>
+<td>4KiB</td>
+<td>2MiB, 4MiB</td>
+</tr>
+<tr>
+<td>x86-64</td>
+<td>4KiB</td>
+<td>2MiB, 1GiB<a href="#fn19" id="fnref19" role="doc-noteref"><sup>19</sup></a></td>
+</tr>
+<tr>
+<td>ARMv7</td>
+<td>4KiB</td>
+<td>64KiB, 1MiB, 16MiB</td>
+</tr>
+<tr>
+<td>ARMv8</td>
+<td>4KiB</td>
+<td>16KiB, 64KiB</td>
+</tr>
+<tr>
+<td>RISCV32</td>
+<td>4KiB</td>
+<td>4MiB</td>
+</tr>
+<tr>
+<td>RISCV64</td>
+<td>4KiB</td>
+<td>2MiB, 1GiB, 512GiB, 256 TiB</td>
+</tr>
+<tr>
+<td>Power ISA</td>
+<td>8KiB</td>
+<td>64 KiB, 16 MiB, 16 GiB</td>
+</tr>
+</tbody>
+</table>
+<p><small>Page sizes available on architectures commonly used today, from <a href="https://en.wikipedia.org/wiki/Page_(computer_memory)#Multiple_page_sizes">Wikipedia</a>.</small></p>
+</div>
+<p>The main advantage of huge pages is that bookkeeping is cheaper, since there’s fewer of them needed to cover the same amount of memory. Moreover other operations are cheaper too, such as resolving a virtual address to a physical address, since one level less of page table is needed: instead of having a 12-bit offset into the page, we’ll have a 21-bit offset, and one less page table level.</p>
+</div>
+
+<div>
+<p>This relieves pressure on the parts of the CPUs that handle this conversion, leading to performance improvements in many circumstances.<a href="#fn20" id="fnref20" role="doc-noteref"><sup>20</sup></a> However, in our case, the pressure is not on the hardware that walks the page table, but on its software counterpart which runs in the kernel.</p>
+<p>On Linux, we can allocate a 2MiB huge page <a href="https://mazzo.li/posts/check-huge-page.html">in a variety of ways</a>, such as by allocating memory aligned to 2MiB and then using <code>madvise</code> to tell the kernel to use huge pages for the provided buffer:</p>
+<div id="cb20"><pre><code><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span>void</span><span>*</span> buf <span>=</span> aligned_alloc<span>(</span><span>1</span> <span>&lt;&lt;</span> <span>21</span><span>,</span> size<span>);</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>madvise<span>(</span>buf<span>,</span> size<span>,</span> MADV_HUGEPAGE<span>)</span></span></code></pre></div>
+<p>Switching to huge pages in our program yields another ~50% improvement:</p>
+<pre><code>% ./write --write_with_vmsplice --huge_page | ./read --read_with_splice
+51.0GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+</div>
+
+<div>
+<p>However, the reason for the improvements is not totally obvious. Naively, we might think that by using huge pages <code>struct page</code> will just refer to a 2MiB page, rather than 4KiB.</p>
+<p>Sadly this is <em>not</em> the case: the kernel code assumes everywhere that a <code>struct page</code> refers to a page of the “standard” size for the current architecture. The way this works for huge pages (and in general for what Linux calls “compound pages”) is that a “head” <code>struct page</code> contains the actual information about the backing physical page, with successive “tail” pages just containing a pointer to the head page.</p>
+<p>So to represent 2MiB huge page we’ll have 1 “head” <code>struct page</code>, and up to 511 “tail” <code>struct page</code>s. Or in the case of our 128KiB buffer, 31 tail <code>struct page</code>s:<a href="#fn21" id="fnref21" role="doc-noteref"><sup>21</sup></a></p>
+<p><img src="https://mazzo.li/assets/images/head-tail-pages.svg"/></p>
+<p>Even if we need all these <code>struct page</code>s, the code generating it ends up significantly faster. Instead of traversing the page table multiple times, once the first entry is found, the following <code>struct page</code>s can be <a href="https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/mm/gup.c#L2457">generated in a simple loop</a>. Hence the performance improvement!</p>
+</div>
+
+<h2 id="busy-loop">Busy looping <a href="#busy-loop">#</a></h2>
+<p>We’re almost done, I promise! Let’s look at <code>perf</code> output once again:</p>
+<pre><code>-   46.91%     0.38%  write    libc-2.33.so       [.] vmsplice
+   - 46.84% vmsplice
+      - 43.15% entry_SYSCALL_64_after_hwframe
+         - do_syscall_64
+            - 41.80% __do_sys_vmsplice
+               + 14.90% wait_for_space
+               + 8.27% __wake_up_common_lock
+                 4.40% add_to_pipe
+               + 4.24% iov_iter_get_pages
+               + 3.92% __mutex_lock.constprop.0
+                 1.81% iov_iter_advance
+               + 0.55% import_iovec
+            + 0.76% syscall_exit_to_user_mode
+        1.54% syscall_return_via_sysret
+        1.49% __entry_text_start
+</code></pre>
+<p>We’re now spending a significant amount of time waiting for the pipe to be writeable (<code>wait_for_space</code>), and waking up readers which were waiting for the pipe to have content (<code>__wake_up_common_lock</code>).</p>
+<p>To sidestep these synchronization costs, we can ask <code>vmsplice</code> to return if the pipe cannot be written to, and busy loop until it is — and the same when reading with <code>splice</code>:</p>
+<div id="cb23"><pre><code><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span>...</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span>// SPLICE_F_NONBLOCK will cause `vmsplice` to return immediately</span></span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a><span>// if we can&#39;t write to the pipe, returning EAGAIN</span></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span>ssize_t</span> ret <span>=</span> vmsplice<span>(</span>STDOUT_FILENO<span>,</span> <span>&amp;</span>bufvec<span>,</span> <span>1</span><span>,</span> SPLICE_F_NONBLOCK<span>);</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span>if</span> <span>(</span>ret <span>&lt;</span> <span>0</span> <span>&amp;&amp;</span> errno <span>==</span> EAGAIN<span>)</span> <span>{</span></span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a>  <span>continue</span><span>;</span> <span>// busy loop if not ready to write</span></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a><span>}</span></span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a><span>...</span></span></code></pre></div>
+<p>By busy looping we get another 25% performance increase:</p>
+<pre><code>% ./write --write_with_vmsplice --huge_page --busy_loop | ./read --read_with_splice --busy_loop
+62.5GiB/s, 256KiB buffer, 40960 iterations (10GiB piped)</code></pre>
+<p>Obviously busy looping comes at che cost of fully occupying a CPU core waiting for <code>vmsplice</code> to be ready. But often this compromise is worth it, and in fact it is a common pattern for high-performance server applications: we trade off possibly wasteful CPU utilization for better latency and/or throughput.</p>
+<p>In our case, this concludes our optimization journey for our little synthetic benchmark, from 3.5GiB/s to 65GiB/s.</p>
+<h2 id="closing-thoughts">Closing thoughts <a href="#closing-thoughts">#</a></h2>
+<p>We’ve systematically improved the performance of our program by looking at the <code>perf</code> output and the Linux source. Pipes and splicing in particular aren’t really hot topics when it comes to high-performance programming, but the themes we’ve touched upon are: zero-copy operations, ring buffers, paging &amp; virtual memory, synchronization overhead.</p>
+<p>There are some details and interesting topics I left out, but this blog post was already spiraling out of control and becoming too long:</p>
+<ul>
+<li><p>In the actual code, the buffers are allocated separatedly, to reduce page table contention by placing them in different page table entries (something that the FizzBuzz program also does).</p>
+<p>Remember that when a page table entry is taken with <code>get_user_pages</code>, its refcount is increased, and decreased on <code>put_page</code>. If we use two page table entries for the two buffers, rather than one page table entry for both of them, we have less contention when modifying the refcount.</p></li>
+<li><p>The tests are ran by pinning the <code>./write</code> and <code>./read</code> processes to two cores with <code>taskset</code>.</p></li>
+<li><p>The code in the repo contains many other options I played with, but did not end up talking about since they were irrelevant or not interesting enough.</p></li>
+<li><p>The repo also contains <a href="https://github.com/bitonic/pipes-speed-test/blob/master/get-user-pages.cpp">a synthetic benchmark</a> for <code>get_user_pages_fast</code>, which can be used to measure exactly how much slower it runs with or without huge pages.</p></li>
+<li><p>Splicing in general is a slightly dubious/<a href="https://dirtypipe.cm4all.com/">dangerous</a> concept, <a href="https://lwn.net/Articles/896267/">which continues to annoy</a> to kernel developers.</p></li>
+</ul>
+<p>Please let me know if this post was helpful, interesting, or unclear!</p>
+<h2 id="acknowledgements">Acknowledgements <a href="#acknowledgements">#</a></h2>
+<p>Many thanks to <a href="https://scvalex.net/">Alexandru Scvorţov</a>, Max Staudt, Alex Appetiti, Alex Sayers, Stephen Lavelle, Peter Cawley, and Niklas Hambüchen for reviewing drafts of this post. Max Staudt also helped me understand some subtleties of <code>get_user_pages</code>.</p>
+
+
+
+
+</div></div>
+  </body>
+</html>
