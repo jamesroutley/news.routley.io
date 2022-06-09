@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://lunatic.solutions/blog/rust-without-the-async-hard-part/">Original</a>
+    <h1>Rust without the async (hard) part</h1>
+    
+    <div id="readability-page-1" class="page"><article itemscope="" itemtype="http://schema.org/Article"><header><p>May 09, 2022</p></header><section itemprop="articleBody"><p>Last week two blog posts, titled <a href="https://hirrolot.github.io/posts/rust-is-hard-or-the-misery-of-mainstream-programming.html">Rust Is Hard, Or: The Misery of Mainstream Programming</a> and
+<a href="https://itsallaboutthebit.com/async-simple/">(async) Rust doesn’t have to be hard</a>, sparked <a href="https://news.ycombinator.com/item?id=31601040">a lot</a> of <a href="https://www.reddit.com/r/rust/comments/v44tp2/async_rust_doesnt_have_to_be_hard/">discussions</a> on <a href="https://news.ycombinator.com/item?id=31611456">Hacker News</a>
+and <a href="https://www.reddit.com/r/rust/comments/v3cktw/rust_is_hard_or_the_misery_of_mainstream/">Reddit</a>.</p>
+<p>This topic is close to my heart. After all, at lunatic we are building a Rust runtime with the
+performance characteristics of async Rust, but without the issues of async Rust. It brings
+Rust back to its pre-1.0 days when it still used <em>user space threads</em> as a concurrency model.</p>
+<p>In this blog post I would like to compare both approaches and show the differences between the
+programming models and runtime characteristics.</p>
+<h4>What problem are we solving with async Rust?</h4>
+<p>Massive concurrency. Your first reaction might be, WAIT I don’t even need massive concurrency, and
+you might be completely right. If you don’t need it, you would be even better off without it (able
+to achieve higher throughput).</p>
+<p>However, if you are doing web apps or any networking stuff, massive concurrency benefits are
+almost always too important to ignore. Look at a web server, it accepts
+an incoming request, opens a connection to the database and waits until the database returns some
+data. Once it has the data it will write it back to the client. Putting a faster CPU into the
+server will not help us here. Most of the time we are actually not doing any compute, just waiting.
+But if we can wait on more of the database queries concurrently without queuing them, we can answer
+more requests in a shorter time.</p>
+<p>This becomes even more important if we introduce some real-time components to our websites. Now
+we have a permanent concurrent connection to the server that mostly doesn’t do anything, but
+occasionally will push a notification to the user. More users looking at our site simultaneously
+means more concurrency on the backend.</p>
+<p>That’s why async is almost the default choice for everyone starting a new web project.</p>
+<h4>Why can’t we “just wait”?</h4>
+<p>What is the big deal with waiting? If we aren’t doing any work, why is waiting so hard? The main
+issue comes from the fact that while we are waiting we need to hold onto all data required to
+continue the computation, like local variables.</p>
+<p>There is a concurrency primitive that ships with every Operating System, the thread. When Operating
+Systems switch out threads, they preserve all CPU registers for us. Let’s look at an example.</p>
+<div data-language="rust"><pre><code><span>use</span> <span>std<span>::</span>io<span>::</span></span><span>Write</span><span>;</span>
+
+<span>fn</span> <span>write_number</span><span>(</span><span>mut</span> stream<span>:</span> <span>std<span>::</span>net<span>::</span></span><span>TcpStream</span><span>,</span> number<span>:</span> <span>u64</span><span>)</span> <span>{</span>
+    <span>let</span> number_as_bytes <span>=</span> number<span>.</span><span>to_le_bytes</span><span>(</span><span>)</span><span>;</span>
+    stream<span>.</span><span>write_all</span><span>(</span><span>&amp;</span>number_as_bytes<span>)</span><span>.</span><span>unwrap</span><span>(</span><span>)</span><span>;</span>
+    <span>println!</span><span>(</span>
+        <span>&#34;Number `{}` written as `{:?}`&#34;</span><span>,</span>
+        number<span>,</span> number_as_bytes
+    <span>)</span><span>;</span>
+<span>}</span></code></pre></div>
+<p>Once the execution reaches the line</p>
+<div data-language="rust"><pre><code>stream<span>.</span><span>write_all</span><span>(</span><span>&amp;</span>number_as_bytes<span>)</span><span>.</span><span>unwrap</span><span>(</span><span>)</span><span>;</span></code></pre></div>
+<p>the Operating System may take some time to write the bytes to the networking interface and is free
+to schedule other work on this CPU core. However, after the data is written and the computation is
+resumed, the local variables <code>number</code> and <code>number_as_bytes</code> are still used in the <code>println!</code>
+statement and need to “survive” the wait. So, where are they saved?</p>
+<p>Sometimes, these variables will be inside of CPU registers, this means that they are automatically
+saved by the OS with all other CPU registers belonging to this thread. Other times, we have too many
+variables to fit into CPU registers, and they will be saved on <strong>the stack</strong>. Each thread gets a
+separate stack. The stack is just a memory region where the thread can put local variables or even
+control flow data, like information about where to return from the currently executing function.</p>
+<p>How big the stack is depends on the Operating System, on Windows it’s usually <code>1Mb</code> by default and
+on Linux <code>8Mb</code>. This may seem like a lot, if we had 1,000 threads we would reserve <code>8Gb</code>
+just for the stack space. Luckily, this is mostly virtual memory, meaning that the Operating System
+will only back it with “real” memory in increments of <code>4Kb</code> (page size) once some data is written
+to it. Until the available space is filled up, and we reach the famous <em>stack overflow</em>
+panic. In the majority of applications we never come close to it though.</p>
+<h4>So, can we use OS threads?</h4>
+<p><span>The problem is that threads just don’t work in practice for massive
+concurrency.</span> On my old MacBook Pro the <strong>whole</strong> machine would reboot if you spawned more than
+2,000 threads inside one process <a href="https://news.ycombinator.com/item?id=25257931">and others have similar issues</a>. Linux will be a bit
+better, but I never heard of anyone being able to pull off massive concurrency just with Operating
+System threads.</p>
+<p>In the end, that’s why we have so many solutions in the user space, to address shortcomings of OS
+threads.</p>
+<h4>What are our options?</h4>
+<p>If the Operating System is so bad at it, can we maybe somehow do it on our own in user space?
+Preserve local variables (context) and schedule different tasks while we are waiting on i/o.</p>
+<p>In the rest of this post I’m going to focus on two approaches of solving this problem in user space:</p>
+<ol>
+<li>Async Rust</li>
+<li>Virtual threads (lunatic)</li>
+</ol>
+<p>Let’s look at the previous example in async Rust and the equivalent lunatic version with virtual
+threads.</p>
+<div>
+<div>
+<div data-language="rust"><pre><code><span>use</span> <span>tokio<span>::</span>io<span>::</span></span><span>AsyncWriteExt</span><span>;</span>
+
+<span>async</span> <span>fn</span> <span>write_number</span><span>(</span>
+    <span>mut</span> stream<span>:</span> <span>tokio<span>::</span>net<span>::</span></span><span>TcpStream</span><span>,</span>
+    number<span>:</span> <span>u64</span>
+<span>)</span> <span>{</span>
+    <span>let</span> number_as_bytes <span>=</span> number<span>.</span><span>to_le_bytes</span><span>(</span><span>)</span><span>;</span>
+    stream<span>.</span><span>write_all</span><span>(</span><span>&amp;</span>number_as_bytes<span>)</span><span>.</span><span>await</span><span>.</span><span>unwrap</span><span>(</span><span>)</span><span>;</span>
+    <span>println!</span><span>(</span>
+        <span>&#34;Number `{}` written as `{:?}`&#34;</span><span>,</span>
+        number<span>,</span> number_as_bytes
+    <span>)</span><span>;</span>
+<span>}</span></code></pre></div>
+</div>
+<div>
+<div data-language="rust"><pre><code><span>use</span> <span>std<span>::</span>io<span>::</span></span><span>Write</span><span>;</span>
+
+<span>fn</span> <span>write_number</span><span>(</span>
+    <span>mut</span> stream<span>:</span> <span>lunatic<span>::</span>net<span>::</span></span><span>TcpStream</span><span>,</span>
+    number<span>:</span> <span>u64</span>
+<span>)</span> <span>{</span>
+    <span>let</span> number_as_bytes <span>=</span> number<span>.</span><span>to_le_bytes</span><span>(</span><span>)</span><span>;</span>
+    stream<span>.</span><span>write_all</span><span>(</span><span>&amp;</span>number_as_bytes<span>)</span><span>.</span><span>unwrap</span><span>(</span><span>)</span><span>;</span>
+    <span>println!</span><span>(</span>
+        <span>&#34;Number `{}` written as `{:?}`&#34;</span><span>,</span>
+        number<span>,</span> number_as_bytes
+    <span>)</span><span>;</span>
+<span>}</span></code></pre></div>
+</div>
+</div>
+<p>Both examples look similar. The lunatic one is almost indistinguishable from the original example
+using threads, except the <code>lunatic::net::TcpStream</code> type. It also works similar
+to the one using threads. It allocates a memory region for a virtual stack where it preserves the
+local variables during context switches.</p>
+<p>The async example may syntactically look similar to the thread one, but it works completely different
+under the hood. <span> I think that this is the main reason why many
+people consider async Rust to be hard. It gives us a similar syntax, but the execution model is
+different, making it much harder to reason about what is happening. </span></p>
+<p>What happens here is that the Rust compiler analyzes the async function, concludes that
+there are two variables that need to be preserved if a context switch happens at <code>.await</code> and creates
+a special struct that just has space for these two variables.</p>
+<p>The benefit of this approach is clear right away, instead of pre-reserving <code>1Mb</code> of space for a stack
+to store local variables, we get a tightly packed structure just using the amount of space
+required to preserve two variables. And the Rust compiler is smart, if we have multiple <code>.await</code>
+points it will re-use
+this struct to preserve the minimal amount of information, depending on the access patterns
+after the <code>.await</code> points.</p>
+<p>The <code>async</code> function has the syntax of a regular function, but it doesn’t “execute” in the same way.
+We don’t have a regular stack that grows as we call more functions, instead the compiler creates a
+state machine that an async executor can drive forward.</p>
+<p>This becomes obvious in the following example, where we introduce a recursive call to the write
+function in case the number is lower than 5.</p>
+<div>
+<div>
+<div data-language="rust"><pre><code><span>use</span> <span>tokio<span>::</span>io<span>::</span></span><span>AsyncWriteExt</span><span>;</span>
+
+<span>async</span> <span>fn</span> <span>write_number_inc</span><span>(</span>
+    stream<span>:</span> <span>&amp;</span><span>mut</span> <span>tokio<span>::</span>net<span>::</span></span><span>TcpStream</span><span>,</span>
+    number<span>:</span> <span>u64</span>
+<span>)</span> <span>{</span>
+    <span>if</span> number <span>&lt;</span> <span>5</span> <span>{</span>
+        <span>write_number_inc</span><span>(</span>stream<span>,</span> number <span>+</span> <span>1</span><span>)</span><span>.</span><span>await</span><span>;</span>
+    <span>}</span>
+
+    <span>let</span> number_as_bytes <span>=</span> number<span>.</span><span>to_le_bytes</span><span>(</span><span>)</span><span>;</span>
+    stream<span>.</span><span>write_all</span><span>(</span><span>&amp;</span>number_as_bytes<span>)</span><span>.</span><span>await</span><span>.</span><span>unwrap</span><span>(</span><span>)</span><span>;</span>
+    <span>println!</span><span>(</span>
+        <span>&#34;Number `{}` written as `{:?}`&#34;</span><span>,</span>
+        number<span>,</span> number_as_bytes
+    <span>)</span><span>;</span>
+<span>}</span></code></pre></div>
+<p>This fails to compile with <code>error[E0733]: recursion in an &#34;async fn&#34;
+requires boxing</code>.</p>
+<p>Instead, we need to do this:</p>
+<div data-language="rust"><pre><code><span>Box</span><span>::</span><span>pin</span><span>(</span><span>async</span> <span>move</span> <span>{</span>
+    <span>write_number_inc</span><span>(</span>stream<span>,</span> number <span>+</span> <span>1</span><span>)</span><span>.</span><span>await</span><span>;</span>
+<span>}</span><span>)</span><span>.</span><span>await</span><span>;</span></code></pre></div>
+<p>Of course, this will also fail to compile, because we are suddenly moving the stream into a new
+place. How do we resolve this? Unclear, as <code>TcpStream</code> is not <code>Clone</code>. We probably need an
+<code>Arc&lt;Mutex&gt;</code> :)</p>
+</div>
+<div>
+<div data-language="rust"><pre><code><span>use</span> <span>std<span>::</span>io<span>::</span></span><span>Write</span><span>;</span>
+
+<span>fn</span> <span>write_number_inc</span><span>(</span>
+    stream<span>:</span> <span>&amp;</span><span>mut</span> <span>lunatic<span>::</span>net<span>::</span></span><span>TcpStream</span><span>,</span>
+    number<span>:</span> <span>u64</span>
+<span>)</span> <span>{</span>
+    <span>if</span> number <span>&lt;</span> <span>5</span> <span>{</span>
+        <span>write_number_inc</span><span>(</span>stream<span>,</span> number <span>+</span> <span>1</span><span>)</span><span>;</span>
+    <span>}</span>
+
+    <span>let</span> number_as_bytes <span>=</span> number<span>.</span><span>to_le_bytes</span><span>(</span><span>)</span><span>;</span>
+    stream<span>.</span><span>write_all</span><span>(</span><span>&amp;</span>number_as_bytes<span>)</span><span>.</span><span>unwrap</span><span>(</span><span>)</span><span>;</span>
+    <span>println!</span><span>(</span>
+        <span>&#34;Number `{}` written as `{:?}`&#34;</span><span>,</span>
+        number<span>,</span> number_as_bytes
+    <span>)</span><span>;</span>
+<span>}</span></code></pre></div>
+<p>Works as you would expect.</p>
+</div>
+</div>
+<p>It’s obvious why you can’t have recursive calls in async functions. The compiler can’t pre-determine
+how many recursive calls you are going to have and can’t reserve the “perfect” amount of space to
+preserve all local variables during context switches.</p>
+<p>On the lunatic side we just keep pushing the new local variables onto the virtual stack, until we
+run out of space. We don’t need to determine during compile time our maximum stack usage and can
+fail during runtime if we end up with too many recursive calls, similar to how OS threads work.</p>
+<p>It was easy to explain why async functions can’t be recursive, but some other limitations of async
+Rust are much harder to explain. Let’s say we want to serialize the number we are writing to the
+<code>TcpStream</code> with the popular serialization library <a href="https://serde.rs">serde</a> and high performance serializer
+<a href="https://github.com/bincode-org/bincode">bincode</a>.</p>
+<div>
+<div>
+<div data-language="rust"><pre><code><span>use</span> <span>tokio<span>::</span>io<span>::</span></span><span>AsyncWriteExt</span><span>;</span>
+
+<span>async</span> <span>fn</span> <span>write_number</span><span>(</span>
+    stream<span>:</span> <span>&amp;</span><span>mut</span> <span>tokio<span>::</span>net<span>::</span></span><span>TcpStream</span><span>,</span>
+    number<span>:</span> <span>u64</span>
+<span>)</span> <span>{</span>
+    <span>let</span> temp_buff
+        <span>=</span> <span>bincode<span>::</span></span><span>serialize</span><span>(</span><span>&amp;</span>number<span>)</span><span>.</span><span>unwrap</span><span>(</span><span>)</span><span>;</span>
+    stream<span>.</span><span>write_all</span><span>(</span><span>&amp;</span>temp_buff<span>)</span><span>.</span><span>await</span><span>.</span><span>unwrap</span><span>(</span><span>)</span><span>;</span>
+    <span>println!</span><span>(</span>
+        <span>&#34;Number `{}` written as bincode.&#34;</span><span>,</span>
+        number
+    <span>)</span><span>;</span>
+<span>}</span></code></pre></div>
+<p>Serde doesn’t play nicely with async Rust and you are forced to temporarily create
+buffers.</p>
+</div>
+<div>
+<div data-language="rust"><pre><code><span>use</span> <span>std<span>::</span>io<span>::</span></span><span>Write</span><span>;</span>
+
+<span>fn</span> <span>write_number_inc</span><span>(</span>
+    stream<span>:</span> <span>&amp;</span><span>mut</span> <span>lunatic<span>::</span>net<span>::</span></span><span>TcpStream</span><span>,</span>
+    number<span>:</span> <span>u64</span>
+<span>)</span> <span>{</span>
+    <span>bincode<span>::</span></span><span>serialize_into</span><span>(</span>stream<span>,</span> <span>&amp;</span>number<span>)</span><span>;</span>
+    <span>println!</span><span>(</span>
+        <span>&#34;Number `{}` written as bincode.&#34;</span><span>,</span>
+        number
+    <span>)</span><span>;</span>
+<span>}</span></code></pre></div>
+<p>Lunatic’s <code>TcpStream</code> implements <code>Read</code> &amp; <code>Write</code> traits and bincode can serialize the number
+directly into the stream without needing to produce in-between copies.</p>
+</div>
+</div>
+<p>To explain why async Rust types don’t support <code>Read</code> and <code>Write</code> traits or why we can’t have
+async functions in traits would require a blog post on its own, so I won’t go there.
+The complexity of this compiler
+transformation, implications on the execution model and lifetimes inside async functions
+are just <strong>hard</strong> to comprehend. There are many awesome <a href="https://boats.gitlab.io/blog/post/async-methods-i/">posts</a> written about it, go read
+them instead.</p>
+<h4>Workarounds?</h4>
+<p>The truth is, once we step into the async Rust world we get a lot of limitations. The general
+advice is, just work around them. Don’t do a zero-copy serialization, allocate an in-between buffer.
+Don’t have async traits? Just <a href="https://crates.io/crates/async-trait">use a macro</a> that will allocate some memory every time the
+function is called. Can’t satisfy the borrow checker? Just wrap the value into an <code>Arc&lt;Mutex&gt;</code>.
+Rust is plenty fast that this usually doesn’t matter.</p>
+<p>I just think that there is a better way. If we are already sacrificing so much, why do we insist
+on having “perfectly” sized stacks with async Rust? An approach where we use virtual stacks seems
+to work just fine.</p>
+<p><span>It’s important to point out that lunatic still schedules the
+virtual threads in user-space. As a matter of fact, it uses an async Rust executor to do so.</span>
+The decision when a task is going to be switched out or what tasks are ready are the same in
+lunatic and async Rust. The only difference is the per task “stack” size and the fact that
+lunatic can’t determine the maximum stack size upfront.</p>
+<p><em>(This is not completely true, lunatic also inserts preemption points into the code so that
+long-running compute workloads don’t block the scheduler. Something that the developer needs to
+manually handle when working with async Rust.)</em></p>
+<h4>Conclusion</h4>
+<p>Massive concurrency is a necessary part of modern web/networking apps. With this post I wanted to
+present an alternative to async Rust to achieve massive concurrency. It’s not really a novel idea,
+because Rust used to work that way in the past, but ultimately went into another direction.</p>
+<p>The effort that went into making async Rust was huge. It pushes the type system to the limit and
+I believe that it’s pretty well-designed. In the end, that’s what actually allowed me to build
+the <a href="https://github.com/lunatic-solutions/lunatic">lunatic runtime</a> on top of it. When you work on such a low-level and performance critical
+code, you will need to completely understand what is actually happening in the background and
+the errors thrown at you by the compiler can be great to guide you in the right direction.</p>
+<p>However, there is another part to Rust. A beautifully designed, somewhat high-level language, with
+an awesome type system and an ecosystem of composable libraries. And I feel that this ecosystem would
+benefit much more from a virtual thread approach to massive concurrency, where you still get to use
+the <code>Read</code> &amp; <code>Write</code> traits to compose things together and wouldn’t need to build a complex mental
+model of execution.</p></section><hr/></article></div>
+  </body>
+</html>
