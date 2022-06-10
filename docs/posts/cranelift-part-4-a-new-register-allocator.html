@@ -1,0 +1,1510 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://cfallin.org/blog/2022/06/09/cranelift-regalloc2/">Original</a>
+    <h1>Cranelift, Part 4: A New Register Allocator</h1>
+    
+    <div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>This post is the fourth part of a three-part series<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup> describing
+work that I have been doing to improve the
+<a href="https://github.com/bytecodealliance/wasmtime/tree/main/cranelift">Cranelift</a>
+compiler. In this post, I’ll describe the work that went into
+<a href="https://github.com/bytecodealliance/regalloc2">regalloc2</a>, a new
+register allocator I developed over the past year. The allocator
+started as an effort to port <a href="https://searchfox.org/mozilla-central/source/js/src/jit/BacktrackingAllocator.cpp">IonMonkey’s register
+allocator</a>
+to Rust and a standalone form usable by Cranelift (“how hard could it
+be?”), but quickly evolved during a focused optimization effort to
+have its own unique design and implementation aspects.</p>
+
+<p><a href="https://en.wikipedia.org/wiki/Register_allocation">Register
+allocation</a> is a
+classically hard
+(<a href="https://en.wikipedia.org/wiki/NP-hardness">NP-hard!</a>) problem, and a
+good solution is mainly a question of concocting a suitable
+combination of heuristics and engineering high-performance data
+structures and algorithms such that <em>most</em> cases are <em>good enough</em>
+with <em>few enough</em> exceptions. As I’ve found, this rabbithole goes
+infinitely deep and there is always more to improve, but for now we’re
+in a fairly good place.</p>
+
+<p>We <a href="https://github.com/bytecodealliance/wasmtime/pull/3989">recently switched over to
+regalloc2</a>,
+and Cranelift 0.84 and the concurrently released Wasmtime 0.37 use it
+by default. Some
+<a href="https://github.com/bytecodealliance/wasmtime/issues/3942">measurements</a>
+show that it generally improves overall compiler speed (which was and
+is dominated by regalloc time) by 20%-ish, and generated code
+performance improves on register pressure-impacted benchmarks up to
+10-20% in Wasmtime. In Cranelift’s use as a backend for rustc via
+<a href="https://github.com/bjorn3/rustc_codegen_cranelift">rustc_codegen_cranelift</a>
+runtime performance improved by <a href="https://github.com/bytecodealliance/wasmtime/pull/3989#issuecomment-1092110720">up to
+7%</a>. The
+allocator seems to have generally fewer compile-time outliers our
+previous allocator, which in many cases is a more important property
+than 10-20% improvements. Overall, it seems to be a reasonable
+performance win with few downsides. Of course, this work benefits
+hugely from the lessons learned in developing that prior allocator,
+<a href="https://github.com/bytecodealliance/regalloc.rs/">regalloc.rs</a>, which
+was work primarily done by Julian Seward and Benjamin Bouvier; I
+learned enormous amounts talking to them and watching their work on
+regalloc.rs in 2020, and this work stands on their shoulders as well
+as IonMonkey’s.</p>
+
+<p>This post will make a whirlwind tour through several topics. After
+reviewing the register allocation problem and why it is important, we
+will learn about regalloc2’s approach: its abstractions, its key
+features, and how its passes work. We’ll then spend a good amount of
+time on “lessons learned”: how we attained reasonable performance; how
+we managed to make anything work at all in reasonable development
+time; how we migrated a large existing compiler codebase to new
+foundational types and invariants; and some perspective on ongoing
+tuning and refinements.</p>
+
+<p>A <a href="https://github.com/bytecodealliance/regalloc2/blob/main/doc/DESIGN.md">design
+document</a>
+for the allocator exists as well, and this blogpost is meant to be
+complementary: we’ll walk through some interesting bits of the
+architecture, but anyone hoping to actually grok the thing in its
+entirety (and please talk to me if this is you!) is advised to dig
+into the design doc and the source for the full story.</p>
+
+<p>Finally, a fair warning: this post has become a bit of a book chapter;
+if you’re looking for a tl;dr, you can skip to the
+<a href="#four-lessons">Lessons</a> section or the <a href="#conclusions">Conclusions</a>.</p>
+
+<h2 id="register-allocation-recap">Register Allocation: Recap</h2>
+
+<p>First, let’s recap what register allocation is and why it’s
+important.<sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">2</a></sup></p>
+
+<p>The basic problem at hand is to assign <em>storage locations</em> to <em>program
+dataflow</em>. We can imagine our compiler input as a graph of operators,
+each of which consumes some values and produces others (let’s ignore
+control flow for the moment):</p>
+
+<p><img src="https://cfallin.org/assets/cranelift-regalloc2-fig1-web.svg" alt="Figure: A dataflow graph"/></p>
+
+<p>Some compilers directly represent the program in this way (called a
+“sea of nodes” IR) but most, including Cranelift, <em>linearize</em> the
+operators into a particular program order. And in fact, by the time
+that the register allocator does its work, the “operators” are really
+machine instructions, or something very close to them, so we will call
+them that: we have a sequence of instructions, and <em>program points</em>
+before and after each one. Even in this new view, we still have the
+dataflow connectivity that we did above; now, each edge corresponds to
+a particular <em>range of program points</em>:</p>
+
+<p><img src="https://cfallin.org/assets/cranelift-regalloc2-fig2-web.svg" alt="Figure: Dataflow graph with liveranges"/></p>
+
+<p>We call each of these dataflow edges, representing a value that must
+flow from one instruction to another, a <em>liverange</em>. We say that
+virtual registers – the names we give the values before regalloc –
+have a set of liveranges.</p>
+
+<p>With control flow, liveranges might be discontiguous from a
+linear-instruction-order point of view, because of jumps; for example:</p>
+
+<p><img src="https://cfallin.org/assets/cranelift-regalloc2-fig3-web.svg" alt="Figure: Control flow with discontiguous liveranges"/></p>
+
+<p>Each instruction requires its inputs to be in registers and produces
+its outputs in registers, usually.<sup id="fnref:3" role="doc-noteref"><a href="#fn:3" rel="footnote">3</a></sup> So, the job of the register
+allocator is to choose one of a finite set of machine registers to
+convey each of the liveranges from its definition(s) to all of its
+use(s).</p>
+
+<p>Why is this hard? In brief, because we may not have enough
+registers. We thus enter a world of <em>compromise</em>: if more values are
+“alive” (need to be kept around for later use) than the number of
+registers that the CPU has, then we have to put some of them somewhere
+else, and bring them back into registers only when we actually need to
+use them. That “somewhere else” is usually memory in the function’s
+stack frame that the compiler reserves (a “stackslot”), and the
+process of saving values away to free up registers is called
+“spilling”.</p>
+
+<p>One more concept before we go further: we may want to choose to place
+a liverange in <em>different</em> places throughout its lifetime, depending
+on the needs of the instruction sequence at certain points. For
+example, if a value is produced at the top of a function, then dormant
+(but live) for a while, and then used frequently in a tight loop at
+the bottom of the function, we don’t <em>really</em> want to spill it, and
+reload it from memory every loop iteration. In other words, given this
+program:</p>
+
+<pre><code>    v0 := ...
+    
+    v1 := ...    // lots of intermediate defs that use all regs
+    v2 := ...
+    ...
+    vN := ...
+    
+    
+loop:
+    v100 := ...
+    v101 := add v0, v100
+    store v101, ...
+    jmp loop
+</code></pre>
+
+<p>we ideally do not want to assign a stack slot to the value <code>v0</code> and
+then produce machine code like</p>
+
+<div><div><pre><code>    <span>add</span> <span>rax</span><span>,</span> <span>rbx</span>      <span>;; `v0` stored in `rax`</span>
+    <span>mov</span> <span>[</span><span>rsp</span><span>+</span><span>16</span><span>],</span> <span>rax</span> <span>;; spill `v0` to a stack slot</span>
+    <span>...</span>
+    
+<span>loop:</span>
+    <span>...</span>
+    <span>mov</span> <span>rax</span><span>,</span> <span>[</span><span>rsp</span><span>+</span><span>16</span><span>]</span> <span>;; load `v0` from stack on every iteration -- expensive!</span>
+    <span>add</span> <span>rcx</span><span>,</span> <span>rax</span>
+    <span>mov</span> <span>[</span><span>...</span><span>],</span> <span>rcx</span>
+    <span>jmp</span> <span>loop</span>
+</code></pre></div></div>
+
+<p>but if we only choose <em>a location</em> per liverange, we either choose a
+register, or a stackslot – no middle ground. Intuitively, it seems
+like we should be able to put the value in a different place while it
+is “dormant” (spill it to the stack, most likely), then pick an
+optimal location during the tight loop. To do so, we need to refer to
+the two parts of the liverange separately, and assign each one a
+separate location. This is called <em>liverange splitting</em>.</p>
+
+<p>If we split liveranges, we can then do something like:</p>
+
+<div><div><pre><code>    <span>add</span> <span>rax</span><span>,</span> <span>rbx</span>      <span>;; `v0` stored in `r0`</span>
+    <span>mov</span> <span>[</span><span>rsp</span><span>+</span><span>16</span><span>],</span> <span>rax</span> <span>;; spill `v0` to a stack slot</span>
+    <span>...</span>
+    
+    <span>mov</span> <span>rdx</span><span>,</span> <span>[</span><span>rsp</span><span>+</span><span>16</span><span>]</span> <span>;; move `v0` from stackslot to a new liverange in `rdx`</span>
+<span>loop:</span>
+    <span>...</span>
+    <span>add</span> <span>rcx</span><span>,</span> <span>rcx</span>      <span>;; no load within loop</span>
+    <span>mov</span> <span>[</span><span>...</span><span>],</span> <span>rcx</span>
+    <span>jmp</span> <span>loop</span>
+</code></pre></div></div>
+
+<p>This seems quite powerful and useful – so why doesn’t every register
+allocator do this? In brief, because it <em>makes the problem much much
+harder</em>. When we have a fixed number of liveranges, we have a fixed
+amount of work, and we assign a register per liverange, probably in
+some priority order. And then we are done.</p>
+
+<p>But as soon as we allow for splitting, we can <em>increase</em> the amount of
+work we have almost arbitrarily: we could split every liverange into
+many tiny pieces, greatly multiplying the cost of register
+allocation. A well-placed split reduces the constraints in the problem
+we’re solving, making it easier, but too many splits just increases
+work and also the likelihood that we will unnecessarily move values
+around.</p>
+
+<p>Splitting is thus the kind of problem that requires finely-tuned
+heuristics. To be concrete, consider the example above: we showed a
+split outside of the tight inner loop. But a naive splitting
+implementation might just split before the use, putting a move from
+stack to register inside the inner loop. Some sort of cost model is
+necessary to put splits in “cheap” places.</p>
+
+<p>With all of that, hopefully you have some feel for the problem: we
+compute liveranges, we might split them, and then we choose where to
+put them. That’s (almost) it – modulo many tiny details.</p>
+
+<h2 id="regalloc2s-design">regalloc2’s Design</h2>
+
+<p>At a high level, regalloc2 is a <em>backtracking</em> register allocator that
+computes precise liveranges, performs <em>merging</em> according to some
+heuristics into “bundles”, and then runs a main loop that assigns
+locations to bundles, sometimes <em>splitting</em> them to make the
+allocation problem easier (or possible at all). Once every part of
+every liverange has a location, it inserts move instructions to
+connect all of the pieces.</p>
+
+<p>Let’s break that down a bit:</p>
+
+<ul>
+  <li>
+    <p>regalloc2 starts with <em>precise liveranges</em>. These are computed
+according to the input to the allocator, which is a program that
+refers to <em>virtual registers</em> and may be in
+<a href="https://en.wikipedia.org/wiki/Static_single_assignment_form">SSA</a>
+form (one definition per register) or non-SSA (multiple definitions
+per register).</p>
+  </li>
+  <li>
+    <p>It then <em>merges</em> these liveranges into larger-than-liverange
+“bundles”. If done correctly, this reduces work (fewer liverange
+bundles to process) and also gives better code (when merged, it is
+guaranteed that the related pieces will not need a move instruction
+to join them).</p>
+  </li>
+  <li>
+    <p>It then builds a priority queue of bundles, and processes them until
+every bundle has a location. (In simplified terms, regalloc2’s
+entire job is to “assign locations to bundles”.) This processing may
+involve <em>undoing</em>, or <em>backtracking</em>, earlier assignments, and may
+also involve <em>splitting</em> bundles into smaller bundles when separate
+pieces could attain better allocations.</p>
+  </li>
+</ul>
+
+<p>We’ll explain each of these design aspects in turn below.</p>
+
+<h3 id="input-instructions-with-operands">Input: Instructions with Operands</h3>
+
+<p>First, let’s talk about the <em>input</em> to the register allocator. To
+understand how regalloc2 works, we first need to understand how it
+sees the world. (Said another way, before we solve the problem, let’s
+define it fully!)</p>
+
+<p>regalloc2 processes a “program” that consists of instructions that
+refer to <em>virtual registers</em> rather than real machine registers. These
+instructions are arranged in a <a href="https://en.wikipedia.org/wiki/Control-flow_graph">control-flow
+graph</a> of basic
+blocks.<sup id="fnref:4" role="doc-noteref"><a href="#fn:4" rel="footnote">4</a></sup></p>
+
+<p>The most important principle regarding the allocator’s view of the
+program is: the <em>meaning</em> of instructions is mostly
+irrelevant. Instead, the allocator cares mainly how a particular
+instruction <em>accesses program values</em> as registers: <em>which</em> values and
+<em>how</em> (read or written), and with <em>what constraints</em> on
+location. Let’s look more at the implications of this principle.</p>
+
+<h4 id="constraints">Constraints</h4>
+
+<p>The allocator views the input program as a sequence of instructions
+that <em>use</em> and <em>define</em> virtual registers. Every access to a register
+managed by the regalloc (an “allocatable register”) must be via a
+virtual register.</p>
+
+<p>Already we see a divergence from common ISAs like x86: there are
+instructions that implicitly access certain registers. (One form of
+the x86 integer multiply instruction always places its output in <code>rax</code>
+and <code>rdx</code>, for example.) Since these registers are not mentioned by
+the instruction explicitly, one might initially think that there is no
+need to create regalloc operands or use virtual registers for
+them. But these registers (e.g. <code>rax</code> and <code>rdx</code>) can also be used by
+explicit inputs and outputs to instructions; so the regalloc at least
+needs to know that the registers will be clobbered, and at some later
+point presumably the results will be read and the registers become
+free again.</p>
+
+<p>We solve this problem by allowing <em>constraints</em> on operands. An
+instruction that always reads or writes a specific physical register
+still names a virtual-register operand. The only difference from an
+ordinary instruction that can use any register is that this operand is
+<em>constrained to a particular register</em>. This lets the allocator
+uniformly reason about virtual registers allocated to physical
+registers as the basic way that space is reserved; the constraint
+becomes only a detail of the allocation process.</p>
+
+<p>Let’s take an x86 instruction <code>mul</code> (integer multiply) as an example
+to see how this works. Ordinarily, one would write the following in
+assembly:</p>
+
+<div><div><pre><code>    <span>;; Multiplicand is implicitly in rax.</span>
+    <span>mul</span> <span>rcx</span>  <span>; multiply by rcx</span>
+    <span>;; 128-bit wide result is implicitly placed rdx (high 64 bits)</span>
+    <span>;; and rax (low 64 bits).</span>
+</code></pre></div></div>
+
+<p>The instruction <code>mul rcx</code> does not tell the whole story from
+regalloc2’s point of view, so we would instead present an instruction
+like so to the register allocator, with constraints annotating
+uses/definitions of virtual registers:</p>
+
+<div><div><pre><code>    <span>;; Put inputs in v0 and v1.</span>
+    <span>mul</span> <span>v0</span> <span>[</span><span>use</span><span>,</span> <span>fixed</span> <span>rax</span><span>],</span> <span>v1</span> <span>[</span><span>use</span><span>,</span> <span>any</span> <span>reg</span><span>],</span> <span>v2</span> <span>[</span><span>def</span><span>,</span> <span>fixed</span> <span>rax</span><span>],</span> <span>v3</span> <span>[</span><span>def</span><span>,</span> <span>fixed</span> <span>rdx</span><span>]</span>
+    <span>;; Use results in v2 and v3.</span>
+</code></pre></div></div>
+
+<p>The allocator will “do the right thing” by either inserting moves or
+generating inputs directly into, and using outputs directly from, the
+appropriate registers. The advantage of this scheme is that aside from
+the constraints, it makes <code>mul</code> behave like any other instruction: it
+isolates complexity in one place and presents a more uniform,
+easier-to-use abstraction for the rest of the compiler.</p>
+
+<h4 id="modify-operands-and-reused-input-constraints">“Modify” Operands and Reused-Input Constraints</h4>
+
+<p>The next difference we might observe between a real ISA like x86 and a
+compiler’s view of the world is: an operator in a compiler IR usually
+produces its result as a <em>completely new value</em>, but real machine
+instructions often <em>modify existing values</em>.</p>
+
+<p>For example, on x86, arithmetic operations are written in <em>two-operand
+form</em>. They look like <code>add rax, rbx</code>, which means: compute the sum of
+<code>rax</code> and <code>rbx</code>, and store the result in <code>rax</code>, overwriting that input
+value.</p>
+
+<p>The register allocator reasons about segments of value dataflow from
+definitions (defs) to uses; but the use of <code>rax</code> in this example seems
+to be neither. Or rather, it is both: it consumes a value in <code>rax</code>,
+and it produces a value in <code>rax</code>.</p>
+
+<p>But we can’t decompose it into a separate use and def either, because
+then the allocator might choose different locations for each. The
+encoding of <code>add rax, rbx</code> only has slots for two register names: the
+input in <code>rax</code> and output in <code>rax</code> must be in the same register!</p>
+
+<p>We solve this by introducing a new kind of constraint: the “reused
+input register” constraint.<sup id="fnref:5" role="doc-noteref"><a href="#fn:5" rel="footnote">5</a></sup> At the regalloc level, we say that the
+<code>add</code> above has <em>three</em> operands: two inputs (uses) and an output (a
+def). It exactly corresponds to the compiler IR-level operator, with
+nicely separated values in different virtual registers. But, we
+constrain the output by indicating that it <em>must be placed in the same
+register as the input</em>. We can assert that this is the case when we
+get final assignments from the regalloc, then emit that register
+number into the “first source and also destination” slot of the
+instruction.<sup id="fnref:6" role="doc-noteref"><a href="#fn:6" rel="footnote">6</a></sup></p>
+
+<p>So, instead of <code>add rax, rbx</code> (or <code>add v0, v1</code> with <code>v0</code> a “modify”
+operand), we can present the following 3-operand instruction to the
+register allocator:</p>
+
+<div><div><pre><code>    <span>add</span> <span>v0</span> <span>[</span><span>use</span><span>,</span> <span>any</span> <span>reg</span><span>],</span> <span>v1</span> <span>[</span><span>use</span><span>,</span> <span>any</span> <span>reg</span><span>],</span> <span>v2</span> <span>[</span><span>def</span><span>,</span> <span>reuse</span><span>-</span><span>input</span><span>(</span><span>0</span><span>)]</span>
+</code></pre></div></div>
+
+<p>This corresponds more closely to what the compiler IR describes,
+namely a new value for the result of the add and non-destructive uses
+of both operands. All of the complexity of saving the destructive
+source if needed is pushed to the allocator itself.</p>
+
+<h4 id="program-points-early-and-late-operands">Program Points, “Early” and “Late” Operands</h4>
+
+<p>Finally, we need to go a bit deeper on what exactly it means to
+allocate a register “at” an instruction. To see why there may be some
+subtlety, let’s consider an example. Take the instruction <code>movzx</code> on
+x86: this instruction does a 16-to-64-bit zero-extend, with one input
+and one output. In pre-regalloc form with virtual registers, we could
+write <code>movzx v1, v0</code>, reading an input in <code>v0</code> and putting the output
+in <code>v1</code>.</p>
+
+<p>An intuitive understanding of liveranges and the allocation problem
+might lead us to reason: both <code>v0</code> and <code>v1</code> are “live” at this
+instruction, so they overlap, and have to be placed in different
+registers.</p>
+
+<pre><code>                          v0    v1
+                           :
+    v1 := movzx v0         |     |
+                                 |
+                                 :
+</code></pre>
+
+<p>But an experienced assembly programmer, knowing that <code>v0</code> is not used
+again after this instruction, might reuse its register for the
+output. So for example, if it were initially in <code>r13</code>, one might write
+<code>movzx r13, r13w</code> (the <code>r13w</code> is x86’s archaic way of writing “the 16
+bit version of <code>r13</code>”).</p>
+
+<p>But isn’t this an invalid assignment, because we have put two
+liveranges in the same register <code>r13</code> when they are both “live” at
+this particular instruction?</p>
+
+<p>It turns out that this will work fine, for a subtle reason: generally
+instructions read all of their inputs, <em>then</em> write all of their
+outputs. In other words, there is a sort of two-phase semantics to
+most instructions. So we could say that the input <code>v0</code> is live up to,
+and including, the “read” or “early” phase of this instruction, and
+the output <code>v1</code> is live starting at the “write” or “late” phase of
+this instruction. These two liveranges don’t conflict at all! So the
+above figure showing liveranges overlapping becomes:</p>
+
+<pre><code>                          v0    v1
+                           :
+                   EARLY   |
+    v1 := movzx v0               
+                   LATE         |
+                                :
+</code></pre>
+
+<p>regalloc2 (along with most other register allocators) thus has a
+notion of “when” an operand occurs – the “operand position” – and it
+calls these two points in an instruction <code>Early</code> and <code>Late</code>. Along
+with this, throughout the allocator, we name program points (distinct
+points at which allocations are made) as <code>Before</code> or <code>After</code> a given
+instruction.</p>
+
+<p>One final bit of subtlety: when a single instruction from a regalloc
+point of view actually emits multiple instructions at the machine
+level, sometimes the usual phasing of reads and writes breaks
+down. For example, maybe a pseudoinstruction becomes a sequence that
+starts to write outputs before it has read all of its inputs. In such
+a case, reusing one of the inputs (which is no longer live at <code>Late</code>)
+as an output register could be catastrophic. For this reason,
+regalloc2 <em>decouples</em> an operand’s position from its kind (use or
+def). One could have an “early def” or a “late use”. Temporary
+registers are also possible: these are live during both early and late
+points on an instruction so they do not conflict with any input or
+output, and can be used in sequences emitted from one
+pseudoinstruction.</p>
+
+<h4 id="regalloc2s-view-of-operands">regalloc2’s View of Operands</h4>
+
+<p>To summarize, each instruction can have a sequence of “operands”, each
+of which:</p>
+
+<ul>
+  <li>Names a <em>virtual register</em> that corresponds to a value in the
+original program;</li>
+  <li>Indicates whether this value is read (“used”) or written
+(“defined”),</li>
+  <li>Indicates when during the instruction execution the value is
+accessed (“early”, before the instruction executes; or “late”, after
+it does);</li>
+  <li>Indicates where the value should be placed: in a machine register of
+a certain kind, or a specific machine register, or in the same
+register that another operand took, or in a slot in the stack frame.</li>
+</ul>
+
+<h3 id="stage-1-live-ranges">Stage 1: Live Ranges</h3>
+
+<p>We’ve described what the register allocator expects as its input. Now
+let’s talk about how the input is processed into an “allocation
+problem” that can be solved by the main algorithm.</p>
+
+<p>The input is described as a graph of blocks of instructions, with
+operands; but most of the allocator works in terms of <em>liveranges</em> and
+<em>bundles of liveranges</em> instead.</p>
+
+<p>In brief, a <em>liverange</em> (originally “live range”, but we say it so
+often it has become one word!) is a span of program points – that is,
+a range of “before” and “after” points on instructions – that
+connects a program value in a virtual register from a definition to
+one or more uses. A liverange represents one unit of needed storage,
+either as a register or a slot in the stackframe.</p>
+
+<p>The basic strategy of regalloc2 is to reduce the input into liveranges
+as soon as possible, and then operate mostly on liveranges,
+translating back to program terms (inserted moves and assigned
+registers per instruction) only at the very end of the process. This
+lets us reason about a simpler “core problem” that is actually quite
+concisely specified:</p>
+
+<ul>
+  <li>A liverange is a span of program points, which can be numbered
+consecutively;</li>
+  <li>A liverange has constraints at certain points that arise from
+program uses/defs;</li>
+  <li>We must assign locations to liveranges, such that:
+    <ul>
+      <li>At any point, at most one liverange lives in a given location;</li>
+      <li>At all points, a liverange’s constraints are satisfied;</li>
+    </ul>
+  </li>
+  <li>We are allowed to split a liverange into pieces and assign different
+locations to each piece. However, moves between pieces have a cost,
+and we must minimize cost.</li>
+</ul>
+
+<p>And that’s it! No need to reason about ISA specifics, or the way that
+regalloc2 generates moves, or anything else. We’ll worry about
+generating moves to “reify” (make real) the assignments later. For
+now, we just need to slot the liveranges into locations and avoid
+conflicts.</p>
+
+<h4 id="computing-liveness">Computing Liveness</h4>
+
+<p>To build up our set of liveranges, we first need to compute
+<em>liveness</em>. This is a property of any particular virtual register at a
+program point indicating that it has a value that will eventually be
+used.</p>
+
+<p><a href="https://en.wikipedia.org/wiki/Live_variable_analysis">Liveness
+analysis</a> is an
+<a href="https://en.wikipedia.org/wiki/Data-flow_analysis">iterative dataflow
+analysis</a> that is
+computed in the backward direction: any use of a virtual register
+propagates liveness backward (“upward” in the program), and a
+definition of that virtual register’s value ends the liveness (when
+scanning upward), because the old value (from above) is no longer
+relevant.</p>
+
+<p>Thus the first thing that regalloc2 does with the input program is to
+<a href="https://github.com/bytecodealliance/regalloc2/blob/33611a68b90e40869bba52934449315a8f4e5477/src/ion/liveranges.rs#L318-L319">run a worklist algorithm to compute precise
+liveness</a>. This
+produces a bitset<sup id="fnref:7" role="doc-noteref"><a href="#fn:7" rel="footnote">7</a></sup> that, at each basic block entry and exit, gives
+us the set of live virtual registers.</p>
+
+<p>Once we know which registers are live into and out of each basic
+block, we can <a href="https://github.com/bytecodealliance/regalloc2/blob/33611a68b90e40869bba52934449315a8f4e5477/src/ion/liveranges.rs#L413-L419">perform block-local
+processing</a>
+to compute actual liveranges with each use of the register properly
+noted. This is another backward scan, but this time we <a href="https://github.com/bytecodealliance/regalloc2/blob/33611a68b90e40869bba52934449315a8f4e5477/src/ion/liveranges.rs#L176-L195">build the data
+structures</a>
+we’ll use for the rest of the allocation program.</p>
+
+<h4 id="normalization-and-saving-fixups-for-later">Normalization, and Saving Fixups for Later</h4>
+
+<p>We mentioned above that one way to see the liverange-building step is
+as a simplification of the problem to its core essence, in order to
+more easily solve it. “Ranges that may overlap” is certainly simpler
+than “instructions that access registers with certain
+semantics”. However, even the constraints on the liveranges can be
+made simpler in several ways.</p>
+
+<p>A good example of a complex set of constraints is the following:</p>
+
+<div><div><pre><code>    <span>inst</span> <span>v0</span> <span>[</span><span>use</span><span>,</span> <span>fixed</span> <span>r0</span><span>],</span> <span>v0</span> <span>[</span><span>use</span><span>,</span> <span>fixed</span> <span>r1</span><span>],</span> <span>v1</span> <span>[</span><span>def</span><span>,</span> <span>any</span> <span>reg</span><span>]</span>
+</code></pre></div></div>
+
+<p>This is an instruction that has two inputs, and takes the inputs in
+fixed physical registers <code>r0</code> and <code>r1</code>. This is completely reasonable
+and such instructions exist in real ISAs (see, e.g., x86’s integer
+divide instruction, with inputs in <code>rdx</code> and <code>rax</code>, or a call with an
+ABI that passes arguments in fixed registers). If the two inputs
+happen to be given the same program value, here virtual register <code>v0</code>,
+then we have created an impossible constraint: we require <code>v0</code> to be
+in <em>both</em> <code>r0</code> and <code>r1</code> at the same time.</p>
+
+<p>As we have formulated the problem, a liverange is in only one place at
+a time; and in fact this is a very useful simplifying invariant, and a
+simpler model than “there are N copies of the virtual register at
+once” (which one(s) are up-to-date, if we allow multiple defs?).</p>
+
+<p>We can “simplify to a previously solved problem” in this case with a
+neat trick: we keep a side-list of “fixup moves” to add back in, after
+we complete allocation, and we insert such a fixup move from <code>r0</code> to
+<code>r1</code> just before this instruction. Then we <em>delete the constraint</em> on
+the second operand that uses <code>v0</code>. The rest of the allocation will
+proceed as if <code>v0</code> were only required in <code>r0</code>; it will end up in that
+location; and the fixup move will copy it to <code>r1</code> as well.</p>
+
+<p>We perform a similar rewrite for reused-input constraints. These seem
+as if they would be fairly fundamental to the core allocation loop,
+because they tie one decision to another; now we have to deal with
+dependent allocation decisions. But we can do a simpler thing: we
+<em>edit the liveranges</em> so that (i) the output that reuses the input has
+a liverange that starts at the <em>early</em> (input) phase, and (ii) the
+input has a liverange that ends just before the instruction, not
+overlapping. (In other words, we shift both back by one program
+point.) Then we insert a fixup move from input to output. The figure
+below illustrates this rewrite.</p>
+
+<pre><code>
+      INITIAL
+                         v0   v1    v2
+                         :    :
+                         |    |
+                  EARLY use  use
+      add v2, v0, v1
+                  LATE             def reuse(0)
+                                     |
+                                     :
+                                     
+      REWRITTEN
+                         v0   v1    v2
+                         :    :
+                         |    |
+                         |    |
+                  LATE   |    |
+                              |    (implicit copy: v2 := v0)
+                  EARLY      use   def
+      add v2, v0, v1                 |
+                  LATE               |
+                                     |
+                                     :
+</code></pre>
+
+<p>One may object that this pessimizes all reused-input allocations –
+haven’t we removed all knowledge of the constraint, so we will almost
+always get different registers at input and output, and cause many new
+moves to be inserted? The answer to this issue comes in the <em>bundle
+merging</em>, which we discuss below (basically, we try to rejoin the two
+parts if no overlap would result).</p>
+
+<p>In general, this is a powerful technique: whenever some complexity
+arises from a constraint or feature, it is best if the complexity can
+be kept as close to the <em>outer boundary</em> of the system as
+possible. Rewrites or lowerings into a simpler “core form” are common
+in compilers, and it so happens that considering regalloc constraints
+in this light is useful too.<sup id="fnref:8" role="doc-noteref"><a href="#fn:8" rel="footnote">8</a></sup></p>
+
+<h3 id="step-2-bundles-and-merging">Step 2: Bundles and Merging</h3>
+
+<p>Once we have created a list of liveranges with constraints, we could
+in theory begin to assign locations right away, finding available
+locations that fulfill constraints and splitting where necessary to do
+so. However, such an approach would almost certainly run more slowly,
+and produce worse code, than most state-of-the-art allocators
+today. Why is that?</p>
+
+<p>A key observation about liveranges in real programs is that there are
+<em>clusters of related liveranges connected by moves</em>. Several examples
+are the liveranges on either side of an SSA block parameter (or
+phi-node), or on either side of a move instruction, or the input and
+reused-register-constrained output of an instruction.<sup id="fnref:9" role="doc-noteref"><a href="#fn:9" rel="footnote">9</a></sup> These
+liveranges often would benefit if they were in the same register: in
+all three cases, it would mean one fewer move instruction in the final
+program.</p>
+
+<p>Processing such related liveranges together, as one unit of
+allocation, would guarantee that they would be assigned the same
+location. (If impossible, the merged liveranges could always be split
+again.) Attaining this result some other way would require reasoning
+about “affinity” for locations between related liveranges, which is a
+much more complex question.</p>
+
+<p>Furthermore, processing multiple liveranges together brings all the
+usual efficiency benefits of batching: the more progress we can make
+with a single decision, the faster the register allocator runs.</p>
+
+<p>We thus define a “bundle” of liveranges as the unit of
+allocation. After computing liveranges in the initial input program
+scan, we merge liveranges into bundles according to a few simple
+heuristics: across SSA block parameters, across move instructions, and
+from inputs to outputs of instructions with “reused-input” constraints.</p>
+
+<p>The one key invariant is: all liveranges in a bundle <em>must not
+overlap</em>. We greedily grow a bundle with the above heuristics, testing
+at each step whether another liverange can join.</p>
+
+<p>Beyond this point in the allocation process, we will reason about
+bundles: we enqueue them in the priority workqueue, we process them
+one at a time and assign locations or split. At the end of the
+process, we’ll scan the liveranges in the bundle and assign each the
+location that the bundle received.</p>
+
+<pre><code>    CORE ALLOCATION PROBLEM:
+
+         bundle0              bundle1               bundle2          bundle3
+           |
+           |                    |                                       |
+           |                    |
+                                |
+                                |                     |
+                                |                     |
+           |
+           |                                                            |
+           
+    ==&gt;
+    
+           bundle0: r0
+           bundle1: r1
+           bundle2: r0
+           bundle3: r2
+</code></pre>
+
+<h3 id="step-3-assignment-loop-and-splitting-heuristics">Step 3: Assignment Loop and Splitting Heuristics</h3>
+
+<p>The heart of the allocator is the main loop that <em>allocates locations
+to bundles</em>. This is at least conceptually simple: pull a bundle off
+of a queue, “probe” potential locations one at a time to see if it
+will fit (has no overlap with points in time for which that location
+is already reserved), assign it the first place it fits. But there is
+significant complexity in the details, as always.</p>
+
+<p>The key data structures are: (i) an “allocation map” for each physical
+register, kept as a BTree for fast lookups, that indicates whether the
+register is free or occupied at any program point and the liverange
+that occupies it; and (ii) a queue of bundles to process. (The <a href="https://github.com/bytecodealliance/regalloc2/blob/main/doc/DESIGN.md">design
+document</a>
+describes several others, such as the second-chance allocation queue
+and the structures used for stackslots, which we skip here for
+simplicity.)</p>
+
+<p>The core part of the allocator’s processing occurs here: we pull one
+bundle at a time from the queue and attempt to place it in one of the
+registers (again we’re ignoring stackslot constraints for simplicity).</p>
+
+<p>For each bundle, we can perform one of the following actions:</p>
+
+<ul>
+  <li>
+    <p>If we find a register with no overlapping allocations already in
+place, we can allocate the bundle to the register; then we’re done!
+This is the best case.</p>
+  </li>
+  <li>
+    <p>Otherwise, we can pick a register where some bundles with a lower
+“spill cost” (determined as a sum of some heuristic values for each
+use of a liverange in a bundle) and <em>evict</em> those already-allocated
+bundles, punting them back to the queue, then put our present bundle
+in this register instead. We do this only if the present bundle has
+a higher spill cost.</p>
+  </li>
+  <li>
+    <p>If this is also not an option, we can split our present bundle into
+pieces and try again. Heuristically, we find it works well to split
+at the first conflict point; in other words, allocate as much as
+would have fit in any register, and then put the remainder back in
+the queue.</p>
+  </li>
+</ul>
+
+<pre><code>   TO ALLOCATE:                  GIVEN:
+
+       bundle0                     r0     r1    r2       r3
+         |                          |b1          |b4
+         |                          |            |
+         |                                       |
+                                    |b2          |
+                                    |            |
+                                                 |
+         |                               |b3     |
+         |                               |       |
+         
+         
+    OPTION 1: Take a free register (r3)
+    
+        - Possible if no overlap. Easiest option!
+        
+    OPTION 2: Evict, if bundle0&#39;s spill cost is higher than evicted bundles
+              and if no completely free register exists:
+    
+
+       bundle1  bundle2            r0     r1    r2
+         |                          |b0          |b4
+         |                          |            |
+                                    |            |
+                 |                               |
+                 |                               |
+                                                 |
+                                    |b0  |b3     |
+                                    |    |       |
+                 
+        (b1 and b2 are re-enqueued)
+         
+    OPTION 3: Split!
+                                      
+                                       
+                                   r0     r1    r2 
+                              --&gt;   |b1   |b0    |b4
+                                    |     |      |
+                                          |      |
+                                    |b2          |
+                                    |            |
+                                                 |
+                              --&gt;   |b0  |b3     |
+                                    |    |       |
+</code></pre>
+
+<p>The presence of <em>eviction</em> as an option is what makes regalloc2 a
+<em>backtracking</em> allocator. It’s not clear why the allocator should
+always finish its job, if it is allowed to undo work. In fact <em>many</em>
+bundles may be evicted in order to place just <em>one</em> bundle instead –
+isn’t this backward progress?</p>
+
+<p>The key to maintaining forward progress is that we <em>only evict bundles
+of lower spill weight</em>, together with the fact that <em>spill weight
+monotonically decreases when splitting</em>. Eventually, if bad luck
+continues far enough, a bundle will be split into individual pieces
+around each use, and these can always be allocated because (if the
+input program does not have fundamentally conflicting constraints on
+one instruction) these single-use bundles have the lowest possible
+spill weight.</p>
+
+<h3 id="step-4-move-handling">Step 4: Move Handling</h3>
+
+<p>Finally, once we have a series of locations assigned to each bundle,
+we have “solved the problem”, but… we still need to convey our
+solution back to the real world, where a compiler is waiting for us to
+provide a series of move, load, and store instructions to place values
+into the right spots.</p>
+
+<p>We split the overall problem into two pieces for the usual simplicity
+reasons: first, we allow ourselves to cut liveranges into as many
+pieces as needed, and put each piece in a different place, at a single
+instruction granularity. We assume that we can edit the program
+somehow to connect these pieces back up. That allowed the above
+liverange/bundle processing to become a tractable problem for a solver
+core to handle. Now, need to connect those liverange fragments. This
+is the second half of the problem: generating moves.</p>
+
+<h4 id="all-in-one-liverange-connectors-program-moves-and-edge-moves">All-in-One: Liverange Connectors, Program Moves, and Edge Moves</h4>
+
+<p>The abstract model for the input to this stage of the allocator is
+that between each pair of instructions, we perform some <em>arbitrary
+permutation</em> of liveranges in locations. One way to see this
+permutation is as a <em>parallel move</em>: a data-movement action that reads
+values in all of their old locations (inputs of the permutation), then
+in parallel, writes the values to all of their new locations (outputs
+of the permutation).</p>
+
+<pre><code>        EARLY
+    inst1      r2, r0, r1
+        LATE
+        
+          { r4 := r0 }              &lt;--- regalloc-inserted moves
+        
+        EARLY
+    inst2      r0, r2, r3
+        LATE
+        
+          { r6 := r5, r5 := r6 }    &lt;--- multiple moves in parallel!
+                                         (arbitrary permutations)
+          
+        EARLY
+    inst3      r5, r4, r2
+        LATE
+</code></pre>
+
+<p>This is why we make a distinction between the “After” point of
+instruction <em>i</em> and the “Before” point of instruction <em>i+1</em>, though a
+traditional compiler textbook would tell you that there is only one
+program point between a pair of instructions. We have two, and between
+these two program points lies the parallel move.<sup id="fnref:10" role="doc-noteref"><a href="#fn:10" rel="footnote">10</a></sup></p>
+
+<p>The process for generating these moves is: we scan liveranges, finding
+points at which they have been split into pieces where the value must
+flow from one piece to the next. We also account for CFG edges and
+block parameters at this point, as well as for move instructions in
+the input program. Once we have accumulated the set of moves that must
+happen, in parallel, at a given priority at a given location, we
+resolve these into a sequence of individual move/load/store
+instructions using the algorithm we describe in the next section.</p>
+
+<p>One thing to note about this design is that we are handling <em>all</em>
+value movement in the program with a single resolution mechanism:
+regalloc-induced movement but also movement that was present in the
+original program. This is valuable because it allows the moves to be
+handled more efficiently. In contrast, we have observed issues in the
+past in allocators that lower moves in stages – e.g., SSA block
+parameters to moves prior to regalloc, then regalloc-induced moves
+during regalloc – where chains of moves occur because each level of
+abstraction is not aware of what other levels below or above it are
+doing.</p>
+
+<h4 id="parallel-move-resolution">Parallel Move Resolution</h4>
+
+<p>The actual problem of resolving a permutation such as:</p>
+
+<pre><code>    { r0 := r1 ; r1 := r2 ; r2 := r0 }
+</code></pre>
+
+<p>into a sequence of moves</p>
+
+<pre><code>    scratch := r0
+    r0 := r1
+    r1 := r2
+    r2 := scratch
+</code></pre>
+
+<p>is a well-studied one, and is known as the “parallel moves
+problem”. The crux of the
+<a href="https://github.com/bytecodealliance/regalloc2/blob/0395614545da5ccc45866bfa50dcdbe9cc37c253/src/moves.rs">solution</a>
+is to understand the permutation as a kind of dependency graph, and
+sort its moves so that we pull an old value out of a given register
+before overwriting it. When we encounter a cycle, we can use a scratch
+register as above.</p>
+
+<p>One might think that something like <a href="https://en.wikipedia.org/wiki/Tarjan%27s_strongly_connected_components_algorithm">Tarjan’s
+algorithm</a>
+for finding strongly-connected components is needed, but in fact there
+is a nice property of the problem that greatly simplifies it. Because
+any valid permutation has at most one writer for any given register,
+we can <em>only have simple cycles</em> of moves, with other uses of old
+values in the cycle handled before realizing the cyclic move. Some
+<a href="https://github.com/bytecodealliance/regalloc2/blob/0395614545da5ccc45866bfa50dcdbe9cc37c253/src/moves.rs#L92-L103">more
+description</a>
+is available in our implementation. In fact, this is such a nice
+observation that we later discovered <a href="https://hal.inria.fr/inria-00289709/document">a
+paper</a> by Rideau et
+al. that names the resulting dependency graphs “windmills” for their
+shape (see figure below – there can be a simple cycle in the middle,
+and only acyclic outward moves from cycle elements in a tree of
+outward shifts) and, delightfully, describes more or less the same
+algorithm to “tilt at windmills” and resolve the moves.</p>
+
+<p><img src="https://cfallin.org/assets/cranelift-regalloc2-fig4.svg" alt="Figure: &#34;Windmills&#34; in a register movement graph"/></p>
+
+<h4 id="scratch-registers-and-cycles">Scratch Registers and Cycles</h4>
+
+<p>The above algorithm works, but has one serious drawback: it requires a
+scratch register whenever we have a cyclic move. The simplest approach
+to this requirement is to set aside one register permanently (or
+actually, one per “register class”: e.g., an integer register and a
+float/vector register). Especially on ISAs with relatively few
+registers, like x86-64 with 16 each of integer and float registers,
+this can impact performance by increasing register pressure and
+forcing more spills.</p>
+
+<p>We thus came up with a
+<a href="https://github.com/bytecodealliance/regalloc2/pull/51">scheme</a> to
+allow use of all registers but still find a scratch when needed for a
+cyclic move. The approach begins with an idea <a href="https://searchfox.org/mozilla-central/rev/de15f9c109f9c474d00faf8032f559c236067c06/js/src/jit/BacktrackingAllocator.cpp#2582">borrowed from
+IonMonkey</a>,
+namely to look for a free register to use as a scratch by actually
+probing the allocation maps. This often works: the need for a cyclic
+move doesn’t necessarily imply that we will have high register
+pressure, and so there are often plenty of free registers available.</p>
+
+<p>What if that doesn’t work, though? In the above PR, we take another
+seemingly-simplistic approach: we use a stackslot as the scratch
+instead! This means that we will resolve the cyclic move into a
+sequence including stores and loads, but this is fine, because we’re
+already in a situation where all registers are full and we need to
+spill <em>something</em>.</p>
+
+<p>We’re not quite done, though: there is another very important use of
+the scratch register in a simplistic design, namely to resolve
+memory-to-memory moves! This arises because our move resolution
+handles both registers and stackslots in a uniform way, so some cycle
+elements may be stackslots (memory locations). Using a stackslot as a
+scratch above just compounds the problem. So we translate, in a
+separate second phase, memory-to-memory moves into a <em>pair</em> of a load
+(from memory into scratch) and a store (from scratch into memory).</p>
+
+<p>So to recap, we may find a cyclic move permutation to be necessary,
+and no registers to be free to use as scratch; so we use a stackslot
+instead. But some of the original move cycle may have been between
+stackslots, so we need <em>another</em> scratch to do make these
+stackslot-to-stackslot moves possible. But we’re already out of
+scratch registers!</p>
+
+<p>The solution to this last issue is that we can do a last-ditch
+emergency spill of <em>any</em> register, just for the duration of one
+move. So we pick a “victim” register of the right kind (integer or
+float), spill it to a second stackslot, use this victim register for a
+memory-to-memory move (a load and store pair), then reload the victim.</p>
+
+<p>This cascading series of solutions, each a little more complex but a
+little rarer, is an example of a complexity-for-performance
+tradeoff. Overall, it is far better to allow the program to use all
+registers; this will reduce spills. And most parallel moves are <em>not</em>
+cyclic, so scratch registers are rarely needed anyway. And when a
+cyclic move <em>is</em> needed, we often have a free register, because this
+condition is mostly orthogonal to high register pressure. It is only
+when all of the bad cases line up – cycle, no free registers, and
+memory-to-memory moves – that we reach for the highest-cost approach
+(decomposing one move into four), and so the most important aspect of
+this fallback is not that it is fast but that it is correct and can
+handle all cases.</p>
+
+<h3 id="everything-else">Everything Else</h3>
+
+<p>This has been a not-so-whirlwind tour of the allocator pipeline in
+regalloc2, but despite my longwindedness, we had to skip many details!
+For example, the way in which stackslots are allocated for spilled
+values, the way in which split pieces of a single original bundle
+share a single spill location (“spill bundles”), the way in which we
+clean up after move insertion with Redundant Move Elimination (a sort
+of abstract interpretation that tracks symbolic locations of values),
+and more, are skipped here but are all described in the design
+document. One could truly write a book on the engineering of a
+register allocator, but the above will have to suffice; now, we must
+move on and draw some lessons!</p>
+
+<h2 id="four-lessons">Four Lessons</h2>
+
+<h3 id="performance">Performance</h3>
+
+<h4 id="cache-locality-and-scans">Cache Locality and Scans</h4>
+
+<p>One enduring theme in the regalloc2 architecture is <em>data structure
+design for performance</em>. As I began the project by transliterating
+IonMonkey code, building Rust equivalents to the data structures in
+the original C++, I found several things:</p>
+
+<ul>
+  <li>
+    <p>The original data structures were heavily <em>pointer-linked</em>. For
+example, liveranges within bundles and uses within liveranges were
+kept as linked lists, to allow for fast insertion and removal in the
+middle, and splicing. A linked list is the classical CS answer to
+these requirements.</p>
+  </li>
+  <li>
+    <p>There were quite a few linear-time queries of these data
+structures. For example, when generating moves between liveranges of
+a virtual register, a scan would traverse the linked list of these
+liveranges, observe the range covering one end of a control-flow
+transition, and do a <a href="https://searchfox.org/mozilla-central/rev/7751fef9eeb3db0a07ae4680daa2a62bd8f49882/js/src/jit/BacktrackingAllocator.cpp#2196"><em>linear-time
+scan</em></a>
+(through the linked list) for the liverange at the other end!</p>
+  </li>
+</ul>
+
+<p>These two design trends combine to make CPU caches exceptionally
+unhappy. First there is the algorithmic inefficiency, then there is
+the cache-unfriendly demand access to random liveranges, each of which
+is a pointer-chasing scan.</p>
+
+<p>regalloc2 adopts two general themes that work against these problems:</p>
+
+<ul>
+  <li>
+    <p>The overall data structure design consists of <em>contiguous-in-memory
+inline structs</em> rather than linked lists. For example, the list of
+liveranges in a bundle is a <code>SmallVec&lt;[LiveRangeListEntry; 4]&gt;</code>,
+i.e. a list with up to four entries inline and otherwise
+heap-allocated, and the entry struct contains the program-point
+range inline. Combining this more compact layout with certain
+<em>invariants</em> – usually, some sort of sorted-order invariant –
+allows for efficient lookups and list merges even without
+linked-list splicing.</p>
+  </li>
+  <li>
+    <p>At a higher level, regalloc2 tries to <em>avoid random lookups as much
+as possible</em>. Sometimes this is unavoidable, but where it is not, a
+linear scan that produces some output as it goes is much more
+cache-friendly.</p>
+  </li>
+</ul>
+
+<p>It is worth examining the particular technique we use to resolve moves
+across control-flow edges. This requires looking up where a virtual
+register is allocated at either end of the edge – two arbitrary
+points in the linear sequence of instructions. The problem is solved
+in IonMonkey (as we linked above) by scanning over ranges to find
+basic block ends and then doing a linear-time linked-list traversal to
+find the “other end”, for overall quadratic time.</p>
+
+<p>Instead we scan the liveranges for a virtual register once and
+<a href="https://github.com/bytecodealliance/regalloc2/blob/0395614545da5ccc45866bfa50dcdbe9cc37c253/src/ion/moves.rs#L126-L164">produce “half-moves” into a
+<code>Vec</code>.</a>
+These “half-moves” are records of either the “source” side of a move,
+at the origin point of a CFG edge, or the “destination” side of a
+move, at the destination point of a CFG edge. After our single scan,
+we sort the list of half-moves by a key (the vreg and destination
+block) so that the source and destination(s) appear together. We can
+then scan <em>this</em> list once and generate all moves in bulk.</p>
+
+<p>If that sounds something like
+<a href="https://en.wikipedia.org/wiki/MapReduce">MapReduce</a>, that is not an
+accident: the technique of leveraging a sort with a well-chosen key
+was invented to allow for efficient parallel computation, and here
+allows the two “ends” of the move to be processed independently.</p>
+
+<p>This technique provides better algorithmic efficiency, much better
+cache residency (we have two steps that boil down to “scan input list
+linearly and produce output list linearly”), and leans on the
+standard-library implementation of <code>sort()</code>, which is likely to be
+faster than anything we can come up with. Profiling of regalloc2 runs
+shows sometimes up to 10% or so of runtime spent in <code>sort()</code>, but this
+is far better than the alternative, in which we do a random
+pointer-chasing lookup at every step.</p>
+
+<h4 id="compact-data">Compact Data</h4>
+
+<p>Another lesson learned over and over during regalloc2 optimization is
+this: data compactness matters! A single <code>struct</code> growing from 16 to
+24 bytes could lead to significant slowdowns if a large input leads to
+allocation and traversals over an array of 10,000 such structs. Every
+improvement in memory footprint is a reduction in cache misses.</p>
+
+<p>We play many games with bitpacking to achieve this. For example,
+regalloc2 puts its <code>Operand</code> in <a href="https://github.com/bytecodealliance/regalloc2/blob/0395614545da5ccc45866bfa50dcdbe9cc37c253/src/lib.rs#L407-L422">32
+bits</a>,
+and this includes a virtual register number, a constraint, a physical
+register number to possibly go with that constraint, the position
+(early/late), kind (def/use), and register class of the operand. Some
+of this optimization requires compromise: as a result of our encoding
+scheme, for example, we can allow only 2M (2<sup>21</sup>) virtual
+registers per function body. But in practice most applications will have
+other limits that take effect before this matters. (And in any case,
+many compilers play these same sorts of tricks, so megabytes-large
+function bodies are problematic in all sorts of ways.) And we sometimes
+<a href="https://github.com/bytecodealliance/regalloc2/pull/13">find ways to pack a few more
+bits</a> (more such
+PRs are always welcome!).</p>
+
+<p>We play similar tricks with program points, spill weights (we <a href="https://github.com/bytecodealliance/regalloc2/blob/0395614545da5ccc45866bfa50dcdbe9cc37c253/src/ion/liveranges.rs#L55-L70">store
+them as
+bfloat16</a>
+because spill weights need not be too precise, only relatively
+comparable, and using only 16 bits lets us pack some flags in the
+upper 16 and save a <code>u32</code>), and more.</p>
+
+<p>Finally, trading off indirection and data-inlining is important: e.g.,
+a
+<a href="https://github.com/bytecodealliance/regalloc2/blob/0395614545da5ccc45866bfa50dcdbe9cc37c253/src/ion/data_structures.rs#L89-L94"><code>LiveRangeList</code></a>
+keeps the program-point range (32 + 32 bits) inline, then a 32-bit
+index to indirect to everything else about the liverange, because
+checking for bundle overlap is the most common reason for traversing
+this list and reducing cache misses in this inner loop is paramount.</p>
+
+<h4 id="reducing-work">Reducing Work</h4>
+
+<p>One final performance technique that at once both sounds completely
+obvious and superficial, yet is quite powerful, is: “simply do less
+work!”</p>
+
+<p>One can often get lost in profiler results, wondering how to shave off
+some hotspots by compacting some data or reworking some inner-loop
+logic, only to miss that one is implicitly assuming that the actual
+computation to be done is invariant. In other words, one might look
+for the fastest way to compute a particular subproblem or framing of
+the problem, rather than the ultimate problem at hand (in this case,
+the register allocation).</p>
+
+<p>In the case of regalloc2, this primarily means that we can improve
+performance by <em>reducing the number of bundles and liveranges</em>. In
+turn, this means that we can get outsized wins by improving our
+merging and splitting heuristics.</p>
+
+<p>Early in the optimization push, I realized that regalloc2 was often
+finding an abnormally large number of conflicts between bundles, and
+splitting far too aggressively. It turned out that the liveness
+analysis was initially <em>approximate</em>, in an intentional, if premature,
+efficiency tradeoff to avoid a fixpoint loop in favor of a single-pass
+loop-backedge-based algorithm that overapproximated liveness (which is
+fine for correctness). The time that this saved was more than offset
+by the large increase in iterations of the bundle processing loop. So
+I reworked this into a <a href="https://github.com/bytecodealliance/regalloc2/blob/b78ccbce6e5700bc1ed2356bbb1d3221de49a353/src/ion/liveranges.rs#L327-L401">precise
+analysis</a>
+that iterates until fixpoint. It is worthwhile to pay that extra
+analysis cost upfront to get exact liveness in order to make our lives
+(and our runtime) better later.</p>
+
+<p>The way in which we compute that precise liveness itself also raises
+an interesting way of reducing work: by carefully choosing
+invariants. We perform the liverange-building scan in such a way that
+we <em>always observe liveranges in (reverse) program order</em>. This lets
+us build the liverange data structures, which are normally sorted,
+with simple appends, merging with contiguous sections from adjacent
+blocks. This is in contrast to the <a href="https://searchfox.org/mozilla-central/rev/70cf6863bd85af2a3188ec1fe5209a3ec1b2de86/js/src/jit/BacktrackingAllocator.cpp#263-340">original IonMonkey allocator’s
+equivalent
+function</a>
+to add liveranges during analysis, which essentially does an insertion
+sort and merge, leading to O(n²) behavior. Note that the IonMonkey
+code has a <code>CoalesceLimit</code> constant that caps the O(n²) behavior at
+some fixed limit. In contrast our liverange build in regalloc2 is
+always linear-time.</p>
+
+<p>The final way in which one can reduce work, related to data-structure
+and invariant choice, is by designing the input (API or data format)
+correctly in order to efficiently encode the problem. The register
+allocator that preceded regalloc2, regalloc.rs, did not have a notion
+of register constraints in instructions’ use of virtual
+registers. Instead, it required the user to use move instructions:
+reused-input constraints become a move prior to the instruction, and
+fixed-register constraints become moves to/from physical registers. It
+then relied on a separate move-elision analysis to try to eliminate
+these moves. regalloc2 has a smaller input because constraints are
+carried on every operand. It can still generate these moves when
+needed, but they often are not. This results in faster allocation as
+well as often better generated code.</p>
+
+<h3 id="correctness-design-for-test-and-fuzzing-first-development">Correctness: “Design for Test” and Fuzzing-First Development</h3>
+
+<p>The next set of lessons to come from regalloc2 have to do with <em>how to
+attain correctness in complex programs</em>.</p>
+
+<p>I believe that regalloc2 is maybe the most <em>intrinsically complex</em>
+program I have written: its operation relies on many interlocking
+invariants across the allocation process, and there are many, many
+edge cases to get right. It is &gt;10K lines of very dense Rust
+code. There should be approximately zero chance for any human to get
+this correct, working on real inputs, in any reasonable timeframe. And
+relying on something this complex to uphold security guarantees that
+rely on correct compilation should be terrifying.</p>
+
+<p>And yet somehow it seems to work, and we haven’t found any miscompiles
+caused by RA2 itself since we switched Cranelift to use regalloc2 in
+April. More broadly, there was
+<a href="https://github.com/bytecodealliance/regalloc2/pull/54">one</a> issue
+where constraints generated by Cranelift could not be handled in some
+cases, resulting in a panic<sup id="fnref:11" role="doc-noteref"><a href="#fn:11" rel="footnote">11</a></sup>; and
+<a href="https://github.com/bytecodealliance/regalloc2/pull/56">another</a> where
+spillslots were not reused as they should be, resulting in worse
+performance; neither could result in incorrect generated code. In the
+integration of RA2 into Cranelift, there were
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4042">two</a>
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4044">bugs</a> that
+could, but both were found within 24 hours by the fuzzers. (That
+doesn’t mean there won’t be any more of course – but things have been
+surprisingly boring and quiet!)</p>
+
+<p>The main superpower, if one can call it that, that enabled this to
+work out is <em>fuzzing</em>. And in particular, a step-by-step approach to
+fuzzing in which I built fuzzing oracles, test harnesses, and fuzz
+targets as I built the allocator itself, and drove development with
+it. Until about 4 months in when I wired up the first version of the
+Cranelift integration, regalloc2 had <em>only</em> ever performed register
+allocation for fuzz-target-generated inputs. It still doesn’t have a
+test harness for manually-written tests; there seems to be no need, as
+the fuzzer is remarkably prescient at finding bugs.</p>
+
+<p>I find it helpful to think of this philosophy in terms of the
+<a href="https://en.wikipedia.org/wiki/Design_for_testing">design-for-test</a>
+idea from digital hardware design. In brief, the idea is that one
+builds additional features or interfaces into the hardware
+specifically so its internal state is visible and it can be tested in
+controlled, systematic ways.</p>
+
+<p>The first thing that I built in the regalloc2 tree was a <a href="https://github.com/bytecodealliance/regalloc2/blob/0395614545da5ccc45866bfa50dcdbe9cc37c253/src/fuzzing/func.rs#L300-L308">function
+body
+generator</a>
+that produces arbitrary control flow, either reducible or irreducible,
+and arbitrary uses and defs according to what SSA allows. I then built
+an <a href="https://github.com/bytecodealliance/regalloc2/blob/main/src/ssa.rs">SSA
+validator</a>,
+and finally, <a href="https://github.com/bytecodealliance/regalloc2/blob/main/fuzz/fuzz_targets/ssagen.rs">fuzzed one against the
+other</a>. This
+way I built confidence that I had fuzzing input that included
+interesting edge cases. This would become an important tool for
+testing the whole allocator, but it was important to “test the tester”
+first and cross-check it against SSA’s requirements. Of course,
+checking SSA requires one to compute flowgraph dominance on the CFG,
+and <a href="https://github.com/bytecodealliance/regalloc2/blob/main/fuzz/fuzz_targets/domtree.rs">that can be fuzzed
+too</a>,
+using a from-first-principles definition of graph dominance. So the
+test-tester has itself been tested in this additional way.</p>
+
+<p>Once I had built enough tools with the lower-level tools, and
+sharpened them all against each other, it was time to write the
+register allocator itself. Once each major piece was implemented, I
+first fuzzed it with the SSA function generator to check for panics
+(assertion failures, mostly). Getting a clean run, given the
+relatively generous spread of asserts throughout the codebase, gave
+some confidence that the allocator was doing <em>something</em>
+reasonable. But to truly be confident that the results were
+semantically correct answers, we needed to lean more heavily on some
+program analysis techniques.</p>
+
+<p>In <a href="% post_url 2021-03-15-cranelift-isel-3 %}">another blog post</a> I
+detailed our “register allocator checker”. In brief, this is a
+<em>symbolic verification</em> engine that checks that the resulting register
+allocations produce the same dataflow connectivity as the original,
+pre-regalloc program. To fully verify regalloc2, I ported the checker
+over, and drove the whole pipeline – SSA function generator,
+allocator, and checker – with a <a href="https://github.com/bytecodealliance/regalloc2/blob/main/fuzz/fuzz_targets/ion_checker.rs">fuzz
+target</a>.</p>
+
+<p>This workflow was remarkably (sometimes maddeningly!) effective. I
+started with a supposedly complete allocator, and ran the
+fuzzer. Within a few seconds it found a “counterexample” where,
+according to the checker, regalloc2 produced an incorrect
+allocation. I built
+<a href="https://github.com/bytecodealliance/regalloc2/blob/main/src/ion/dump.rs">annotation</a>
+tooling to produce <a href="https://gist.github.com/cfallin/38d80aac45da75ce9eb142f5e28c0648">views of the allocator’s liveranges and other
+metadata</a>
+over the original program. I pored over this and debug-log output of
+the allocator’s various stages, eventually worked out the bug (often
+some corner-case I had not considered, or sometimes an unexpected
+interaction between two different parts of the system) and came up
+with a fix. With the particular fuzz-bug fixed, I started up the main
+fuzzer again. libFuzzer’s startup seems to run over the entire corpus
+before generating new inputs, so sometimes my bugfixes would quickly
+cause regressions in other cases I had already handled before. After
+juggling solutions and finding some way to maintain correctness in all
+cases, I would let the fuzzer run again, usually finding my next novel
+fuzzbug within a few minutes.</p>
+
+<p>This was my life for a month or so. Fuzzers, especially over complex
+programs with strict oracles, are <em>relentless</em>: they leave no rock
+unturned, they find every bug you could imagine and some you can’t,
+and they accept no excuses. But one day… you run the fuzzer and you
+find that it keeps running. And running. Three hours later, it’s still
+running. There is no better feeling in the software-engineering
+universe, and frankly fuzzing with a strong oracle (like symbolic
+checking or differential execution fuzzing) is probably the
+second-strongest assurance one will get that one’s code is <em>correct</em>
+(with respect to the “spec” implied by the testcase generator and
+oracles, mind!) short of actual formal verification. This was the
+project that changed my opinion on fuzzing from “nice to have
+supplemental correctness technique” to “the only way to develop
+complex software”.</p>
+
+<h3 id="compatibility-and-migration-path">Compatibility and Migration Path</h3>
+
+<p>The last lesson I want to draw from my regalloc2 experience is how one
+might think about compatibility and migrations, in the context of
+large “replace a whole unit” updates to software projects.</p>
+
+<p>The regalloc2 effort occurred within the context of the Cranelift
+project, and was designed primarily for use in Cranelift (though it
+can be used, and apparently is being used, as a standalone library
+elsewhere as well). As such, a primary design directive for regalloc2
+could be “do whatever is needed to fit into Cranelfit’s assumptions
+about the register allocator”.</p>
+
+<p>On the other hand, conforming to the imprint left by the last register
+allocator is a good way to sacrifice a rare chance to explore
+different corners of the design space. The design of the API of
+regalloc.rs made in 2020 was quite good for the time – simple, easy
+to use, and purpose-built for Cranelift – but we subsequently learned
+several lessons. For example, regalloc.rs required the program to be
+already lowered out of SSA, resulting in somewhat inefficient
+interactions between blockparam-generated moves and regalloc-generated
+moves. Ideally we wanted to do something better here.</p>
+
+<p>A timeline for context: regalloc2 proper was working, with its fuzzer
+as its only client, after about 6 weeks of initial implementation
+(late March to early May 2021). I cheerfully dove into a refactoring
+of Cranelift at that point to adapt to the new abstractions.</p>
+
+<p>Less cheerfully after a few weeks of effort, I stopped this
+direct-port effort at around 547 type errors remaining (having never
+gotten past a full typecheck). There was simply too much changing all
+at once, and it was clearly not going to be a reasonable single diff
+to review or to trust for correctness. I had underestimated how much
+would have to change; pulling one string loosened three others.</p>
+
+<p>It was clear that some sort of transition would need to happen in
+multiple stages, so I next built a <a href="https://github.com/bytecodealliance/regalloc.rs/pull/127">compatibility
+shim</a> as a
+new “algorithm” in regalloc.rs that was a thin wrapper around
+regalloc2. This involved significant work in regalloc2 to expand its
+range of accepted inputs: support for non-SSA code, support for
+“modify” operands as well as uses and defs, and explicit handling of
+program-level moves with integration into the move generation
+logic. This was working by August of 2021. Performance results were
+not as good as initially expected with “native” regalloc2 API usage,
+but were a promising intermediate step nonetheless.</p>
+
+<p>However, for somewhat complicated reasons, review of that PR stalled,
+and I spent time in other parts of Cranelift (the
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/isle/docs/language-reference.md">ISLE</a>
+DSL and instruction-selector backends using it). When I eventually
+came back to RA2, in February 2022, several things had changed: some
+refactoring (as a result of ISLE) made adaptation to “SSA-like” form
+in x86 instructions easier, and the enhancements to regalloc2 as part
+of the regalloc.rs compatibility shim also let us use RA2 directly and
+migrate away from “modify” operands, moves, etc., in an incremental
+way.</p>
+
+<p>So I made a second attempt at porting Cranelift to use regalloc2
+directly, this time
+<a href="https://github.com/bytecodealliance/wasmtime/pull/3989">succeeding</a>,
+to <a href="https://github.com/bytecodealliance/wasmtime/issues/3942">fairly good
+results</a>. We’ve
+been using RA2 since that PR merged in mid-April 2022, about a year
+after RA2 began.</p>
+
+<p>I learned a few valuable lessons from this saga, but the main one is:
+incremental migration paths are everything. The above PR may look
+horribly scary but much of the churn was “semantically boring”: RA2
+supported, in the end, most of the same abstractions as regalloc.rs,
+with only blockparam handling changing fundamentally. This is a sort
+of hybrid of the “compatibility shim” and “direct use of new API”
+approaches: new API, but supporting a superset of the semantic demands
+of the old API. One can then migrate single API use-sites at a time
+away from “legacy semantics” and eventually delete the warts (e.g.,
+“modify” operands in addition to pure uses/defs) if one desires, but
+that is decoupled from the main atomic switchover. I indeed hope to do
+such cleanup in Cranelift, in due time.</p>
+
+<p>Along with that, it is useful to think of finite budget for
+semantic/design-level cleanup per change. Rewrites are opportune times
+to push a project into a better design-space and benefit from lessons
+learned, sometimes in ways that would be hard or impossible to do with
+a truly incremental approach. However, at the margins where the
+rewrite connects to the outside world, this shift causes tension and
+so is fundamentally constrained or else has to pull the whole world
+along with it. I am happy that regalloc2 pulls responsibility for SSA
+lowering into the allocator; it can be handled more efficiently
+there. Likewise I am happy that the compatibility-shim effort filled
+in support for regalloc.rs features that made the rest of the
+transition easier.</p>
+
+<h3 id="unending-and-unwinnable-nature-of-heuristic-tuning">Unending and Unwinnable Nature of Heuristic-Tuning</h3>
+
+<p>The final lesson I wish to pull out of this experience is one that has
+become apparent in the time since the initial transition to RA2: any
+program that solves an NP-complete problem in a complex way, with a
+hybridized ball of hundreds of individual heuristics and techniques
+that somehow works most of the time, is <em>always</em> going to make someone
+unhappy in some case and at some point unambiguous wins become very
+hard to find. That is not at all to say that it’s not worth continuing
+attempts at optimization; sometimes improvements do become
+apparent. But they become much rarer after an initial hillclimb to the
+top of a “competent implementation of one point in design-space” local
+maximum.</p>
+
+<p>While looking for more performance, I experimented with many different
+split heuristics. Especially difficult are splits’ relationship to
+loops: when one has a hot inner loop, one <em>really</em> wants to place a
+split-point that implies an expensive move (load or store) <em>outside</em>
+the inner loop. But getting this right in all cases is subtle, because
+the winning tradeoff depends on register pressure inside the loop, how
+many values are live across the loop and to the following code, how
+many uses occur in the loop and how frequently (rare path vs. common
+path), and so on. In the end, I actually abandoned a number of more
+complex cost heuristics (an example is in this <a href="https://github.com/bytecodealliance/regalloc2/commit/428e6a41f7b37697196e3a82e8326f22839307b5">never-merged
+commit</a>)
+and went with several simple heuristics: <a href="https://github.com/bytecodealliance/regalloc2/blob/b78ccbce6e5700bc1ed2356bbb1d3221de49a353/src/ion/process.rs#L896-L903">minimize the cost of the
+implied move at a
+split</a>,
+and <a href="https://github.com/bytecodealliance/regalloc2/blob/b78ccbce6e5700bc1ed2356bbb1d3221de49a353/src/ion/process.rs#L1036-L1052">explicitly hoist split-points outside of
+loops</a>. This
+worked best overall, but did leave a little performance unclaimed in
+some microbenchmarks.</p>
+
+<p>Sometimes clearer improvements are still possible. One example of a
+recent investigation: in
+<a href="https://github.com/bytecodealliance/wasmtime/pull/3785">#3785</a>, we
+noticed that switching to RA2 had caused an extra move instruction to
+appear in a particular sequence. This seems minor, but it is always
+good to understand <em>why</em> it might have occurred and if it points to
+some deeper issue. After some
+<a href="https://github.com/bytecodealliance/regalloc2/pull/49">investigation</a>
+it became apparent that the splitting heuristics were suboptimal in
+the particular case of a liverange that spans from a
+register-constrained use to a stack-constrained use. The details are
+beyond the scope of this post (thank goodness, it’s long enough
+already!); but empirically I found that trimming liveranges around a
+split-site in a slightly different way tended to improve results.</p>
+
+<p>So, some changes will be an unmitigated win, but not every tradeoff is
+so. At the very least, the nature of a register allocator is that one
+will likely have an unending stream of “could work better in this
+case” sorts of issues. Can’t win ‘em all (but keep trying
+nonetheless!).</p>
+
+<h2 id="conclusions">Conclusions</h2>
+
+<p>We’re finally at the conclusions – thanks to all who have persisted
+in reading this far!</p>
+
+<p>regalloc2 has been an immensely rewarding project for me, despite (or
+perhaps because of) the ups-and-downs inherent in building an
+honest-to-goodness, actually-works,
+somewhat-competitive-with-peer-compilers register allocator. It was a
+far larger project than I had anticipated: when I began, I told my
+manager it would probably be a few weeks to evaluate scope, maybe a
+month of work total. Witness <a href="https://en.wikipedia.org/wiki/Hofstadter%27s_law">Hofstadter’s
+Law</a> in action: that
+is, it will always take longer than you think it will, even when
+accounting for Hofstadter’s Law.</p>
+
+<p>I hope some of the above lessons have been illuminating, and perhaps
+this post has given some sense of how many interesting problems the
+register-allocator space contains. It’s a well-studied area for at
+least 40 years now, with countless approaches and clever tricks to
+learn and to combine in new ways; the work is far from over!</p>
+
+<h2 id="acknowledgments">Acknowledgments</h2>
+
+<p>Many, many thanks to: <a href="https://github.com/julian-seward1">Julian
+Seward</a> and <a href="https://github.com/bnjbvr">Benjamin
+Bouvier</a> for numerous discussions about
+register allocation throughout 2020, and Julian for several followup
+discussions after regalloc2 started to exist; Julian Seward and
+<a href="https://github.com/Amanieu">Amanieu d’Antras</a> for initial code-review
+of regalloc2 proper; Amanieu for a number of really high-quality PRs
+to improve RA2 and add feature support; and <a href="https://github.com/fitzgen">Nick
+Fitzgerald</a> for code-review of the (quite
+extensive) Cranelift refactoring to use regalloc2. Enormous thanks to
+Nick for reading over this entire post and providing feedback as well.</p>
+
+<hr/>
+
+
+  </div>
+</article>
+
+      </div>
+    </div></div>
+  </body>
+</html>
