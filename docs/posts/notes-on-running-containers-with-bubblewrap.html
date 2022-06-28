@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://jvns.ca/blog/2022/06/28/some-notes-on-bubblewrap/">Original</a>
+    <h1>Notes on running containers with bubblewrap</h1>
+    
+    
+
+<p>Hello! About a year ago I got mad about Docker container startup time. This was
+because I was building an <a href="https://jvns.ca/blog/2021/09/24/new-tool--an-nginx-playground/">nginx playground</a>
+where I was starting a new &ldquo;container&rdquo; on every HTTP request, and so for it to
+feel reasonably snappy, nginx needed to start quickly.</p>
+
+<p>Also, I was running this project on a pretty small cloud machine (256MB RAM), a
+small CPU, so I really wanted to avoid unnecessary overhead.</p>
+
+<p>I&rsquo;ve been looking for a way to run containers faster since then, but I couldn&rsquo;t
+find one until last week when I discovered
+<a href="https://github.com/containers/bubblewrap">bubblewrap</a>!! It&rsquo;s very fast and I
+think it&rsquo;s super cool, but I also ran into a bunch of fun problems that I
+wanted to write down for my future self.</p>
+
+<h3 id="some-disclaimers">some disclaimers</h3>
+
+<ul>
+<li>I&rsquo;m not sure if the way I&rsquo;m using bubblewrap in this post is maybe not how it&rsquo;s intended to be used</li>
+<li>there are a lot of sharp edges when using bubblewrap in this way, you need to
+think a lot about Linux namespaces and how containers work</li>
+<li>bubblewrap is a security tool but I am not a security person and I am only
+doing this for weird tiny projects. you should definitely not take security
+advice from me.</li>
+</ul>
+
+<p>Okay, all of that said, let&rsquo;s talk about I&rsquo;m trying to use bubblewrap to run
+containers fast and in a relatively secure way :)</p>
+
+<h3 id="docker-containers-take-300ms-to-start-on-my-machine">Docker containers take ~300ms to start on my machine</h3>
+
+<p>I ran a quick benchmark to see how long a Docker container takes to run a
+simple command (<code>ls</code>). For both Docker and Podman, it&rsquo;s about 300ms.</p>
+
+<pre><code>$ time docker run --network none -it ubuntu:20.04 ls / &gt; /dev/null
+Executed in  378.42 millis 
+$ time podman run --network none -it ubuntu:20.04 ls / &gt; /dev/null
+Executed in  279.27 millis
+</code></pre>
+
+<p>Almost all of this time is overhead from docker and podman &ndash; just running <code>ls</code>
+by itself takes about 3ms:</p>
+
+<pre><code>$ time ls / &gt; /dev/null
+Executed in    2.96 millis 
+</code></pre>
+
+<p>I want to stress that, while I&rsquo;m not sure exactly what the slowest part of
+Docker and podman startup time is (I spent 5 minutes trying to profile them and
+gave up), I&rsquo;m 100% sure it&rsquo;s something important.</p>
+
+<p>The way we&rsquo;re going to run containers faster with bubblewrap has a lot of
+limitations and it&rsquo;s a lower level interface which is a lot trickier to use.</p>
+
+<h3 id="goal-1-containers-that-start-quickly">goal 1: containers that start quickly</h3>
+
+<p>I felt like it <em>should</em> be possible to have containers that start essentially
+instantly or at least in less than 5ms. My thought process:</p>
+
+<ul>
+<li>creating a new namespace with <code>unshare</code> is basically instant</li>
+<li><a href="https://jvns.ca/blog/2016/10/10/what-even-is-a-container/">containers are basically just a bunch of namespaces</a></li>
+<li>what&rsquo;s the problem?</li>
+</ul>
+
+<h3 id="container-startup-time-is-usually-not-that-important">container startup time is (usually) not that important</h3>
+
+<p>Most of the time when people are using containers, they&rsquo;re running some
+long-running process inside the container like a webserver, so it doesn&rsquo;t
+really matter if it takes 300ms to start.</p>
+
+<p>So it makes sense to me that there aren&rsquo;t a lot of container tools that
+optimize for startup time. But I still wanted to optimize for startup time :)</p>
+
+<h3 id="goal-2-run-the-containers-as-an-unprivileged-user">goal 2: run the containers as an unprivileged user</h3>
+
+<p>Another goal I had was to be able to run my containers as an unprivileged user
+instead of root.</p>
+
+<p>I was surprised the first time I learned that Docker actually runs containers
+as root &ndash; even though I run <code>docker run ubuntu:20.04</code> as an unprivileged user (<code>bork</code>), that
+message is actually sent to a daemon running as root, and the Docker container
+process itself also runs as root (albeit a <code>root</code> that&rsquo;s stripped of all its
+capabilities).</p>
+
+<p>That&rsquo;s fine for Docker (they have lots of very smart people making sure that
+they get it right!), but if I&rsquo;m going to do container stuff <em>without</em> using
+Docker (for the speed reasons mentioned above), I&rsquo;d rather not do it as root to
+keep everything a bit more secure.</p>
+
+<h3 id="podman-can-run-containers-as-an-non-root-user">podman can run containers as an non-root user</h3>
+
+<p>Before we start talking about how to do weird stuff with bubblewrap, I want to
+quickly talk about a much more normal tool to run containers: podman!</p>
+
+<p>Podman, unlike Docker, can run containers as an unprivileged user!</p>
+
+<p>If I run this from my normal user:</p>
+
+<pre><code>$ podman run -it ubuntu:20.04 ls
+</code></pre>
+
+<p>it doesn&rsquo;t secretly run as root behind the scenes! It just starts the container
+as my normal user, and then uses something called &ldquo;user namespaces&rdquo; so that
+<em>inside the container</em> I appear to be root.</p>
+
+<p>The other cool thing aboud podman is that it has exactly the same interface as
+Docker, so you can just take a Docker command and replace <code>docker</code> with
+<code>podman</code> and it&rsquo;ll Just Work. I&rsquo;ve found that sometimes I need to do some extra
+work to get podman to work in practice, but it&rsquo;s still pretty nice that it has
+the same command line interface.</p>
+
+<p>This &ldquo;run containers as a non-root user&rdquo; feature is normally called &ldquo;rootless
+containers&rdquo;. (I find that name kind of counterintuitive, but that&rsquo;s what people call it)</p>
+
+<h3 id="failed-attempt-1-write-my-own-tool-using-runc">failed attempt 1: write my own tool using <code>runc</code></h3>
+
+<p>I knew that Docker and podman use
+<a href="https://github.com/opencontainers/runc">runc</a> under the hood, so I thought &ndash;
+well, maybe I can just use <code>runc</code> directly to make my own tool that starts
+containers faster than Docker does!</p>
+
+<p>I tried to do this 6 months ago and I don&rsquo;t remember most of the details, but basically
+I spent 8 hours working on it, got frustrated because I couldn&rsquo;t get anything
+to work, and gave up.</p>
+
+<p>One specific detail I remember struggling with was setting up a working <code>/dev</code>
+for my programs to use.</p>
+
+<h3 id="enter-bubblewrap">enter bubblewrap</h3>
+
+<p>Okay, that was a very long preamble so let&rsquo;s get to the point! Last week, I
+discovered a tool called <code>bubblewrap</code> that was basically exactly the thing I
+was trying to build with <code>runc</code> in my failed attempt, except that it actually
+works and has many more features and it&rsquo;s built by people who know things about
+security! Hooray!</p>
+
+<p>The interface to bubblewrap is pretty different than the interface to Docker &ndash;
+it&rsquo;s much lower level.  There&rsquo;s no concept of a container image &ndash; instead you
+map a bunch of directories on your host to directories in the container.</p>
+
+<p>For example, here&rsquo;s how to run a container with the same root directory as your
+host operating system, but with only read access to that root directory, and only write access to <code>/tmp</code>.</p>
+
+<pre><code>bwrap \
+    --ro-bind / / \
+    --bind /tmp /tmp \
+    --proc /proc --dev /dev \
+    --unshare-pid \
+    --unshare-net \
+    bash
+</code></pre>
+
+<p>For example, you could imagine running some untrusted process under bubblewrap
+this way and then putting all the files you the process to access in <code>/tmp</code>.</p>
+
+<h3 id="bubblewrap-runs-containers-as-an-unprivileged-non-root-user">bubblewrap runs containers as an unprivileged (non-root) user</h3>
+
+<p>Like podman, bubblewrap runs containers as a non-root user, using user
+namespaces. It can also run containers as root, but in this post we&rsquo;re just
+going to be talking about using it as an unprivileged user.</p>
+
+<h3 id="bubblewrap-is-fast">bubblewrap is fast</h3>
+
+<p>Let&rsquo;s see how long it takes to run <code>ls</code> in a bubblewrap container!</p>
+
+<pre><code>$ time bwrap --ro-bind / / --proc /proc --dev /dev --unshare-pid ls /
+Executed in    8.04 millis
+</code></pre>
+
+<p>That&rsquo;s a big difference! 8ms is a lot faster than 279ms.</p>
+
+<p>Of course, like we said before, the reason bubblewrap is faster is that it does
+a lot less. So let&rsquo;s talk about some things bubblewrap doesn&rsquo;t do.</p>
+
+<h3 id="some-things-bubblewrap-doesn-t-do">some things bubblewrap doesn&rsquo;t do</h3>
+
+<p>Here are some things that Docker/podman do that bubblewrap doesn&rsquo;t do:</p>
+
+<ul>
+<li>set up overlayfs mounts for you, so that your changes to the filesystem don&rsquo;t affect the base image</li>
+<li>set up networking bridges so that you can connect to a webserver inside the container</li>
+<li>probably a bunch more stuff that I&rsquo;m not thinking of</li>
+</ul>
+
+<p>In general, bubblewrap is a much lower level tool than something like Docker.</p>
+
+<p>Also, bubblewrap seems to have pretty different goals than Docker &ndash; the README
+seems to say that it&rsquo;s intended as a tool for sandboxing desktop software (I
+think it comes from <a href="https://flatpak.org/">flatpak</a>).</p>
+
+<h3 id="running-a-container-image-with-bubblewrap">running a container image with bubblewrap</h3>
+
+<p>I couldn&rsquo;t find instructions for running a Docker container image with
+bubblewrap, so here they are. Basically I just use Docker to download the
+container image and put it into a directory and then run it with <code>bwrap</code>:</p>
+
+<p>There&rsquo;s also a tool called <a href="https://github.com/projectatomic/bwrap-oci">bwrap-oci</a> which looks cool but I
+couldn&rsquo;t get it to compile.</p>
+
+<pre><code>mkdir rootfs
+docker export $(docker create frapsoft/fish) | tar -C rootfs -xf -
+bwrap \
+    --bind $PWD/rootfs / \
+    --proc /proc --dev /dev \
+    --uid 0 \
+    --unshare-pid \
+    --unshare-net \
+    fish
+</code></pre>
+
+<p>One important thing to note is that this doesn&rsquo;t create a temporary overlay
+filesystem for the container&rsquo;s file writes, so it&rsquo;ll let the container edit
+files in the image.</p>
+
+<p>I wrote a post about <a href="https://jvns.ca/blog/2019/11/18/how-containers-work--overlayfs/">overlay filesystems</a> if
+you want to see how you could do that yourself though.</p>
+
+<h3 id="running-containers-with-bubblewrap-isn-t-the-same-as-with-podman">running &ldquo;containers&rdquo; with bubblewrap isn&rsquo;t the same as with podman</h3>
+
+<p>I just gave an example of how to &ldquo;run a container&rdquo; with bubblewrap, and you
+might think &ldquo;cool, this is just like podman but faster!&rdquo;. It is not, and it&rsquo;s
+actually unlike using podman in even more ways than I expected.</p>
+
+<p>I put &ldquo;container&rdquo; in scare quotes because there are two ways to define &ldquo;container&rdquo;:</p>
+
+<ul>
+<li>something that implements <a href="https://opencontainers.org/about/overview/">OCI runtime specification</a></li>
+<li>any way of running a process in a way that&rsquo;s somehow isolated from the host system</li>
+</ul>
+
+<p>bubblewrap is a &ldquo;container&rdquo; tool in the second sense. It definitely provides
+isolation, and it does that using the same features &ndash; Linux namespaces &ndash; as
+Docker.</p>
+
+<p>But it&rsquo;s not a container tool in the first sense. And it&rsquo;s a lower level tool
+so you can get into a bunch of weird states and you really need to think about
+all the weird details of how container work while using it.</p>
+
+<p>For the rest of the post I&rsquo;m going to talk about some weird things that can
+happen with bubblewrap that would not happen with podman/Docker.</p>
+
+<h3 id="weird-thing-1-processes-that-don-t-exist">weird thing 1: processes that don&rsquo;t exist</h3>
+
+<p>Here&rsquo;s an example of a weird situation I got into with bubblewrap that confused
+me for a minute:</p>
+
+<pre><code>$ bwrap --ro-bind / / --unshare-all bash
+$ ps aux
+... some processes
+root      390073  0.0  0.0   2848   124 pts/9    S    14:28   0:00 bwrap --ro-bind / / --unshare-all --uid 0 bash
+... some other processes
+$ kill 390073
+bash: kill: (390073) - No such process
+$ ps aux | grep 390073
+root      390073  0.0  0.0   2848   124 pts/9    S    14:28   0:00 bwrap --ro-bind / / --unshare-all --uid 0 bash
+</code></pre>
+
+<p>Here&rsquo;s what happened</p>
+
+<ul>
+<li>I started a bash shell inside bubblewrap</li>
+<li>I ran <code>ps aux</code>, and saw a process with PID  <code>390073</code></li>
+<li>I try to kill the process. It fails with the error <code>no such process</code>. What?</li>
+<li>I ran <code>ps aux</code>, and still see the process with PID  <code>390073</code></li>
+</ul>
+
+<p>What&rsquo;s going on? Why doesn&rsquo;t the process <code>390073</code> exist, even though <code>ps</code> says it does? Isn&rsquo;t that impossible?</p>
+
+<p>Well, the problem is that <code>ps</code> doesn&rsquo;t actually list all the processes in your
+current PID namespace. Instead, it iterates through all the entries in <code>/proc</code>
+and prints those out. Usually, what&rsquo;s in <code>/proc</code> is actually the same as the processes on your system.</p>
+
+<p>But with Linux containers these things can get out of sync. What&rsquo;s happening in
+this example is that we have the <code>/proc</code> from the host PID namespace, but those
+aren&rsquo;t actually the processes that we have access to in our PID namespace.</p>
+
+<p>Passing <code>--proc /proc</code> to bwrap fixes the issue &ndash; <code>ps</code> then actually lists the correct processes.</p>
+
+<pre><code>$ bwrap --ro-bind / / --unshare-all --dev /dev --proc /proc ps aux
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+bork           1  0.0  0.0   3644   136 ?        S+   16:21   0:00 bwrap --ro-bind / / --unshare-all --dev /dev --proc /proc ps au
+bork           2  0.0  0.0  21324  1552 ?        R+   16:21   0:00 ps aux
+</code></pre>
+
+<p>Just 2 processes! Everything is normal!</p>
+
+<h3 id="weird-thing-2-trying-to-listen-on-port-80">weird thing 2: trying to listen on port 80</h3>
+
+<p>Passing <code>--uid 0</code> to bubblewrap makes the user inside the container <code>root</code>. You
+might think that this means that the root user has administrative privileges
+inside the container, but that&rsquo;s not true!</p>
+
+<p>For example, let&rsquo;s try to listen on port 80:</p>
+
+<pre><code>$ bwrap --ro-bind / / --unshare-all --uid 0 nc -l 80
+nc: Permission denied
+</code></pre>
+
+<p>What&rsquo;s going on here is that the new root user actually doesn&rsquo;t have the
+<strong>capabilities</strong> it needs to listen on port 80. (you need special permissions
+to listen on ports less than 1024, and 80 is less than 1024)</p>
+
+<p>There&rsquo;s actually a capability specifically for listening on privileged ports
+called <code>CAP_NET_BIND_SERVICE</code>.</p>
+
+<p>So to fix this all we need to do is to tell bubblewrap to give our user that
+capability.</p>
+
+<pre><code>$ bwrap --ro-bind / / --unshare-all --uid 0 --cap-add cap_net_bind_service nc -l 80
+(no output, success!!!)
+</code></pre>
+
+<p>This works! Hooray!</p>
+
+<h3 id="finding-the-right-capabilities-is-pretty-annoying">finding the right capabilities is pretty annoying</h3>
+
+<p>bubblewrap doesn&rsquo;t give out any capabilities by default, and I find that
+figuring out all the right capabilities and adding them manually is kind of
+annoying. Basically my process is</p>
+
+<ul>
+<li>run the thing</li>
+<li>see what fails</li>
+<li>read <code>man capabilities</code> to figure out what capabilities I&rsquo;m missing</li>
+<li>add the capability with <code>--cap-add</code></li>
+<li>repeat until everything is running</li>
+</ul>
+
+<p>But that&rsquo;s the price I pay for wanting things to be fast I guess :)</p>
+
+<h3 id="weird-thing-2b-dev-dev-makes-listening-on-privileged-ports-not-work">weird thing 2b:  <code>--dev /dev</code> makes listening on privileged ports not work</h3>
+
+<p>One other strange thing is that if I take the exact same command above (which
+worked!) and add <code>--dev /dev</code> (to set up the <code>/dev/</code> directory), it causes it to not work again:</p>
+
+<pre><code>$ bwrap --ro-bind / / --dev /dev --unshare-all --uid 0 --cap-add cap_net_bind_service nc -l 80
+nc: Permission denied
+</code></pre>
+
+<p>I think this might be a bug in bubblewrap, but I haven&rsquo;t mustered the courage
+to dive into the bubblewrap code and start investigating yet. Or maybe there&rsquo;s
+something obvious I&rsquo;m missing!</p>
+
+<h3 id="weird-thing-3-uid-mappings">weird thing 3: UID mappings</h3>
+
+<p>Another slightly weird thing was &ndash; I tried to run <code>apt-get update</code> inside a bubblewrap Ubuntu container and everything went very poorly.</p>
+
+<p>Here&rsquo;s how I ran <code>apt-get update</code> inside the Ubuntu container:</p>
+
+<pre><code>mkdir rootfs
+docker export $(docker create ubuntu:20.04) | tar -C rootfs -xf -
+bwrap \
+    --bind $PWD/rootfs / \
+    --proc /proc\
+    --uid 0 \
+    --unshare-pid \
+    apt-get update
+</code></pre>
+
+<p>And here are the error messages:</p>
+
+<pre><code>E: setgroups 65534 failed - setgroups (1: Operation not permitted)
+E: setegid 65534 failed - setegid (22: Invalid argument)
+E: seteuid 100 failed - seteuid (22: Invalid argument)
+E: setgroups 0 failed - setgroups (1: Operation not permitted)
+.... lots more similar errors
+</code></pre>
+
+<p>At first I thought &ldquo;ok, this is a capabilities problem, I need to set
+<code>CAP_SETGID</code> or something to give the container permission to change groups. But I did that and it didn&rsquo;t help at all!</p>
+
+<p>I think what&rsquo;s going on here is a problem with UID maps. What are UID maps?
+Well, every time you run a container using &ldquo;user namespaces&rdquo; (which podman is
+doing), it creates a mapping of UIDs inside the container to UIDs on the host.</p>
+
+<p>Let&rsquo;s look that the UID maps! Here&rsquo;s how do that:</p>
+
+<p>````
+root@kiwi:/# cat /proc/self/uid_map
+         0       1000          1
+root@kiwi:/# cat /proc/self/gid_map
+      1000       1000          1</p>
+
+<pre><code>
+This is saying that user 0 in the container is mapped to user 1000 on in the
+host, and group 1000 is mapped to group 1000. (My normal user's UID/GID is 1000, so this makes sense). You can find out
+about this `uid_map` file in `man user_namespaces`.
+
+All other users/groups that aren't 1000 are mapped to user 65534 by default, according
+to `man user_namespaces`.
+
+### what's going on: non-mapped users can't be used
+
+The only users and groups that have been mapped are `0` and `1000`. But `man user_namespaces` says:
+
+&gt; After the uid_map and gid_map files have been written, only the mapped values may be used in system calls that change user and group IDs.
+
+`apt` is trying to use users 100 and 65534. Those aren't on the list of mapped
+users! So they can't be used!
+
+This works fine in podman, because podman sets up its UID and GID mappings differently:
+
+</code></pre>
+
+<p>$ podman run -it ubuntu:20.04 bash
+root@793d03a4d773:/# cat /proc/self/uid_map
+         0       1000          1
+         1     100000      65536
+root@793d03a4d773:/# cat /proc/self/gid_map
+         0       1000          1
+         1     100000      65536
+```</p>
+
+<p>All the users get mapped, not just 1000.</p>
+
+<p>I don&rsquo;t quite know how to fix this, but I think it&rsquo;s probably possible in
+bubblewrap to set up the uid mappings the same way as podman does &ndash; there&rsquo;s an
+<a href="https://github.com/containers/bubblewrap/issues/468">issue about it here that links to a workaround</a>.</p>
+
+<p>But this wasn&rsquo;t an actual problem I was trying to solve so I didn&rsquo;t dig further
+into it.</p>
+
+<h3 id="it-works-pretty-great">it works pretty great!</h3>
+
+<p>I&rsquo;ve talked about a bunch of issues, but the things I&rsquo;ve been trying to do in bubblewrap
+have been very constrained and it&rsquo;s actually been pretty simple. For example, I
+was working on a git project where I really just want to run <code>git</code> inside a
+container and map a git repository from the host.</p>
+
+<p>That&rsquo;s very simple to get to work with bubblewrap! There were basically no weird problems!
+It&rsquo;s really fast!</p>
+
+<p>So I&rsquo;m pretty excited about this tool and I might use it for more stuff in the
+future.</p>
+
+  </body>
+</html>
