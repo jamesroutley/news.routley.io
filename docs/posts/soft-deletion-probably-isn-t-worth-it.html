@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://brandur.org/soft-deletion">Original</a>
+    <h1>Soft deletion probably isn&#39;t worth it</h1>
+    
+    <div id="readability-page-1" class="page"><article><p>Anyone who’s seen a couple different production database environments is likely familiar with the “soft deletion” pattern – instead of deleting data directly via <code>DELETE</code> statement, tables get an extra <code>deleted_at</code> timestamp and deletion is performed with an update statement instead:</p>
+
+<pre><code>UPDATE foo SET deleted_at = now() WHERE id = $1;
+</code></pre>
+
+<p>The concept behind soft deletion is to make deletion safer, and reversible. Once a record’s been hit by a hard <code>DELETE</code>, it may technically still be recoverable by digging down into the storage layer, but suffice it to say that it’s really hard to get back. Theoretically with soft deletion, you just set <code>deleted_at</code> back to <code>NULL</code> and you’re done:</p>
+
+<pre><code>-- and like magic, it&#39;s back!!
+UPDATE foo SET deleted_at = NULL WHERE id = $1;
+</code></pre>
+
+<h2 id="code-leakage"><a href="#code-leakage">Downsides: Code leakage</a></h2>
+
+<p>But the technique has some major downsides. The first is that soft deletion logic bleeds out into all parts of your code. All our selects look something like this:</p>
+
+<pre><code>SELECT *
+FROM customer
+WHERE id = @id
+    AND deleted_at IS NULL;
+</code></pre>
+
+<p>And forgetting that extra predicate on <code>deleted_at</code> can have dangerous consequences as it accidentally returns data that’s no longer meant to be seen.</p>
+
+<p>Some ORMs or ORM plugins make this easier by automatically chaining the extra <code>deleted_at</code> clause onto every query (see <a href="https://github.com/ActsAsParanoid/acts_as_paranoid"><code>acts_as_paranoid</code></a> for example), but just because it’s hidden doesn’t necessarily make things better. If an operator ever queries the database directly they’re even more likely to forget <code>deleted_at</code> because normally the ORM does the work for them.</p>
+
+<h3 id="foreign-keys"><a href="#foreign-keys">Losing foreign keys</a></h3>
+
+<p>Another consequence of soft deletion is that foreign keys are effectively lost.</p>
+
+<p>The major benefit of foreign keys is that they guarantee referential integrity. For example, say you have customers in one table that may refer to a number of invoices in another. Without foreign keys, you could delete a customer, but forget to remove its invoices, thereby leaving a bunch of orphaned invoices that reference an customer that’s gone.</p>
+
+<p>With foreign keys, trying to remove that customer without removing the invoices first is an error:</p>
+
+<pre><code>ERROR:  update or delete on table &#34;customer&#34; violates
+    foreign key constraint &#34;invoice_customer_id_fkey&#34; on table &#34;invoice&#34;
+
+DETAIL:  Key (id)=(64977e2b-40cc-4261-8879-1c1e6243699b) is still
+    referenced from table &#34;invoice&#34;.
+</code></pre>
+
+<p>As with other relational database features like predefined schemas, types, and check constraints, the database is helping to keep data valid.</p>
+
+<p>But with soft deletion, this goes out the window. A customer may be soft deleted with its <code>deleted_at</code> flag set, but we’re now back to being able to forget do the same for its invoices. Their foreign keys are still valid because the customer record is technically still there, but there’s no equivalent check that the invoices are also soft deleted, so you can be left with your customer being “deleted”, but its invoices still live.</p>
+
+<h3 id="pruning"><a href="#pruning">Pruning data is hard</a></h3>
+
+<p>The last few years have seen major advances in terms of consumer data protection like the roll out of <a href="https://en.wikipedia.org/wiki/General_Data_Protection_Regulation">GDPR</a> in Europe. As such, it’s generally frowned upon for data to be retained infinitely, which by default would be the case for soft deleted rows.</p>
+
+<p>So you may eventually find yourself writing a hard deletion process which looks at soft deleted records beyond a certain horizon and permanently deletes them from the database.</p>
+
+<p>But the same foreign keys that soft deletion rendered mostly useless now make this job more difficult because a record can’t be removed without also making sure that all its dependencies are removed as well (<code>ON DELETE CASCADE</code> could do this automatically, but use of cascade is fairly dangerous and not recommended for higher fidelity data).</p>
+
+<p>Luckily, you can still do this in systems that support CTEs like Postgres, but you end up with some pretty elaborate queries. Here’s a snippet from one that I wrote recently which keeps all foreign keys satisfied by removing everything as part of a single operation:</p>
+
+<pre><code>WITH team_deleted AS (
+    DELETE FROM team
+    WHERE (
+        team.archived_at IS NOT NULL
+        AND team.archived_at &lt; @archived_at_horizon::timestamptz
+    )
+    RETURNING *
+),
+
+--
+-- team resources
+--
+cluster_deleted AS (
+    DELETE FROM cluster
+    WHERE team_id IN (
+        SELECT id FROM team_deleted
+    )
+    OR (
+        archived_at IS NOT NULL
+        AND archived_at &lt; @archived_at_horizon::timestamptz
+    )
+    RETURNING *
+),
+invoice_deleted AS (
+    DELETE FROM invoice
+    WHERE team_id IN (
+        SELECT id FROM team_deleted
+    )
+    OR (
+        archived_at IS NOT NULL
+        AND archived_at &lt; @archived_at_horizon::timestamptz
+    )
+    RETURNING *
+),
+
+--
+-- cluster + team resources
+--
+subscription_deleted AS (
+    DELETE FROM subscription
+    WHERE cluster_id IN (
+        SELECT id FROM cluster_deleted
+    ) OR team_id IN (
+        SELECT id FROM team_deleted
+    )
+    RETURNING *
+)
+
+SELECT &#39;cluster&#39;, array_agg(id) FROM cluster_deleted
+UNION ALL
+SELECT &#39;invoice&#39;, array_agg(id) FROM invoice_deleted
+UNION ALL
+SELECT &#39;subscription&#39;, array_agg(id) FROM subscription_deleted
+UNION ALL
+SELECT &#39;team&#39;, array_agg(id) FROM team_deleted;
+</code></pre>
+
+<p>The unabridged version of this is five times as long and includes a full 30 separate tables. It’s cool that this works, but is so overly elaborate as to be a liability.</p>
+
+<p>And even with liberal testing, this kind of query can still end up being a reliability problem because in case a new dependency is added in the future but an update to the query is forgotten, it’ll suddenly start failing after a year’s (or whatever the hard delete horizon is) delay.</p>
+
+<h3 id="undelete"><a href="#undelete">Does undelete really work?</a></h3>
+
+<p>Once again, soft deletion is theoretically a hedge against accidental data loss. As a last argument against it, I’d ask you to consider, realistically, whether undeletion is something that’s ever actually done.</p>
+
+<p>When I worked at Heroku, we used soft deletion.</p>
+
+<p>When I worked at Stripe, we used soft deletion.</p>
+
+<p>At my job right now, we use soft deletion.</p>
+
+<p>As far as I’m aware, never <em>once</em>, in ten plus years, did anyone at any of these places ever actually use soft deletion to undelete something. </p>
+
+<p>The biggest reason for that is that almost always, <strong>data deletion also has non-data side effects</strong>. Calls may have been made to foreign systems to archive records there, objects may have been removed in blob stores, or servers spun down. The process can’t simply be reversed by setting <code>NULL</code> on <code>deleted_at</code> – equivalent undos need to exist for all those other operations too, and they rarely do.</p>
+
+<p>We had a couple cases at Heroku where an important user deleted an app by accident and wanted to recover it. We had soft deletion, and theoretically other delete side effects could’ve been reversed, but we still made the call not to try because no one had ever done it before, and trying to do it in an emergency was exactly the wrong time to figure it out – we’d almost certainly get something wrong and leave the user in a bad state. Instead, we rolled forward by creating a new app, and helping them copy environment and data from the deleted app to it. So even where soft deletion was theoretically most useful, we still didn’t use it.</p>
+
+<h2 id="deleted-records"><a href="#deleted-records">Alternative: A deleted records table</a></h2>
+
+<p>Although I’ve never seen an undelete work in practice, soft deletion wasn’t completely useless because we would occasionally use it to refer to deleted data – usually a manual process where someone wanted to see to a deleted object for purposes of assisting with a support ticket or trying to squash a bug.</p>
+
+<p>And while I’d argue against the traditional soft deletion pattern due to the downsides listed above, luckily there’s a compromise.</p>
+
+<p>Instead of keeping deleted data in the same tables from which it was deleted from, there can be a new relation specifically for storing all deleted data, and with a flexible <code>jsonb</code> column so that it can capture the properties of any other table:</p>
+
+<pre><code>CREATE TABLE deleted_record (
+    id uuid PRIMARY KEY DEFAULT gen_ulid(),
+    deleted_at timestamptz NOT NULL default now(),
+    original_table varchar(200) NOT NULL,
+    original_id uuid NOT NULL,
+    data jsonb NOT NULL
+);
+</code></pre>
+
+<p>A deletion then becomes this:</p>
+
+<pre><code>WITH deleted AS (
+    DELETE FROM customer
+    WHERE id = @id
+    RETURNING *
+)
+INSERT INTO deleted_record
+		(original_table, original_id, data)
+SELECT &#39;foo&#39;, id, to_jsonb(deleted.*)
+FROM deleted
+RETURNING *;
+</code></pre>
+
+<p>This does have a downside compared to <code>deleted_at</code> – the process of selecting columns into <code>jsonb</code> isn’t easily reversible. While it’s possible to do so, it would likely involve building one-off queries and manual intervention. But again, that might be okay – consider how often you’re really going to be trying to undelete data.</p>
+
+<p>The technique solves all the problems outlined above:</p>
+
+<ul>
+<li><p>Queries for normal, non-deleted data no longer need to include <code>deleted_at IS NULL</code> everywhere.</p></li>
+
+<li><p>Foreign keys still work. Attempting to remove a record without also getting its dependencies is an error.</p></li>
+
+<li><p>Hard deleting old records for regulatory requirements gets really, really easy: <code>DELETE FROM deleted_record WHERE deleted_at &lt; now() - &#39;1 year&#39;::interval</code>.</p></li>
+</ul>
+
+<p>Deleted data is a little harder to get at, but not by much, and is still kept around in case someone needs to look at it.</p>
+
+
+
+</article></div>
+  </body>
+</html>
