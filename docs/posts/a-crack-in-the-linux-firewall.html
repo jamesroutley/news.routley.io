@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.randorisec.fr/crack-linux-firewall/">Original</a>
+    <h1>A Crack in the Linux Firewall</h1>
+    
+    <div id="readability-page-1" class="page"><div id="blog">
+                        <p>In our previous article <a href="https://randorisec.fr/yet-another-bug-netfilter">Yet another bug into Netfilter</a>, I presented a vulnerability found within the netfilter subsystem of the Linux kernel.
+During my investigation, I found a weird comparison that does not fully protect a copy within a buffer.
+It led to a heap buffer overflow that was exploited to obtain root privileges on Ubuntu 22.04.</p>
+<h2 id="a-small-jump-in-the-past">A small jump in the past</h2>
+<p>In the last episode, we reached an out-of-bound within the <code>nft_set</code> structure (<code>/include/net/netfilter/nf_tables.h</code>).</p>
+<div><pre><code data-lang="c"><span>struct</span> nft_set {
+    <span>struct</span> list_head        list;
+    <span>struct</span> list_head        bindings;
+    <span>struct</span> nft_table        <span>*</span>table;
+    possible_net_t          net;
+    <span>char</span>                <span>*</span>name;
+    u64             handle;
+    u32             ktype;
+    u32             dtype;
+    u32             objtype;
+    u32             size;
+    u8              field_len[NFT_REG32_COUNT];
+    u8              field_count;
+    u32             use;
+    atomic_t            nelems;
+    u32             ndeact;
+    u64             timeout;
+    u32             gc_int;
+    u16             policy;
+    u16             udlen;
+    <span>unsigned</span> <span>char</span>           <span>*</span>udata;
+    <span>/* runtime data below here */</span>
+    <span>const</span> <span>struct</span> nft_set_ops    <span>*</span>ops ____cacheline_aligned;
+    u16             flags:<span>14</span>,
+                    genmask:<span>2</span>;
+    u8              klen;
+    u8              dlen;
+    u8              num_exprs;
+    <span>struct</span> nft_expr         <span>*</span>exprs[NFT_SET_EXPR_MAX];
+    <span>struct</span> list_head        catchall_list;
+    <span>unsigned</span> <span>char</span>           data[]
+        __attribute__((aligned(__alignof__(u64))));
+};
+</code></pre></div><p>As <code>nft_set</code> contains lots of data, some other fields of this structure could be used to get a better write primitive.
+I decided to search around the length fields (<code>udlen</code>, <code>klen</code> and <code>dlen</code>) because it could be helpful to perform some overflows.</p>
+<h2 id="research-for-code-and-anomalies">Research for Code and Anomalies</h2>
+<p>Exploring the different accesses to the field <code>dlen</code>, a call to the <code>memcpy</code> function <code>(1)</code> in <code>nft_set_elem_init</code> (<code>/net/netfilter/nf_tables_api.c</code>) hold my attention.</p>
+<div><pre><code data-lang="c"><span>void</span> <span>*</span><span>nft_set_elem_init</span>(<span>const</span> <span>struct</span> nft_set <span>*</span>set,
+            <span>const</span> <span>struct</span> nft_set_ext_tmpl <span>*</span>tmpl,
+            <span>const</span> u32 <span>*</span>key, <span>const</span> u32 <span>*</span>key_end,
+            <span>const</span> u32 <span>*</span>data, u64 timeout, u64 expiration, gfp_t gfp)
+{
+    <span>struct</span> nft_set_ext <span>*</span>ext;
+    <span>void</span> <span>*</span>elem;
+
+    elem <span>=</span> kzalloc(set<span>-&gt;</span>ops<span>-&gt;</span>elemsize <span>+</span> tmpl<span>-&gt;</span>len, gfp);                <span>&lt;=====</span> (<span>0</span>)
+    <span>if</span> (elem <span>==</span> NULL)
+        <span>return</span> NULL;
+
+    ext <span>=</span> nft_set_elem_ext(set, elem);
+    nft_set_ext_init(ext, tmpl);
+
+    <span>if</span> (nft_set_ext_exists(ext, NFT_SET_EXT_KEY))
+        memcpy(nft_set_ext_key(ext), key, set<span>-&gt;</span>klen);
+    <span>if</span> (nft_set_ext_exists(ext, NFT_SET_EXT_KEY_END))
+        memcpy(nft_set_ext_key_end(ext), key_end, set<span>-&gt;</span>klen);
+    <span>if</span> (nft_set_ext_exists(ext, NFT_SET_EXT_DATA))
+        memcpy(nft_set_ext_data(ext), data, set<span>-&gt;</span>dlen);                 <span>&lt;=====</span> (<span>1</span>)
+
+    ...
+
+    <span>return</span> elem;
+}
+</code></pre></div><p>This call is suspicious because two different objects are used.
+The destination buffer is stored within an <code>nft_set_ext</code> object, <code>ext</code>, whereas the size of copy is extracted from an <code>nft_set</code> object.
+The object <code>ext</code> is dynamically allocated at <code>(0)</code> with <code>elem</code> and the size reserved for it is <code>tmpl-&gt;len</code>.
+I wanted to check that the value stored in <code>set-&gt;dlen</code> is used to compute the value stored in <code>tmpl-&gt;len</code>.</p>
+<h3 id="the-wrong-place">The wrong place</h3>
+<p><code>nft_set_elem_init</code> is called <code>(5)</code> within the function <code>nft_add_set_elem</code> (<code>/net/netfilter/nf_tables_api.c</code>), which is responsible to add an element to a netfilter set.</p>
+<div><pre><code data-lang="c"><span>static</span> <span>int</span> <span>nft_add_set_elem</span>(<span>struct</span> nft_ctx <span>*</span>ctx, <span>struct</span> nft_set <span>*</span>set,
+
+                <span>const</span> <span>struct</span> nlattr <span>*</span>attr, u32 nlmsg_flags)
+{
+    <span>struct</span> nlattr <span>*</span>nla[NFTA_SET_ELEM_MAX <span>+</span> <span>1</span>];
+    <span>struct</span> nft_set_ext_tmpl tmpl;
+    <span>struct</span> nft_set_elem elem;                                                   <span>&lt;=====</span> (<span>2</span>)
+    <span>struct</span> nft_data_desc desc;
+    
+    ...
+    
+    <span>if</span> (nla[NFTA_SET_ELEM_DATA] <span>!=</span> NULL) {
+        err <span>=</span> nft_setelem_parse_data(ctx, set, <span>&amp;</span>desc, <span>&amp;</span>elem.data.val,           <span>&lt;=====</span> (<span>3</span>)
+                         nla[NFTA_SET_ELEM_DATA]);
+        <span>if</span> (err <span>&lt;</span> <span>0</span>)
+            <span>goto</span> err_parse_key_end;
+
+        ...
+
+        nft_set_ext_add_length(<span>&amp;</span>tmpl, NFT_SET_EXT_DATA, desc.len);              <span>&lt;=====</span> (<span>4</span>)
+    }
+    
+    ...
+    
+    err <span>=</span> <span>-</span>ENOMEM;
+    elem.priv <span>=</span> nft_set_elem_init(set, <span>&amp;</span>tmpl, elem.key.val.data,                <span>&lt;=====</span> (<span>5</span>)
+                      elem.key_end.val.data, elem.data.val.data,
+                      timeout, expiration, GFP_KERNEL);
+    <span>if</span> (elem.priv <span>==</span> NULL)
+        <span>goto</span> err_parse_data;
+    
+    ...
+</code></pre></div><p>As you can observe, <code>set-&gt;dlen</code> is not used to reserve the space for data associated with the id <code>NFT_SET_EXT_DATA</code>, instead it is <code>desc.len</code> <code>(5)</code>.
+<code>desc</code> is initialized within the function <code>nft_setelem_parse_data</code> (<code>/net/netfilter/nf_tables_api.c</code>) called at <code>(3)</code></p>
+<div><pre><code data-lang="c"><span>static</span> <span>int</span> <span>nft_setelem_parse_data</span>(<span>struct</span> nft_ctx <span>*</span>ctx, <span>struct</span> nft_set <span>*</span>set,
+                  <span>struct</span> nft_data_desc <span>*</span>desc,
+                  <span>struct</span> nft_data <span>*</span>data,
+                  <span>struct</span> nlattr <span>*</span>attr)
+{
+    <span>int</span> err;
+
+    err <span>=</span> nft_data_init(ctx, data, NFT_DATA_VALUE_MAXLEN, desc, attr);          <span>&lt;=====</span> (<span>6</span>)
+    <span>if</span> (err <span>&lt;</span> <span>0</span>)
+        <span>return</span> err;
+
+    <span>if</span> (desc<span>-&gt;</span>type <span>!=</span> NFT_DATA_VERDICT <span>&amp;&amp;</span> desc<span>-&gt;</span>len <span>!=</span> set<span>-&gt;</span>dlen) {             <span>&lt;=====</span> (<span>7</span>)
+        nft_data_release(data, desc<span>-&gt;</span>type);
+        <span>return</span> <span>-</span>EINVAL;
+    }
+
+    <span>return</span> <span>0</span>;
+}
+</code></pre></div><p>First of all, <code>data</code> and <code>desc</code> are filled in <code>nft_data_init</code> (<code>/net/netfilter/nf_tables_api.c</code>) according to data provided by a user <code>(6)</code>.
+The critical part is the check done between <code>desc-&gt;len</code> and <code>set-&gt;dlen</code> at <code>(7)</code>, it only occurs when data associated to the added element has a type different of <code>NFT_DATA_VERDICT</code>.</p>
+<p>However, <code>set-&gt;dlen</code> is controlled by the user when a new set is created. 
+The only restriction is that <code>set-&gt;dlen</code> should be lower than 64 bytes and the data type should be different of <code>NFT_DATA_VERDICT</code>.
+Moreover, when <code>desc-&gt;type</code> is equal to <code>NFT_DATA_VERDICT</code>, <code>desc-&gt;len</code> is equal to 16 bytes.</p>
+<p>Adding an element of type <code>NFT_DATA_VERDICT</code> to a set with data type <code>NFT_DATA_VALUE</code> usually lead to <code>desc-&gt;len</code> being different from <code>set-&gt;dlen</code>.
+Therefore, it is possible to perform a heap buffer overflow in <code>nft_set_elem_init</code> at <code>(1)</code>.
+This buffer overflow can be extended up to 48 bytes long.</p>
+<h2 id="stay-here--i-will-be-back-soon-">Stay here ! I will be back soon !</h2>
+<p>Nevertheless, this is not a standard buffer overflow, when a user can directly control the overflowing data.
+In this case, random data will be copied out of the allocated buffer.</p>
+<p>If we check the call to <code>nft_set_elem_init</code> <code>(5)</code>, one can observe that copied data are extracted from a local variable <code>elem</code>, which is a <code>nft_set_elem</code> object.</p>
+<div><pre><code data-lang="c">    <span>struct</span> nft_set_elem elem;                                                   <span>&lt;=====</span> (<span>2</span>)
+    
+    ...
+    
+    elem.priv <span>=</span> nft_set_elem_init(set, <span>&amp;</span>tmpl, elem.key.val.data,                <span>&lt;=====</span> (<span>5</span>)
+                      elem.key_end.val.data, elem.data.val.data,
+                      timeout, expiration, GFP_KERNEL);
+</code></pre></div><p><code>nft_set_elem</code> (<code>/net/netfilter/nf_tables.h</code>) are used to store information about new elements during their creation.</p>
+<div><pre><code data-lang="c"><span>#define NFT_DATA_VALUE_MAXLEN   64
+</span><span></span>
+<span>struct</span> nft_verdict {
+    u32             code;
+    <span>struct</span> nft_chain        <span>*</span>chain;
+};
+
+<span>struct</span> nft_data {
+    <span>union</span> {
+        u32         data[<span>4</span>];
+        <span>struct</span> nft_verdict  verdict;
+    };
+} __attribute__((aligned(__alignof__(u64))));
+
+<span>struct</span> nft_set_elem {
+    <span>union</span> {
+        u32     buf[NFT_DATA_VALUE_MAXLEN <span>/</span> <span>sizeof</span>(u32)];
+        <span>struct</span> nft_data val;
+    } key;
+    <span>union</span> {
+        u32     buf[NFT_DATA_VALUE_MAXLEN <span>/</span> <span>sizeof</span>(u32)];
+        <span>struct</span> nft_data val;
+    } key_end;
+    <span>union</span> {
+        u32     buf[NFT_DATA_VALUE_MAXLEN <span>/</span> <span>sizeof</span>(u32)];
+        <span>struct</span> nft_data val;
+    } data;
+    <span>void</span>            <span>*</span>priv;
+};
+</code></pre></div><p>As one can see, 64 bytes are reserved to temporarily store data associated to the new element.
+However, only 16 bytes at most are written into <code>elem.data</code> when the buffer overflow is triggered.
+Therefore, random bytes are used in the overflow.</p>
+<h3 id="finally-not-so-random">Finally, not so random</h3>
+<p>At this point, I found a buffer overflow without control on data used for the corruption.
+Building an exploit with an uncontrolled buffer overflow is a real challenge.</p>
+<p><code>elem.data</code> used in the overflow is not initialized <code>(2)</code>.
+It could be used to control the overflow.</p>
+<p>Let’s have a look to the caller, maybe the previously called function can help to control data used for the overflow.
+<code>nft_add_set_elem</code> is called in <code>nf_tables_newsetelem</code> (<code>/net/netfilter/nf_tables_api.c</code>) for each elements that the user wants to add to the set.</p>
+<div><pre><code data-lang="c"><span>static</span> <span>int</span> <span>nf_tables_newsetelem</span>(<span>struct</span> sk_buff <span>*</span>skb,
+                <span>const</span> <span>struct</span> nfnl_info <span>*</span>info,
+                <span>const</span> <span>struct</span> nlattr <span>*</span> <span>const</span> nla[])
+{
+    ...
+    
+    nla_for_each_nested(attr, nla[NFTA_SET_ELEM_LIST_ELEMENTS], rem) {
+        err <span>=</span> nft_add_set_elem(<span>&amp;</span>ctx, set, attr, info<span>-&gt;</span>nlh<span>-&gt;</span>nlmsg_flags);
+        <span>if</span> (err <span>&lt;</span> <span>0</span>) {
+            NL_SET_BAD_ATTR(extack, attr);
+            <span>return</span> err;
+        }
+    }
+}
+</code></pre></div><p><code>nla_for_each_nested</code> is used to iterate over attributes sent by the user, so the user is able to control the number of iteration that will be done.
+And <code>nla_for_each_nested</code> is only using macros and inline functions, so a call to <code>nft_add_set_elem</code> can be directly followed by another call to <code>nft_add_set_elem</code>.
+It is very useful because it allows to use data of a previous element in the overflow, as <code>elem.data</code> is not initialized.
+Moreover, one can ignore the randomization of the stack layout.
+Therefore, the way to control the overflow will be independent of the kernel compilation.</p>
+<p>The following schema summarizes the different stages of <code>elem.data</code> within the stack to produce a controlled overflow.</p>
+<p><a href="https://www.randorisec.fr/img/blog/uninit-path.png"><img src="https://www.randorisec.fr/img/blog/uninit-path.png" alt="Different steps of the elem.data during the exploitation"/></a></p>
+<p>Random data are stored within the stack, adding a new element with <code>NFT_DATA_VALUE</code> data leads to user-controlled data within the stack.
+Finally, adding a second element with <code>NFT_DATA_VERDICT</code> data will trigger the buffer overflow and the data residue of the last element will be copied during the overflow.</p>
+<h3 id="cache-selection">Cache selection</h3>
+<p>The last thing we didn’t discuss before developing my exploitation strategy is the cache where the overflow happens.
+<code>elem</code>, allocated at <code>(0)</code>, is dependent from the different options selected by the user, as shown in the previous extract of the function <code>nft_add_set_elem</code>, its size may vary.
+There are several options that can be used to increase it, such as <code>NFT_SET_ELEM_KEY</code> and <code>NFT_SET_ELEM_KEY_END</code>.
+They allow to reserve two buffers with a length up to 64 bytes in <code>elem</code>.
+So this overflow can clearly happen in several caches.
+<code>elem</code> is allocated on Ubuntu 22.04 with the flag <code>GFP_KERNEL</code>.
+Therefore, the concerned caches are <code>kmalloc-{64,96,128,192}</code>.</p>
+<p>Now, the only thing that remains is to align <code>elem</code> on the cache object size to perform the best overflow.
+The next schema represents the construction of <code>elem</code> to align it on 64 bytes.</p>
+<p><a href="https://www.randorisec.fr/img/blog/elem-build.png"><img src="https://www.randorisec.fr/img/blog/elem-build.png" alt="Elem build"/></a></p>
+<p>We used the following construction in order to target the <code>kmalloc-64</code> cache:</p>
+<ul>
+<li>20 bytes for the object header</li>
+<li>28 bytes of padding via <code>NFT_SET_ELEM_KEY</code></li>
+<li>16 bytes to store the element data of type <code>NFT_DATA_VERDICT</code>.</li>
+</ul>
+<h2 id="gimme-a-leak">Gimme a leak</h2>
+<p>Now that it is possible to control the overflowing data, the next step is to find a way to retrieve the KASLR base.
+As the overflow only occurred in <code>kmalloc-x</code> caches, the classical <code>msg_msg</code> objects cannot be used to perform an information leak, because they are allocated within the <code>kmalloc-cg-x</code> caches.</p>
+<p>We looked at <code>user_key_payload</code> (<code>/include/keys/user-type.h</code>) objects, normally used to store sensitive user information in kernel land, represent a good alternative.
+They are similar to <code>msg_msg</code> objects in their structure: a header with the object size, then a buffer with user data.</p>
+<div><pre><code data-lang="c"><span>struct</span> user_key_payload {
+    <span>struct</span> rcu_head rcu;        <span>/* RCU destructor */</span>
+    <span>unsigned</span> <span>short</span>  datalen;    <span>/* length of this data */</span>
+    <span>char</span>        data[] __aligned(__alignof__(u64)); <span>/* actual data */</span>
+};
+</code></pre></div><p>These objects are allocated within the function <code>user_preparse</code> (<code>/security/keys/user_defined.c</code>)</p>
+<div><pre><code data-lang="c"><span>int</span> <span>user_preparse</span>(<span>struct</span> key_preparsed_payload <span>*</span>prep)
+{
+    <span>struct</span> user_key_payload <span>*</span>upayload;
+    size_t datalen <span>=</span> prep<span>-&gt;</span>datalen;
+
+    <span>if</span> (datalen <span>&lt;=</span> <span>0</span> <span>||</span> datalen <span>&gt;</span> <span>32767</span> <span>||</span> <span>!</span>prep<span>-&gt;</span>data)
+        <span>return</span> <span>-</span>EINVAL;
+
+    upayload <span>=</span> kmalloc(<span>sizeof</span>(<span>*</span>upayload) <span>+</span> datalen, GFP_KERNEL);                <span>&lt;=====</span> (<span>6</span>)
+    <span>if</span> (<span>!</span>upayload)
+        <span>return</span> <span>-</span>ENOMEM;
+
+    <span>/* attach the data */</span>
+    prep<span>-&gt;</span>quotalen <span>=</span> datalen;
+    prep<span>-&gt;</span>payload.data[<span>0</span>] <span>=</span> upayload;
+    upayload<span>-&gt;</span>datalen <span>=</span> datalen;
+    memcpy(upayload<span>-&gt;</span>data, prep<span>-&gt;</span>data, datalen);                                <span>&lt;=====</span> (<span>7</span>)
+    <span>return</span> <span>0</span>;
+}
+</code></pre></div><p>The allocation done at <code>(6)</code> is taking into consideration the length of the data provided by the user.
+Then, data is stored just after the header with the call to <code>memcpy</code> at <code>(7)</code>
+The header of <code>user_key_payload</code> objects is 24 bytes long, consequently they can be used to spray several caches, <code>kmalloc-32</code> to <code>kmalloc-8k</code>.</p>
+<p>As with <code>msg_msg</code> objects, the goal is to overwrite the field <code>datalen</code> with a bigger value than the initial one.
+When retrieving the information stored, the corrupted object will return more data than initially provided by the user.</p>
+<p>However, there is an important drawback with this spray.
+The number of allocated objects is restricted.
+The <code>sysctl</code> variable <code>kernel.keys.maxkeys</code> defines the limit on the number of allowed keys within a user keyring. 
+Moreover, <code>kernel.keys.maxbytes</code> restricts the number of stored bytes within a keyring.
+The default values of these variables are very low.
+They are shown below for Ubuntu 22.04</p>
+<pre><code>kernel.keys.maxbytes = 20000
+kernel.keys.maxkeys = 200
+</code></pre><h3 id="leaking-is-good-leaking-useful-is-better">Leaking is good, leaking useful is better</h3>
+<p>Since I found a way to leak information, the next step is to find interesting information.
+Working within the <code>kmalloc-64</code> cache seemed the best one, this is the cache with the smallest objects where the overflow can occur.
+Consequently, a higher number of objects can leak.</p>
+<p><code>percpu_ref_data</code> (<code>/include/linux/percpu-refcount.h</code>) objects are also allocated in this cache.
+They are interessant targets because they contain two useful kinds of pointers.</p>
+<div><pre><code data-lang="c"><span>struct</span> percpu_ref_data {
+    atomic_long_t       count;
+    percpu_ref_func_t   <span>*</span>release;
+    percpu_ref_func_t   <span>*</span>confirm_switch;
+    <span>bool</span>            force_atomic:<span>1</span>;
+    <span>bool</span>            allow_reinit:<span>1</span>;
+    <span>struct</span> rcu_head     rcu;
+    <span>struct</span> percpu_ref   <span>*</span>ref;
+};
+</code></pre></div><p>These objects store pointers to functions (fields <code>release</code> and <code>confirm_switch</code>) that can be used to compute the KASLR base or module bases when they are leaked and also a pointer to a dynamically allocated object (field <code>ref</code>) useful to compute the physmap base.</p>
+<p>Such objects are allocated during a call to <code>percpu_ref_init</code> (<code>/lib/percpu-refcount.c</code>).</p>
+<div><pre><code data-lang="c"><span>int</span> <span>percpu_ref_init</span>(<span>struct</span> percpu_ref <span>*</span>ref, percpu_ref_func_t <span>*</span>release,
+            <span>unsigned</span> <span>int</span> flags, gfp_t gfp)
+{
+    <span>struct</span> percpu_ref_data <span>*</span>data;
+    
+    ...
+    
+    data <span>=</span> kzalloc(<span>sizeof</span>(<span>*</span>ref<span>-&gt;</span>data), gfp);
+    
+    ...
+    
+    data<span>-&gt;</span>release <span>=</span> release;
+    data<span>-&gt;</span>confirm_switch <span>=</span> NULL;
+    data<span>-&gt;</span>ref <span>=</span> ref;
+    ref<span>-&gt;</span>data <span>=</span> data;
+    <span>return</span> <span>0</span>;
+}
+</code></pre></div><p>The simplest way to allocate <code>percpu_ref_data</code> objects is to use the <code>io_uring_setup</code> syscall (<code>/fs/io_uring.c</code>). 
+And in order to program the release of such an object, a simple call to the <code>close</code> syscall is enough.</p>
+<p>The allocation of a <code>percpu_ref_data</code> object is done during the initialization of an <code>io_ring_ctx</code> object (<code>/fs/io_uring.c</code>) within the function <code>io_ring_ctx_alloc</code> (<code>/fs/io_uring.c</code>).</p>
+<div><pre><code data-lang="c"><span>static</span> __cold <span>struct</span> io_ring_ctx <span>*</span><span>io_ring_ctx_alloc</span>(<span>struct</span> io_uring_params <span>*</span>p)
+{
+    <span>struct</span> io_ring_ctx <span>*</span>ctx;
+    
+    ...
+    
+    <span>if</span> (percpu_ref_init(<span>&amp;</span>ctx<span>-&gt;</span>refs, io_ring_ctx_ref_free,
+                PERCPU_REF_ALLOW_REINIT, GFP_KERNEL))
+        <span>goto</span> err;
+
+    ...
+}
+</code></pre></div><p>As <code>io_uring</code> is integrated to the Linux core, the leak of <code>io_ring_ctx_ref_free</code> (<code>/fs/io_uring.c</code>) allows to compute the KASLR base.</p>
+<p>During my investigation, some unexpected <code>percpu_ref_data</code> objects were in the leak but with the address of the function <code>io_rsrc_node_ref_zero</code> (<code>/fs/io_uring.c</code>) within the field <code>release</code>.
+After analyzing the origin of these objects, I understood that they also come from the <code>io_uring_setup</code> syscall.
+This good side effect of the <code>io_uring_setup</code> syscall allowed to improve the leak within my exploit.</p>
+<h2 id="i-am-groot">I am (G)root</h2>
+<p>Now, that it is possible to obtain a useful information leak, a good write primitive is needed to perform a privilege escalation.</p>
+<p>A few weeks ago, Lam Jun Rong from Starlabs released an <a href="https://starlabs.sg/blog/2022/06/io_uring-new-code-new-bugs-and-a-new-exploit-technique/#unlinking_attack">article</a> that describes a new way to exploit the CVE-2021-41073.
+He is presenting a new write primitive, the unlinking attack.
+It is based on the <code>list_del</code> operation.
+After corrupting a <code>list_head</code> object with two addresses, one address gets stored at the other.</p>
+<p>As in the article of L.J. Rong, the target for the <code>list_head</code> corruption in my exploit is a <code>simple_xattr</code> object.</p>
+<div><pre><code data-lang="c"><span>struct</span> simple_xattr {
+    <span>struct</span> list_head list;
+    <span>char</span> <span>*</span>name;
+    size_t size;
+    <span>char</span> value[];
+};
+</code></pre></div><p>To work, this technique requires to know which object has been corrupted.
+In the other case, removing random items from the list leads surly to a fault in the list traversal.
+The items in the list are identified with their names.</p>
+<p>To identify the corrupted object, I perform a trick on the <code>name</code> field: allocating <code>name</code> with a length high enough to have 256 bytes reserved, the least significant byte of the returned address is null.
+Little endian architectures, such as <em>x86_64</em>, allow us to just erase the least significant byte of <code>name</code> after the two pointers in the <code>list_head</code>.
+Consequently, it is possible to prepare the <code>list</code> field for the write primitive and at the same time to identify the corrupted object truncating its name.
+The only requirement is that all the names have the same end.</p>
+<p>The following schema summarizes the construction of the name for a spray with <code>simple_xattr</code> objects.</p>
+<p><a href="https://www.randorisec.fr/img/blog/xattr-names.png"><img src="https://www.randorisec.fr/img/blog/xattr-names.png" alt="Schema of the xattr names construction"/></a></p>
+<p>Using this write primitive, it is possible to edit the <code>modprobe_path</code> with a path in the <code>/tmp/</code> folder.
+It allows to execute any program with root privileges, and enjoy a root shell !</p>
+<p><a href="https://www.randorisec.fr/img/blog/poc.gif"><img src="https://www.randorisec.fr/img/blog/poc.gif" alt="Running poc"/></a></p>
+
+<p>This exploitation method is based on the hypothesis that a specific address is mapped in kernel land which is not always the case.
+So the exploit is not fully reliable but it still has a good success rate.
+The second drawback of the unlinking attack is the kernel panic that comes when the exploit is finished.
+This could be avoided by finding objects that can stay in the kernel memory at the end of the exploit process.</p>
+<h2 id="the-end-of-the-story">The end of the story</h2>
+<p>This vulnerability has been reported to the Linux security team and CVE-2022-34918 has been assigned.
+They proposed a patch that I tested and reviewed, and it has been released in the upstream tree within the commit <a href="https://github.com/torvalds/linux/commit/7e6bc1f6cabcd30aba0b11219d8e01b952eacbb6">7e6bc1f6cabcd30aba0b11219d8e01b952eacbb6</a>.</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>To sum up, I found a heap buffer overflow within the Netfilter subsystem of the Linux kernel.
+This vulnerability could be exploited to get a privilege escalation on Ubuntu 22.04.
+The source code of the exploit is available on our <a href="https://github.com/randorisec/CVE-2022-34918-LPE-PoC">GitHub</a>.</p>
+<p>I would like to acknowledge RandoriSec for the opportunity they gave me to perform vulnerability research inside the Linux kernel during my internship and also my research team for their advice.</p>
+
+                    </div></div>
+  </body>
+</html>
