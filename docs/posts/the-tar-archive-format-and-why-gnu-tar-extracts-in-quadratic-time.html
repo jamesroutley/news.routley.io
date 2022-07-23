@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://mort.coffee/home/tar/">Original</a>
+    <h1>The tar archive format, and why GNU tar extracts in quadratic time</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+<p>Date: 2022-07-23 </p>
+<p>(If you&#39;re here from Google and just need help with tar being slow:
+If you trust the tar archive, extract with <code>-P</code> to make tar fast.)</p>
+<p>A couple of days ago, I had a 518GiB tar.gz file (1.1 TiB uncompressed) that I had to extract.
+At first, GNU tar was doing a great job, chewing through the tar.gz at around 100MiB/s.
+But after a while, it slowed significantly; down to less than a kilobyte per second.
+<a href="http://www.ivarch.com/programs/pv.shtml">pv</a>&#39;s time estimate went from a bit over an hour,
+to multiple hours, to over a day, to almost a week.
+After giving it some time, and after failing to find anything helpful through Google,
+I decided that learning the tar file format and making my own tar extractor would probably be faster
+than waiting for tar.
+And I was right; before the day was over, I had a working tar extractor,
+and I had successfully extracted my 1.1TiB tarball.</p>
+<p>I will explain why GNU tar is so slow later in this post, but first, let&#39;s take a look at:</p>
+<h2>The original tar file format</h2>
+<p>Tar is pretty unusual for an archive file format.
+There&#39;s no archive header, no index of files to fascilitate seeking, no magic bytes to help <code>file</code>
+and its ilk detect whether a file is a tar archive, no footer, no archive-wide metadata.
+The only kind of thing in a tar file is a file object.</p>
+<p>So, how do these file objects look?
+Well, they start with a 512-byte file object header which looks like this:</p>
+<pre><code>struct file_header {
+	char file_path[100];
+	char file_mode[8];
+	char owner_user_id[8];
+	char owner_group_id[8];
+	char file_size[12];
+	char file_mtime[12];
+	char header_checksum[8];
+	char file_type;
+	char link_path[100];
+
+	char padding[255];
+};
+</code></pre>
+<p>Followed by <code>ceil(file_size / 512)</code> 512-byte blocks of payload (i.e file contents).</p>
+<p>We have most of the attributes we would expect a file object to have:
+the file path, the mode, the modification time (mtime), the user/group ID, the file size,
+and the file type.
+To support symlinks and hard links, there&#39;s also a link path.</p>
+<p>The original tar file format defines these possible values for the <code>file_type</code> field:</p>
+<ul>
+<li><code>&#39;0&#39;</code> (or sometimes <code>&#39;\0&#39;</code>, the NUL character): Normal file</li>
+<li><code>&#39;1&#39;</code>: Hard link</li>
+<li><code>&#39;2&#39;</code>: Symbolic link</li>
+</ul>
+<p>Future extensions to tar implements additional file types, among them <code>&#39;5&#39;</code>, which represents a directory.
+Some old tar implementations apparently used a trailing slash <code>&#39;/&#39;</code> in a <code>&#39;0&#39;</code>-type file object
+to represent directories, at least according to Wikipedia.</p>
+<p>You may think that the numeric values (<code>file_mode</code>, <code>file_size</code>, <code>file_mtime</code>, ...) would be
+encoded in base 10, or maybe in hex, or using plain binary numbers (&#34;base 256&#34;).
+But no, they&#39;re actually encoded as octal strings (with a NUL terminator,
+or sometimes a space terminator).
+Tar is the only file format I know of which uses base 8 to encode numbers.
+I don&#39;t quite understand why, since octal is neither space-efficient nor human-friendly.
+When representing numbers in this post, I will write them in decimal (base 10).</p>
+<p>To encode a tar archive with one file called <code>&#34;hello.txt&#34;</code> and the content <code>&#34;Hello World&#34;</code>,
+we need two 512-byte blocks:</p>
+<ol>
+<li>Bytes 0-511: Header, <code>type=&#39;0&#39;</code>, <code>file_path=&#34;./hello.txt&#34;</code>, <code>file_size=11</code></li>
+<li>Bytes 512-1023: <code>&#34;Hello World&#34;</code>, followed by 501 zero bytes</li>
+</ol>
+<p>In addition, a tar file is supposed to end with 1024 zero-bytes to represent an end-of-file marker.</p>
+<p>The two big limitations of the original tar format is that paths can&#39;t be longer than 100 characters,
+and files can&#39;t be larger than 8GiB (8^11 bytes).
+Otherwise though, I quite like the simplicity of the format.
+We&#39;ll discuss how various extensions address the limitations later,
+but first, let&#39;s try to implement an extractor:</p>
+<p>(Feel free to skip this source code, but you should at least skim the comments)</p>
+<pre><code>// tarex.c
+
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sys/stat.h&gt;
+#include &lt;string.h&gt;
+
+struct file_header {
+	char file_path[100];
+	char file_mode[8];
+	char owner_user_id[8];
+	char owner_group_id[8];
+	char file_size[12];
+	char file_mtime[12];
+	char header_checksum[8];
+	char file_type;
+	char link_path[100];
+
+	char padding[255];
+};
+
+// We don&#39;t bother with great error reporting, just abort on error
+#define check(x) if (!(x)) abort()
+
+// Utilities to abort on short read/write
+#define xfread(ptr, size, f) check(fread(ptr, 1, size, f) == size)
+#define xfwrite(ptr, size, f) check(fwrite(ptr, 1, size, f) == size)
+
+// Tar represents all its numbers as octal
+size_t parse_octal(char *str, size_t maxlen) {
+	size_t num = 0;
+	for (size_t i = 0; i &lt; maxlen &amp;&amp; str[i] &gt;= &#39;0&#39; &amp;&amp; str[i] &lt;= &#39;7&#39;; ++i) {
+		num *= 8;
+		num += str[i] - &#39;0&#39;;
+	}
+
+	return num;
+}
+
+// Extract one file from the archive.
+// Returns 1 if it extracted something, or 0 if it reached the end.
+int extract(FILE *f) {
+	unsigned char header_block[512];
+	xfread(header_block, sizeof(header_block), f);
+	struct file_header *header = (struct file_header *)header_block;
+
+	// The end of the archive is represented with blocks of all-zero content.
+	// For simplicity, assume that if the file path is empty, the block is all zero
+	// and we reached the end.
+	if (header-&gt;file_path[0] == &#39;\0&#39;) {
+		return 0;
+	}
+
+	// The file path and link path fields aren&#39;t always 0-terminated, so we need to copy them
+	// into our own buffers, otherwise we break on files with exactly 100 character paths.
+	char file_path[101] = {0};
+	memcpy(file_path, header-&gt;file_path, 100);
+	char link_path[101] = {0};
+	memcpy(link_path, header-&gt;link_path, 100);
+
+	// We need these for later
+	size_t file_size = parse_octal(header-&gt;file_size, sizeof(header-&gt;file_size));
+	FILE *out_file = NULL;
+
+	if (header-&gt;file_type == &#39;0&#39; || header-&gt;file_type == &#39;\0&#39;) {
+		// A type of &#39;0&#39; means that this is a plain file.
+		// Some early implementations also use a NUL character (&#39;\0&#39;) instead of an ASCII zero.
+
+		fprintf(stderr, &#34;Regular file: %s\n&#34;, header-&gt;file_type, file_path);
+		out_file = fopen(file_path, &#34;w&#34;);
+		check(out_file != NULL);
+
+	} else if (header-&gt;file_type == &#39;1&#39;) {
+		// A type of &#39;1&#39; means that this is a hard link.
+		// That means we create a hard link at &#39;file_path&#39; which links to the file at &#39;link_path&#39;.
+
+		fprintf(stderr, &#34;Hard link: %s -&gt; %s\n&#34;, file_path, link_path);
+		check(link(link_path, file_path) &gt;= 0);
+
+	} else if (header-&gt;file_type == &#39;2&#39;) {
+		// A type of &#39;2&#39; means that this is a symbolic link.
+		// That means we create a symlink at &#39;file_path&#39; which links to the file at &#39;link_path&#39;.
+
+		fprintf(stderr, &#34;Symbolic link: %s -&gt; %s\n&#34;, file_path, link_path);
+		check(symlink(link_path, file_path) &gt;= 0);
+
+	} else if (header-&gt;file_type == &#39;5&#39;) {
+		// A type of &#39;5&#39; means that this is a directory.
+
+		fprintf(stderr, &#34;Directory: %s\n&#34;, file_path);
+		check(mkdir(file_path, 0777) &gt;= 0);
+
+		// Directories sometimes use the size field, but they don&#39;t contain data blocks.
+		// Zero out file_size to avoid skipping entries.
+		file_size = 0;
+
+	} else {
+		// There are other possible fields added by various tar implementations and standards,
+		// but we&#39;ll ignore those for this implementation.
+		fprintf(stderr, &#34;Unsupported file type %c: %s\n&#34;, header-&gt;file_type, file_path);
+	}
+
+	// We have read the header block, now we need to read the payload.
+	// If we&#39;re reading a file (i.e if &#39;outfile&#39; is non-NULL) we will also write the body,
+	// but otherwise we&#39;ll just skip it.
+	char block[512];
+	while (file_size &gt; 0) {
+		xfread(block, sizeof(block), f);
+		size_t n = file_size &gt; 512 ? 512 : file_size;
+
+		file_size -= n;
+		if (out_file != NULL) {
+			xfwrite(block, n, out_file);
+		}
+	}
+
+	// Indicate that we have successfully extracted a file object, and are ready to read the next
+	return 1;
+}
+
+int main() {
+	while (extract(stdin));
+}
+</code></pre>
+<p>Let&#39;s see it in action:</p>
+<pre><code>~/tarex $ ls
+tarex.c testdir
+~/tarex $ gcc -o tarex tarex.c
+~/tarex $ tree
+.
+├── tarex.c
+├── tarex
+└── testdir
+    ├── hello-symlink -&gt; hello.txt
+    ├── hello.txt
+    └── subdir
+        └── file.txt
+
+~/tarex $ tar c testdir &gt;testdir.tar
+~/tarex $ mkdir extract &amp;&amp; cd extract
+
+~/tarex/extract $ ../tarex &lt;../testdir.tar
+Directory: testdir/
+Symbolic link: testdir/hello-symlink -&gt; hello.txt
+Directory: testdir/subdir/
+Regular file: testdir/hello.txt
+Regular file: testdir/subdir/file.txt
+
+~/tarex/extract $ tree
+.
+└── testdir
+    ├── hello-symlink -&gt; hello.txt
+    ├── hello.txt
+    └── subdir
+        └── file.txt
+</code></pre>
+<h2>The UStar file format</h2>
+<p>The first major extension to the tar file format we will look at is the UStar format,
+which increases the file length limit to 256 characters and adds some new file types.
+The header is expanded to this:</p>
+<pre><code>struct file_header {
+	// Original tar header fields
+	char file_path[100];
+	char file_mode[8];
+	char owner_user_id[8];
+	char owner_group_id[8];
+	char file_size[12];
+	char file_mtime[12];
+	char header_checksum[8];
+	char file_type;
+	char link_path[100];
+
+	// New UStar fields
+	char magic_bytes[6];
+	char version[2];
+	char owner_user_name[32];
+	char owner_group_name[32];
+	char device_major_number[8];
+	char device_minor_number[8];
+	char prefix[155];
+
+	char padding[12];
+};
+</code></pre>
+<p>We now have some magic bytes (defined to be <code>&#34;ustar\0&#34;</code> for the UStar format),
+as well as the owner user/group names.
+But most importantly, we have a <code>prefix</code> field, which allows up to 256 character file paths.
+With UStar, instead of just extracting the bytes from <code>file_path</code> and <code>link_path</code> like before,
+we must construct a file path like this:</p>
+<pre><code>void read_path(char dest[257], char path[100], char prefix[100]) {
+	// If there&#39;s no prefix, use name directly
+	if (prefix[0] == &#39;\0&#39;) {
+		memcpy(dest, path, 100);
+		dest[100] = &#39;\0&#39;;
+		return;
+	}
+
+	// If there is a prefix, the path is: &lt;prefix&gt; &#39;/&#39; &lt;path&gt;
+	size_t prefix_len = strnlen(prefix, 100);
+	memcpy(dest, prefix, prefix_len);
+	dest[prefix_len] = &#39;/&#39;;
+	memcpy(&amp;dest[prefix_len + 1], path, 100);
+	dest[256] = &#39;\0&#39;;
+}
+
+int extract(FILE *f) {
+	/* ... */
+
+	char file_path[257];
+	read_path(file_path, header-&gt;file_path, header-&gt;prefix);
+	char link_path[257];
+	read_path(link_path, header-&gt;link_path, header-&gt;prefix);
+
+	/* ... */
+}
+</code></pre>
+<p>The original tar format had the file types <code>&#39;0&#39;</code> (or <code>&#39;\0&#39;</code>), <code>&#39;1&#39;</code> and <code>&#39;2&#39;</code>,
+for regular files, hard links and symlinks.
+UStar defines these additional file types:</p>
+<ul>
+<li><code>&#39;3&#39;</code> and <code>&#39;4&#39;</code>: Character devices and block devices. These are the reason for the new
+<code>device_major_number</code> and <code>device_minor_number</code> fields.</li>
+<li><code>&#39;5&#39;</code>: Directories.</li>
+<li><code>&#39;6&#39;</code>: FIFO files.</li>
+<li><code>&#39;7&#39;</code>: Contiguous files. This type isn&#39;t really used much these days, and most implementations
+just treat it as a regular file.</li>
+</ul>
+<p>This is definitely an improvement, but we can still only encode up to 256 character long paths.
+And that 8GiB file size limit still exists. Which leads us to:</p>
+<h2>The pax file format</h2>
+<p>The POSIX.1-2001 standard introduced the <code>pax</code> command line tool, and with it, a new set of
+extensions to the tar file format.
+This format is identical to UStar, except that it adds two new file object types: <code>&#39;x&#39;</code> and <code>&#39;g&#39;</code>.
+Both of these types let us define &#34;extended header records&#34;, as the spec calls it.
+Records set with <code>&#39;x&#39;</code> apply to only the next file, while records set with <code>&#39;g&#39;</code> apply to all
+following files.</p>
+<p>With this new extended header, we can encode the access and modification times with more precision,
+user/group IDs above 8^7, file sizes over 8^11, file paths of arbitrary length, and a whole lot more.
+The records are in the payload of the extended headr file object,
+and use a simple length-prefixed key/value syntax.
+To represent our <code>&#34;hello.txt&#34;</code> example file with an access time attribute,
+we need these four 512-byte blocks:</p>
+<ol>
+<li>Header, <code>type=&#39;x&#39;</code>, <code>file_size=30</code></li>
+<li><code>&#34;30 atime=1658409251.551879906\n&#34;</code>, followed by 482 zeroes</li>
+<li>Header, <code>type=&#39;0&#39;</code>, <code>file_path=&#34;hello.txt&#34;</code>, <code>file_size=11</code></li>
+<li><code>&#34;Hello World&#34;</code>, followed by 501 zero bytes</li>
+</ol>
+<p>Interestingly, these extended header records all seem to use decimal (base 10).
+On the one hand, using base 10 makes sense, but on the other hand, wouldn&#39;t it be nice to stick to
+one way of representing numbers?</p>
+<p>Anyways, we can see that the file format has become quite complex now.
+Just the file path can be provided in any of four different ways:</p>
+<ul>
+<li>The full path might be in the <code>file_path</code> field.</li>
+<li>The path might be a combination of the <code>prefix</code> and the <code>file_path</code> fields.</li>
+<li>The previous file object might&#39;ve been an <code>&#39;x&#39;</code> type record with set a <code>path</code> property.</li>
+<li>There might&#39;ve been some <code>&#39;g&#39;</code> type file object earlier in the archive which set a <code>path</code> property.</li>
+</ul>
+<h2>The GNU tar file format</h2>
+<p>GNU tar has its own file format, called <code>gnu</code>, which is different from the pax format.
+Like pax, the <code>gnu</code> format is based on UStar, but it has a different way of encoding
+arbitrary length paths and large file sizes:</p>
+<ul>
+<li>It introduces the <code>&#39;L&#39;</code> type, where the payload of the file object represents the <code>file_path</code>
+of the next file object.</li>
+<li>It introduces the <code>&#39;K&#39;</code> type, where the payload of the file object represents the <code>link_path</code>
+of the next file object.</li>
+<li>A link with both a long <code>file_path</code> and a long <code>link_path</code> is preceeded by both an <code>&#39;L&#39;</code> type
+file object and a <code>&#39;K&#39;</code> type file object. The order isn&#39;t specified from what I can tell.</li>
+<li>If a file is over 8GiB, it will set the high bit of the first character in <code>file_size</code>,
+and the rest of the string is parsed as base 256 (i.e it&#39;s treated as a 95-bit integer, big endian).</li>
+</ul>
+<p>In some ways, I prefer this approach over the pax approach, since it&#39;s much simpler;
+the pax format requires the extractor to parse the record grammar.
+On the other hand, the pax format is both more space efficient and vastly more flexible.</p>
+<p>In any case, the result is that a tar extractor which wants to support both pax tar files
+and GNU tar files needs to support 5 different ways of reading the file path,
+5 different ways of reading the link path,
+and 3 different ways of reading the file size.</p>
+<p>Whatever happened to the nice and simple format we started out with?</p>
+<h2>Why GNU tar extracts in quadratic time</h2>
+<p>Our simple tar extraction implementation has what could be considered a quite serious security bug:
+It allows people to put files outside the directory we&#39;re extracting to.
+Nothing is stopping an evil arcive from containing a file object with <code>file_path=&#34;../hello.txt&#34;</code>.
+You might try to fix that by just disallowing file objects from using &#34;..&#34; as a path component,
+but it&#39;s not that simple.
+Consider the following sequence of file objects:</p>
+<ol>
+<li>Symlink, <code>file_path=&#34;./foo&#34;</code>, <code>link_path=&#34;..&#34;</code></li>
+<li>Normal file, <code>file_path=&#34;./foo/hello.txt&#34;</code></li>
+</ol>
+<p>We want to allow symlinks which point to their parent directory, since there are completely legitimate
+use cases for that.
+We could try to figure out whether a symlink will end up pointing to somewhere outside of the
+extraction directory, but that gets complicated real fast when you have to consider symlinks
+to symlinks and hard links to symlinks.
+It might be possible to do correctly, but it&#39;s not the solution GNU tar goes for.</p>
+<p>When GNU tar encounters a hard link or symlink with <code>&#34;..&#34;</code> as a path component in its <code>link_path</code>,
+tar will create a regular file in its place as a placeholder, and put a note about the delayed link
+in a linked list datastructure.
+When it&#39;s done extracting the entire archive, it will go through the whole list of delayed links
+and replace the placeholders with proper links.
+So far, so good.</p>
+<p>The problem comes when trying to extract a hard link which <em>doesn&#39;t</em> contain <code>&#34;..&#34;</code> as a path component
+in its <code>link_path</code>.
+GNU tar wants to create such hard links immediately if it can.
+But it can&#39;t create a hard link if the target is occupied by a placeholder file.
+That means, every time GNU tar wants to create a hard link, it first has to walk the entire linked list
+of delayed links and see if the target is a delayed link.
+If the target is a delayed link, the new link must also be delayed.</p>
+<p>Your time complexity alarm bells should be starting to ring now.
+For every hard link, we walk the list of all delayed links.
+But it actually gets worse; for reasons I don&#39;t quite understand yet, tar will actually go through
+the entire list of delayed links <em>again</em> if it found out that it can create the link immediately.
+So for all &#34;normal&#34; hard links, it has to go through the entire linked list of delayed links <em>twice</em>.</p>
+<p>If you&#39;re a bit crafty, you can construct a tar archive which GNU tar extracts in precisely O(n^2) time;
+you just need to alternate between links whose <code>link_path</code> has <code>&#34;..&#34;</code> as a path component
+and thus get delayed, and &#34;normal&#34; hard links which don&#39;t get delayed.
+If you&#39;re a bit unlucky, you might have a totally benign tarball which nevertheless happens to contain
+a bunch of symlinks which refer to files in a parent directory, followed by a bunch of normal hard links.
+This is what had happened to me.
+My tarball happened to contain over 800 000 links with <code>&#34;..&#34;</code> as a path component.
+It also happened to contain over 5.4 million hard links.
+Every one of those hard links had to go through the entire list of every hitherto deferred link.
+No wonder tar got slow.</p>
+<p>If you ever find yourself in this situation, pass the <code>--absolute-paths</code> (or <code>-P</code>) parameter to tar.
+Tar&#39;s documentation says this about <code>--absolute-paths</code>:</p>
+<blockquote>
+<p>Preserve pathnames.  By default, absolute pathnames (those that begin with a <code>/</code>
+character) have the leading slash removed both when creating archives and extracting
+from them.  Also, tar will refuse to extract archive entries whose pathnames contain <code>..</code>
+or whose target directory would be altered by a symlink.  This option suppresses these
+behaviors.</p>
+</blockquote>
+<p>You would never guess it from reading the documentation, but when you pass <code>--absolute-paths</code>
+during extraction,
+tar assumes that the archive is benign and the whole delayed linking mechanism is disabled.
+Make sure you trust the tar archive though! When extracted with <code>--absolute-paths</code>,
+a malicious archive will be able to put files anywhere it wants.</p>
+<p>I&#39;m absolutely certain that it&#39;s possible to make GNU tar extract in O(n) without <code>--absolute-paths</code>
+by replacing the linked list with a hash map.
+But that&#39;s an adventure for another time.</p>
+<h2>References</h2>
+<p>These are the documents I&#39;ve drawn information from when researching for my tar extractor
+and this blog post:</p>
+<ul>
+<li>The Wikipedia article on tar: <a href="https://en.wikipedia.org/wiki/Tar_(computing)#File_format">https://en.wikipedia.org/wiki/Tar_(computing)#File_format</a></li>
+<li>The POSIX spec for pax: <a href="https://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html#tag_20_92_13_01">https://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html#tag_20_92_13_01</a></li>
+<li>The GNU tar file format docs: <a href="https://www.gnu.org/software/tar/manual/html_node/Standard.html">https://www.gnu.org/software/tar/manual/html_node/Standard.html</a></li>
+<li>The GNU tar source code: <a href="https://git.savannah.gnu.org/cgit/tar.git/tree/">https://git.savannah.gnu.org/cgit/tar.git/tree/</a>
+(in particular, <a href="https://git.savannah.gnu.org/cgit/tar.git/tree/src/extract.c">extract.c</a>)</li>
+</ul>
+<p>If I have represented anything inaccurately in this post, please do correct me.</p>
+	</div></div>
+  </body>
+</html>
