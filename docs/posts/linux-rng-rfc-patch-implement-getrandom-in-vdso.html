@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://lore.kernel.org/lkml/20220729145525.1729066-1-Jason@zx2c4.com/">Original</a>
+    <h1>Linux RNG RFC Patch: implement getrandom() in vDSO</h1>
+    
+    <div id="readability-page-1" class="page"><pre id="b">From: &#34;Jason A. Donenfeld&#34; &lt;Jason@zx2c4.com&gt;
+To: linux-kernel@vger.kernel.org
+Cc: &#34;Jason A. Donenfeld&#34; &lt;Jason@zx2c4.com&gt;,
+	linux-crypto@vger.kernel.org, x86@kernel.org,
+	Nadia Heninger &lt;nadiah@cs.ucsd.edu&gt;,
+	Thomas Ristenpart &lt;ristenpart@cornell.edu&gt;,
+	Theodore Ts&#39;o &lt;tytso@mit.edu&gt;,
+	Vincenzo Frascino &lt;vincenzo.frascino@arm.com&gt;,
+	Adhemerval Zanella Netto &lt;adhemerval.zanella@linaro.org&gt;,
+	Florian Weimer &lt;fweimer@redhat.com&gt;
+Subject: <a href="#r" id="t">[PATCH RFC v1] random: implement getrandom() in vDSO</a>
+Date: Fri, 29 Jul 2022 16:55:25 +0200	<a href="#r">[thread overview]</a>
+Message-ID: &lt;20220729145525.1729066-1-Jason@zx2c4.com&gt; (<a href="https://lore.kernel.org/lkml/20220729145525.1729066-1-Jason@zx2c4.com/raw">raw</a>)
+
+Two statements:
+
+  1) Userspace wants faster cryptographically secure numbers of
+     arbitrary size, big or small.
+
+  2) Userspace is currently unable to safely roll its own RNG with the
+     same security profile as getrandom().
+
+Statement (1) has been debated for years, with arguments ranging from
+&#34;we need faster cryptographically secure card shuffling!&#34; to &#34;the only
+things that actually need good randomness are keys, which are few and
+far between&#34; to &#34;actually, TLS CBC nonces are frequent&#34; and so on. I
+don&#39;t intend to wade into that debate substantially, except to note that
+recently glibc added arc4random(), whose goal is to return a
+cryptographically secure uint32_t. So here we are.
+
+Statement (2) is more interesting. The kernel is the nexus of all
+entropic inputs that influence the RNG. It is in the best position, and
+probably the only position, to decide anything at all about the current
+state of the RNG and of its entropy. One of the things it uniquely knows
+about is when reseeding is necessary.
+
+For example, when a virtual machine is forked, restored, or duplicated,
+it&#39;s imparative that the RNG doesn&#39;t generate the same outputs. For this
+reason, there&#39;s a small protocol between hypervisors and the kernel that
+indicates this has happened, alongside some ID, which the RNG uses to
+immediately reseed, so as not to return the same numbers. Were userspace
+to expand a getrandom() seed from time T1 for the next hour, and at some
+point T2 &lt; hour, the virtual machine forked, userspace would continue to
+provide the same numbers to two (or more) different virtual machines,
+resulting in potential cryptographic catastrophe. Something similar
+happens on resuming from hibernation (or even suspend), with various
+compromise scenarios there in mind.
+
+There&#39;s a more general reason why userspace rolling its own RNG from a
+getrandom() seed is fraught. There&#39;s a lot of attention paid to this
+particular Linuxism we have of the RNG being initialized and thus
+non-blocking or uninitialized and thus blocking until it is initialized.
+These are our Two Big States that many hold to be the holy
+differentiating factor between safe and not safe, between
+cryptographically secure and garbage. The fact is, however, that the
+distinction between these two states is a hand-wavy wishy-washy inexact
+approximation. Outside of a few exceptional cases (e.g. a HW RNG is
+available), we actually don&#39;t really ever know with any rigor at all
+when the RNG is safe and ready (nor when it&#39;s compromised). We do the
+best we can to &#34;estimate&#34; it, but entropy estimation is fundamentally
+impossible in the general case. So really, we&#39;re just doing guess work,
+and hoping it&#39;s good and conservative enough. Let&#39;s then assume that
+there&#39;s always some potential error involved in this differentiator.
+
+In fact, under the surface, the RNG is engineered around a different
+principal, and that is trying to *use* new entropic inputs regularly and
+at the right specific moments in time. For example, close to boot time,
+the RNG reseeds itself more often than later. At certain events, like VM
+fork, the RNG reseeds itself immediately. The various heuristics for
+when the RNG will use new entropy and how often is really a core aspect
+of what the RNG has some potential to do decently enough (and something
+that will probably continue to improve in the future from random.c&#39;s
+present set of algorithms). So in your mind, put away the metal
+attachment to the Two Big States, which represent an approximation with
+a potential margin of error. Instead keep in mind that the RNG&#39;s primary
+operating heuristic is how often and exactly when it&#39;s going to reseed.
+
+So, if userspace takes a seed from getrandom() at point T1, and uses it
+for the next hour (or N megabytes or some other meaningless metric),
+during that time, potential errors in the Two Big States approximation
+are amplified. During that time potential reseeds are being lost,
+forgotten, not reflected in the output stream. That&#39;s not good.
+
+The simplest statement you could is that userspace RNGs that expand a
+getrandom() seed at some point T1 are nearly always *worse*, in some
+way, than just calling getrandom() every time a random number is
+desired.
+
+For those reasons, after some discussion on libc-alpha, glibc&#39;s
+arc4random() now just calls getrandom() on each invocation. That&#39;s
+trivially safe, and gives us latitude to then make the safe thing faster
+without becoming unsafe at our leasure. Card shuffling isn&#39;t
+particularly fast, however.
+
+How do we rectify this? By putting a safe implementation of getrandom()
+in the vDSO, which has access to whatever information a
+particular iteration of random.c is using to make its decisions. I use
+that careful language of &#34;particular iteration of random.c&#34;, because the
+set of things that a vDSO getrandom() implementation might need for making
+decisions as good as the kernel&#39;s will likely change over time. This
+isn&#39;t just a matter of exporting certain *data* to userspace. We&#39;re not
+going to commit to a &#34;data API&#34; where the various heuristics used are
+exposed, locking in how the kernel works for decades to come, and then
+leave it to various userspaces to roll something on top and shoot
+themselves in the foot and have all sorts of complexity disasters.
+Rather, vDSO getrandom() is supposed to be the *same exact algorithm*
+that runs in the kernel, except it&#39;s been hoisted into userspace as
+much as possible. And so vDSO getrandom() and kernel getrandom() will
+always mirror each other hermetically.
+
+API-wise, vDSO getrandom has this signature:
+
+  ssize_t getrandom(void **state, void *buffer, size_t len, unsigned long flags);
+
+The return value and the latter 3 arguments are the same as ordinary
+getrandom(). The first argument is a double pointer to some state that
+vDSO allocates and manages. Call it first with *&amp;my_state==NULL, and
+subsequently with the same &amp;my_state, and only that first call will
+allocate. We very intentionally do *not* leave state memory management
+up to the caller. There are too many weird things that can go wrong, and
+it&#39;s important that vDSO does not provide too generic of a mechanism.
+It&#39;s not going to store its state in just any old memory address. It&#39;ll
+do it only in ones it allocates.
+
+Right now this means it&#39;s a mlock&#39;d page with WIPEONFORK set. In the
+future maybe there will be other interesting page flags or
+anti-heartbleed measures, or other platform-specific kernel-specific
+things that can be set. Again, it&#39;s important that the vDSO has a say in
+how this works rather than agreeing to operate on any old address;
+memory isn&#39;t neutral.
+
+Because WIPEONFORK implies a whole page, vDSO getrandom() itself uses
+vDSO getcpu() in order to shard into various buckets, so that this
+remains fast from multiple threads.
+
+The interesting meat of the implementation is in lib/vdso/getrandom.c,
+as generic C code, and it aims to mainly follow random.c&#39;s buffered fast
+key erasure logic. Before the RNG is initialized, it falls back to the
+syscall. Right now it uses a simple generation counter to make its
+decisions on reseeding; this covers many cases, but not all, so this RFC
+still has a little bit of improvement work to do. But it should give you
+the general idea.
+
+The actual place that has the most work to do is in all of the other
+files. Most of the vDSO shared page infrastructure is centered around
+gettimeofday, and so the main structs are all in arrays for different
+timestamp types, and attached to time namespaces, and so forth. I&#39;ve
+done the best I could to add onto this in an unintrusive way, but you&#39;ll
+notice almost immediately from glancing at the code that it still needs
+some untangling work. This also only works on x86 at the moment. I could
+certainly use a hand with this part.
+
+So far in my test results, performance is pretty stellar, and it seems
+to be working. But this is very, very young, immature code, suitable for
+an RFC and no more, so expect dragons.
+
+Cc: linux-crypto@vger.kernel.org
+Cc: x86@kernel.org
+Cc: Nadia Heninger &lt;nadiah@cs.ucsd.edu&gt;
+Cc: Thomas Ristenpart &lt;ristenpart@cornell.edu&gt;
+Cc: Theodore Ts&#39;o &lt;tytso@mit.edu&gt;
+Cc: Vincenzo Frascino &lt;vincenzo.frascino@arm.com&gt;
+Cc: Adhemerval Zanella Netto &lt;adhemerval.zanella@linaro.org&gt;
+Cc: Florian Weimer &lt;fweimer@redhat.com&gt;
+Signed-off-by: Jason A. Donenfeld &lt;Jason@zx2c4.com&gt;
+---
+ <a id="iZ31arch:x86:entry:vdso:Makefile" href="#Z31arch:x86:entry:vdso:Makefile">arch/x86/entry/vdso/Makefile</a>          |   2 +-
+ <a id="iZ31arch:x86:entry:vdso:vdso.lds.S" href="#Z31arch:x86:entry:vdso:vdso.lds.S">arch/x86/entry/vdso/vdso.lds.S</a>        |   2 +
+ <a id="iZ31arch:x86:entry:vdso:vgetrandom.c" href="#Z31arch:x86:entry:vdso:vgetrandom.c">arch/x86/entry/vdso/vgetrandom.c</a>      |  16 +++
+ <a id="iZ31arch:x86:include:asm:vdso:getrandom.h" href="#Z31arch:x86:include:asm:vdso:getrandom.h">arch/x86/include/asm/vdso/getrandom.h</a> |  74 +++++++++++
+ <a id="iZ31arch:x86:include:asm:vvar.h" href="#Z31arch:x86:include:asm:vvar.h">arch/x86/include/asm/vvar.h</a>           |  16 +++
+ <a id="iZ31drivers:char:random.c" href="#Z31drivers:char:random.c">drivers/char/random.c</a>                 |   4 +
+ <a id="iZ31include:vdso:datapage.h" href="#Z31include:vdso:datapage.h">include/vdso/datapage.h</a>               |   6 +
+ <a id="iZ31lib:vdso:getrandom.c" href="#Z31lib:vdso:getrandom.c">lib/vdso/getrandom.c</a>                  | 176 ++++++++++++++++++++++++++
+ 8 files changed, 295 insertions(+), 1 deletion(-)
+ create mode 100644 arch/x86/entry/vdso/vgetrandom.c
+ create mode 100644 arch/x86/include/asm/vdso/getrandom.h
+ create mode 100644 lib/vdso/getrandom.c
+
+<span><a href="#iZ31arch:x86:entry:vdso:Makefile" id="Z31arch:x86:entry:vdso:Makefile">diff</a> --git a/arch/x86/entry/vdso/Makefile b/arch/x86/entry/vdso/Makefile
+index 76cd790ed0bd..a60d4771d500 100644
+--- a/arch/x86/entry/vdso/Makefile
++++ b/arch/x86/entry/vdso/Makefile
+</span><span>@@ -24,7 +24,7 @@ VDSO32-$(CONFIG_X86_32)		:= y
+</span> VDSO32-$(CONFIG_IA32_EMULATION)	:= y
+ 
+ # files to link into the vdso
+<span>-vobjs-y := vdso-note.o vclock_gettime.o vgetcpu.o
+</span><span>+vobjs-y := vdso-note.o vclock_gettime.o vgetcpu.o vgetrandom.o
+</span> vobjs32-y := vdso32/note.o vdso32/system_call.o vdso32/sigreturn.o
+ vobjs32-y += vdso32/vclock_gettime.o
+ vobjs-$(CONFIG_X86_SGX)	+= vsgx.o
+<span><a href="#iZ31arch:x86:entry:vdso:vdso.lds.S" id="Z31arch:x86:entry:vdso:vdso.lds.S">diff</a> --git a/arch/x86/entry/vdso/vdso.lds.S b/arch/x86/entry/vdso/vdso.lds.S
+index 4bf48462fca7..1919cc39277e 100644
+--- a/arch/x86/entry/vdso/vdso.lds.S
++++ b/arch/x86/entry/vdso/vdso.lds.S
+</span><span>@@ -28,6 +28,8 @@ VERSION {
+</span> 		clock_getres;
+ 		__vdso_clock_getres;
+ 		__vdso_sgx_enter_enclave;
+<span>+		getrandom;
++		__vdso_getrandom;
+</span> 	local: *;
+ 	};
+ }
+<span><a href="#iZ31arch:x86:entry:vdso:vgetrandom.c" id="Z31arch:x86:entry:vdso:vgetrandom.c">diff</a> --git a/arch/x86/entry/vdso/vgetrandom.c b/arch/x86/entry/vdso/vgetrandom.c
+new file mode 100644
+index 000000000000..40389c399c6a
+--- /dev/null
++++ b/arch/x86/entry/vdso/vgetrandom.c
+</span><span>@@ -0,0 +1,16 @@
+</span><span>+// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2022 Jason A. Donenfeld &lt;Jason@zx2c4.com&gt;. All Rights Reserved.
++ */
++#include &lt;linux/kernel.h&gt;
++#include &lt;linux/types.h&gt;
++
++#include &#34;../../../../lib/vdso/getrandom.c&#34;
++
++ssize_t __vdso_getrandom(void **state, void *buffer, size_t len, unsigned long flags)
++{
++	return __cvdso_getrandom(state, buffer, len, flags);
++}
++
++ssize_t getrandom(void **, void *, size_t, unsigned long)
++	__attribute__((weak, alias(&#34;__vdso_getrandom&#34;)));
+</span><span><a href="#iZ31arch:x86:include:asm:vdso:getrandom.h" id="Z31arch:x86:include:asm:vdso:getrandom.h">diff</a> --git a/arch/x86/include/asm/vdso/getrandom.h b/arch/x86/include/asm/vdso/getrandom.h
+new file mode 100644
+index 000000000000..83cb483aab74
+--- /dev/null
++++ b/arch/x86/include/asm/vdso/getrandom.h
+</span><span>@@ -0,0 +1,74 @@
+</span><span>+/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2022 Jason A. Donenfeld &lt;Jason@zx2c4.com&gt;. All Rights Reserved.
++ */
++#ifndef __ASM_VDSO_GETRANDOM_H
++#define __ASM_VDSO_GETRANDOM_H
++
++#ifndef __ASSEMBLY__
++
++#include &lt;asm/unistd.h&gt;
++#include &lt;asm/vvar.h&gt;
++
++static __always_inline ssize_t
++getrandom_syscall(void *buffer, size_t len, unsigned long flags)
++{
++	long ret;
++
++	asm (&#34;syscall&#34; : &#34;=a&#34; (ret) :
++	     &#34;0&#34; (__NR_getrandom), &#34;D&#34; (buffer), &#34;S&#34; (len), &#34;d&#34; (flags) :
++	     &#34;rcx&#34;, &#34;r11&#34;, &#34;memory&#34;);
++
++	return ret;
++}
++
++static __always_inline void *
++mmap_syscall(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
++{
++	long ret;
++	register long r10 asm(&#34;r10&#34;) = flags;
++	register long r8 asm(&#34;r8&#34;) = fd;
++	register long r9 asm(&#34;r9&#34;) = offset;
++
++	asm (&#34;syscall&#34; : &#34;=a&#34; (ret) :
++	     &#34;0&#34; (__NR_mmap), &#34;D&#34; (addr), &#34;S&#34; (len), &#34;d&#34; (prot),
++	     &#34;r&#34; (r10), &#34;r&#34; (r8), &#34;r&#34; (r9) :
++	     &#34;rcx&#34;, &#34;r11&#34;);
++
++	return (void *)ret;
++}
++
++static __always_inline int
++munmap_syscall(void *addr, size_t len)
++{
++	long ret;
++
++	asm (&#34;syscall&#34; : &#34;=a&#34; (ret) :
++	     &#34;0&#34; (__NR_munmap), &#34;D&#34; (addr), &#34;S&#34; (len) :
++	     &#34;rcx&#34;, &#34;r11&#34;);
++
++	return ret;
++}
++
++static __always_inline int
++madvise_syscall(void *addr, size_t len, int advice)
++{
++	long ret;
++
++	asm (&#34;syscall&#34; : &#34;=a&#34; (ret) :
++	     &#34;0&#34; (__NR_madvise), &#34;D&#34; (addr), &#34;S&#34; (len), &#34;d&#34; (advice) :
++	     &#34;rcx&#34;, &#34;r11&#34;);
++
++	return ret;
++}
++
++#define __vdso_rng_data (VVAR(_vdso_rng_data))
++
++static __always_inline const struct vdso_rng_data *__arch_get_vdso_rng_data(void)
++{
++	return &amp;__vdso_rng_data;
++}
++
++#endif /* !__ASSEMBLY__ */
++
++#endif /* __ASM_VDSO_GETRANDOM_H */
+</span><span><a href="#iZ31arch:x86:include:asm:vvar.h" id="Z31arch:x86:include:asm:vvar.h">diff</a> --git a/arch/x86/include/asm/vvar.h b/arch/x86/include/asm/vvar.h
+index 183e98e49ab9..9d9af37f7cab 100644
+--- a/arch/x86/include/asm/vvar.h
++++ b/arch/x86/include/asm/vvar.h
+</span><span>@@ -26,6 +26,8 @@
+</span>  */
+ #define DECLARE_VVAR(offset, type, name) \
+ 	EMIT_VVAR(name, offset)
+<span>+#define DECLARE_VVAR_SINGLE(offset, type, name) \
++	EMIT_VVAR(name, offset)
+</span> 
+ #else
+ 
+<span>@@ -37,6 +39,10 @@ extern char __vvar_page;
+</span> 	extern type timens_ ## name[CS_BASES]				\
+ 	__attribute__((visibility(&#34;hidden&#34;)));				\
+ 
+<span>+#define DECLARE_VVAR_SINGLE(offset, type, name)				\
++	extern type vvar_ ## name					\
++	__attribute__((visibility(&#34;hidden&#34;)));				\
++
+</span> #define VVAR(name) (vvar_ ## name)
+ #define TIMENS(name) (timens_ ## name)
+ 
+<span>@@ -44,12 +50,22 @@ extern char __vvar_page;
+</span> 	type name[CS_BASES]						\
+ 	__attribute__((section(&#34;.vvar_&#34; #name), aligned(16))) __visible
+ 
+<span>+#define DEFINE_VVAR_SINGLE(type, name)					\
++	type name							\
++	__attribute__((section(&#34;.vvar_&#34; #name), aligned(16))) __visible
++
+</span> #endif
+ 
+ /* DECLARE_VVAR(offset, type, name) */
+ 
+ DECLARE_VVAR(128, struct vdso_data, _vdso_data)
+ 
+<span>+#if !defined(_SINGLE_DATA)
++#define _SINGLE_DATA
++DECLARE_VVAR_SINGLE(640, struct vdso_rng_data, _vdso_rng_data)
++#endif
++
+</span> #undef DECLARE_VVAR
+<span>+#undef DECLARE_VVAR_SINGLE
+</span> 
+ #endif
+<span><a href="#iZ31drivers:char:random.c" id="Z31drivers:char:random.c">diff</a> --git a/drivers/char/random.c b/drivers/char/random.c
+index 7bf11fa66265..a18ff41713d7 100644
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+</span><span>@@ -59,6 +59,7 @@
+</span> #include &lt;asm/irq.h&gt;
+ #include &lt;asm/irq_regs.h&gt;
+ #include &lt;asm/io.h&gt;
+<span>+#include &lt;vdso/datapage.h&gt;
+</span> 
+ /*********************************************************************
+  *
+<span>@@ -84,6 +85,7 @@ static DEFINE_STATIC_KEY_FALSE(crng_is_ready);
+</span> /* Various types of waiters for crng_init-&gt;CRNG_READY transition. */
+ static DECLARE_WAIT_QUEUE_HEAD(crng_init_wait);
+ static struct fasync_struct *fasync;
+<span>+DEFINE_VVAR_SINGLE(struct vdso_rng_data, _vdso_rng_data);
+</span> 
+ /* Control how we warn userspace. */
+ static struct ratelimit_state urandom_warning =
+<span>@@ -221,6 +223,7 @@ static void crng_reseed(void)
+</span> 		++next_gen;
+ 	WRITE_ONCE(base_crng.generation, next_gen);
+ 	WRITE_ONCE(base_crng.birth, jiffies);
+<span>+	WRITE_ONCE(_vdso_rng_data.generation, next_gen + 1);
+</span> 	if (!static_branch_likely(&amp;crng_is_ready))
+ 		crng_init = CRNG_READY;
+ 	spin_unlock_irqrestore(&amp;base_crng.lock, flags);
+<span>@@ -660,6 +663,7 @@ static void __cold _credit_init_bits(size_t bits)
+</span> 		crng_reseed(); /* Sets crng_init to CRNG_READY under base_crng.lock. */
+ 		if (static_key_initialized)
+ 			execute_in_process_context(crng_set_ready, &amp;set_ready);
+<span>+		_vdso_rng_data.is_ready = true;
+</span> 		wake_up_interruptible(&amp;crng_init_wait);
+ 		kill_fasync(&amp;fasync, SIGIO, POLL_IN);
+ 		pr_notice(&#34;crng init done\n&#34;);
+<span><a href="#iZ31include:vdso:datapage.h" id="Z31include:vdso:datapage.h">diff</a> --git a/include/vdso/datapage.h b/include/vdso/datapage.h
+index 73eb622e7663..cbacfd923a5c 100644
+--- a/include/vdso/datapage.h
++++ b/include/vdso/datapage.h
+</span><span>@@ -109,6 +109,11 @@ struct vdso_data {
+</span> 	struct arch_vdso_data	arch_data;
+ };
+ 
+<span>+struct vdso_rng_data {
++	unsigned long generation;
++	bool is_ready;
++};
++
+</span> /*
+  * We use the hidden visibility to prevent the compiler from generating a GOT
+  * relocation. Not only is going through a GOT useless (the entry couldn&#39;t and
+<span>@@ -120,6 +125,7 @@ struct vdso_data {
+</span>  */
+ extern struct vdso_data _vdso_data[CS_BASES] __attribute__((visibility(&#34;hidden&#34;)));
+ extern struct vdso_data _timens_data[CS_BASES] __attribute__((visibility(&#34;hidden&#34;)));
+<span>+extern struct vdso_rng_data _vdso_rng_data __attribute__((visibility(&#34;hidden&#34;)));
+</span> 
+ /*
+  * The generic vDSO implementation requires that gettimeofday.h
+<span><a href="#iZ31lib:vdso:getrandom.c" id="Z31lib:vdso:getrandom.c">diff</a> --git a/lib/vdso/getrandom.c b/lib/vdso/getrandom.c
+new file mode 100644
+index 000000000000..3ffc900f31ff
+--- /dev/null
++++ b/lib/vdso/getrandom.c
+</span><span>@@ -0,0 +1,176 @@
+</span><span>+// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2022 Jason A. Donenfeld &lt;Jason@zx2c4.com&gt;. All Rights Reserved.
++ */
++
++#include &lt;linux/kernel.h&gt;
++#include &lt;linux/atomic.h&gt;
++#include &lt;linux/fs.h&gt;
++#include &lt;vdso/datapage.h&gt;
++#include &lt;asm/vdso/getrandom.h&gt;
++#include &lt;asm/vdso/vsyscall.h&gt;
++#include &lt;asm/page.h&gt;
++#include &lt;uapi/linux/mman.h&gt;
++#include &#34;../crypto/chacha.c&#34;
++
++#define NEG_NULL ((void *)~0UL)
++
++struct getrandom_state {
++	unsigned long generation;
++	union {
++		struct {
++			u8 key[CHACHA_KEY_SIZE];
++			u8 batch[CHACHA_BLOCK_SIZE * 3 / 2];
++		};
++		u8 key_batch[CHACHA_BLOCK_SIZE * 2];
++	};
++	u8 pos;
++	bool in_use;
++};
++
++enum { NUM_BUCKETS = PAGE_SIZE / sizeof(struct getrandom_state) };
++
++static bool allocate_new_state(void **state)
++{
++	void *new_state;
++
++	if (cmpxchg(state, NULL, NEG_NULL) != NULL)
++		return false;
++
++	new_state = mmap_syscall(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
++				 MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
++	if (new_state == NEG_NULL)
++		goto err_unlock;
++
++	if (madvise_syscall(new_state, PAGE_SIZE, MADV_WIPEONFORK))
++		goto err_unmap;
++
++	WRITE_ONCE(*state, new_state);
++	return true;
++
++err_unmap:
++	munmap_syscall(new_state, PAGE_SIZE);
++err_unlock:
++	WRITE_ONCE(*state, NULL);
++	return false;
++}
++
++extern long getcpu(unsigned int *cpu, unsigned int *node, void *unused);
++
++static struct getrandom_state *find_free_bucket(struct getrandom_state *buckets)
++{
++	unsigned int start = 0, i;
++
++	if (getcpu(&amp;start, NULL, NULL) == 0)
++		start %= NUM_BUCKETS;
++
++	for (i = start;;) {
++		struct getrandom_state *state = &amp;buckets[i];
++
++		if (cmpxchg(&amp;state-&gt;in_use, false, true) == false)
++			return state;
++
++		i = i == NUM_BUCKETS - 1 ? 0 : i + 1;
++		if (i == start)
++			break;
++	}
++
++	return NULL;
++}
++
++static void memcpy_and_zero(void *dst, void *src, size_t len)
++{
++#define CASCADE(type) \
++	while (len &gt;= sizeof(type)) { \
++		*(type *)dst = *(type *)src; \
++		*(type *)src = 0; \
++		dst += sizeof(type); \
++		src += sizeof(type); \
++		len -= sizeof(type); \
++	}
++#ifdef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
++#if BITS_PER_LONG == 64
++	CASCADE(u64);
++#endif
++	CASCADE(u32);
++	CASCADE(u16);
++#endif
++	CASCADE(u8);
++#undef CASCADE
++}
++
++static ssize_t __always_inline
++__cvdso_getrandom(void **state, void *buffer, size_t len, unsigned long flags)
++{
++	const struct vdso_rng_data *v = __arch_get_vdso_rng_data();
++	struct getrandom_state *buckets = *state, *s;
++	u32 chacha_state[CHACHA_STATE_WORDS];
++	unsigned long generation;
++	ssize_t ret = min_t(size_t, MAX_RW_COUNT, len);
++	size_t batch_len;
++
++	if (unlikely(!v-&gt;is_ready))
++		return getrandom_syscall(buffer, len, flags);
++
++	if (unlikely(!len))
++		return 0;
++
++	if (unlikely(!buckets)) {
++		if (!allocate_new_state(state))
++			return getrandom_syscall(buffer, len, flags);
++		buckets = *state;
++	} else if (unlikely(buckets == NEG_NULL)) {
++		return getrandom_syscall(buffer, len, flags);
++	}
++
++	s = find_free_bucket(buckets);
++	if (unlikely(!s))
++		return getrandom_syscall(buffer, len, flags);
++
++retry_generation:
++	generation = READ_ONCE(v-&gt;generation);
++	if (unlikely(s-&gt;generation != generation)) {
++		if (getrandom_syscall(s-&gt;key, sizeof(s-&gt;key), 0) != sizeof(s-&gt;key)) {
++			WRITE_ONCE(s-&gt;in_use, false);
++			return getrandom_syscall(buffer, len, flags);
++		}
++		s-&gt;pos = sizeof(s-&gt;batch);
++		s-&gt;generation = generation;
++		if (generation != READ_ONCE(v-&gt;generation))
++			goto retry_generation;
++	}
++
++	len = ret;
++more_batch:
++	batch_len = min_t(size_t, sizeof(s-&gt;batch) - s-&gt;pos, len);
++	if (batch_len) {
++		memcpy_and_zero(buffer, s-&gt;batch, batch_len);
++		s-&gt;pos += batch_len;
++		buffer += batch_len;
++		len -= batch_len;
++		if (!len) {
++			WRITE_ONCE(s-&gt;in_use, false);
++			return ret;
++		}
++	}
++
++	chacha_init_consts(chacha_state);
++	memcpy(&amp;chacha_state[4], s-&gt;key, CHACHA_KEY_SIZE);
++	memset(&amp;chacha_state[12], 0, sizeof(u32) * 4);
++
++	while (len &gt;= CHACHA_BLOCK_SIZE) {
++		chacha20_block(chacha_state, buffer);
++		if (unlikely(chacha_state[12] == 0))
++			++chacha_state[13];
++		buffer += CHACHA_BLOCK_SIZE;
++		len -= CHACHA_BLOCK_SIZE;
++	}
++
++	chacha20_block(chacha_state, s-&gt;key_batch);
++	if (unlikely(chacha_state[12] == 0))
++		++chacha_state[13];
++	chacha20_block(chacha_state, s-&gt;key_batch + CHACHA_BLOCK_SIZE);
++	s-&gt;pos = 0;
++	memzero_explicit(chacha_state, sizeof(chacha_state));
++	goto more_batch;
++}
+</span>-- 
+2.35.1
+
+</pre><hr/><pre>                 <a href="#R">reply</a>	other threads:[<a href="https://lore.kernel.org/lkml/?t=20220729145618">~2022-07-29 14:56 UTC</a>|<a href="https://lore.kernel.org/lkml/">newest</a>]
+
+<b>Thread overview: </b><a id="r">[no followups]</a> expand[<a href="https://lore.kernel.org/lkml/20220729145525.1729066-1-Jason@zx2c4.com/T/#u">flat</a>|<a href="https://lore.kernel.org/lkml/20220729145525.1729066-1-Jason@zx2c4.com/t/#u">nested</a>]  <a href="https://lore.kernel.org/lkml/20220729145525.1729066-1-Jason@zx2c4.com/t.mbox.gz">mbox.gz</a>  <a href="https://lore.kernel.org/lkml/20220729145525.1729066-1-Jason@zx2c4.com/t.atom">Atom feed</a>
+</pre><hr/><pre id="R"><b>Reply instructions:</b>
+
+You may reply publicly to <a href="#t">this message</a> via plain-text email
+using any one of the following methods:
+
+* Save the following mbox file, import it into your mail client,
+  and reply-to-all from there: <a href="https://lore.kernel.org/lkml/20220729145525.1729066-1-Jason@zx2c4.com/raw">mbox</a>
+
+  Avoid top-posting and favor interleaved quoting:
+  <a href="https://en.wikipedia.org/wiki/Posting_style#Interleaved_style">https://en.wikipedia.org/wiki/Posting_style#Interleaved_style</a>
+
+* Reply using the <b>--to</b>, <b>--cc</b>, and <b>--in-reply-to</b>
+  switches of git-send-email(1):
+
+  git send-email \
+    --in-reply-to=20220729145525.1729066-1-Jason@zx2c4.com \
+    --to=jason@zx2c4.com \
+    --cc=adhemerval.zanella@linaro.org \
+    --cc=fweimer@redhat.com \
+    --cc=linux-crypto@vger.kernel.org \
+    --cc=linux-kernel@vger.kernel.org \
+    --cc=nadiah@cs.ucsd.edu \
+    --cc=ristenpart@cornell.edu \
+    --cc=tytso@mit.edu \
+    --cc=vincenzo.frascino@arm.com \
+    --cc=x86@kernel.org \
+    --subject=&#39;Re: [PATCH RFC v1] random: implement getrandom() in vDSO&#39; \
+    /path/to/YOUR_REPLY
+
+  <a href="https://kernel.org/pub/software/scm/git/docs/git-send-email.html">https://kernel.org/pub/software/scm/git/docs/git-send-email.html</a>
+
+* If your mail client supports setting the <b>In-Reply-To</b> header
+  via mailto: links, try the <a href="mailto:jason%40zx2c4.com?In-Reply-To=%3C20220729145525.1729066-1-Jason@zx2c4.com%3E&amp;Cc=adhemerval.zanella%40linaro.org%2Cfweimer%40redhat.com%2Clinux-crypto%40vger.kernel.org%2Clinux-kernel%40vger.kernel.org%2Cnadiah%40cs.ucsd.edu%2Cristenpart%40cornell.edu%2Ctytso%40mit.edu%2Cvincenzo.frascino%40arm.com%2Cx86%40kernel.org&amp;Subject=Re%3A%20%5BPATCH%20RFC%20v1%5D%20random%3A%20implement%20getrandom%28%29%20in%20vDSO">mailto: link</a>
+</pre>
+<hr/><pre>This is a public inbox, see <a href="https://lore.kernel.org/lkml/_/text/mirror/">mirroring instructions</a>
+for how to clone and mirror all data and code used for this inbox;
+as well as URLs for NNTP newsgroup(s).</pre></div>
+  </body>
+</html>
