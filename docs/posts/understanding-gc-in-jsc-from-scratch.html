@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://webkit.org/blog/12967/understanding-gc-in-jsc-from-scratch/">Original</a>
+    <h1>Understanding GC in JSC from Scratch</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+                                
+                <p>JavaScript relies on garbage collection (GC) to reclaim memory. In this post, we will dig into JSC’s garbage collection system.</p>
+<p>Before we start, let me briefly introduce myself. I am Haoran Xu, a PhD student at Stanford University. While I have not yet contributed a lot to JSC, I found JSC a treasure of elegant compiler designs and efficient implementations, and my research is exploring ways to transfer JSC’s design to support other programming languages like Lua at a low engineering cost. This post was initially posted on <a href="https://sillycross.github.io/2022/06/02/2022-06-02/" target="_blank" rel="noopener">my blog</a> — great thanks to the WebKit project for cross-posting it on their official blog!</p>
+<p>Filip Pizlo’s <a href="https://webkit.org/blog/7122/introducing-riptide-webkits-retreating-wavefront-concurrent-garbage-collector/" target="_blank" rel="noopener">blog post on GC</a> is great at explaining the novelties of JSC’s GC, and also positions it within the context of various GC schemes in academia and industry. However, as someone with little GC background, I felt the blog alone insufficient for me to get a solid understanding of the algorithm and the motivation behind the design. Through digging into the code, and with some great help from Saam Barati, one of JSC’s lead developers, I wrote up this blog post in the hope that it can help more people understand this beautiful design.</p>
+<p>The garbage collector in JSC is <a href="https://en.wikipedia.org/wiki/Tracing_garbage_collection#Moving_vs._non-moving" target="_blank" rel="noopener">non-compacting</a>, <a href="https://en.wikipedia.org/wiki/Tracing_garbage_collection#Generational_GC_(ephemeral_GC)" target="_blank" rel="noopener">generational</a> and mostly–<a href="https://en.wikipedia.org/wiki/Tracing_garbage_collection#Stop-the-world_vs._incremental_vs._concurrent" target="_blank" rel="noopener">concurrent</a>. On top of being concurrent, JSC’s GC heavily employs lock-free programming for better performance.</p>
+<p>As you can imagine, JSC’s GC design is quite complex. Instead of diving into the complex invariants and protocols, we will start with a simple design, and improve it step by step to converge at JSC’s design. This way, we not only understand <em>why</em> JSC’s design works, but also <em>how</em> JSC’s design was constructed over time.</p>
+<p>But first of all, let’s get into some background.</p>
+<h3>Memory Allocation in JSC</h3>
+<p>Memory allocators and GCs are tightly coupled by nature – the allocator allocates memory to be reclaimed by the GC, and the GC frees memory to be reused by the allocator. In this section, we will briefly introduce JSC’s memory allocators.</p>
+<p>At the core of the memory allocation scheme in JSC is the data structure <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/BlockDirectory.h.html#JSC::BlockDirectory" target="_blank" rel="noopener">BlockDirectory</a>. It implements a fixed-sized allocator, that is, an allocator that only allocates memory chunks of some fixed size <code>S</code>. The allocator keeps tracks of a list of fixed-sized (in current code, 16KB) memory pages (“blocks”) it owns, and a free list. Each block is divided into cells of size <code>S</code>, and has a footer at its end, which contains metadata needed for the GC and allocation, e.g., which cells are free. By aggregating and sharing metadata at the footer, it both saves memory and improves performance of related operations: we will go into the details later in this post.</p>
+<p>When a <code>BlockDirectory</code> needs to make an allocation, it tries to allocate from its free list. If the free list is empty, it tries to iterate through the blocks it owns, to see if it can find a block containing free cells (which are marked free by GC). If yes, it <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/MarkedBlock.cpp.html#_ZN3JSC11MarkedBlock6Handle5sweepEPNS_8FreeListE" target="_blank" rel="noopener">scans the block footer metadata</a> to find out all the free cells in this block, and put into the free list. Otherwise, it allocates a new block from malloc. Note that this implies a <code>BlockDirectory</code>’s free list only contains cells in one block: this is called <code>m_currentBlock</code> in the code, and we will revisit this later.</p>
+<p><code>BlockDirectory</code> is used as the building block to build the memory allocators in JSC. JSC employs three kinds of allocators:</p>
+<ol>
+<li><a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/CompleteSubspace.h.html#32" target="_blank" rel="noopener">CompleteSubspace</a>: this is a segregated allocator responsible for allocating small objects (max size about 8KB). Specifically, there is a pre-defined list of exponentially-growing size-classes, and one <code>BlockDirectory</code> is used to handle allocation for each size class. So to allocate an object, you find the smallest size class large enough to hold the object, and allocate from the directory for that size class.</li>
+<li><a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/PreciseAllocation.h.html#JSC::PreciseAllocation" target="_blank" rel="noopener">PreciseAllocation</a>: this is used to handle large allocations that cannot be handled by the <code>CompleteSubspace</code> allocator. It simply relies on the standard (malloc-like) memory allocator, though in JSC a custom malloc implementation called <code>libpas</code> is used. The downside is that since a <code>PreciseAllocation</code> is created on a per-object basis, the GC cannot aggregate and share metadata information of multiple objects together to save memory and improve performance (as <code>MarkedBlock</code>’s block footer did). Therefore, every <code>PreciseAllocation</code> comes with a whopping overhead of a <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/PreciseAllocation.h.html#JSC::PreciseAllocation" target="_blank" rel="noopener">96-byte GC header</a> to store the various metadata information needed for GC for this object (though this overhead is justified since each allocation is already at least 8KB).</li>
+<li><a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/IsoSubspace.h.html#JSC::IsoSubspace" target="_blank" rel="noopener">IsoSubspace</a>: each <code>IsoSubspace</code> is used to allocate objects of a fixed type with a fixed size. So each <code>IsoSubspace</code> simply holds a <code>BlockDirectory</code> to do allocation (though JSC also has an optimization for small <code>IsoSubspace</code> by making them backed by <code>PreciseAllocation</code>). This is a security hardening feature that makes use-after-free-based attacks harder.</li>
+</ol>
+<p><code>IsoSubspace</code> is mostly a simplified <code>CompleteSubspace</code>, so we will ignore it for the purpose of this post. <code>CompleteSubspace</code> is the one that handles the common case: small allocations, and <code>PreciseAllocation</code> is mostly the rare slow path for large allocations.</p>
+<h3>Generational GC Basics</h3>
+<p>In JSC’s generational GC model, the heap consists of a small “new space” (eden), holding the newly allocated objects, and a large “old space” holding the older objects that have survived one GC cycle. Each GC cycle is either an <em>eden GC</em> or a <em>full GC</em>. New objects are allocated in the eden. When the eden is full, an eden GC is invoked to garbage-collect the unreachable objects in eden. All the surviving objects in eden are then considered to be in the old space. To reclaim objects in the old space, a full GC is needed.</p>
+<p>The effectiveness of the above scheme relies on the so-called “generational hypothesis”:</p>
+<ol>
+<li>Most objects collected by the GC are young objects (died when they are still in eden), so an eden GC (which only collects the eden) is sufficient to reclaim most newly allocated memory.
+</li>
+<li>
+<p>Pointers from old space to eden is much rarer than pointers from eden to old space or pointers from eden to eden, so an eden GC’s runtime is approximately linear to the size of the eden, as it only needs to start from a small subset of the old space. This implies that the cost of GC can be amortized by the cost of allocation.</p>
+</li>
+</ol>
+<h4>Inlined vs. Outlined Metadata: Why?</h4>
+<p>Practically every GC scheme uses some kind of metadata to track which objects are alive. In this section, we will explain how the GC metadata is stored in JSC, and the motivation behind its design.</p>
+<p>In JSC, every object managed by the GC carries the following metadata:</p>
+<ol>
+<li>Every object managed by the GC inherits the <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/runtime/JSCell.h.html#JSC::JSCell" target="_blank" rel="noopener">JSCell</a> class, which contains a 1-byte member <code>cellState</code>. This <code>cellState</code> is a color marker with two colors: white and black.
+</li>
+<li>
+<p>Every object also has two out-of-object metadata bits: <code>isNew</code> and <code>isMarked</code>. For objects allocated by <code>PreciseAllocation</code>, the bits reside in the GC header. For objects allocated by <code>CompleteSubspace</code>, the bits reside in the block footer.</p>
+</li>
+</ol>
+<p>This may seem odd at first glance since <code>isNew</code> and <code>isMarked</code> could have been stored in the unused bits of <code>cellState</code>. However, this is intentional.</p>
+<p>The inlined metadata <code>cellState</code> is easy to access for the mutator thread (the thread executing JavaScript code), since it is just a field in the object. However, it has bad memory locality for the GC and allocators, which need to quickly traverse through all the metadata of all objects in some block owned by <code>CompleteSubspace</code> (which is the common case). Outlined metadata have the opposite performance characteristics: they are more expensive to access for the mutator thread, but since they are aggregated into bitvectors and stored in the block footer of each block, GC and allocators can traverse them really fast.</p>
+<p>So JSC keeps both inlined and outlined metadata to get the better of both worlds: the mutator thread’s fast path will only concern the inlined <code>cellState</code>, while the GC and allocator logic can also take advantage of the memory locality of the outlined bits <code>isNew</code> and <code>isMarked</code>.</p>
+<p>Of course, the cost of this is a more complex design… so we have to unfold it bit by bit.</p>
+<h3>A Really Naive Stop-the-World Generational GC</h3>
+<p>Let’s start with a really naive design just to understand what is needed. We will design a generational, but stop-the-world (i.e. not incremental nor concurrent) GC, with no performance optimizations at all. In this design, the mutator side transfers control to the GC subsystem at a “safe point” to start a GC cycle (eden or full). The GC subsystem performs the GC cycle from the beginning to the end (as a result, the application cannot run during this potentially long period, thus “stop-the-world”), and then transfer control back to the mutator side.</p>
+<p>For this purpose, let’s temporarily forget about <code>CompleteSubspace</code>: it is an optimized version of <code>PrecisionAllocation</code> for small allocations, and while it is an important optimization, it’s easier to understand the GC algorithm without it.</p>
+<p>It turns out that in this design, all we need is one <code>isMarked</code> bit. The <code>isMarked</code> bit will indicate if the object is reachable at the end of the last GC cycle (and consequently, is in the old space, since any object that survived a GC cycle is in old space). All objects are born with <code>isMarked = false</code>.</p>
+<p>The GC will use a breadth-first search to scan and mark objects. For full GC, we want to reset all <code>isMarked</code> bits to <code>false</code> at the beginning, and do a BFS to scan and mark all objects reachable from <a href="https://en.wikipedia.org/wiki/Tracing_garbage_collection#Reachability_of_an_object" target="_blank" rel="noopener">GC roots</a>. Then all the unmarked objects are known to be dead. For an eden GC, we only want to scan the eden space. Fortunately, all objects in the old space are already marked at the end of the previous GC cycle, so they are naturally ignored by the BFS, so we can simply reuse the same BFS algorithm in full GC. In pseudo-code:</p>
+<p>Eden GC preparation phase: no work is needed.</p>
+<p>Full GC preparation phase:</p>
+<pre><code><span>for</span> (<span>JSCell</span>* <span>obj</span> : <span>heap</span>)
+    <span>obj</span>-&gt;<span>isMarked</span> = <span>false</span>;
+</code></pre>
+<p>Eden/Full GC marking phase:</p>
+<pre><code><span>while</span> (!<span>queue</span>.<span>empty</span>()) {
+    <span>JSCell</span>* <span>obj</span> = <span>queue</span>.<span>pop</span>();
+    <span>obj</span>-&gt;<span>ForEachChild</span>([&amp;](<span>JSCell</span>* <span>child</span>) {
+        <span>if</span> (!<span>child</span>-&gt;<span>isMarked</span>) {
+            <span>child</span>-&gt;<span>isMarked</span> = <span>true</span>;
+            <span>queue</span>.<span>push</span>(<span>child</span>);
+        }
+    });
+}
+</code></pre>
+<p>Eden/Full GC collection phase:</p>
+<pre><code><span>for</span> (<span>JSCell</span>* <span>obj</span> : <span>heap</span>) {
+    <span>if</span> (!<span>obj</span>-&gt;<span>isMarked</span>)
+        <span>free</span>(<span>obj</span>);
+}
+</code></pre>
+<p>But where does the scan start, so that we can scan through every reachable object? For full GC, the answer is clear: we just start the scan from all <a href="https://en.wikipedia.org/wiki/Tracing_garbage_collection#Reachability_of_an_object" target="_blank" rel="noopener">GC roots</a>. However, for an eden GC, in order to reliably scan through all reachable objects, the situation is slightly more complex:</p>
+<ol>
+<li>Of course, we still need to push the GC roots to the initial queue.
+</li>
+<li>
+<p>If an object in the old space contains a pointer to an object in eden, we need to put the old space object to the initial queue.</p>
+</li>
+</ol>
+<p>The invariant for the second case is maintained on the mutator side. Specifically, whenever one writes a pointer slot of some object <code>A</code> in the heap to point to another object <code>B</code>, one needs to check if <code>A.isMarked</code> is <code>true</code> and <code>B.isMarked</code> is <code>false</code>. If so, one needs to put <code>A</code> into a “remembered set”. An eden GC must treat the objects in the remembered set as if they were GC roots. This is called a <code>WriteBarrier</code>. In pseudo-code:</p>
+<pre><code><span>if</span> (<span>obj</span>-&gt;<span>isMarked</span> &amp;&amp; !<span>dst</span>-&gt;<span>isMarked</span>)
+    <span>addToRememberedSet</span>(<span>obj</span>);
+</code></pre>
+<h3>Getting Incremental</h3>
+<p>A stop-the-world GC isn’t optimal for production use. A GC cycle (especially a full GC cycle) can take a long time. Since the mutator (application logic) cannot run during the stop-the-world period, the application would appear irresponsive to the user, which can be a very bad user experience for long pauses.</p>
+<p>A natural way to shorten this irresponsive period is to run GC incrementally: at safe points, the mutator transfers control to the GC. The GC only runs for a short time, doing a portion of the work for the current GC cycle (eden or full), then return control to the mutator. This way, each GC cycle is split into many small steps, so the irresponsive periods are less noticeable to the user.</p>
+<p>Incremental GC poses a few new challenges to the GC scheme.</p>
+<p>The first challenge is the extra interference between the GC and the mutator: the mutator, namely the allocator and the <code>WriteBarrier</code>, must be prepared to see states arisen from a partially-completed GC cycle. And the GC side must correctly mark all reachable objects despite changes made by the mutator side in between.</p>
+<p>Specifically, our full GC must change: imagine that the full GC scanned some object <code>o</code> and handed back control to mutator, then the mutator changed a field of <code>o</code> to point to some other object <code>dst</code>. The object <code>dst</code> must not be missed from scanning. Fortunately, in such a case <code>o</code> will be <code>isMarked</code> and <code>dst</code> will be <code>!isMarked</code> (if <code>dst</code> has <code>isMarked</code> then it has been scanned, so there’s nothing to worry about), so <code>o</code> will be put into the remembered set.</p>
+<p>Therefore, for a full GC to function correctly in the incremental GC scheme, it must consider the remembered set as a GC root as well, just like the eden GC.</p>
+<p>The other parts of the algorithm as of now can remain unchanged (we leave the proof of correctness as an exercise for the reader). Nevertheless, “what happens if a GC cycle is run partially?” is something that we must keep in mind as we add more optimizations.</p>
+<p>The second challenge is that the mutator side can repeatedly put an old space object into the remembered set, and result in redundant work for the GC: for example, the GC popped some object <code>o</code> in the remembered set, traversed from it, and handed over control to mutator. The mutator modified <code>o</code> again, putting it back to the remembered set. If this happens too often, the incremental GC could do a lot more work than a stop-the-world GC.</p>
+<p>The situation will get even worse once we make our GC concurrent: in a concurrent GC, since the GC is no longer stealing CPU time from the mutator, the mutator gets higher throughput, thus will add even more objects into the remembered set. In fact, JSC observed up to 5x higher memory consumption without any mitigation. Therefore, two techniques are employed to mitigate this issue.</p>
+<p>The first and obvious mitigation is to have the GC scan the remembered set last: only when the queue has otherwise been empty do we start popping from the remembered set. The second mitigation employed by JSC is a technique called <em>Space-Time Scheduler</em>. In short, if it observes that the mutator was allocating too fast, the mutator would get decreasingly less time quota to run so the GC can catch up (and in the extreme case, the mutator would get zero time quota to run, so it falls back to the stop-the-world approach). Filip Pizlo’s <a href="https://webkit.org/blog/7122/introducing-riptide-webkits-retreating-wavefront-concurrent-garbage-collector/" target="_blank" rel="noopener">blog post</a> has explained it very clearly, so feel free to take a look if you are interested.</p>
+<p>Anyways, let’s update the pseudo-code for the eden/full GC marking phase:</p>
+<pre><code><span>while</span> (!<span>queue</span>.<span>empty</span>() || !<span>rmbSet</span>.<span>empty</span>()) {
+            <span>JSCell</span>* <span>obj</span> = !<span>queue</span>.<span>empty</span>() ? <span>queue</span>.<span>pop</span>() : <span>rmbSet</span>.<span>pop</span>();
+    <span>obj</span>-&gt;<span>ForEachChild</span>([&amp;](<span>JSCell</span>* <span>child</span>) {
+        <span>if</span> (!<span>child</span>-&gt;<span>isMarked</span>) {
+            <span>child</span>-&gt;<span>isMarked</span> = <span>true</span>;
+            <span>queue</span>.<span>push</span>(<span>child</span>);
+        }
+    });
+}
+</code></pre>
+<h3>Incorporate in CompleteSubspace</h3>
+<p>It’s time to get our <code>CompleteSubspace</code> allocator back so we don’t have to suffer the huge per-object GC header overhead incurred by <code>PreciseAllocation</code>.</p>
+<p>For <code>PreciseAllocation</code>, the actual memory management work is done by <code>malloc</code>: when the mutator wants to allocate an object, it just <code>malloc</code>s it, and when the GC discovers a dead object, it just <code>free</code>s it.</p>
+<p><code>CompleteSubspace</code> introduces another complexity, as it only allocates/deallocates memory from malloc at 16KB-block level, and does memory management itself to divide the blocks into cells that it serves to the application. Therefore, it has to track whether each of its cells is available for allocation. The mutator allocates from the available cells, and the GC marks dead cells as available for allocation again.</p>
+<p>The <code>isMarked</code> bit is not enough for the <code>CompleteSubspace</code> allocator to determine if a cell contains a live object or not: newly allocated objects have <code>isMarked = false</code> but are clearly live objects. Therefore, we need another bit.</p>
+<p>In fact, there are other good reasons that we need to support checking if a cell contains a live object or not. A canonical example is the conservative stack scanning: JSC does not precisely understand the layout of the stack, so it needs to treat everything on the stack that could be pointers and pointing to live objects as a GC root, and this involves checking if a heap pointer points to a live object or not.</p>
+<p>One can easily imagine some kind of <code>isLive</code> bit that is <code>true</code> for all live objects, which is only flipped to <code>false</code> by the GC when the object is dead. However, JSC employed a slightly different scheme, which is needed to facilitate optimizations that we will mention later.</p>
+<p>As you have seen earlier, the bit used by JSC is called <code>isNew</code>.</p>
+<p><a name="purposeOfIsNewBit"></a>However, keep in mind: you should <strong>not</strong> think of <code>isNew</code> as a bit that tells you <strong>anything</strong> related to its name, or indicates anything by itself. You should think of it as a helper bit, which sole purpose is that, when working together with <code>isMarked</code>, they tell you if a cell contains a live object or not. This thinking mode will be more important in the next section when we introduce logical versioning.</p>
+<p>The core invariant around <code>isNew</code> and <code>isMarked</code> is:</p>
+<ol>
+<li>At <strong>any</strong> moment, an object is dead iff its <code>isNew = false</code> and <code>isMarked = false</code>.</li>
+</ol>
+<p>If we were a stop-the-world GC, then to maintain this invariant, we only need the following:</p>
+<ol>
+<li>When an object is born, it has <code>isNew = true</code> and <code>isMarked = false</code>.
+</li>
+<li>
+<p>At the end of each eden or full GC cycle, we set <code>isNew</code> of all objects to <code>false</code>.</p>
+</li>
+</ol>
+<p>Then, all newly-allocated objects are live because its <code>isNew</code> is <code>true</code>. At the end of each GC cycle, an object is live iff its <code>isMarked</code> is <code>true</code>, so after we set <code>isNew</code> to <code>false</code> (due to rule 2), the invariant on what is a dead object is maintained, as desired.</p>
+<p>However, in an incremental GC, since the state of a partially-run GC cycle can be exposed to mutator, we need to ensure that the invariant holds in this case as well.</p>
+<p>Specifically, in a full GC, we reset all <code>isMarked</code> to <code>false</code> at the beginning. Then, during a partially-run GC cycle, the mutator may see a live object with both <code>isMarked = false</code> (because it has not been marked by the GC yet), and <code>isNew = false</code> (because it has survived one prior GC cycle). This violates our invariant.</p>
+<p>To fix this, at the beginning of a full GC, we additionally do <code>isNew |= isMarked</code> before clearing <code>isMarked</code>. Now, during the whole full GC cycle, all live objects must have <code>isNew = true</code>, so our invariant is maintained. At the end of the cycle, all <code>isNew</code> bits are cleared, and as a result, all the unmarked objects become dead, so our invariant is still maintained as desired. So let’s update our pseudo-code:</p>
+<p>Eden GC preparation phase: no work is needed.</p>
+<p>Full GC preparation phase:</p>
+<pre><code>
+<span>for</span> (<span>PreciseAllocation</span>* <span>pa</span> : <span>allPreciseAllocations</span>) {
+    <span>pa</span>-&gt;<span>isNew</span> |= <span>pa</span>-&gt;<span>isMarked</span>;
+    <span>pa</span>-&gt;<span>isMarked</span> = <span>false</span>;
+}
+
+<span>for</span> (<span>BlockFooter</span>* <span>block</span> : <span>allCompleteSubspaceBlocks</span>) {
+    <span>for</span> (<span>size_t</span> <span>cellId</span> = <span>0</span>; <span>cellId</span> &lt; <span>block</span>-&gt;<span>numCells</span>; <span>cellId</span>++) {
+        <span>block</span>-&gt;<span>isNew</span>[<span>cellId</span>] |= <span>block</span>-&gt;<span>isMarked</span>[<span>cellId</span>];
+        <span>block</span>-&gt;<span>isMarked</span>[<span>cellId</span>] = <span>false</span>;
+    }
+}
+</code></pre>
+<p>Eden/Full GC collection phase:</p>
+<pre><code><span>for</span> (<span>BlockFooter</span>* <span>block</span> : <span>allCompleteSubspaceBlocks</span>) {
+    <span>for</span> (<span>size_t</span> <span>cellId</span> = <span>0</span>; <span>cellId</span> &lt; <span>block</span>-&gt;<span>numCells</span>; <span>cellId</span>++) {
+        <span>block</span>-&gt;<span>isNew</span>[<span>cellId</span>] = <span>false</span>;
+    }
+}
+
+<span>for</span> (<span>PreciseAllocation</span>* <span>pa</span> : <span>allPreciseAllocations</span>) {
+    <span>pa</span>-&gt;<span>isNew</span> = <span>false</span>;
+    <span>if</span> (!<span>pa</span>-&gt;<span>isMarked</span>)
+        <span>free</span>(<span>pa</span>);
+}
+</code></pre>
+<p>In <code>CompleteSubspace</code> allocator, to check if a cell in a block contains a live object (if not, then the cell is available for allocation):</p>
+<pre><code><span>bool</span> <span>cellContainsLiveObject</span>(<span>BlockFooter</span>* <span>block</span>, <span>size_t</span> <span>cellId</span>) {
+    <span>return</span> <span>block</span>-&gt;<span>isMarked</span>[<span>cellId</span>] || <span>block</span>-&gt;<span>isNew</span>[<span>cellId</span>];
+}
+</code></pre>
+<h3>Logical Versioning: Do Not Sweep!</h3>
+<p>We are doing a lot of work at the beginning of a full GC cycle and at the end of any GC cycle, since we have to iterate through all the blocks in <code>CompleteSubspace</code> and update their <code>isMarked</code> and <code>isNew</code> bits. Despite that the bits in one block are clustered into bitvectors thus have good memory locality, this could still be an expensive operation, especially after we have a concurrent GC (as this stage cannot be made concurrent). So we want something better.</p>
+<p>The optimization JSC employs is logical versioning. Instead of physically clearing all bits in all blocks for every GC cycle, we only bump a global “logical version”, indicating that all the bits are logically cleared (or updated). Only when we actually need to mark a cell in a block during the marking phase do we then physically clear (or update) the bitvectors in this block.</p>
+<p>You may ask: why bother with logical versioning, if in the future we still have to update the bitvectors physically anyway? There are two good reasons:</p>
+<ol>
+<li>If all cells in a block are dead (either died out during this GC cycle, or already dead before this GC cycle), then we will never mark anything in the block, so logical versioning enabled us to avoid the work altogether. This also implies that at the end of each GC cycle, it’s unnecessary to figure out which blocks become completely empty, as logical versioning makes sure that these empty blocks will not cause overhead to future GC cycles.
+</li>
+<li>
+<p>The marking phase can be done concurrently with multiple threads <em>and</em> while the mutator thread is running (our scheme isn’t concurrent now, but we will do it soon), while the preparation / collection phase must be performed with the mutator stopped. Therefore, shifting the work to the marking phase reduces GC latency in a concurrent setting.</p>
+</li>
+</ol>
+<p>There are two global version number <code>g_markVersion</code> and <code>g_newVersion</code>. Each block footer also stores its local version number <code>l_markVersion</code> and <code>l_newVersion</code>.</p>
+<p>Let’s start with the easier case: the logical versioning for the <code>isNew</code> bit.</p>
+<p>If you revisit the pseudo-code above, in GC there is only one place where we write <code>isNew</code>: at the end of each GC cycle, we set all the <code>isNew</code> bits to <code>false</code>. Therefore, we simply <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/MarkedSpace.cpp.html#446" target="_blank" rel="noopener">bump</a> <code>g_newVersion</code> there instead. A local version <code>l_newVersion</code> smaller than <code>g_newVersion</code> means that all the <code>isNew</code> bits in this block have been logically cleared to <code>false</code>.</p>
+<p>When the <code>CompleteSubspace</code> allocator allocates a new object, it needs to start with <code>isNew = true</code>. One can clearly do this directly, but JSC did it in a trickier way that involves a block-level bit named <code>allocated</code> for slightly better performance. This is not too interesting, so I deferred it to <a href="#isNewAndAllocateBit">the end of the post</a>, and our scheme described here right now will not employ this optimization (but is otherwise intentionally kept semantically equivalent to JSC):</p>
+<ol>
+<li>When a <code>BlockDirectory</code> starts allocating from a new block, it update the the block’s <code>l_newVersion</code> to <code>g_newVersion</code>, and set <code>isNew</code> to <code>true</code> for all already-allocated cells (as the block may not be fully empty), and <code>false</code> for all free cells.
+</li>
+<li>
+<p>Whenever it allocates a cell, it sets its <code>isNew</code> to true.</p>
+</li>
+</ol>
+<p>Why do we want to bother setting <code>isNew</code> to <code>true</code> for all already-allocated cells in the block? This is to provide a good property. Since we bump <code>g_newVersion</code> at the end of every GC cycle, due to the scheme above, for any block with latest <code>l_newVersion</code>, a cell is live if and only if its <code>isNew</code> bit is set. Now, when checking if a cell is live, if its <code>l_newVersion</code> is the latest, then we can just return <code>isNew</code> without looking at <code>isMarked</code>, so our logic is simpler.</p>
+<p>The logical versioning for the <code>isMarked</code> bit is similar. At the beginning of a full GC cycle, we bump the <code>g_markVersion</code> to indicate that all mark bits are logically cleared. Note that the global version is not bumped for eden GC, since eden GC does not clear <code>isMark</code> bits.</p>
+<p>There is one extra complexity: the above scheme would break down in an incremental GC. Specifically, <em>during</em> a full GC cycle, we have logically cleared the <code>isMarked</code> bit, but we also didn’t do anything to the <code>isNew</code> bit, so all cells in the old space would appear dead to the allocator. In our old scheme without logical versioning, this case is prevented by doing <code>isNew |= isMarked</code> at the start of the full GC, but we cannot do it now with logical versioning.</p>
+<p>JSC solves this problem with the following clever trick: <em>during</em> a full GC, we should also accept <code>l_markVersion</code> that is off-by-one. In that case, we know the <code>isMarked</code> bit accurately reflects whether or not a cell is live, since that is the result of the last GC cycle. If you are a bit confused, take a look at footnote for a more elaborated case discussion. It might also help to take a look at the comments in the pseudo-code below:</p>
+<pre><code><span>bool</span> <span>cellContainsLiveObject</span>(<span>BlockFooter</span>* <span>block</span>, <span>size_t</span> <span>cellId</span>) {
+    <span>if</span> (<span>block</span>-&gt;<span>l_newVersion</span> == <span>g_newVersion</span>) {
+                                <span>return</span> <span>block</span>-&gt;<span>isNew</span>[<span>cellId</span>];
+    }
+
+            <span>if</span> (<span>isMarkBitLogicallyCleared</span>(<span>block</span>)) {
+                <span>return</span> <span>false</span>;
+    }
+
+            <span>return</span> <span>block</span>-&gt;<span>isMarked</span>[<span>cellId</span>];
+}
+
+
+<span>bool</span> <span>isMarkBitLogicallyCleared</span>(<span>BlockFooter</span>* <span>block</span>) {
+    <span>if</span> (<span>block</span>-&gt;<span>l_markVersion</span> == <span>g_markVersion</span>) {
+                <span>return</span> <span>false</span>;
+    }
+
+    <span>if</span> (<span>IsFullGcRunning</span>() &amp;&amp; <span>IsGcInMarkingPhase</span>() &amp;&amp;
+        <span>block</span>-&gt;<span>l_markVersion</span> == <span>g_markVersion</span> - <span>1</span>) {
+                                        <span>return</span> <span>false</span>;
+    }
+
+    <span>return</span> <span>true</span>;
+}
+
+</code></pre>
+<p>Before we mark an object in <code>CompleteSubspace</code>, we need to update the <code>l_markVersion</code> of the block holding the cell to the latest, and materialize the <code>isMarked</code> bits of all cells in the block. That is, we need to run the logic at the full GC preparation phase in our old scheme: <code>isNew |= isMarked</code>, <code>isMarked = false</code> for all cells in the block. This is shown below.</p>
+<pre><code><span>void</span> <span>markObject</span>(<span>BlockFooter</span>* <span>block</span>, <span>size_t</span> <span>cellId</span>) {
+    <span>aboutToMark</span>(<span>block</span>);
+    <span>block</span>-&gt;<span>isMarked</span>[<span>cellId</span>] = <span>true</span>;
+}
+
+
+<span>void</span> <span>aboutToMark</span>(<span>BlockFooter</span>* <span>block</span>) {
+    <span>if</span> (<span>block</span>-&gt;<span>l_markVersion</span> == <span>g_markVersion</span>) {
+                        <span>return</span>;
+    }
+
+            <span>if</span> (<span>isMarkBitLogicallyCleared</span>(<span>block</span>)) {
+                                <span>for</span> (<span>size_t</span> <span>cellId</span> = <span>0</span>; <span>cellId</span> &lt; <span>block</span>-&gt;<span>numCells</span>; <span>cellId</span>++) {
+            <span>block</span>-&gt;<span>isMarked</span>[<span>cellId</span>] = <span>false</span>;
+        }
+    } <span>else</span> {
+                        <span>if</span> (<span>block</span>-&gt;<span>l_newVersion</span> &lt; <span>g_newVersion</span>) {
+                                                            <span>for</span> (<span>size_t</span> <span>cellId</span> = <span>0</span>; <span>cellId</span> &lt; <span>block</span>-&gt;<span>numCells</span>; <span>cellId</span>++) {
+                <span>block</span>-&gt;<span>isNew</span>[<span>cellId</span>] = <span>block</span>-&gt;<span>isMarked</span>[<span>cellId</span>];
+                <span>block</span>-&gt;<span>isMarked</span>[<span>cellId</span>] = <span>false</span>;
+            }
+
+                        <span>block</span>-&gt;<span>l_newVersion</span> = <span>g_newVersion</span>;
+        } <span>else</span> {
+                                                                                    <span>for</span> (<span>size_t</span> <span>cellId</span> = <span>0</span>; <span>cellId</span> &lt; <span>block</span>-&gt;<span>numCells</span>; <span>cellId</span>++) {
+                <span>block</span>-&gt;<span>isMarked</span>[<span>cellId</span>] = <span>false</span>;
+            }
+        }
+    }
+
+        <span>block</span>-&gt;<span>l_markVersion</span> = <span>g_markVersion</span>;
+}
+</code></pre>
+<p>A fun fact: despite that what we conceptually want to do above is <code>isNew |= isMarked</code>, the above code never performs a <code>|=</code> at all 🙂</p>
+<p>And also, let’s update the pseudo-code for the preparation GC logic:</p>
+<p>Eden GC preparation phase: no work is needed.</p>
+<p>Full GC preparation phase:</p>
+<pre><code><span>for</span> (<span>PreciseAllocation</span>* <span>pa</span> : <span>allPreciseAllocations</span>) {
+    <span>pa</span>-&gt;<span>isNew</span> |= <span>pa</span>-&gt;<span>isMarked</span>;
+    <span>pa</span>-&gt;<span>isMarked</span> = <span>false</span>;
+}
+
+<span>g_markVersion</span>++;
+</code></pre>
+<p>Eden/Full GC collection phase:</p>
+<pre><code><span>for</span> (<span>PreciseAllocation</span>* <span>pa</span> : <span>allPreciseAllocations</span>) {
+    <span>pa</span>-&gt;<span>isNew</span> = <span>false</span>;
+    <span>if</span> (!<span>pa</span>-&gt;<span>isMarked</span>)
+        <span>free</span>(<span>pa</span>);
+}
+
+<span>g_newVersion</span>++;
+</code></pre>
+<p>With logical versioning, the GC no longer sweeps the <code>CompleteSubspace</code> blocks to reclaim dead objects: the reclamation happens lazily, when the allocator starts to allocate from the block. This, however, introduces an unwanted side-effect. Some objects use manual memory management internally: they own additional memory that are not managed by the GC, and have C++ destructors to free that memory when the object is dead. This improves performance as it reduces the work of the GC. However, now we may not immediately sweep dead objects and run destructors, so the memory that is supposed to be freed by the destructor could be kept around indefinitely if the block is never allocated from. To mitigate this issue, JSC will also periodically sweep blocks and run the destructors of the dead objects. This is <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/IncrementalSweeper.h.html#JSC::IncrementalSweeper" target="_blank" rel="noopener">implemented</a> by <code>IncrementalSweeper</code>, but we will not go into details.</p>
+<p>To conclude, logical versioning provides two important optimizations to the GC scheme:</p>
+<ol>
+<li>The so-called “sweep” phase of the GC (to find and reclaim dead objects) is removed for <code>CompleteSubspace</code> objects. The reclamation is done lazily. This is clearly better than sweeping through the block again and again in every GC cycle.</li>
+<li>The full GC does not need to reset all <code>isMarked</code> bits in the preparation phase, but only lazily reset them in the marking phase by <code>aboutToMark</code>: this not only reduces work, but also allows the work to be done in parallel and concurrently while the mutator is running, after we make our GC scheme concurrent.</li>
+</ol>
+<h3>Optimizing WriteBarrier: The cellState Bit</h3>
+<p>As we have explained earlier, whenever the mutator modified a pointer of a marked object <code>o</code> to point to an unmarked object, it needs to add <code>o</code> to the “remembered set”, and this is called the <code>WriteBarrier</code>. In this section, we will dig a bit deeper into the <code>WriteBarrier</code> and explain the optimizations around it.</p>
+<p>The first problem with our current <code>WriteBarrier</code> is that the <code>isMarked</code> bit resides in the block footer, so retrieving its value requires quite a few computations from the object pointer. Also it doesn’t sit in the same CPU cache line as the object, which makes the access even slower. This is undesirable as the cost is paid for every <code>WriteBarrier</code>, regardless of if we add the object to the remembered set.</p>
+<p>The second problem is our <code>WriteBarrier</code> will repeatedly add the same object <code>o</code> to the remembered set every time it is run. The obvious solution is to make <code>rememberedSet</code> a hash set to de-duplicate the objects it contains, but doing a hash lookup to check if the object already exists is far too expensive.</p>
+<p>This is where the last metadata bit that we haven’t explained yet: the <code>cellState</code> bit comes in, which solves both problems.</p>
+<p>Instead of making <code>rememberedSet</code> a hash table, we reserve a byte (though we only use 1 bit of it) named <code>cellState</code> in every object’s object header, to indicate if we might need to put the object into the remembered set in a <code>WriteBarrier</code>. Since this bit resides in the object header as an object field (instead of in the block footer), it’s trivially accessible to the mutator who has the object pointer.</p>
+<p><code>cellState</code> has two possible values: <code>black</code> and <code>white</code>. The most important two invariants around <code>cellState</code> are the following:</p>
+<ol>
+<li>For any object with <code>cellState = white</code>, it is guaranteed that the object does not need to be added to remembered set.</li>
+<li>Unless <em>during</em> a full GC cycle, all <code>black</code> (live) objects have <code>isMarked = true</code>.</li>
+</ol>
+<p>Invariant 1 serves as a fast-path: <code>WriteBarrier</code> can return immediately if our object is <code>white</code>, and checking it only requires one load instruction (to load <code>cellState</code>) and one comparison instruction to validate it is <code>white</code>.</p>
+<p>However, if the object is <code>black</code>, a slow-path is needed to check whether it is actually needed to add the object to the remembered set.</p>
+<p>Let’s look at our new <code>WriteBarrier</code>:</p>
+<pre><code><span>void</span> <span>WriteBarrier</span>(<span>JSCell</span>* <span>obj</span>) {
+    <span>if</span> (<span>obj</span>-&gt;<span>cellState</span> == <span>black</span>)
+        <span>WriteBarrierSlowPath</span>(<span>obj</span>);
+}
+</code></pre>
+<p>The first thing to notice is that the <code>WriteBarrier</code> is no longer checking if <code>dst</code> (the object that the pointer points to) is marked or not. Clearly this does not affect the correctness: we are just making the criteria less restrictive. However, the performance impact of removing this <code>dst</code> check is a tricky question without a definite answer, even for JSC developers. Through some preliminary testing, their conclusion is that adding back the <code>!isMarked(dst)</code> check slightly regresses performance. They have two hypotheses. First, by not checking <code>dst</code>, more objects are put into the remembered set and need to be scanned by the GC, so the total amount of work increased. However, the mutator’s work probably decreased, as it does fewer checks and touches fewer cache lines (by not touching the outlined <code>isMarked</code> bit). Of course such benefit is offset because the mutator is adding more objects into the remembered set, but this isn’t too expensive either, as the remembered set is only a segmented vector. The GC has to do more work, as it needs to scan and mark more objects. However, after we make our scheme concurrent, the marking phase of the GC can be done concurrently as the mutator is running, so the latency is probably hidden. Second, JSC’s DFG compiler has an <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/dfg/DFGStoreBarrierInsertionPhase.cpp.html" target="_blank" rel="noopener">optimization pass</a> that coalesces barriers on the same object together, and it is harder for such barriers to check all the <code>dsts</code>.</p>
+<p>The interesting part is how the invariants above are maintained by the relavent parties. As always, there are three actors: the mutator (<code>WriteBarrier</code>), the allocator, and the GC.</p>
+<p>The interaction with the allocator is the simplest. All objects are born <code>white</code>. This is correct because newly-born objects are not marked, so have no reason to be remembered.</p>
+<p>The interaction with GC is during the GC marking phase:</p>
+<ol>
+<li>When we mark an object and push it into the queue, we set its <code>cellState</code> to <code>white</code>.</li>
+<li>When we pop an object from the queue, before we start to scan its children, we set its <code>cellState</code> to <code>black</code>.</li>
+</ol>
+<p>In pseudo-code, the Eden/Full GC marking phase now looks like the following (Line 5 and Line 9 are the newly-added logic to handle <code>cellState</code>, other lines unchanged):</p>
+<pre><code><span>while</span> (!<span>queue</span>.<span>empty</span>() || !<span>rmbSet</span>.<span>empty</span>()) {
+            <span>JSCell</span>* <span>obj</span> = !<span>queue</span>.<span>empty</span>() ? <span>queue</span>.<span>pop</span>() : <span>rmbSet</span>.<span>pop</span>();
+    <span>obj</span>-&gt;<span>cellState</span> = <span>black</span>;           
+    <span>obj</span>-&gt;<span>ForEachChild</span>([&amp;](<span>JSCell</span>* <span>child</span>) {
+        <span>if</span> (!<span>child</span>-&gt;<span>isMarked</span>) {
+            <span>markObject</span>(<span>child</span>);
+            <span>child</span>-&gt;<span>cellState</span> = <span>white</span>;             <span>queue</span>.<span>push</span>(<span>child</span>);
+        }
+    });
+}
+</code></pre>
+<p>Let’s argue why the invariant is maintained by the above code.</p>
+<ol>
+<li>For invariant 1, note that in the above code, an object is <code>white</code> only if it is inside the queue (as once it’s popped out, it becomes <code>black</code> again), pending scanning of its children. Therefore, it is guaranteed that the object will still be scanned by the GC later, so we don’t need to add the object to remembered set, as desired. </li>
+<li>For invariant 2, at the end of any GC cycle, any live object is marked, which means it has been scanned, so it is <code>black</code>, as desired. </li>
+</ol>
+<p>Now let’s look at what <code>WriteBarrierSlowPath</code> should do. Clearly, it’s correct if it simply unconditionally add the object to remembered set, but that also defeats most of the purpose of <code>cellState</code> as an optimization mechanism: we want something better. A key use case of <code>cellState</code> is to prevent adding an object into the remembered set if it is already there. Therefore, after we put the object into the remembered set, we will set its <code>cellState</code> to <code>white</code>, like shown below.</p>
+<pre><code><span>void</span> <span>WriteBarrierSlowPath</span>(<span>JSCell</span>* <span>obj</span>) { 
+    <span>obj</span>-&gt;<span>cellState</span> = <span>white</span>;
+    <span>addToRememberedSet</span>(<span>obj</span>);
+}
+</code></pre>
+<p>Let’s prove why the above code works. Once we added an object to remembered set, we set it to <code>white</code>. We don’t need to add the same object into the remembered set until it gets popped out from the set by GC. But when GC pops out the object, it would set its <code>cellState</code> back to <code>black</code>, so we are good.</p>
+<p>JSC employed one more optimization. During a full GC, we might see a <code>black</code> object that has <code>isMarked = false</code> (note that this is the only possible case that the object is unmarked, due to invariant 2). In this case, it’s unnecessary to add the object to remembered set, since the object will eventually be scanned in the future (or it became dead some time later before it was scanned, in which case we are good as well). Furthermore, we can flip it back to <code>white</code>, so we don’t have to go into this slow path the next time a <code>WriteBarrier</code> on this object runs. To sum up, the optimized version is as below:</p>
+<pre><code><span>void</span> <span>WriteBarrierSlowPath</span>(<span>JSCell</span>* <span>obj</span>) {
+    <span>if</span> (<span>IsFullGcRunning</span>()) {
+        <span>if</span> (!<span>isMarked</span>(<span>obj</span>)) {
+                                                <span>obj</span>-&gt;<span>cellState</span> = <span>white</span>;
+            <span>return</span>;
+        }
+    } <span>else</span> {
+        <span>assert</span>(<span>isMarked</span>(<span>obj</span>));     }
+
+    <span>obj</span>-&gt;<span>cellState</span> = <span>white</span>;
+    <span>addToRememberedSet</span>(<span>obj</span>);
+}
+</code></pre>
+<h3>Getting Concurrent and Getting Wild</h3>
+<p>At this point, we already have a very good incremental and generational garbage collector: the mutator, allocator and GC all have their respective fast-paths for the common cases, and with logical versioning, we avoided redundant work as much as possible. In my humble opinion, this is a good balance point between performance and engineering complexity.</p>
+<p>However, because JSC is one of the core drivers of performance in Safari, it’s unsurprising that performance is a top priority, even at the cost of engineering complexity. To squeeze out every bit of performance, JSC made their GC concurrent. This is no easy feat: due to the nature of GCs, it’s often too slow to use locks to protect against certain race conditions, so extensive lock-free programming is employed.</p>
+<p>But once lock-free programming is involved, one starts to get into all sorts of architecture-dependent memory reordering problems. x86-64 is the more strict architecture: it only requires <code>StoreLoadFence()</code>, and it provides TSO-like semantics. JSC also supports ARM64 CPUs, which has even fewer guarantees: load-load, load-store, store-load, and store-store can all be reordered by the CPU, so a lot more operations need fences. As if things were not bad enough, for performance reasons, JSC often avoids using memory fences on ARM64. They have the so-called <code>Dependency</code> <a href="https://sillycross.github.io/r/WebKit/Source/WTF/wtf/Atomics.h.html#_ZN3WTF10DependencyC1Ev" target="_blank" rel="noopener">class</a>, which creates an implicit CPU data dependency on ARM64 through some scary assembly hacks, so they can get the desired memory ordering for a specific data-flow without paying the cost of a memory fence. As you can imagine, with all of these complications and optimizations, the code can become difficult to read.</p>
+<p>So due to my limited expertise, it’s unsurprising if I missed to explain or mis-explained some important race conditions in the code, especially some ARM64-specific ones: if you spotted any issue in this post, please let me know.</p>
+<p>Let’s go through the concurrency assumptions first. JavaScript is a single-threaded language, so there is always only one mutator thread. Apart from the mutator thread, JSC has a bunch of compilation threads, a GC thread, and a bunch of marking threads. Only the GC marking phase is concurrent: during which the mutator thread, the compiler threads, and a bunch of marking threads are concurrently running (yes, the marking itself is also done in parallel). However, all the other GC phases are run with the mutator thread and compilation threads stopped.</p>
+<h4>Some Less Interesting Issues</h4>
+<p>First of all, clearly the <code>isMarked</code> and <code>isNew</code> bitvector must be made safe for concurrent access, since multiple threads (including marking threads and mutator) may concurrently update it. Using CAS with appropriate retry/bail mechanism is enough for the bitvector itself.</p>
+<p><code>BlockFooter</code> is harder, and needs to be protected with a lock: multiple threads could be simultaneously calling <code>aboutToMark()</code>, so <code>aboutToMark()</code> must be guarded. For the reader side (the <code>isMarked()</code> function, which involves first checking if <code>l_markVersion</code> is latest, then reading the <code>isMarked</code> bitvector), in x86-64 thanks to x86-TSO, one does not need a lock or any memory fence (as long as <code>aboutToMark</code> takes care to update <code>l_markVersion</code> after the bitvector). In ARM64, since load-load reordering is allowed, a <code>Dependency</code> is required.</p>
+<p>Making the <code>cellContainsLiveObject</code> (or in JSC jargon, <code>isLive</code>) check lock-free is harder, since it involves potentially reading both the <code>isMarked</code> bit and the <code>isNew</code> bit. JSC <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/MarkedBlockInlines.h.html#_ZN3JSC11MarkedBlock6Handle6isLiveEjjbPKNS_8HeapCellE" target="_blank" rel="noopener">employs optimistic locking</a> to provide a fast-path. This is not very different from an optimistic locking scheme you can find in a textbook, so I won’t dive into the details.</p>
+<p>Of course, there are a lot more subtle issues to change. Almost all the pseudo-code above needs to be adapted for concurrency, either by using a lock or CAS, or by using some sort of memory barrier and concurrency protocol to ensure that the code works correctly under races. But now let’s turn to some more important and tricky issues.</p>
+<h4>The Race Between WriteBarrier and Marking</h4>
+<p>One of the most important races is the race between <code>WriteBarrier</code> and GC’s marking threads. The marking threads and the mutator thread can access the <code>cellState</code> of an object concurrently. For performance reasons, a lock is infeasible, so a race condition arises.</p>
+<p>It’s important to note that we call <code>WriteBarrier</code> <strong>after</strong> we have written the pointer into the object. This is not only more convenient to use (especially for JIT-generated code), but also allows a few optimizations: for example, <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/dfg/DFGStoreBarrierInsertionPhase.cpp.html" target="_blank" rel="noopener">in certain cases</a>, multiple writes to the same object may only call <code>WriteBarrier</code> once at the end.</p>
+<p>With this in mind, let’s analyze why our current implementation is buggy. Suppose <code>o</code> is an object, and the mutator wants to store a pointer to another object <code>target</code> into a field <code>f</code> of <code>o</code>. The marking logic of the GC wants to scan <code>o</code> and append its children into the queue. We need to make sure that GC will observe the <code>o-&gt;target</code> pointer link.</p>
+<p>Let’s first look at the correct logic:</p>
+<table>
+<thead>
+<tr>
+<th>Mutator (WriteBarrier)</th>
+<th>GC (Marker)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Store(o.f, target)</code></td>
+<td><code>Store(o.cellState, black)</code></td>
+</tr>
+</tbody>
+</table>
+<p>This is mostly just a copy of the pseudocode in the above sections, except that we have two <code>StoreLoadFence()</code>. A <code>StoreLoadFence()</code> guarantees that no <code>LOAD</code> after the fence may be executed by the CPU out-of-order engine until all <code>STORE</code> before the fence have completed. Let’s first analyze what could go wrong without either of the fences.</p>
+<p>Just to make things perfectly clear, the precondition is <code>o.cellState = white</code> (because <code>o</code> is in the GC’s queue) and <code>o.f = someOldValue</code>.</p>
+<p>What could go wrong if the mutator <code>WriteBarrier</code> doesn’t have the fence? Without the fence, the CPU can execute the <code>LOAD</code> in line 3 before the <code>STORE</code> in line 1. Then, in the following interleaving:</p>
+<ol>
+<li>
+<p>[Mutator Line 3] t1 = Load(o.cellState)    // t1 = white</p>
+</li>
+<li>
+<p>[GC Line 1] Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[GC Line 3] t2 = Load(o.f)                 // t2 = some old value</p>
+</li>
+<li>
+<p>[Mutator Line 1] Store(o.f, target)</p>
+</li>
+</ol>
+<p>Now, the mutator did not add <code>o</code> to remembered set (because <code>t1</code> is <code>white</code>, not <code>black</code>), and <code>t2</code> in GC is the old value in <code>o.f</code> instead of <code>target</code>, so GC did not push <code>target</code> into the queue. So the pointer link from <code>o</code> to <code>target</code> is missed in GC. This can result in <code>target</code> being wrongly reclaimed despite it is live.</p>
+<p>And what could go wrong if the GC marking logic doesn’t have the fence? Similarly, without the fence, the CPU can execute the <code>LOAD</code> in line 3 before the <code>STORE</code> in line 1. Then, in the following interleaving:</p>
+<ol>
+<li>
+<p>[GC Line 3] t2 = Load(o.f)                 // t2 = some old value</p>
+</li>
+<li>
+<p>[Mutator Line 1] Store(o.f, target)</p>
+</li>
+<li>
+<p>[Mutator Line 3] t1 = Load(o.cellState)    // t1 = white</p>
+</li>
+<li>
+<p>[GC Line 1] Store(o.cellState, black)</p>
+</li>
+</ol>
+<p>Similar to above, mutator sees <code>t1 = white</code> and GC sees <code>t2 = oldValue</code>. So <code>o</code> is not added to remembered set, and <code>target</code> is not pushed into the queue, the pointer link is missed.</p>
+<p>Finally, let’s analyze why the code behaves correctly if both fences are present. Unfortunately there is not a better way than manually enumerating all the interleavings. Thanks to the fences, <code>Mutator Line 1</code> must execute before <code>Mutator Line 3</code>, and <code>GC Line 1</code> must execute before <code>GC Line 3</code>, but the four lines can otherwise be reordered arbitrarily. So there are <code>4! / 2! / 2! = 6</code> possible interleavings. So let’s go!</p>
+<p>Interleaving 1:</p>
+<ol>
+<li>
+<p>[Mutator Line 1] Store(o.f, target)</p>
+</li>
+<li>
+<p>[Mutator Line 3] t1 = Load(o.cellState)    // t1 = white</p>
+</li>
+<li>
+<p>[GC Line 1] Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[GC Line 3] t2 = Load(o.f)                 // t2 = target</p>
+</li>
+</ol>
+<p>In this interleaving, the mutator did not add <code>o</code> to remembered set, but the GC sees <code>target</code>, so it’s fine.</p>
+<p>Interleaving 2:</p>
+<ol>
+<li>
+<p>[GC Line 1] Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[GC Line 3] t2 = Load(o.f)                  // t2 = some old value</p>
+</li>
+<li>
+<p>[Mutator Line 1] Store(o.f, target)</p>
+</li>
+<li>
+<p>[Mutator Line 3] t1 = Load(o.cellState)    // t1 = black</p>
+</li>
+</ol>
+<p>In this interleaving, the GC saw the old value, but the mutator added <code>o</code> to the remembered set, so the GC will eventually drain from the remembered set and scan <code>o</code> again, at which time it will see the correct new value <code>target</code>, so it’s fine.</p>
+<p>Interleaving 3:</p>
+<ol>
+<li>
+<p>[Mutator Line 1] Store(o.f, target)</p>
+</li>
+<li>
+<p>[GC Line 1] Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[Mutator Line 3] t1 = Load(o.cellState)    // t1 = black</p>
+</li>
+<li>
+<p>[GC Line 3] t2 = Load(o.f)                 // t2 = target</p>
+</li>
+</ol>
+<p>In this interleaving, the GC saw the new value <code>target</code>, nevertheless, the mutator saw <code>t1 = black</code> and added <code>o</code> to the remembered set. This is unfortunate since the GC will scan <code>o</code> again, but it doesn’t affect correctness.</p>
+<p>Interleaving 4:</p>
+<ol>
+<li>
+<p>[Mutator Line 1] Store(o.f, target)</p>
+</li>
+<li>
+<p>[GC Line 1] Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[GC Line 3] t2 = Load(o.f)                 // t2 = target</p>
+</li>
+<li>
+<p>[Mutator Line 3] t1 = Load(o.cellState)    // t1 = black</p>
+</li>
+</ol>
+<p>Same as Interleaving 3.</p>
+<p>Interleaving 5:</p>
+<ol>
+<li>
+<p>[GC Line 1] Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[Mutator Line 1] store(o.f, target)</p>
+</li>
+<li>
+<p>[Mutator Line 3] t1 = Load(o.cellState)    // t1 = black</p>
+</li>
+<li>
+<p>[GC Line 3] t2 = Load(o.f)                 // t2 = target</p>
+</li>
+</ol>
+<p>Same as Interleaving 3.</p>
+<p>Interleaving 6:</p>
+<ol>
+<li>
+<p>[GC Line 1] Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[Mutator Line 1] Store(o.f, target)</p>
+</li>
+<li>
+<p>[GC Line 3] t2 = Load(o.f)                 // t2 = target</p>
+</li>
+<li>
+<p>[Mutator Line 3] t1 = Load(o.cellState)    // t1 = black</p>
+</li>
+</ol>
+<p>Same as Interleaving 3.</p>
+<p>This proves that with the two <code>StoreLoadFence()</code>, our code is no longer vulnerable to the above race condition.</p>
+<h4>Another Race Condition Between WriteBarrier and Marking</h4>
+<p>The above fix alone is not enough: there is another race between <code>WriteBarrier</code> and GC marking threads. Recall that in <code>WriteBarrierSlowPath</code>, we attempt to flip the object back to <code>white</code> if we saw it is not marked (this may happen during a full GC), as illustrated below:</p>
+<pre><code>... <span>omitted</span> ...
+<span>if</span> (!<span>isMarked</span>(<span>obj</span>)) {
+    <span>obj</span>-&gt;<span>cellState</span> = <span>white</span>;
+    <span>return</span>;
+}
+... <span>omitted</span> ...
+
+</code></pre>
+<p>It turns out that, after setting the object <code>white</code>, we need to do a <code>StoreLoadFence()</code>, and check again if the object is marked. If it becomes marked, we need to set <code>obj-&gt;cellState</code> back to <code>black</code>.</p>
+<p>Without the fix, the code is vulnerable to the following race:</p>
+<ol>
+<li>[Precondition] <code>o.cellState = black</code> and <code>o.isMarked = false</code></li>
+<li>
+<p>[WriteBarrier] Check isMarked()                 // see false</p>
+</li>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[GC Marking] Popped ‘o’ from queue, Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>[Postcondition] <code>o.cellState = white</code> and <code>o.isMarked = true</code></li>
+</ol>
+<p>The post-condition is bad because <code>o</code> will not be added to the remembered set in the future, despite that it needs to be (as the GC has already scanned it).</p>
+<p>Let’s now prove why the code is correct when the fix is applied. Now the <code>WriteBarrier</code> logic looks like this:</p>
+<ol>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)</p>
+</li>
+</ol>
+<p>Note that we omitted the first “Check isMarked()” line because it must be the first thing executed in the interleaving, as otherwise the <code>if</code>-check won’t pass at all.</p>
+<p>The three lines in <code>WriteBarrier</code> cannot be reordered by CPU: Line 1-2 cannot be reordered because of the <code>StoreLoadFence()</code>, line 2-3 cannot be reordered since line 3 is a store that is only executed if line 2 is true. The two lines in GC cannot be reordered by CPU because line 2 stores to the same field <code>o.cellState</code> as line 1.</p>
+<p>In addition, note that it’s fine if at the end of <code>WriteBarrier</code>, the object is <code>black</code> but GC has only executed to line 1: this is unfortunate, because the next <code>WriteBarrier</code> on this object will add the object to the remembered set despite it being unnecessary. However, it does not affect our correctness. So now, let’s enumerate all the interleavings again!</p>
+<p>Interleaving 1.</p>
+<ol>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = false</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // not executed</p>
+</li>
+</ol>
+<p>Object is not marked and white, OK.</p>
+<p>Interleaving 2.</p>
+<ol>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = false</p>
+</li>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // not executed</p>
+</li>
+</ol>
+<p>Object is in queue and white, OK.</p>
+<p>Interleaving 3.</p>
+<ol>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = true</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // executed</p>
+</li>
+</ol>
+<p>Object is in queue and black, unfortunate but OK.</p>
+<p>Interleaving 4.</p>
+<ol>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = true</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // executed</p>
+</li>
+</ol>
+<p>Object is in queue and black, unfortunate but OK.</p>
+<p>Interleaving 5.</p>
+<ol>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = false</p>
+</li>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[GC Marking] Popped ‘o’ from queue, Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // not executed</p>
+</li>
+</ol>
+<p>Object is marked and black, OK.</p>
+<p>Interleaving 6.</p>
+<ol>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = true</p>
+</li>
+<li>
+<p>[GC Marking] Popped ‘o’ from queue, Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // executed</p>
+</li>
+</ol>
+<p>Object is marked and black, OK.</p>
+<p>Interleaving 7.</p>
+<ol>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = true</p>
+</li>
+<li>
+<p>[GC Marking] Popped ‘o’ from queue, Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // executed</p>
+</li>
+</ol>
+<p>Object is marked and black, OK.</p>
+<p>Interleaving 8.</p>
+<ol>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[GC Marking] Popped ‘o’ from queue, Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = true</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // executed</p>
+</li>
+</ol>
+<p>Object is marked and black, OK.</p>
+<p>Interleaving 9.</p>
+<ol>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[GC Marking] Popped ‘o’ from queue, Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = true</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // executed</p>
+</li>
+</ol>
+<p>Object is marked and black, OK.</p>
+<p>Interleaving 10.</p>
+<ol>
+<li>
+<p>[GC Marking] CAS(o.isMarked, true), Store(o.cellState, white), pushed ‘o’ into queue</p>
+</li>
+<li>
+<p>[GC Marking] Popped ‘o’ from queue, Store(o.cellState, black)</p>
+</li>
+<li>
+<p>[WriteBarrier] Store(o.cellState, white)</p>
+</li>
+<li>
+<p>[WriteBarrier] t1 = isMarked()  // t1 = true</p>
+</li>
+<li>
+<p>[WriteBarrier] if (t1 == true): Store(o.cellState, black)   // executed</p>
+</li>
+</ol>
+<p>Object is marked and black, OK.</p>
+<p>So let’s update our pseudo-code. However, I would like to note that, in JSC’s implementation, they did not use a <code>StoreLoadFence()</code> after <code>obj-&gt;cellState = white</code>. Instead, they made the <code>obj-&gt;cellState = white</code> a CAS from <code>black</code> to <code>white</code> (with memory ordering <code>memory_order_seq_cst</code>). This is stronger than a <code>StoreLoadFence()</code> so their logic is also correct. Nevertheless, just in case my analysis above missed some other race with other components, our pseudo-code will stick to their logic…</p>
+<p>Mutator <code>WriteBarrier</code> pseudo-code:</p>
+<pre><code><span>void</span> <span>WriteBarrier</span>(<span>JSCell</span>* <span>obj</span>) {
+    <span>StoreLoadFence</span>();     <span>if</span> (<span>obj</span>-&gt;<span>cellState</span> == <span>black</span>)
+        <span>WriteBarrierSlowPath</span>(<span>obj</span>);
+}
+
+<span>void</span> <span>WriteBarrierSlowPath</span>(<span>JSCell</span>* <span>obj</span>) {
+    <span>if</span> (<span>IsGcRunning</span>()) {
+        <span>if</span> (!<span>isMarked</span>(<span>obj</span>)) {
+            <span>if</span> (<span>SUCCESS</span> == 
+                <span>CompareAndSwap</span>(<span>obj</span>-&gt;<span>cellState</span>, <span>black</span> , <span>white</span> )) {
+                <span>if</span> (<span>isMarked</span>(<span>obj</span>)) {
+                    <span>obj</span>-&gt;<span>cellState</span> = <span>black</span>;
+                }
+            }
+            <span>return</span>;
+        }
+    } <span>else</span> {
+        <span>assert</span>(<span>isMarked</span>(<span>obj</span>));
+    }
+
+    <span>obj</span>-&gt;<span>cellState</span> = <span>white</span>;
+        <span>rmbSet</span>.<span>push</span>(<span>obj</span>);
+}
+</code></pre>
+<p>Eden/Full GC Marking phase:</p>
+<pre><code><span>while</span> (!<span>queue</span>.<span>empty</span>() || !<span>rmbSet</span>.<span>empty</span>()) {
+    <span>JSCell</span>* <span>obj</span> = !<span>queue</span>.<span>empty</span>() ? <span>queue</span>.<span>pop</span>() : <span>rmbSet</span>.<span>pop</span>();
+    <span>obj</span>-&gt;<span>cellState</span> = <span>black</span>;
+
+    <span>StoreLoadFence</span>(); 
+    <span>obj</span>-&gt;<span>ForEachChild</span>([&amp;](<span>JSCell</span>* <span>child</span>) {
+        <span>if</span> (!<span>child</span>-&gt;<span>isMarked</span>) {
+            <span>markObject</span>(<span>child</span>);
+            <span>child</span>-&gt;<span>cellState</span> = <span>white</span>;
+            <span>queue</span>.<span>push</span>(<span>child</span>);
+        }
+    });
+}
+</code></pre>
+<h4>Remove Unnecessary Memory Fence In WriteBarrier</h4>
+<p>The <code>WriteBarrier</code> is now free of hazardous race conditions. However, we are executing a <code>StoreLoadFence()</code> for every <code>WriteBarrier</code>, which is a very expensive CPU instruction. Can we optimize it?</p>
+<p>The idea is the following: the fence is used to protect against race with GC. Therefore, we definitely need the fence if the GC is concurrently running. However, the fence is unnecessary if the GC is not running. Therefore, we can check if the GC is running first, and only execute the fence if the GC is indeed running.</p>
+<p>JSC is even more clever: instead of having two checks (one that checks if the GC is running and one that checks if the <code>cellState</code> is <code>black</code>), it combines them into a single check for the fast-path where the GC is not running and the object is <code>white</code>. The trick is the following:</p>
+<ol>
+<li>Assume <code>black = 0</code> and <code>white = 1</code> in the <code>cellState</code> enum.</li>
+<li>Create a global variable called <code>blackThreshold</code>. This <code>blackThreshold</code> is normally <code>0</code>, but at the beginning of a GC cycle, it will be set to <code>1</code>, and it will be reset back to <code>0</code> at the end of the GC cycle.</li>
+<li>Now, check if <code>obj-&gt;cellState &gt; blackThreshold</code>.</li>
+</ol>
+<p>Then, if the check succeeded, we know we can immediately return: the only case this check can succeed is when the GC is not running and we are <code>white</code> (because <code>blackThreshold = 0</code> and <code>cellState = 1</code> is the only situation to pass the check). This way, the fast path only executes one check. If the check fails, then we fallback to the slow path, which performs the full procedure: check if GC is running, execute a fence if needed, then check if <code>cellState</code> is <code>black</code> again. In pseudo-code:</p>
+<pre><code><span>void</span> <span>WriteBarrier</span>(<span>JSCell</span>* <span>obj</span>) {
+    <span>if</span> (<span>obj</span>-&gt;<span>cellState</span> &gt; <span>g_blackThreshold</span>) {
+                        <span>return</span>;
+    }
+
+    <span>if</span> (!<span>IsGcRunning</span>()) {
+                        <span>WriteBarrierSlowPath</span>(<span>obj</span>);
+    } <span>else</span> {
+                        <span>StoreLoadFence</span>();
+        <span>if</span> (<span>obj</span>-&gt;<span>cellState</span> == <span>black</span>) {
+            <span>WriteBarrierSlowPath</span>(<span>obj</span>);
+        }
+    }
+}
+</code></pre>
+<p>Note that there is no race between <code>WriteBarrier</code> and GC setting/clearing <code>IsGcRunning()</code> flag and changing the <code>g_blackThreshold</code> value, because the mutator is always stopped at a safe point (of course, halfway inside <code>WriteBarrier</code> is not a safe point) when the GC starts/finishes.</p>
+<h4>“Obstruction-Free Double Collect Snapshot”</h4>
+<p>The concurrent GC also introduced new complexities for the <code>ForEachChild</code> function used by the GC marking phase to scan all objects referenced by a certain object. Each JavaScript object has a <code>Structure</code> (aka, hidden class) that describes how the content of this object shall be interpreted into object fields. Since the GC marking phase is run concurrently with the mutator, and the mutator may change the <code>Structure</code> of the object, and may even change the size of the object’s butterfly, the GC must be sure that despite the race conditions, it will never crash by dereferencing invalid pointers and never miss to scan a child. Using a lock is clearly infeasible for performance reasons. JSC uses a so-called <em>obstruction-free double collect snapshot</em> to solve this problem. Please refer to <a href="https://webkit.org/blog/7122/introducing-riptide-webkits-retreating-wavefront-concurrent-garbage-collector/" target="_blank" rel="noopener">Filip Pizlo’s GC blog post</a> to see how it works.</p>
+<h3>Some Minor Design Details and Optimizations</h3>
+<p>You might find this section helpful if you want to actually read and understand the code of JSC, but otherwise feel free to skip it: these details are not centric to the design, and are not particularly interesting either. I mention them only to bridge the gap between the GC scheme explained in this post and the actual implementation in JSC.</p>
+<p>As explained earlier, each <code>CompleteSubspace</code> owns a list of <code>BlockDirectory</code> to handle allocations of different sizes; each <code>BlockDirectory</code> has an active block <code>m_currentBlock</code> where it allocates from, and it achieves this by holding a free list of all available cells in the block. But how does it work exactly?</p>
+<p>As it turns out, each <code>BlockDirectory</code> has a <code>cursor</code>, which is <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/LocalAllocator.cpp.html#_ZN3JSC14LocalAllocator5resetEv" target="_blank" rel="noopener">reset</a> to point at the beginning of the block list at the end of an eden or full GC cycle. Until it is reset, it can only move forward. The <code>BlockDirectory</code> will <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/BlockDirectory.cpp.html#_ZN3JSC14BlockDirectory22findBlockForAllocationERNS_14LocalAllocatorE" target="_blank" rel="noopener">move the cursor forward</a>, until it finds a block containing available cells, and allocate from it. If the cursor reaches the end of the list, it will attempt to <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/LocalAllocator.cpp.html#195" target="_blank" rel="noopener">steal a 16KB block</a> from another <code>BlockDirectory</code> and allocate from it. If that also fails, it will allocate a new 16KB block from malloc and allocate from it.</p>
+<p>I also mentioned that a <code>BlockDirectory</code> uses a free list to allocate from the currently active block <code>m_currentBlock</code>. It’s important to note that in the actual implementation of JSC, the cells in <code>m_currentBlock</code> does not respect the rule for <code>isNew</code> bit. Therefore, to check liveness, one either needs to do a special-case check to see if the cell is from <code>m_currentBlock</code> (for example, see <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/HeapCell.cpp.html#_ZN3JSC8HeapCell6isLiveEv" target="_blank" rel="noopener">HeapCell::isLive</a>), or, for the GC, stop the mutator, destroy the free list (and populate <code>isNew</code> in the process), do whatever inspection, then rebuild the free list and resume the mutator. The latter is implemented by <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/MarkedBlock.cpp.html#_ZN3JSC11MarkedBlock6Handle14stopAllocatingERKNS_8FreeListE" target="_blank" rel="noopener">two</a> <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/MarkedBlock.cpp.html#_ZN3JSC11MarkedBlock6Handle16resumeAllocatingERNS_8FreeListE" target="_blank" rel="noopener">functions</a> named <code>stopAllocating()</code> and <code>resumeAllocating()</code>, which are automatically called whenever the world is <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/Heap.cpp.html#_ZN3JSC4Heap16stopThePeripheryENS_11GCConductorE" target="_blank" rel="noopener">stopped</a> or <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/Heap.cpp.html#_ZN3JSC4Heap18resumeThePeripheryEv" target="_blank" rel="noopener">resumed</a>.</p>
+<p><a name="isNewAndAllocateBit"></a>The motivation of allowing <code>m_currentBlock</code> to not respect the rule for <code>isNew</code> is (a tiny bit of) performance. Instead of manually setting <code>isNew</code> to <code>true</code> for every allocation, a block-level bit <code>allocated</code> (aggregated as a bitvector in <code>BlockDirectory</code>) is used to indicate if a block is full of live objects. When the <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/MarkedBlock.cpp.html#_ZN3JSC11MarkedBlock6Handle18didConsumeFreeListEv" target="_blank" rel="noopener">free list becomes empty</a> (i.e., the block is fully allocated), we simply set <code>allocated</code> to <code>true</code> for this block. When querying cell liveness, we <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/MarkedBlockInlines.h.html#101" target="_blank" rel="noopener">check this bit first</a> and directly return true if it is set. The <code>allocated</code> bitvector is <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/BlockDirectory.cpp.html#252" target="_blank" rel="noopener">cleared at the end of each GC cycle</a>, and since the global logical version for <code>isNew</code> is also bumped, this effectively clears all the <code>isNew</code> bits, just as we desired.</p>
+<p>JSC’s design also supports the so-called <em>constraint solver</em>, which allows specification of implicit reference edges (i.e., edges not represented as pointer in the object). This is mainly used to support JavaScript interaction with DOM. This part is not covered in this post.</p>
+<p>Weak references have multiple implementations in JSC. The general (but less efficient) implementation is <code>WeakImpl</code>, denoting a weak reference edge. The data structure managing them is <code>WeakSet</code>, and you can see it in <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/MarkedBlock.h.html#JSC::MarkedBlock::Handle::m_weakSet" target="_blank" rel="noopener">every block footer</a>, and in <a href="https://sillycross.github.io/r/WebKit/Source/JavaScriptCore/heap/PreciseAllocation.h.html#JSC::PreciseAllocation::m_weakSet" target="_blank" rel="noopener">every PreciseAllocation GC header</a>. However, JSC also employs more efficient specialized implementations to handle the weak map feature in JavaScript. The details are not covered in this post.</p>
+<p>In JSC, objects may also have destructors. There are three ways destructors are run. First, when we begin allocating from a block, destructors of the dead cells are run. Second, the <code>IncrementalSweeper</code> periodically scans the blocks and runs destructors. Finally, when the VM shuts down, the <code>lastChanceToFinalize()</code> function is called to ensure that all destructors are run at that time. The details of <code>lastChanceToFinalize()</code> are not covered in this post.</p>
+<p>JSC employs a conservative approach for pointers on the stack and in registers: the GC uses UNIX signals to suspend the mutator thread, so it can copy its stack contents and CPU register values to search for data that looks like pointers. However, it’s important to note that a UNIX signal is <strong>not</strong> used to suspend the execution of the mutator: the mutator always <strong>actively</strong> suspends itself at a safe point. This is critical, as otherwise it could be suspended at weird places, for example, in a <code>HeapCell::isLive</code> check after it has read <code>isNew</code> but before it has read <code>isMarked</code>, and then GC did <code>isNew |= isMarked, isMarked = false</code>, and boom. So it seems like the only reason to suspend the thread is for the GC to get the CPU register values, including the <code>SP</code> register value so the GC knows where the stack ends. It’s unclear to me if it’s possible to do so in a cooperative manner instead of using costly UNIX signals.</p>
+<h3>Acknowledgements</h3>
+<p>I thank Saam Barati from Apple’s JSC team for his enormous help on this blog post. Of course, any mistakes in this post are mine.</p>
+<hr/>
+<h4>Footnotes</h4>
+<hr/>
+
+
+                            </div></div>
+  </body>
+</html>
