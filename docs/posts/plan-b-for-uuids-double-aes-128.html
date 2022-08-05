@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://pvk.ca/Blog/2022/07/11/plan-b-for-uuids-double-aes-128/">Original</a>
+    <h1>Plan B for UUIDs: double AES-128</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>It looks like internauts are having another go at the <a href="https://brandur.org/nanoglyphs/026-ids">“UUID as primary key”</a> debate,
+where the fundamental problem is the tension between nicely structured primary keys that tend to improve spatial locality in the storage engine,
+and unique but otherwise opaque identifiers that avoid running into <a href="https://www.hyrumslaw.com/">Hyrum’s law</a> when communicating with external entities and generally prevent <a href="https://en.wikipedia.org/wiki/German_tank_problem">unintentional information leakage</a>.<sup id="fnref:state-of-sin" role="doc-noteref"><a href="#fn:state-of-sin" rel="footnote">1</a></sup></p>
+<p>I guess I’m lucky that the systems I’ve worked on mostly fall in two classes:<sup id="fnref:really-performance-sensitive" role="doc-noteref"><a href="#fn:really-performance-sensitive" rel="footnote">2</a></sup></p>
+<ol>
+<li>
+<p>those with trivial write load (often trivial load in general), where the performance implications of UUIDs for primary keys are irrelevant.</p>
+</li>
+<li>
+<p>those where performance concerns lead us to heavily partition the data, by tenant if not more finely… making information leaks from sequentially allocation a minor concern.</p>
+</li>
+</ol>
+<p>Of course, there’s always the possibility that a system in the first class eventually handles a much higher load.
+Until roughly 2016, I figured we could always sacrifice some opacity and switch to <a href="https://www.ietf.org/archive/id/draft-peabody-dispatch-new-uuid-format-04.html#section-1-6.1.1">one of the many k-sorted alternatives</a> created by <a href="https://github.com/segmentio/ksuid">web</a>-<a href="https://www.mongodb.com/docs/manual/reference/method/ObjectId/">scale</a> <a href="https://firebase.blog/posts/2015/02/the-2120-ways-to-ensure-unique_68">companies</a>.</p>
+<p>By 2016-17, I felt comfortable assuming <a href="https://en.wikipedia.org/wiki/AES_instruction_set#x86_architecture_processors">AES-NI</a> was available on any x86 server,<sup id="fnref:also-arm" role="doc-noteref"><a href="#fn:also-arm" rel="footnote">3</a></sup> and that opens up a different option:
+work with structured “leaky” keys internally, and encrypt/decrypt them at the edge (e.g., by printing a <a href="https://www.postgresql.org/docs/current/xtypes.html">user-defined type</a> in the database server).
+Assuming we get the cryptography right, such an approach lets us
+have our cake (present structured keys to the database’s storage engine),
+and eat it too (present opaque unique identifiers to external parties),
+as long as the computation overhead of repeated encryption and decryption at the edge remains reasonable.</p>
+<p>I can’t know why this approach has so little mindshare, but I think part of the reason must be that developers tend to have an outdated mental cost model for strong encryption like <a href="https://en.wikipedia.org/wiki/Advanced_Encryption_Standard">AES-128</a>.<sup id="fnref:poll" role="doc-noteref"><a href="#fn:poll" rel="footnote">4</a></sup>
+This quantitative concern is the easiest to address, so that’s what I’ll do in this post.
+That leaves the usual hard design questions around complexity, debuggability, and failure modes… and new ones related to symmetric key management.</p>
+
+<p><a href="https://brandur.org/nanoglyphs/026-ids">Brandur</a> compares sequential keys and UUIDs.
+I’m thinking more generally about “structured” keys, which may be sequential in single-node deployments, or include a short sharding prefix in smaller (range-sharded) distributed systems.
+Eventually, a short prefix will run out of bits, and fully random UUIDs are definitely more robust for range-sharded systems that might scale out to hundreds of nodes…
+especially ones focused more on horizontal scalability than single-node performance.</p>
+<p>That being said, design decisions that unlock scalability to hundreds or thousands of nodes have a tendency to also force you to <a href="https://www.usenix.org/system/files/conference/hotos15/hotos15-paper-mcsherry.pdf">distribute work over a dozen machines when a laptop might have sufficed</a>.</p>
+<p>Mentioning cryptography makes people ask for a crisp threat model.
+There isn’t one here (and the question makes sense outside cryptography and auth!).</p>
+<p>Depending on the domain, leaky or <a href="https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html">guessable external ids</a> can <a href="https://web.archive.org/web/20220601153759/https://www.wired.com/story/parler-hack-data-public-posts-images-video/#:~:text=Increase%20a%20value%20in%20a%20Parler%20post%20url%20by%20one%2C%20and%20you%27d%20get%20the%20next%20post%20that%20appeared%20on%20the%20site.">enable scraping</a>,
+let competitors estimate the creation rate and number of accounts (or, similarly, activity) in your application,
+or, more benignly, expose an accidentally powerful API endpoint that will be difficult to replace.</p>
+<p>Rather than try to pinpoint the exact level of dedication we’re trying to foil, from curious power user to nation state actor, let’s aim for something that’s hopefully as hard to break as our transport (e.g., HTTPS).
+AES should be helpful.</p>
+<h2 id="hardware-assisted-aes-not-not-fast">Hardware-assisted AES: not not fast</h2>
+<p>Intel shipped their first chip with AES-NI in 2010, and AMD in 2013.
+A decade later, it’s anything but exotic, and is available even in low-power <a href="https://en.wikichip.org/wiki/intel/microarchitectures/goldmont">Goldmont Atoms</a>.
+For <em>consumer</em> hardware, with a longer tail of old machines than servers, the May 2022 <a href="https://web.archive.org/web/20220619045520/https://store.steampowered.com/hwsurvey/">Steam hardware survey</a> shows 96.28% of the responses came from machines that support AES-NI (under “Other Settings”), an availability rate somewhere between those of AVX (2011) and SSE4.2 (2008).</p>
+<p>The core of the AES-NI extension to the x86-64 instruction set is a pair of instructions to perform <a href="https://www.felixcloutier.com/x86/aesenc">one round of AES encryption (<code>AESENC</code>)</a> or <a href="https://www.felixcloutier.com/x86/aesdec">one round of decryption (<code>AESDEC</code>)</a> on a 16-byte block.
+<a href="https://uops.info/table.html?search=aesenc&amp;cb_lat=on&amp;cb_tp=on&amp;cb_WSM=on&amp;cb_ICL=on&amp;cb_ADLP=on&amp;cb_ADLE=on&amp;cb_ZENp=on&amp;cb_ZEN3=on&amp;cb_measurements=on&amp;cb_aes=on">Andreas Abel’s uops.info</a> shows that the first implementation, in Westmere, had a 6-cycle latency for each round, and that Intel and AMD have been optimising the instructions to bring their latencies down to 3 (Intel) or 4 (AMD) cycles per round.</p>
+<p>That’s pretty good (on the order of a multiplication), but each instruction only handles one round. The schedule for AES-128, the fastest option, consists of 10 rounds:
+<a href="https://www.intel.com/content/dam/doc/white-paper/advanced-encryption-standard-new-instructions-set-paper.pdf#page=17">an initial whitening xor, 9 <code>aesenc</code> / <code>aesdec</code> and 1 <code>aesenclast</code> / <code>aesdeclast</code></a>.
+Multiply 3 cycles per round by 10 “real” rounds, and we find a latency of 30 cycles (\(+ 1\) for the whitening <code>xor</code>) on recent Intels and \(40 + 1\) cycles on recent AMDs, assuming the key material is already available in registers or L1 cache.</p>
+<p>This might be disappointing given that <a href="https://2013.diac.cr.yp.to/slides/gueron.pdf#page=20">AES128-CTR could already achieve more than 1 byte/cycle in 2013</a>.
+There’s a gap between throughput and latency because pipelining lets contemporary x86 chips start <em>two</em> rounds per cycle, while prior rounds are still in flight (i.e., 6 concurrent rounds when each has a 3 cycle latency).</p>
+<p>Still, 35-50 cycles latency to encrypt or decrypt a single 16-byte block with AES-128 is similar to a <a href="https://en.wikichip.org/wiki/intel/microarchitectures/skylake_(server)#:~:text=50-70%20cycles%20latency">L3 cache hit</a>…
+really not that bad compared to executing a durable DML statement, or even a single lookup in a <a href="https://memcached.org/">big hash table stored in RAM</a>.</p>
+<h2 id="a-trivial-encryption-scheme-for-structured-keys">A trivial encryption scheme for structured keys</h2>
+<p>AES works on 16 byte blocks, and 16-byte randomish external ids are generally accepted practice.
+The simplest approach to turn structured keys into something that’s provably difficult to distinguish from random bits probably goes as follows:</p>
+<ol>
+<li>Fix a global AES-128 key.</li>
+<li>Let primary keys consist of a sequential 64-bit id and a randomly generated 64-bit integer.<sup id="fnref:not-strictly" role="doc-noteref"><a href="#fn:not-strictly" rel="footnote">5</a></sup></li>
+<li>Convert a primary key to an external id by encrypting the primary key’s 128 bits with AES-128, using the global key (each global key defines a unique permutation from 128 bits input to 128 bit output).</li>
+<li>Convert an external id to a potential primary key by decrypting the external id with AES-128, using the same global key.</li>
+</ol>
+
+<p><small><a href="https://pvk.ca/images/2022-07-11-plan-b-for-uuids-double-aes-128/aes128.c">source: aes128.c</a></small></p>
+<p>The computational core lies in the <code>encode</code> and <code>decode</code> functions, two identical functions from a performance point of view.
+We can estimate how long it takes to encode (or decode) an identifier by executing <code>encode</code> in a tight loop, with a data dependency linking each iteration to the next;
+the data dependency is necessary to prevent superscalar chips from overlapping multiple loop iterations.<sup id="fnref:latency-throughput" role="doc-noteref"><a href="#fn:latency-throughput" rel="footnote">6</a></sup></p>
+<p><a href="https://bit.ly/3nMxIKV">uiCA predicts 36 cycles per iteration on Ice Lake</a>.
+On my unloaded 2 GHz EPYC 7713, I observe 50 cycles/<code>encode</code> (without frequency boost), and 13.5 ns/<code>encode</code> when boosting a single active core.
+That’s orders of magnitude less than a syscall, and <a href="https://en.wikichip.org/wiki/amd/cores/milan#:~:text=l3%20cache%20with%2046%20cycles%20average%20latency">in the same range as a slow L3 hit</a>.</p>
+
+<p><small><a href="https://pvk.ca/images/2022-07-11-plan-b-for-uuids-double-aes-128/aes128-latency.c">source: aes128-latency.c</a></small></p>
+<p>This simple solution works if our external interface may expose arbitrary 16-byte ids.
+AES-128 defines permutation, so we could also run it in reverse to generate sequence/nonce pairs for preexisting rows that avoid changing their external id too much (e.g., pad integer ids with zero bytes).</p>
+<p>However, it’s sometimes important to generate <a href="https://datatracker.ietf.org/doc/html/rfc4122">valid UUIDs</a>,
+or to at least save one bit in the encoding as an escape hatch for a versioning scheme.
+We can do that, with <a href="https://en.wikipedia.org/wiki/Format-preserving_encryption">format-preserving encryption</a>.</p>
+<h2 id="controlling-one-bit-in-the-external-encrypted-id">Controlling one bit in the external encrypted id</h2>
+<p>We view our primary keys as pairs of 64-bit integers, where the first integer is a sequentially allocated identifier.
+Realistically, the top bit of that sequential id will always be zero (i.e., the first integer’s value will be less than \(2^{63}\)).
+Let’s ask the same of our external ids.</p>
+<p>The code in this post assumes a little-endian encoding, for simplicity (and because the world runs on little endian), but the same logic works for big endian.</p>
+<p><a href="https://www.cs.ucdavis.edu/~rogaway/papers/subset.pdf#page=7">Black and Rogaway’s cycle-walking method</a> can efficiently fix one input/output bit: we just keep encrypting the data until bit 63 is zero.</p>
+<p>When decrypting, we know the initial (fully decrypted) value had a zero in bit 63, and we also know that we only re-encrypted when the output did <em>not</em> have a zero in bit 63.
+This means we can keep iterating the decryption function (at least once) until we find a value with a zero in bit 63.</p>
+
+<p><small><a href="https://pvk.ca/images/2022-07-11-plan-b-for-uuids-double-aes-128/aes128-cycle-walk.c">source: aes128-cycle-walk.c</a></small></p>
+<p>This approach terminates after two rounds of encryption (<code>encode</code>) or decryption (<code>decode</code>), in expectation.</p>
+<p>That’s not bad, but some might prefer a deterministic algorithm.
+More importantly, the expected runtime scales exponentially with the number of bits we want to control, and no one wants to turn their database server into a glorified shitcoin miner.
+This exponential scaling is far from ideal for <a href="https://datatracker.ietf.org/doc/html/rfc4122#section-4.4">UUIDv4</a>, where only 122 of the 128 bits act as payload:
+we can expect to loop 64 times in order to fix the remaining 6 bits.</p>
+<h2 id="controlling-more-bits-with-a-feistel-network">Controlling more bits with a Feistel network</h2>
+<p>A <a href="https://en.wikipedia.org/wiki/Feistel_cipher">Feistel network</a> derives a permutation over tuples of values from <a href="https://en.wikipedia.org/wiki/Pseudorandom_function_family">hash functions</a> over the individual values.
+There are <a href="https://nvlpubs.nist.gov/nistpubs/specialpublications/nist.sp.800-38g.pdf">NIST recommendations for general format-preserving encryption (FFX)</a> with Feistel networks, but they call for 8+ AES invocations to encrypt one value.</p>
+<p>FFX solves a much harder problem than ours:
+we only have 64 bits (not even) of actual information, the rest is just random bits.
+Full format-preserving encryption must assume everything in the input is meaningful information that must not be leaked, and supports arbitrary domains (e.g., decimal credit card numbers).</p>
+<p>Our situation is closer to a 64-bit payload (the sequential id) and a 64-bit random <a href="https://en.wikipedia.org/wiki/Cryptographic_nonce">nonce</a>.
+It’s tempting to simply <code>xor</code> the payload with the low bits of (truncated) AES-128, or any <a href="https://en.wikipedia.org/wiki/Pseudorandom_function_family">PRF</a> like <a href="https://en.wikipedia.org/wiki/SipHash">SipHash</a><sup id="fnref:compliance" role="doc-noteref"><a href="#fn:compliance" rel="footnote">7</a></sup> or <a href="https://en.wikipedia.org/wiki/BLAKE_(hash_function)#BLAKE3">BLAKE3</a> applied to the nonce:</p>
+<pre><code>BrokenPermutation(id, nonce):
+    id ^= PRF_k(nonce)[0:len(id)]  # e.g., truncated AES_k
+    return (id, nonce)
+</code></pre>
+<p>The <code>nonce</code> is still available, so we can apply the same <code>PRF_k</code> to the <code>nonce</code>, and undo the <code>xor</code> (<code>xor</code> is a self-inverse) to recover the original <code>id</code>.
+Unfortunately, random 64-bit values <em>could</em> repeat on realistic database sizes (a couple billion rows).
+When an attacker observes two external ids with the same nonce, they can <code>xor</code> the encrypted payloads and find the <code>xor</code> of the two plaintext sequential ids.
+This might seem like a minor information leak, but clever people have been known to amplify similar leaks and fully break encryption systems.</p>
+<p>Intuitively, we’d want to also mix the 64 random bits with before returning an external id.
+That sounds a lot like a Feistel network, for which <a href="https://inst.eecs.berkeley.edu/~cs276/fa20/notes/Luby_Rackoff_paper.pdf">Luby and Rackoff</a> have shown that <a href="https://en.wikipedia.org/wiki/Feistel_cipher#Theoretical_work">3 rounds are pretty good</a>:</p>
+<pre><code>PseudoRandomPermutation(A, B):
+    B ^= PRF_k1(A)[0:len(b)]  # e.g., truncated AES_k1
+    A ^= PRF_k2(B)[0:len(a)]
+    B ^= PRF_k3(A)[0:len(b)]
+    
+    return (A, B)
+</code></pre>
+<p>This function is reversible (a constructive proof that it’s a permutation):
+apply the <code>^= PRF_k</code> steps in reverse order (at each step, the value fed to the PRF passes unscathed), like peeling an onion.</p>
+<p>If we let A be the sequentially allocated id, and B the 64 random bits, we can observe that <code>xor</code>ing the uniformly generated B with a pseudorandom function’s output is the same as generating bits uniformly.
+In our case, we can skip the first round of the Feistel network;
+we <em>deterministically</em> need exactly two <a href="https://en.wikipedia.org/wiki/Pseudorandom_function_family">PRF</a> evaluations, instead of the two <em>expected</em> AES (<a href="https://en.wikipedia.org/wiki/Pseudorandom_permutation">PRP</a>) evaluations for the previous cycle-walking algorithm.</p>
+<pre><code>ReducedPseudoRandomPermutation(id, nonce):
+    id ^= AES_k1(nonce)[0:len(id)]
+    nonce ^= AES_k2(id)[0:len(nonce)]
+    return (id, nonce)
+</code></pre>
+<p>This is a minimal tweak to fix <code>BrokenPermutation</code>: we hide the value of <code>nonce</code> before returning it, in order to make it harder to use collisions.
+That Feistel network construction works for arbitrary splits between <code>id</code> and <code>nonce</code>, but closer (balanced) bitwidths are safer.
+For example, we can work within the <a href="https://www.ietf.org/archive/id/draft-peabody-dispatch-new-uuid-format-04.html#v8">layout proposed for UUIDv8</a> and assign \(48 + 12 = 60\) bits for the sequential id (row id or timestamp), and 62 bits for the uniformly generated value.<sup id="fnref:uuidv7" role="doc-noteref"><a href="#fn:uuidv7" rel="footnote">8</a></sup></p>
+
+<p><small><a href="https://pvk.ca/images/2022-07-11-plan-b-for-uuids-double-aes-128/aes128-feistel.c">source: aes128-feistel.c</a></small></p>
+<p>Again, we can evaluate the time it takes to encode (or symmetrically, decode) an internal identifier into an opaque UUID by <a href="https://godbolt.org/#z:OYLghAFBqd5QCxAYwPYBMCmBRdBLAF1QCcAaPECAMzwBtMA7AQwFtMQByARg9KtQYEAysib0QXACx8BBAKoBnTAAUAHpwAMvAFYTStJg1AB9U8lJL6yAngGVG6AMKpaAVxYMQAZgCcpBwAyeAyYAHLuAEaYxCAAbNIADqgKhLYMzm4e3n5JKTYCQSHhLFEx8RaYVvkMQgRMxAQZ7p6%2BFVVptfUEhWGR0XHSCnUNTVmtQ109xaUDAJQWqK7EyOwcAKQATF7ByG5YANRrXo54LCzBBMTBAHQIR9hrGgCCm9sMu64HR45D6FhUt3ujxeWx2e0wh2OvwugK8D2erzBnwh32hqFh8JBbw%2BXyhBHQtDwEQxwMR73BkJ%2Bl2CwBJCOephYXA2AA48PsEsQqMYANaYACeGjWAFYAEJcLgigAiR1FwMZzLZHK5vIFkrFEulstJCK2/2CEKE2AAinJsKFHNhjABZJ4ADX2UC4cgCAUp332sQ0s32AFp9lxZqS9ZgaCF9qEAPIWq22h1Ol1u74e2IbH3%2BwM6p5DYiuazK071fmq/mkgDscvpPlcF3ixgI%2ByUAEdXIwVtqqzXBHWGwwBO2vJWXmWZYOszm8w3MKoCNFmLRjHh0OWh49qxcWfX9hF%2BbOFCLxbEtWOESOOy9nhMbMh9l2CD3lVQIHeHxFCApSPs0AwhvsFaz2T5UsxSvPAb01YUpSDU9Vw0Hx/yVWcWASSEpT/M5jCUAhjEwBI8HiVQIA0T83wIBQgxPC8Lx8JCUKONDjAw1QSEwvBFQgWjPyAg8hUgijYKxTkmGAFgmH2ABxRxHFvBhiBcWgAyFKt%2BGIR0UgAL0wLd2XogNZX2HTjkU/S8E2OUNlFaDqLXWjUPQlhjCYTAlHeVj2M4/ZuLFUy%2BPPHUaMwZC7MYhynJc3YmCGNzWQ4wKEi4gUDy4XioL8uDiEwAglgYfZaJ449VzPelszqa9G0uSd9mnWdiHnRd0H2FTROwtsMEwCAJ3zTlC2IYsgI5HkrLWCt/NcBg0kOEaqzXTqpxnOcxHqqqlzSnwZoqrqrlE3qSwG1bhrQ2zdOG2C1rg64Eh5OzLtIfyDrS6jaIunlrmbVt3hRYUHi8NDOSfJ7LuuPsPs/P6S29Q4NlifYjVNc1LRte1VoBl7gZWQ4vt0v7YuQ57XswFs20wUGVSAwNIehqMY0Ru1VoyrLatyuLrkwFbKPu4rTCYAhqQiVxZ1MKA%2B2CQkQlmH1ZoLba%2BsS55WqwYxaFQVAEg6jaG266Xdpuxs8E0rcMoSTBuaGqbqLGiaTruuDJc1ottZ5fabfVqr5tqxal2W5d2bgg7yu5lEfsm0612e66eVu6azx96iVLUvWtIbQy0KFQcDMpfZDeNggTLMsyht952A5Zz3dKa7mcPeNq1eLy7%2BKzNd6ey/3Z2evyiqo0CbxFg1b1rSR62BYBMvrMCeQUYwomAYJn37rcACo0GQuhokn%2BormiU3TrvLwNi3JXPwQUyY7XSKWH2AA3FxuZXiBNg2ZAEhrZdhUcBgRUcHONg2fz9j//%2BAH/3vsQdAZFkD31/oAqB%2BwQCQx/j9Jg98IBK3mHA%2Biy5v4QCPqgiBFliBIMXqgZe9BiBr2IBvYgswQAgFwcKYgERVD30/LQ5YjDv6R2otAqB982AsBIKWdhcDkDgO/vXKsTdGZQBfAPAgswj7uiMrvH0w1pJK3bjKYqXcDIMFFhCaRg9njD2wteceld0AQCvkuLeo0Li733qgQ%2Bx8BKnwUOfK%2BBgbD0Dvt/EBYCEgf3fq/L%2BP8qxcMATw1AF9IbCk2MKY2qhmEbBiWKNRkEAkf2CZAsJf8IlRNibEzA6AEnRIPEfLUr9AmfwgaE7JOTv6P2ftUzhtSYEY1FKktCECfr4MwSg5hYoymQTQd0pB2DqEsKYGwjYiSf5JJAVMmZsT6ELLQXM5ACysnZJ4YFfhTChEiLTHTTKzcpFz1kfI5Mii0yTVUagdR45SpgW0Q2ZAyFjCuHiBAb8v5LENXnhfYp3yGy/P2P8/k1iqxAr7t2GRoLVB2QBatKF%2BiGzz35Ai0sJ84J4CoI6ee8L6K6TRQXM6PgJE5VTqdcleKCVGWJZCAAYn6LgrTJTsw7sGLw%2BpwyhAAErYGUIpDQwqlJYm5RCUIABJAAKtgXlQrRXAguPsUSM8IXUS0SiqqBgEhKBfqKPlAqCo2MEJuBsXlRQaUwKgJ8YMgIQzMrrTSNqIB2rVEGNJWKfBxw6gnbSdlKXpw9Fal1QF%2BIGTzhZEla4LU%2BU6UHJxDc4K8MfvybxsQ3WCkSbEICn4Q22tJgKb0YjqIpoSGmzYGbC38i4Nmi1%2BbXXVu9NKPNCcXWZuLQ9NcPqrX%2Bt0oGwy0lDXKFzhZfOwdrY%2BFtlte2/VLp2ROgZT8Olo7OMLuuGFW4p7BDskY0eyBTHboYOmwGb0iYlrXGuedul5ZaSVirV1EcIwyrlRe9dZ9vGzI2K03BooWBILrm%2B0lWqHC7pHiYieDgIBvusnBSoTBdWFIPHGuyoH/RHv2hyqsTYFAkAIBAeDiH0CtudU%2BQjeqfQAHonXWrIzqvV%2BU%2BIcLXFAht5GkNihSqg15CR3nxBg1eq4ggny0OuF4XFsSxMSaSVJ9J7DNn/wgFwa4GhQXaoQwxsUw79jUeSilHTz7ZW8vmApv%2BSmVNqfY/q7T1Gf5DOo1KozJmamAPM6p%2Be6miMHm0xmP0EZ%2BWCt08K6UBnHOvqA9Syl5YNFPA4PMWgnBhS8E8BwLQpBUCcGkrhpY6NXg8FIAQTQcX5g8hAMKYiCWOCSGS0V9LnBeAKBAMRQrqW4ukDgLAJAS88IkPIJQbrK8YjIGAMyWtNBaA1UaxACItW3zMF6pwfLS82CCEjDo/ktWsCiSMOIVrpB8AZWsHgC%2BzlavTkwMgfmqw0sXEqLVwkERiBFmcFgWr1IWCLba1QAwwAFAADU8CYAAO6RiNil/L/BBAiDEOwKQMhBCKBUOoPbuha0GCMCAUwxhzAPca5AeYKtqiNY4L6SM37fSiWcg1yoF3qj2AYE4FwzQ9CBANNMfotbcipAEKMTwnPkjc4YFMPoMRa2WFpx0YYjQmdZDFzTo7AhOgNGFyUDnFgpe870BMZXbORcSHmNl5YsOCsZVWDweLiWat7YyxwVQLJYi%2BniPsYAwiAwbGuCyiAjhPy4EICQSGXha37GcMQ6IAfAy8Ba1ocWpBSvlf0JwarpAPt6dICltLNuGtNYK0VmPlWNhW4z/VnPrWY8neICkOwkggA%3D%3D%3D">encoding in a loop, with a data dependency between each iteration and the next</a>
+<small>(<a href="https://pvk.ca/images/2022-07-11-plan-b-for-uuids-double-aes-128/aes128-feistel-latency.c">source: aes128-feistel-latency.c</a>)</small>.</p>
+<p>The format-preserving Feistel network essentially does double the work of a plain AES-128 encryption, with a serial dependency between the two AES-128 evaluations.
+We expect roughly twice the latency, and <a href="https://uica.uops.info/?code=.L8%3A%0D%0A%20%20%20%20%20%20%20%20movq%20%20%20%20xmm0%2C%20rdx%0D%0A%20%20%20%20%20%20%20%20add%20%20%20%20%20rcx%2C%201%0D%0A%20%20%20%20%20%20%20%20pxor%20%20%20%20xmm0%2C%20xmm15%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm14%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm13%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm12%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm11%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm10%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20XMMWORD%20PTR%20%5Brsp-72%5D%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20XMMWORD%20PTR%20%5Brsp-56%5D%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20XMMWORD%20PTR%20%5Brsp-40%5D%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20XMMWORD%20PTR%20%5Brsp-24%5D%0D%0A%20%20%20%20%20%20%20%20aesenclast%20%20%20%20%20%20xmm0%2C%20XMMWORD%20PTR%20%5Brsp-120%5D%0D%0A%20%20%20%20%20%20%20%20movq%20%20%20%20rax%2C%20xmm0%0D%0A%20%20%20%20%20%20%20%20and%20%20%20%20%20rax%2C%20r9%0D%0A%20%20%20%20%20%20%20%20xor%20%20%20%20%20rdi%2C%20rax%0D%0A%20%20%20%20%20%20%20%20movq%20%20%20%20xmm0%2C%20rdi%0D%0A%20%20%20%20%20%20%20%20pxor%20%20%20%20xmm0%2C%20xmm9%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20XMMWORD%20PTR%20%5Brsp-104%5D%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20XMMWORD%20PTR%20%5Brsp-88%5D%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm8%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm7%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm6%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm5%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm4%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm3%0D%0A%20%20%20%20%20%20%20%20aesenc%20%20xmm0%2C%20xmm2%0D%0A%20%20%20%20%20%20%20%20aesenclast%20%20%20%20%20%20xmm0%2C%20xmm1%0D%0A%20%20%20%20%20%20%20%20movq%20%20%20%20rax%2C%20xmm0%0D%0A%20%20%20%20%20%20%20%20and%20%20%20%20%20rax%2C%20rsi%0D%0A%20%20%20%20%20%20%20%20xor%20%20%20%20%20rdx%2C%20rax%0D%0A%20%20%20%20%20%20%20%20cmp%20%20%20%20%20r8%2C%20rcx%0D%0A%20%20%20%20%20%20%20%20jne%20%20%20%20%20.L8&amp;syntax=asIntel&amp;uArchs=ICL&amp;tools=uiCA&amp;alignment=0&amp;uiCAHtmlOptions=traceTable&amp;uiCAHtmlOptions=graph">uiCA agrees</a>:
+78 cycles/format-preserving encoding on Ice Lake (compared to 36 cycles for AES-128 of 16 bytes).</p>
+<p>On my unloaded 2 GHz EPYC 7713, I observe 98 cycles/format-preserving encoding (compared to 50 cycles for AES-128 of 16 bytes), and 26.5 ns/format-presering encoding when boosting a single active core (13.5 ns for AES-128).</p>
+<p>Still much faster than a syscall, and, although twice as slow as AES-128 of one 16 byte block, not that slow: somewhere between a L3 hit and a load from RAM.</p>
+<h2 id="sortable-internal-ids-pseudo-random-external-ids-not-not-fast">Sortable internal ids, pseudo-random external ids: not not fast</h2>
+<p>With hardware-accelerated <a href="(https://en.wikipedia.org/wiki/Advanced_Encryption_Standard)">AES-128</a> (<a href="https://en.wikipedia.org/wiki/SipHash">SipHash</a> or <a href="https://en.wikipedia.org/wiki/BLAKE_(hash_function)#BLAKE3">BLAKE3</a> specialised for 8-byte inputs would probably be slower, but not unreasonably so), converting between structured 128-bit ids and opaque UUIDs takes less than 100 cycles on contemporary x86-64 servers… faster than a load from main memory!</p>
+<p>This post only addressed the question of runtime performance.
+I think the real challenges with encrypting external ids aren’t strictly technical in nature, and have more to do with making it hard for programmers to accidentally leak internal ids.
+I don’t know how that would go because I’ve never had to use this trick in a production system, but it seems like it can’t be harder than doing the same in a schemas that have explicit internal primary keys and external ids on each table.
+I’m also hopeful that one could do something smart with views and user-defined types.</p>
+<p>Either way, I believe the runtime overhead of encrypting and decrypting 128-bit identifiers is a non-issue for the vast majority of database workloads.
+Arguments against encrypting structured identifiers should probably focus on system complexity, key management<sup id="fnref:rotation" role="doc-noteref"><a href="#fn:rotation" rel="footnote">9</a></sup> (e.g., between production and testing environments), and graceful failure in the face of <a href="https://sigops.org/s/conferences/hotos/2021/papers/hotos21-s01-hochschild.pdf#page=3">faulty hardware</a> or code accidentally leaking internal identifiers.</p>
+<p><small>Thank you Andrew, Barkley, Chris, Jacob, Justin, Marius, and Ruchir, for helping me clarify this post, and for reminding me about things like range-sharded distributed databases.</small></p>
+<hr/>
+
+</div></div>
+  </body>
+</html>
