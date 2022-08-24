@@ -74,6 +74,8 @@ var (
 
 		"https://blog.golang.org/feed.atom?format=xml",
 		"https://anewsletter.alisoneroman.com/feed",
+
+		"https://routley.io/reserialised/great-expectations/2022-08-24/index.xml",
 	}
 
 	// Show up to 60 days of posts
