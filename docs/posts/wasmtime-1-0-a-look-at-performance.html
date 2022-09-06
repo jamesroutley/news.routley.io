@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://bytecodealliance.org/articles/wasmtime-10-performance">Original</a>
+    <h1>Wasmtime 1.0: A Look at Performance</h1>
+    
+    <div id="readability-page-1" class="page"><div itemprop="articleBody">
+    <p>In preparation for our upcoming release of Wasmtime 1.0 on September
+20, we have prepared two blog posts describing the work we have put
+into the compiler and runtime recently. This first post will describe
+<em>performance</em>-related projects: making the compiler generate faster
+code, making the compiler itself run faster, making Wasmtime
+instantiate a compiled module faster, and making Wasmtime’s runtime as
+efficient as possible once the module is running. Our subsequent post
+will describe the work we have done to ensure that Wasmtime is secure
+and that the compiler generates correct code. We’re excited to present
+all of our work in both of these directions!</p>
+
+<h2 id="what-is-performance">What is Performance?</h2>
+
+<p>We care about making Wasmtime and Cranelift <em>fast</em>, because speed has
+both direct effects (a faster system!) and indirect effects
+(newly-possible applications! higher developer productivity!). But
+what do we mean by “fast”? In fact, there are multiple <em>kinds</em> of
+speed.</p>
+
+<p>When Wasmtime executes a Wasm program, the CPU executes both native
+instructions that have been compiled from the Wasm bytecode, and parts
+of the “Wasmtime runtime”, which is the part of Wasmtime that
+maintains data structures to help implement Wasm semantics. For each
+of these two halves of the execution, there are two <em>phases</em>:
+startup/initialization (compilation of Wasm code, and initialization
+of runtime), and steady-state execution. All four combinations of
+these two dimensions have some impact on performance and can be
+optimized separately:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th> </th>
+      <th>Compiler (Cranelift)</th>
+      <th>Runtime (Wasmtime)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Startup Phase</td>
+      <td>Time to compile code</td>
+      <td>Time to instantiate a Wasm module</td>
+    </tr>
+    <tr>
+      <td>Steady-State Phase</td>
+      <td>Speed of generated code</td>
+      <td>Speed of runtime primitives</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>We have done extensive work to improve each of these four quadrants,
+and we’ll discuss each of them in this blog post!</p>
+
+<h2 id="wasm-module-instantiation">Wasm Module Instantiation</h2>
+
+<p>A key aspect of WebAssembly’s security approach is the <em>isolation
+between separate instances</em>: each instantiation of a Wasm module gets
+its own state and cannot affect the state of others. To use this
+isolation effectively, some applications of Wasm will instantiate a
+fresh instance for <em>every unit of work</em>, such as an incoming request
+on a server. This fine-grained isolation means that a bug triggered
+while processing one unit of work can’t affect any subsequent unit
+(either accidentally or maliciously!). Instead, each unit of work
+starts from a well-defined state and the “blast radius”, or potential
+damage, of a bug is limited.</p>
+
+<p>Extremely fast module instantiation is thus a key requirement for a
+Wasm VM like Wasmtime. Over the past year, we have done substantial
+work to take module instantiation from <em>milliseconds</em> to
+<em>microseconds</em>. How is this possible? In brief, by doing as little
+work as possible, and doing it lazily when we must, or ahead-of-time
+if we can.</p>
+
+<p>We have already <a href="https://bytecodealliance.org/articles/making-javascript-run-fast-on-webassembly">discussed how we do Wasm-level
+snapshotting</a>
+to make startup of certain workloads fast. This technique can be
+applied to any WebAssembly context, because it generates a
+purpose-built Wasm module with the initialized state
+included. However, even this is often not enough: a simple Wasm
+runtime will need to allocate memory, initialize data structures, and
+copy the initial heap image from this pre-initialized module into the
+Wasm heap before it executes a single Wasm instruction. Can we do
+better?</p>
+
+<h3 id="virtual-memory-tricks">Virtual Memory Tricks</h3>
+
+<p>Modern computers use <a href="https://en.wikipedia.org/wiki/Virtual_memory">virtual
+memory</a>: an abstracted
+view of memory that lets the operating system compose a “virtual” view
+of an address space from many different physical parts, and lazily
+load or generate contents of a single memory “page” (a small unit,
+typically 4 to 16 KiB) when it is first accessed. The processor
+includes hardware that gives us this remapping ability without
+significant extra cost, and so finding ways to leverage
+“virtual-memory tricks” is often the best way to implement complex
+behavior with memory.</p>
+
+<p>Let’s recap: our issue is that we have an “image” of a Wasm program’s
+heap state, and instantiating the Wasm program requires initializing a
+large block of memory (the heap) to this image. The simplest
+implementation would be to allocate the block (via <code>malloc</code> or <code>mmap</code>
+or some other allocator) and then copy the data into the right
+locations. This is in fact how Wasmtime used to work!</p>
+
+<p>But virtual memory lets us use a technique known as
+“<a href="https://en.wikipedia.org/wiki/Copy-on-write">copy-on-write</a>” as
+well. The key idea is that because we can (i) change the physical page
+that a virtual page of memory refers to, and (ii) <em>apply permissions</em>
+such as read-only protection, we can keep one copy of the “initial
+state” around and create a new Wasm heap by setting up read-only
+mappings to this one copy.</p>
+
+<p>This means that now the cost of instantiation is reduced to the cost
+of making that mapping. This may even be a constant-time operation
+(i.e., not dependent on how large the heap is) if the kernel is smart
+about lazily populating the per-page mappings: it can just create a
+single node in a mapping data structure instead. Production operating
+systems like the Linux kernel, and also macOS and Windows, work this
+way.</p>
+
+<p>According to the Wasm specification, the Wasm heap must behave <em>as if</em>
+it were a separate copy. But there is a subtle trick we can play here:
+sharing a single copy of the data is fine as long as the program only
+performs reads. This is because if no instance of the program changes
+the one data copy, then no other instance can tell it is being
+shared. This is why instantiating without copying anything is still
+a <em>correct</em> approach.</p>
+
+<p>But what do we do when one instance <em>does</em> modify some of its heap? In
+this case, we do as the “copy-on-write” technique’s name implies: we
+catch the write before it happens (because of the read-only
+permissions), we make a new copy of that single page, and we alter the
+mapping so that the particular instance gets that “private”, and now
+writeable, copy of the page.</p>
+
+<p>We implemented <a href="https://github.com/bytecodealliance/wasmtime/pull/3697">an “instance
+allocator”</a> in
+Wasmtime that makes use of this copy-on-write (CoW) technique for very
+fast instantiations. It also uses a Linux syscall known as <code>madvise</code>
+to quickly “reset” the page mappings back to the original read-only
+heap image, so we can reuse the same mappings over and over when the
+same Wasm program is re-instantiated many times. (One might imagine
+this would be the case in a server serving many requests, for
+example!)</p>
+
+<p>There is more we could do here still: we have studied the way that the
+Linux kernel’s locking, and its interaction with the hardware (“TLB
+flushes” and “inter-processor interrupts” (IPIs)), can cause
+bottlenecks, and we have further plans down the road. But for now,
+this virtual-memory-based approach is extremely fast compared to the
+earlier explicit memory initialization.</p>
+
+<h3 id="lazy-initialization">Lazy Initialization</h3>
+
+<p>After building the basic copy-on-write implementation above, we next
+realized that the Wasmtime runtime was spending significant time
+initializing data structures before starting to execute the compiled
+Wasm code.</p>
+
+<p>A WebAssembly virtual machine needs to implement various abstractions
+that the Wasm program expects to have available. We have already
+talked about heaps above, but there are others too. The VM needs to
+provide “function imports”, or the ability to call functions from
+other modules or the embedding context (the application that embeds
+Wasmtime). It needs to implement “tables”, which are a way for Wasm
+program to store references to functions or other objects. And there
+are quite a few more. All of these need to be initialized to the
+proper state before the program starts.</p>
+
+<p>It turns out that when a large program executes, it may only use a
+small number of the imported functions, or function references stored
+in a table. So the time spent to fill out this state — in some
+cases, hundreds of kilobytes of memory, with some work to compute each
+individual word or struct — is mostly wasted.</p>
+
+<p>This was a prime use-case for the technique of “lazy initialization”:
+that is, deferring the work of setting up some state until it is
+actually needed. To make this work, one needs a way to track the “not
+yet initialized” state and differentiate it from the normal state at
+runtime, and then one needs to check for this and do the
+initialization at a fine granularity — for a single item
+— right before using it.</p>
+
+<p>We
+<a href="https://github.com/bytecodealliance/wasmtime/pull/3733">implemented</a>
+lazy initialization for tables of function references and the function
+closure objects they point to. This optimization removed the other big
+piece of work done when instantiating a large Wasm module. For the
+multi-megabyte test case we were using (a version of the SpiderMonkey
+JS engine compiled to Wasm), the heap initialization involved writing
+tens of megabytes. After using virtual-memory tricks as above we were
+down to hundreds of kilobytes. Finally with lazy table and
+function-object initialization we wrote just a few kilobytes to memory
+per instantiation with no expensive computations at all.<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup></p>
+
+<p>Following this work, we did a series of optimizations to other
+bottlenecks that removing the two major ones exposed
+(<a href="https://github.com/bytecodealliance/wasmtime/pull/3742">1</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/3741">2</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/3739">3</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/3727">4</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/3791">5</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/3850">6</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4041">7</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4051">8</a>). At the
+end of that line of work, we were satisfied that we had pared
+instantiation down to its bare essentials, and any further bottlenecks
+were likely to be elsewhere in the system — either the thing
+that requests the instantiation, or the Wasm program that is
+instantiated!</p>
+
+<p>We should note, too, that Wasmtime had already been designed to
+frontload a lot of the work of loading and verifying a Wasm module
+prior to the instantiation event itself. For example, the
+<a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Linker.html">Linker</a>
+and
+<a href="https://docs.rs/wasmtime/latest/wasmtime/struct.InstancePre.html">InstancePre</a>
+structs allow the user of Wasmtime to explicitly do import resolution
+and typechecking beforehand, amortized over many instantiations. It
+was in this context that we were able to focus solely on the mechanics
+of setting up the runtime-internal state for an instance.</p>
+
+<h3 id="fast-instantiation-results">Fast Instantiation: Results</h3>
+
+<p>As a result of all of this work, instantiation time of
+<code>SpiderMonkey.wasm</code> went from about 2 milliseconds (eager initialization
+of all heap and other data structures) to 5 microseconds, or <a href="https://github.com/bytecodealliance/wasmtime/pull/3733#pullrequestreview-877688702">400
+times
+faster</a>. Not
+bad!</p>
+
+<h2 id="runtime-performance">Runtime Performance</h2>
+
+<p>Now that we’ve started the Wasm program, we need to help it run as
+quickly as possible with fast runtime primitives!</p>
+
+<p>While most of the CPU time during Wasm execution is typically spent in
+the Wasm program itself, or in the “hostcalls” that it invokes (which
+are code that the Wasmtime user plugs into Wasmtime and which we don’t
+control directly), there are parts of Wasmtime itself that have to run
+in certain cases. These bits of code are what we call the “VM
+runtime”.</p>
+
+<p>We need bits of the runtime, for example, to help us “walk the stack”
+and list all of the active stack frames when we generate a stacktrace
+for a trap, or when we trace all active object references for garbage
+collection. We also need a small part of the runtime called a
+“trampoline” when we invoke code outside of Wasmtime, or when code
+outside of Wasmtime initially invokes Wasm code.</p>
+
+<h3 id="fast-stack-walking">Fast Stack-Walking</h3>
+
+<p>We have completed several projects to speed up parts of the runtime
+over the past year. The most impressive win is perhaps the <a href="https://github.com/bytecodealliance/wasmtime/pull/4431">fast stack
+walking</a>
+work. Previously, in order to allow Wasmtime to enumerate all
+stackframes, the Cranelift compiler generated what is known as “unwind
+info”. This is a kind of metadata that describes where the compiled
+code will put values on the stack at any given point. Using this
+metadata, Wasmtime’s “unwinder” is able to reverse-engineer the
+program state: it understands the stack frame of one active function
+call at a time, eventually finding out who called it and iterating up
+the stack until it reaches the initial entry into Wasm.</p>
+
+<p>This turns out to be extremely slow, for several reasons. First, the
+metadata format, known as
+<a href="https://en.wikipedia.org/wiki/DWARF">DWARF</a><sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">2</a></sup>, is quite complex,
+and takes significant effort to interpret. This is an advantage when
+it comes to working for any conceivable stack-frame layout — so
+it can be produced by many different compilers — but in our
+case, this flexibility is overkill. Second, the system library
+typically used to walk a stack with DWARF metadata is known as
+<a href="https://www.nongnu.org/libunwind/">libunwind</a>, and though it is
+widely used and generally reliable, it has significant scalability
+issues. For example, we discovered that the system unwinder has poor
+performance when thousands of Wasm modules (each with their own DWARF
+metadata) are loaded into a single process. Collecting a trap
+stacktrace in such a case could take up to half a second! Interacting
+with the system unwinder is also a source of bugs in some cases, and
+makes fixing them harder. We have had such issues on multiple
+platforms. Controlling our own unwind process lets us solve these
+issues.</p>
+
+<p>To address this issue, we developed a <a href="https://github.com/bytecodealliance/wasmtime/pull/4431">custom
+stack-walker</a>. We
+started with the observation that because we control the compiled
+code, we can limit the complexity of the stack format to something
+that is much easier and faster to traverse. Specifically, we can
+ensure that we always maintain a linked list of <a href="https://en.wikipedia.org/wiki/Call_stack#Stack_and_frame_pointers">frame
+pointers</a>. A
+stack walk is then as simple as a linked-list traversal, with saved
+return addresses immediately adjacent to each frame-pointer value.</p>
+
+<p>According to the
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4431#issue-1301146972">benchmarks</a>,
+this change improved the speed of stack walking by between 64% and
+99.95%, depending on the situation, and it completely removed the
+quadratic worst-case and other potential issues, known or unknown, of
+relying on <code>libunwind</code> and its complex metadata. This performance
+improvement is a huge qualitative improvement: it allows stack traces
+to be enabled in contexts where they previously could not be, and
+improves Wasmtime’s robustness substantially.</p>
+
+<h3 id="fast-cooperative-multitasking-with-epoch-interruption">Fast Cooperative Multitasking with Epoch Interruption</h3>
+
+<p>A common use-case for Wasmtime is to run many different WebAssembly
+guests concurrently and timeslice between them. Wasmtime has <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.async_support">built-in
+support</a>
+for running calls to Wasm on an async event loop.</p>
+
+<p>One issue that a Wasmtime user might have in such a situation is how
+to <em>limit the execution time</em> of a Wasm program. Typically when
+running asynchronously with an event loop, a compute-intensive task
+should be split into segments so that the event loop is not stalled
+for more than a maximum “timeslice”.</p>
+
+<p>With a standard compilation of Wasm bytecode to native machine code, a
+loop in Wasm becomes a loop in the compiled code and runs as many
+iterations as it likes, with no limit. If the user calls this function
+from an event loop, then that event loop may be stalled indefinitely.</p>
+
+<p>Thus, especially when running untrusted code, it is important for the
+Wasmtime user to establish a way to <em>regain control</em> after a certain
+time limit. So Wasmtime must provide a way to <em>interrupt</em> Wasm
+execution at a certain point.</p>
+
+<p>Prior to this year, the main way to implement this behavior was via
+<a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.consume_fuel">“fuel”</a>. This
+is a mechanism by which the compiled Wasm code is augmented with code
+that counts “operations”, checks this current count against a limit,
+and yields back to the caller or event loop if the limit is exceeded.</p>
+
+<p>Fuel is an effective mechanism, but it is heavyweight: it requires
+augmenting every piece of code with the “counting”, and frequently
+storing that count to memory and checking it.</p>
+
+<p>In our <a href="https://github.com/bytecodealliance/wasmtime/pull/3699">epoch
+interruption</a>
+work, we realized that there is actually a much faster way. Fuel is
+overly precise: it counts operations and stops at exactly the
+limit. But if we could instead rely on some external agent to change a
+flag in memory at approximately the right time, we could just test
+that flag and branch to the yield if it changes. This removes the need
+to account fuel usage (which is almost as expensive as the main Wasm
+computation itself), and removes the frequent updates to the count in
+memory. Instead a single, infrequently-changing value can be touched
+once by a periodically-waking thread and this “broadcasts” an
+interrupt to all worker threads in Wasm code.</p>
+
+<p>It turns out that this makes execution of <code>SpiderMonkey.wasm</code> roughly
+twice as fast as when using fuel interruption. For applications that
+require interruption schemes because of their asynchronous event loop,
+this is quite a significant boost!</p>
+
+<h2 id="cranelift-compiled-code-quality">Cranelift: Compiled-Code Quality</h2>
+
+<p>We’ll talk now about the compiler,
+<a href="https://github.com/bytecodealliance/wasmtime/tree/main/cranelift/">Cranelift</a>,
+that underpins Wasmtime. We use Cranelift to compile Wasm bytecode to
+native machine code that the computer can execute directly.  We have
+had a number of long-running projects to overhaul pieces of the
+Cranelift compiler pipeline to improve performance. Broadly speaking,
+we can improve the quality of generated code by implementing more
+optimization passes, tuning the instruction-selection rules as needed,
+and improving the core algorithms such as register allocation to
+support more advanced heuristics and approaches.</p>
+
+<h3 id="register-allocator-revamp-regalloc2">Register Allocator Revamp: regalloc2</h3>
+
+<p>One major compiler effort that we have made over the past year or so
+is the introduction of our new register allocator,
+<a href="https://github.com/bytecodealliance/regalloc2">regalloc2</a>. A
+<em>register allocator</em> is a piece of a compiler that assigns storage
+locations to values in the program. WebAssembly, as an abstract and
+hardware-independent virtual machine, does not have a notion of input
+and output locations for most instructions. Rather it just speaks of
+an abstract “operand stack” (and locals and the heap, but most
+instructions do not operate on these). In a real CPU, instructions
+operate on data in <em>registers</em>, which are small storage locations that
+can hold one value (e.g. a 64-bit number) each. A register allocator
+decides which values to keep in which registers at which times. Doing
+this well improves program performance substantially because it
+implies less moving around of values.</p>
+
+<p>regalloc2 was designed to support more advanced kinds of algorithms to
+decide how to allocate values to registers (you can read <a href="https://cfallin.org/blog/2022/06/09/cranelift-regalloc2/">more detail
+in this
+post</a> or <a href="https://github.com/bytecodealliance/regalloc2/blob/main/doc/DESIGN.md">in
+its design
+document</a>). When
+introduced, it improved runtime performance of <code>SpiderMonkey.wasm</code> by
+about 5% and another CPU-intensive benchmark, <code>bz2</code>, by 4% (for
+example). It also had a substantial impact on compile time, as we’ll
+discuss below. (Both impacts will be augmented further in the future
+as we adjust Cranelift’s code generation to make more use of
+regalloc2’s additional features.)</p>
+
+<h3 id="better-pattern-maching-new-backends-isle-and-ongoing-tuning">Better Pattern Maching: New Backends, ISLE, and Ongoing Tuning</h3>
+
+<p>The next major set of improvements we have done are in the area of
+<em>instruction selection</em>. The instruction-selection problem is that of
+choosing the best CPU instructions to implement a given program
+behavior. Because each CPU has its own unique set of instructions, and
+because these can be combined in many different ways, this is a very
+difficult combinatorial puzzle to solve. Cranelift initially <a href="https://cfallin.org/blog/2020/09/18/cranelift-isel-1/">adopted
+a new compiler-backend
+design</a> that
+enables more advanced pattern-matching, and currently takes an
+approach of <a href="https://github.com/bytecodealliance/rfcs/pull/15">expressing instruction lowerings in a pattern-matching
+DSL (domain-specific
+language)</a> so that
+we can more easily tune these patterns.</p>
+
+<p>Measuring from just before we switched to the new backend framework by
+default, up to just before adopting regalloc2 — so, measuring
+the effect of the new backend framework and a year of tuning it
+— we improved performance on <code>SpiderMonkey.wasm</code> by 22%, and
+<code>bz2</code> by 18%. This was a substantial win and we continue to find ways
+to tune the instruction patterns.</p>
+
+<h3 id="future-mid-end-optimizations">Future: Mid-end Optimizations</h3>
+
+<p>In the future, we plan to introduce <a href="https://github.com/bytecodealliance/rfcs/pull/27">more advanced mid-end
+optimizations</a> to
+Cranelift. A “mid-end optimizer” is the part of the compiler that
+transforms the program in ways that make it faster <em>before</em> it is
+“lowered” into a machine-specific form (that is, before instruction
+selection). There is a <a href="https://www.clear.rice.edu/comp512/Lectures/Papers/1971-allen-catalog.pdf">classical set of
+optimizations</a>
+that almost all compilers will perform that includes basic rules like
+simplifying constant expressions (<code>1 + 1</code> becomes <code>2</code>). But there are
+many more complex and subtle transformations too.</p>
+
+<p>Our
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4249">prototype</a>
+“mid-end optimizer” improves performance of <code>SpiderMonkey.wasm</code> by 13%
+and <code>bz2</code> by 3%, and serves as a framework in which we can more easily
+write a large number of “rewrite rules” to express algebraic
+identities, clever implementations of particular computations (such as
+bit-twiddling tricks), and many others. We are excited by the
+potential that this carries!</p>
+
+<h2 id="cranelift-compile-time-optimizations">Cranelift: Compile-Time Optimizations</h2>
+
+<p>Aside from optimizing Cranelift’s generated code, the compilation
+process itself is a nontrivial computation, and if it is too slow,
+then Wasmtime could take a long time to start up with a new piece of
+code, hindering productivity (for Wasm developers) and responsiveness
+(for end-users accessing new applications). Thus, <em>compiler speed</em> is
+an important metric, and we’ve worked hard to improve this. Broadly
+speaking, we can improve compile time by choosing better algorithms in
+the key parts of the backend, such as the register allocator or the
+optimization passes, or by doing general program optimizations, like
+reducing memory use.</p>
+
+<h3 id="regalloc2">regalloc2</h3>
+
+<p>Many of the above revamps that we designed to improve the quality of
+the compiler’s output also, by virtue of better design or more careful
+construction, run faster. The regalloc2 switchover improved compile
+times substantially, because register allocation is a large fraction
+of compile time: measuring single-thread time (not compiling in
+parallel), <code>SpiderMonkey.wasm</code> builds 6% faster and <code>bz2</code> 10%
+faster. One of the explicit design goals of regalloc2 was to avoid bad
+outliers with more robust algorithms, and this has a particular effect
+on parallel compilation, where hard-to-compile functions “stick out”
+more: on a 12-core system, <code>SpiderMonkey.wasm</code> builds 21% faster and
+<code>bz2</code> builds 15% faster. The best improvement was in <code>clang.wasm</code>, a
+Wasm-module version of the Clang compiler, which now builds 42% faster
+in Cranelift. Improvements of 20% or so are typical.</p>
+
+<h3 id="mid-end-optimizer-many-passes-into-one">Mid-End Optimizer: Many Passes into One</h3>
+
+<p>Algorithmic redesign can substantially improve compile time as
+well. In our mid-end optimizer prototype, we have taken a new approach
+to the relevant part of the compiler design: several different
+“passes”, or specific algorithms that transform the program in a
+certain way, have been combined into one unified framework that passes
+over the program only once. This approach allows better compile times
+in many cases. We measured <code>bz2</code> compiling 15% faster under our
+prototype, for example (and <code>SpiderMonkey.wasm</code> is roughly at parity).</p>
+
+<h3 id="standard-program-optimizations">Standard Program Optimizations</h3>
+
+<p>A compiler is a computer program like any other — perhaps more
+CPU-intensive than most — and the sorts of changes that one
+would make to any program to speed it up, one can make to a compiler
+as well. One particularly effective kind of change for speed is to
+<em>reduce memory allocation and usage</em>. The less memory the program
+allocates, the faster it runs, for at least two reasons: the memory
+allocator itself can be slow, and using more memory can cause more
+cache misses and memory traffic as well. Cranelift also tends to
+stress allocators especially hard because of its multithreaded
+compilation model.</p>
+
+<p>We recently had a series of changes
+(<a href="https://github.com/bytecodealliance/wasmtime/pull/4536">1</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4584">2</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4586">3</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4621">4</a>,
+<a href="https://github.com/bytecodealliance/wasmtime/pull/4710">5</a>) that
+improve compiler performance by about 5% in aggregate with Rust’s
+default allocator, and substantially more (22-32%, 11%, 9-13%, 8-10%,
+and 2-6% respectively) if the system allocator is particularly slow
+(as it is in the Sightglass benchmark suite, or more realistically,
+with <a href="https://twitter.com/gabrielesvelto/status/1558083461059153920">custom
+allocators</a>
+that some programs use for various reasons). These wins are important
+because over-dependence on fast malloc makes Cranelift less flexible
+and less applicable in some situations.</p>
+
+<h2 id="conclusions">Conclusions</h2>
+
+<p>This post has been a whirlwind tour of many of the ways we have
+optimized Wasmtime and Cranelift to perform better in each of the four
+quadrants: Wasm compiler speed, speed of compiled Wasm code, runtime
+initialization speed, and runtime steady-state speed. High performance
+is a critical aspect of any software that aspires to be part of a
+foundation for building efficient, long-lasting systems. If
+WebAssembly is to succeed, it needs tools that execute it as quickly
+as possible, so that it can compete with native code. We continue to
+work toward this goal.</p>
+
+
+  </div></div>
+  </body>
+</html>
