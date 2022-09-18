@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://poniesandlight.co.uk/reflect/island_rendergraph_2/">Original</a>
+    <h1>Vulkan Render-Queues and how they Sync</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    
+  	<div><p>This summer I embarked on a big rewrite of the foundations of <a href="https://github.com/tgfrerer/island">Island</a>, the Vulkan renderer I&#39;ve been working on. This touched the big, load-bearing synchronisation parts, which was quite painful. All this to shave a yak of epic proportions, really: <em>eventually</em> I&#39;d like to implement Vulkan Video, and for this to work, I will need a way to decode frames on a special video-decode queue, which cannot be the main draw-compute-transfer versatile queue.</p>
+<p>This means that for Vulkan video to work, we need to be able to run multiple queues, and for this to work, resources must be able to change queue ownership, which doesn&#39;t sound that bad at first, but changing queue <em>family</em> ownership in Vulkan is a ceremonial almost matching the intricacy of a baroque courtship ritual - it requires both queues from different families to perform a precise, polite little dance of release &amp; acquire - and if, in this sordid sarabande, a step gets missed or misplaced, oops, that&#39;s it, it&#39;s a deadlock and your program and the wedding is off.</p>
+</div>
+<div>
+	
+<blockquote>
+	<p><span>&#34;…a precise, polite little dance of release &amp; acquire…&#34;</span>
+	</p>
+</blockquote>
+<p>There is of course, a way to make queue ownership transfers the responsibility of the driver, by declaring every resource to be <code>VK_SHARING_MODE_CONCURRENT</code> instead of <code>VK_SHARING_MODE_EXCLUSIVE</code>. But how much <em>fun</em> would that be? And, it is said that this is <em>rather bad</em> for performance (I would assume that queue ownership is then internally transferred lazily at the last possible moment, and that this could cause bubbles). And, heck, we&#39;re using a rendergraph, which means the renderer should get out intentions telegraphed far enough ahead in advance to make the right decisions…</p>
+
+<p>So here&#39;s the goal: we&#39;d like a system that can gracefully scale, whether there is one queue or sixteen, a system that can flexibly distribute renderpasses onto available queues - that can scale with the amount of available queues and the capabilities of these available queues, and that can automatically transfer resources as needed between queues.</p>
+<p>On the bonus side, if this works, we get a new way of exploiting GPU parallelism - because independent Vulkan queues may execute in parallel. This means that for example we could run a compute pass at the same time as we run an independent graphics pass, which may give us better GPU utilisation.</p>
+<h2 id="return-of-the-rendergraph">Return of the Rendergraph <a href="#return-of-the-rendergraph"></a></h2>
+<p>Now, where to start? Probably where I left off with <a href="https://poniesandlight.co.uk/reflect/island_rendregraph_1">the previous post</a>- once Rendergraph assembly is complete.</p>
+<figure>
+<img src="https://poniesandlight.co.uk/img/island_rendergraph/multi_queue_graph.png" alt="Two submissions to single queue" title="Two submissions to single queue"/>
+<figcaption>
+    <b>Fig. 1:</b></figcaption>
+</figure>
+</div>
+<div>
+	
+<p>In Island, once the Rendergraph has been assembled, the backend receives a list of independent subgraphs, where each subgraph guarantees that it will only access its own resources - or, if resources are shared, that these resources are strictly <code>READ_ONLY</code> within the same queue family, for the <span title=", meaning globally for all renderpasses for this frame">full frame</span><span>, meaning globally for all renderpasses for this frame</span>.</p>
+<p>When the renderer forms subgraphs out of passes, the GPU queue requirements for <span title="of a subgraph">all passes </span><span>of a subgraph</span> are accumulated: Say, you have a subgraph that consists of two passes, one <code>COMPUTE</code> and a <code>DRAW</code> pass, and because they use the same resource, they have been combined into a single subgraph. Now, this subgraph will have the requirements <code>COMPUTE|DRAW</code>, and will only run on a queue that supports hybrid <code>COMPUTE</code> <em>and</em> <code>DRAW</code> operations. This is pretty nice, because by using a hybrid queue, we can save ourselves resource ownership transfer.</p>
+<p>Another nice consequence of this is that we can treat subgraphs as <em>completely isolated</em> from each other. And since these subgraphs are perfectly isolated from each other, the backend can translate each subgraph into a render command batch, and submit each batch on whichever matching queue is available and the most idle.</p>
+
+<p>Of course, using multiple queues comes at a complexity cost: now we have the additional responsibility that all GPU queues that we bring to the party must synchronise with each other. How do they do that? Well, by talking to each other, for a start.</p>
+</div>
+<div>
+	
+<p>Semaphores is how queues talk to each other in Vulkan. You can only use them on queue submissions, where you can name the semaphores that you wish this queue to wait for, the command batch to process, and then the semaphores to signal once this submission has been processed:</p>
+<div><div>
+<table><tbody><tr><td>
+<pre><code><span>1
+</span><span>2
+</span><span>3
+</span><span>4
+</span><span>5
+</span><span>6
+</span><span>7
+</span><span>8
+</span><span>9
+</span></code></pre></td>
+<td>
+<pre><code data-lang="c">VkSubmitInfo2 submitInfo{
+    (...)
+    .waitSemaphoreInfoCount   <span>=</span>  <span>// number of semaphores to wait for
+</span><span></span>    .pWaitSemaphoreInfos      <span>=</span>  <span>// semaphores to wait for before processing batch
+</span><span></span>    .commandBufferInfoCount   <span>=</span>  <span>// number of command buffers for this batch
+</span><span></span>    .pCommandBufferInfos      <span>=</span>  <span>// array of command buffers forming this batch
+</span><span></span>    .signalSemaphoreInfoCount <span>=</span>  <span>// number of semaphores to signal
+</span><span></span>    .pSignalSemaphoreInfos    <span>=</span>  <span>// semaphores to signal once batch has been processed
+</span><span></span>};
+</code></pre></td></tr></tbody></table>
+</div>
+</div><p>If Semaphores is how Vulkan GPU queues talk to each other, then <a href="https://www.khronos.org/blog/vulkan-timeline-semaphores"><em>Timeline Semaphores</em></a> is how modern, more <em>relaxed</em> queues talk to each other. Timeline Semaphores can nowadays be used in place of the more clunky Binary Semaphores, and they are nicer to work with, because they are more tolerant: not every signal event on a Timeline Semaphore must be answered. Binary Semaphores, by contrast, require every <code>signal</code> event to have a matching <code>wait</code> event. Timeline Semaphores are more forgiving: it&#39;s enough if you guarantee that the value signalled by the semaphore is monotonically increasing - and then you can wait on the highest signalled value that makes sense for a specific point in the execution <span title=" (hence perhaps the name?)">timeline</span><span> (hence perhaps the name?)</span>. You could also wait on more than one queue for the same Timeline Semaphore value.</p>
+<p>I find Timeline Semaphores so useful, that in Island, each queue automatically gets its own exclusive Timeline Semaphore, whether it uses it or not.</p>
+<p>I hope that this short paean to Timeline Semaphores has you convinced that Timeline Semaphores are the future, and that we therefore would like to use Timeline Semaphores for every &amp; all our realtime-graphics needs. Sounds good? Well, unfortunately, at the time of writing, <a href="https://www.khronos.org/blog/vulkan-timeline-semaphores">we can&#39;t use Timeline Semaphores for swapchain operations</a>, which is the place where we absolutely <em>must</em> use semaphores. That&#39;s sad, but there&#39;s a way around: we can still use a hybrid of Binary and Timeline Semaphores.</p>
+<h2 id="extending-islands-single-queue-system">Extending Island&#39;s Single Queue System <a href="#extending-islands-single-queue-system"></a></h2>
+<p>Currently Island uses two Binary Semaphores per frame in order to synchronise with the <span title=" (window system integration)">WSI</span><span> (window system integration)</span> API (that&#39;s the swapchain system): <code>PRESENT_COMPLETE</code>, and <code>RENDER_COMPLETE</code>.</p>
+<ul>
+<li><code>PRESENT_COMPLETE</code> is signalled when the presentation system has finished acquiring the image which will be the current backbuffer, telling us that this image is ready to be written to.</li>
+<li><code>RENDER_COMPLETE</code> is signalled when all commands from the render command batch have been submitted and processed, and said backbuffer image is ready to be flipped onto the screen.</li>
+</ul>
+<p>We therefore need to wait for <code>PRESENT_COMPLETE</code> before we begin rendering, and we signal that we&#39;re done with rendering by signalling <code>RENDER_COMPLETE</code>. In a single-queue renderer, we can submit all the render commands in one big <span title=" (a batch is a list of command buffers that are grouped together in a single submission)">batch</span><span> (a batch is a list of command buffers that are grouped together in a single submission)</span>, and synchronise this single submission by first waiting on <code>PRESENT_COMPLETE</code>, then processing the command batch, and then signalling <code>RENDER_COMPLETE</code> on completion.</p>
+<figure>
+<img src="https://poniesandlight.co.uk/img/island_rendergraph/queue_single_submission.png" alt="Simple single Queue Submission" title="Simple single Queue Submission"/>
+<figcaption>
+    <b>Fig. 2:</b></figcaption>
+</figure>
+<p>In the hypothetical case that we wanted to submit two render batches, this becomes a bit more complicated, because we can&#39;t wait more than once for the same Binary Semaphore unless we signal it again. Fortunately, we don&#39;t need to: we can just split the workload into two, and wait on <code>PRESENT_COMPLETE</code> on the first submission, and then signal <code>RENDER_COMPLETE</code> on the second submission. Because submissions on the same queue get executed in submission order, things still happen in the correct sequence.</p>
+<figure>
+<img src="https://poniesandlight.co.uk/img/island_rendergraph/queue_split_submission.png" alt="Two submissions to single queue" title="Two submissions to single queue"/>
+<figcaption>
+    <b>Fig. 3:</b></figcaption>
+</figure>
+<h2 id="multi-queue-rendering">Multi-Queue Rendering <a href="#multi-queue-rendering"></a></h2>
+<p>Now let&#39;s say, we allow the user to choose (via a shopping list of queue capabilities) which kind and how many queues they wish to use for their Island application.</p>
+</div>
+<div>
+		
+	
+<div><div>
+<table><tbody><tr><td>
+<pre><code><span>1
+</span><span>2
+</span><span>3
+</span><span>4
+</span><span>5
+</span><span>6
+</span></code></pre></td>
+<td>
+<pre><code data-lang="c">VkQueueFlags queue_capabilities[ <span>3</span> ] <span>=</span> {
+    VK_QUEUE_GRAPHICS_BIT <span>|</span> VK_QUEUE_COMPUTE_BIT,
+    VK_QUEUE_COMPUTE_BIT,
+    VK_QUEUE_COMPUTE_BIT,
+};
+le_backend_vk<span>:</span><span>:</span>settings_i.set_requested_queue_capabilities( queue_capabilities, <span>3</span> );
+</code></pre></td></tr></tbody></table>
+</div>
+</div><p>Note that it is not guaranteed that queues are always available: this is hardware dependent, which is why we must make sure that everything we do must have a graceful fallback. More on this later. But let&#39;s say we have more than one GPU queue available, and we have multiple independent subgraphs assembled into Vulkan command batches, then we could submit these to run in parallel.</p>
+<p>Of course, we would still have to enforce that whoever writes to the backbuffer needs to wait for the backbuffer resource to be available, signalled via <code>PRESENT_COMPLETE</code> - and we would also need to enforce that <code>RENDER_COMPLETE</code> only gets signalled, once <em>all</em> renderbatches have been submitted and processed. How can we enforce this?</p>
+<p>We will use a trick: since operations on a queue happen in submission order, we can extend the previous split submission over multiple queues by adding some Timeline Semaphores:</p>
+<p>On <code>queue_0</code> (a graphics/compute queue) we first wait for <code>PRESENT_COMPLETE</code>, then execute the command batch for <code>queue_0</code>, then signal the Timeline Semaphore for <code>queue_0</code>.</p>
+<p>Starting at the same time, <code>queue_1</code> (a compute-only queue) <span title=" (because it doesn&#39;t touch the backbuffer image)">doesn&#39;t need to wait for anyone</span><span> (because it doesn&#39;t touch the backbuffer image)</span>, it executes its command batch, and then signals its Timeline Semaphore for <code>queue_1</code>.</p>
+<p>Back on <code>queue_0</code>, we wait for <span title="(that&#39;s the Timeline Semaphore from &lt;code&gt;queue_0&lt;/code&gt; &lt;em&gt;and&lt;/em&gt; the Timeline Semaphore from &lt;code&gt;queue_1&lt;/code&gt;)">all Timeline Semaphores </span><span>(that&#39;s the Timeline Semaphore from <code>queue_0</code> <em>and</em> the Timeline Semaphore from <code>queue_1</code>)</span>, then execute zero commands, and immediately signal <code>RENDER_COMPLETE</code>. The last queue submission on <code>queue_0</code> is only there for synchronisation - it harvests all Timeline Semaphores across all queues, and then, on the main queue, signals <code>RENDER_COMPLETE</code>.</p>
+<figure>
+<img src="https://poniesandlight.co.uk/img/island_rendergraph/queue_parallel_split_submission.png" alt="Submissions to two queues" title="Submissions to two queues"/>
+<figcaption>
+    <b>Fig. 4:</b>Two queues in sync- note how <code>queue_1</code> may start processing even before <code>queue_0</code>, as it does not have to wait for anyone.
+</figcaption>
+</figure>
+<p>This then is the first piece of the puzzle: this will help us synchronize parallel queue submissions while still keeping up the pretense to the swapchain system that nothing has changed.</p>
+<p>It will also gracefully fall back in case we only have one queue available: regardless whether the first or the second sub-graph get processed first, the sub-graph which draws to the backbuffer image will wait for that image to be available, and at the end, once both sub-graphs have been processed, we signal <code>RENDER_COMPLETE</code>. There&#39;s no chance of a deadlock.</p>
+<h2 id="resources-best-kept-within-the-family">Resources: Best Kept within the Family <a href="#resources-best-kept-within-the-family"></a></h2>
+<p>Now that we have found a way to synchronise multiple queues, we need to look into how we will transfer queue family ownership for resources.</p>
+<p>Note that there is a difference between queue ownership and queue <em>family</em> ownership. Two queues may merrily read-only from the same resource - as long as they are from the same family. If the two queues, however, are from different queue families, then this is a different story, as a resource that has been declared <code>VK_SHARING_MODE_EXCLUSIVE</code> can only belong to one family at a time - not even shared read-only access is allowed - we must make sure that queue ownership is transferred before a new family accesses the resource.</p>
+<p>A resource transfer contains two matching operations: release and acquire. It must follow the following procedure: First, the currently owning queue family must release the resource. This is done by issuing a pipeline barrier <em>on the owning queue family</em>. The barrier contains two pieces of important information: it must name the source queue family and also the destination queue family. Acquire works similarly: the acquiring queue must issue a pipeline barrier that names the source queue family (the queue family that previously released the resource) and then names the destination queue family (the queue family that acquires the resource). It is this kind of double accounting that makes Vulkan programming sometimes feel a bit bureaucratic, but so be it. We must do this for every resource that changes queue family ownership.</p>
+<h2 id="keeping-it-within-the-transfer-window">Keeping it Within the Transfer Window <a href="#keeping-it-within-the-transfer-window"></a></h2>
+<p>So that we don&#39;t end up with a huge number of operations on different queues that depend on each other, it&#39;s perhaps good to think of ways to organise things, and group things together that belong together. It might also be a good idea to do all transfers before the rendering season begins. Once we have done this, a pattern appears:</p>
+<p>First, for every queue family, we release all resources that lose queue ownership from this queue family. Then, for each queue family, acquire any resources that receive queue ownership from that queue family.</p>
+<p>We must guard for one extra edge case: What if two queues from the same queue family exist, and both require <code>READ_ONLY</code> access to an acquired resource? How do we prevent the queue which is not involved in acquiring the resource to race ahead and to read from that resource before it has been safely acquired? We can do this by adding a separate <code>must_wait_acquire</code> submission to any of these sibling queues - all this submission does is to wait for the main sibling to signal via Timeline Semaphore that resource acquisition has completed. Because such a submission essentially blocks a sibling queue until it gets the correct signal, any subsequent submissions on this queue are protected from accidentally starting too early.</p>
+<p>From here on, we can continue with how our frame was built before: we submit renderbatches on each queue, and at the end, on the main queue, in a separate submission exclusively used for synchronisation, we wait for all Timeline Semaphores, and then signal <code>RENDER_COMPLETE</code>.</p>
+<h2 id="putting-it-all-together">Putting it all together <a href="#putting-it-all-together"></a></h2>
+<p>So let&#39;s say we have a rendergraph that can be split into three independent subgraphs just like this, where the resource <code>compute_buffer[0|1]</code> ping-pongs between two compute passes and a draw pass:</p>
+<figure>
+<img src="https://poniesandlight.co.uk/img/island_rendergraph/multi_queue_graph.png" alt="Rendergraph" title="Rendergraph"/>
+<figcaption>
+    <b>Fig. 5:</b></figcaption>
+</figure>
+<p>Island will, if three queues are available, distribute this workload as follows:</p>
+<figure>
+<img src="https://poniesandlight.co.uk/img/island_rendergraph/multi_queue_submission.png" alt="Frame rendered with three queues" title="Frame rendered with three queues"/>
+<figcaption>
+    <b>Fig. 6:</b></figcaption>
+</figure>
+<p>Note in the diagram above that Island inserted a <code>must_wait_acquire</code> step to protect <code>queue_2</code> from accessing <code>compute_buffer[1]</code> before <code>queue_1</code> had a chance to acquire it for their shared queue family. This is only necessary if two queues from the same queue family want to access a <code>READ_ONLY</code> resource which needs to be acquired first.</p>
+<p>In case there are only two queues available, the renderer detects that the <code>must_wait_acquire</code> element is not necessary anymore because submission order protects the resource from being accessed first:</p>
+<figure>
+<img src="https://poniesandlight.co.uk/img/island_rendergraph/dual_queue_submission.png" alt="Frame rendered with two queues" title="Frame rendered with two queues"/>
+<figcaption>
+    <b>Fig. 7:</b></figcaption>
+</figure>
+<p>The nice thing about this approach to resource ownership transfer is that it just slots in to the current code path - it&#39;s one extra function which generates the extra sync submissions. And this makes it very easy to skip. Now, why would we want to skip this function? Well, if the renderer detects that there is only a single queue family available, all the resource queue ownership bookkeeping and the transfer logic is not needed, and we can just skip it.</p>
+<p>If we only have only a single queue available - how does our frame look like? Like this:</p>
+<figure>
+<img src="https://poniesandlight.co.uk/img/island_rendergraph/single_queue_submission.png" alt="Single-queue frame" title="Single-queue frame"/>
+<figcaption>
+    <b>Fig. 8:</b></figcaption>
+</figure>
+<p>Note that the queue ownership transfer operations have melted away as there is only one queue family in the game and therefore no need to transfer ownership.</p>
+<figure>
+<img src="https://poniesandlight.co.uk/img/island_preview.png" alt="Island preview image" title="Island preview image"/>
+<figcaption>
+    If you&#39;re interested in how I applied the method described in this post to the <a href="https://github.com/tgfrerer/island">Island</a> codebase, I recommend you take a look at the <a href="https://github.com/tgfrerer/island/blob/732ec17cee3bfecb857e5793a5a64b233c0490aa/modules/le_backend_vk/le_backend_vk.cpp#L7070">relevant lines</a> in the source code inside Island&#39;s Vulkan backend module, <code>le_backend_vk.cpp</code>, on github.
+</figcaption>
+</figure>
+<h2 id="what-ive-learned-so-far">What I&#39;ve Learned so far <a href="#what-ive-learned-so-far"></a></h2>
+<p>Overall I&#39;m quite pleased of how this has turned out - Island seems a pretty robust and adaptive renderer right now when it comes to use multiple queues.</p>
+<p>Some early design choices for simplification took a lot of complexity out of the system: the decision to make subgraphs completely resource-independent from each other made it much simpler to reason about queue submissions, because now each queue submission could be looked at in isolation.</p>
+<p>Sorting and grouping submissions showed me that there was a lot of repetition in the system, and these patterns led to the current architecture of the frame.</p>
+</div>
+<div>
+		
+	
+<p>I don&#39;t like to interleave new functionality into existing code - because it blurs the intent of the code - but with the <a href="https://github.com/tgfrerer/island/blob/732ec17cee3bfecb857e5793a5a64b233c0490aa/modules/le_backend_vk/le_backend_vk.cpp#L6584">implementation</a> of resource ownership transfer, I got lucky, and found a way to place it into its own dedicated, isolated function by taking advantage of the implicit synchronisation guarantee that submissions on a queue happen in submission order.</p>
+<p>Automatically drawing diagrams also helped a lot when reasoning about synchronisation. It makes it much easier for me to spot bugs and possible issues when I can see how a system fits together. All the diagrams in this post were automatically generated within Island - and rendered through <a href="https://graphviz.org/">graphviz</a>.</p>
+
+
+	</div>
+	
+	
+	
+		<div>
+			<h3>RSS:</h3>
+			<p>Find out first about new posts by subscribing to the <a href="https://poniesandlight.co.uk/reflect/feed.xml">RSS Feed</a> <a href="https://poniesandlight.co.uk/reflect/feed.xml" type="application/rss+xml">R</a></p>
+		</div>
+	
+		<p>
+			<h3>Further Posts:</h3>
+		</p>
+		
+        </div></div>
+  </body>
+</html>
