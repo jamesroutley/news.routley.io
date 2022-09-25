@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://univalence.me/posts/mvsqlite-2">Original</a>
+    <h1>Storage and transaction in mvSQLite, the distributed SQLite on FoundationDB</h1>
+    
+    <div id="readability-page-1" class="page"><div><div><p>mvSQLite is the <a href="https://github.com/losfair/mvsqlite" target="_blank">open-source</a>, SQLite-compatible distributed database built on FoundationDB. You might be interested in <a href="https://univalence.me/posts/mvsqlite" target="_blank">the introduction post</a> if this is the first time you heard of mvSQLite.</p>
+<p>This post explains how multi-versioned data is stored and how externally-consistent ACID transactions work in mvSQLite.</p>
+<h2>Preface</h2>
+<p>mvSQLite&#39;s storage layer is designed around two core ideas: <strong>immutability</strong> and <strong>concurrency</strong>.</p>
+<p><em>Immutable versions</em> and <em>branching</em> are well-known concepts in Git-based modern software workflows, and mvSQLite brings these to the database world. mvSQLite keeps all historic versions of the database accessible. Different from traditional mechanisms for implementing Point-in-Time Recovery (PITR), mvSQLite does not checkout a historic version by replaying the logs - instead, the time complexity of reading from a time in the past is <code>O(log n)</code>, identical to that of reading the current version.</p>
+<p><em>Concurrency</em> is a core property users expect from distributed databases. Uniquely in the distributed SQLite world, mvSQLite provides <strong>both read and write concurrency across a cluster of machines</strong>: readers do not conflict with each other, readers do not conflict with writers, and multiple writers <em>sometimes</em> conflict with each other.</p>
+<p>In the rest of this post I will explain how mvSQLite implements immutability and concurrency.</p>
+<h2>Layered page index</h2>
+<p>Vanilla SQLite stores data in a single file on the local disk. From the perspective of SQLite&#39;s virtual filesystem (VFS), the minimal unit of data is a <em>page</em> - a byte sequence with a fixed length ranging from 512 to 65536 bytes.</p>
+<p>mvSQLite maps the concept of pages to FoundationDB as a set of <code>(page_number, page_versionstamp) → page_hash</code> key-value mappings. When a page is requested by a client, the storage layer performs a reverse range scan on the key range <code>(page_number, 0)..=(page_number, requested_versionstamp)</code> with <code>limit=1</code> to find out the latest versionstamp that satisfies the client version constraint. At any given versionstamp, the collection of all pages as observed by the above logic forms a <strong>consistent snapshot</strong> of the database.</p>
+<p>Here&#39;s an illustration of the mechanism.</p>
+<p><img src="https://notion-fetch.univalent.net/image/d64bf89213a54168a1df3f00fbfd9cac/c49c1ed23aef41677dfcbe122407613cc47163a882e5d83dadc635fe27de420e.png" height="1224" width="1674"/></p><h3>What is a versionstamp?</h3>
+<p>The concept &#34;versionstamp&#34; is used in this section. It&#39;s the &#34;timestamp&#34; handed out by FoundationDB&#39;s logical clock: a monotonic 80-bit integer, uniquely assigned to each FDB transaction during commit.</p>
+<p>The order between two versionstamps is equivalent to the logical order between the corresponding FDB transactions. If <code>versionstamp(A) &lt; versionstamp(B)</code>, then transaction A logically happens before transaction B.</p>
+<h2>The content-addressed page store</h2>
+<p>The content-addressed page store is a set of <code>page_hash → page_content</code> key-value mappings. On a client page read request, the storage layer looks up the hash in the store after fetching it from the layered page index.</p>
+<p>Page content is not directly stored in the layered page index, because the index is designed to be compact. Compactness makes batch index operations efficient. These operations include <strong>transaction commit</strong>, which atomically writes a set of new page versions to the index, and <strong>garbage collection</strong>, which scans through the entire page index as part of the process for discovering garbage.</p>
+<h3>Delta encoding</h3>
+<p>Page-level multi-versioning is useful to the external world, but introduces space efficiency challenges internally. One of these issues is that, what data should be stored when a page is changed? A naive implementation is to just store the entire page, but it is pretty wasteful: if you updated one row in a transaction, maybe only a single byte in a page is changed, but still the entire 8KiB is stored again.</p>
+<p>So here&#39;s the <strong>delta page</strong> mechanism. Instead of storing the whole new version of the page, you only store the difference between the new and old versions. The difference is encoded by computing the XOR of the two versions, and then running <a href="https://github.com/facebook/zstd" target="_blank">zstd</a> compression on the result. This gives us pretty efficient delta encoding.</p>
+<p><img src="https://notion-fetch.univalent.net/image/d64bf89213a54168a1df3f00fbfd9cac/e8e915c4fa35a6e4b22ab1b80eeb4c6365ad9ffd0ceb6defa9cc057d3cc01137.png" height="601" width="1200"/></p><h2>Transacting on the page index</h2>
+<p>mvSQLite exposes the strictest transaction consistency level, aka <em>external consistency</em>, to applications. SQLite&#39;s default <code>SERIALIZABLE</code> isolation level applies, and linearizability is provided in addition.</p>
+<p>Different from vanilla SQLite and most other replicated/distributed SQLite variants, mvSQLite does not rely on SQLite&#39;s own rollback journal or write-ahead log (WAL) to ensure transaction properties because FoundationDB provides more efficient primitives.</p>
+<p>Let&#39;s see the lifetime of a transaction.</p>
+<p><strong>Phase 1: Initialization</strong></p>
+<p>When the first query after a <code>BEGIN</code> statement is executed, or one of <code>BEGIN IMMEDIATE</code> or <code>BEGIN EXCLUSIVE</code> is executed, the <code>xLock</code> VFS method is called and the client initializes the transaction.</p>
+<p>Two pieces of metadata are fetched from the storage layer:</p>
+<ul>
+<li>Database read version.</li>
+<li>Mutation log since the client&#39;s last known version.</li>
+</ul>
+<p>Page numbers included in the mutation log are flushed from the local in-memory cache.</p>
+<p><strong>Phase 2: Normal operation</strong></p>
+<p>VFS read requests are converted into storage layer page reads with the database read version fetched in Phase 1. VFS write requests are converted into content-addressed page store writes, and the hashes of newly written pages are kept in a in-memory buffer.</p>
+<p>The page numbers from the VFS read requests are buffered in memory. This buffer is called the <em>read set</em>.</p>
+<p><strong>Phase 3: Commit</strong></p>
+<p>When the <code>xUnlock</code> VFS method is called, we know SQLite has decided to end the transaction. Rollback and commit don&#39;t really make a difference here, since on the page level a rollback is just a write-back of the original pages.</p>
+<p>The client then sends the read version, the read set and the local mutations (<code>page_number → page_hash</code>) to the storage layer, and requests for commit. Now the storage layer carefully performs a complex sequence of read-write conflict check, and then writes to the page index. Details of the commit logic is described in the <a href="https://github.com/losfair/mvsqlite/wiki/Atomic-commit" target="_blank">Atomic commit</a> documentation.</p>
+<p>After the commit finishes, the storage layer returns a mutation log between the transaction&#39;s read version and the committed version, excluding the transaction&#39;s own mutations. Page numbers included in the mutation log are flushed from the local in-memory cache. This ensures we will not see stale data after concurrent mutations.</p>
+<h2>Try it</h2>
+<p>mvSQLite is beta software and is definitely not bug-free, but you can safely try it even for your important data as long as you have enabled FoundationDB&#39;s <a href="https://apple.github.io/foundationdb/backups.html" target="_blank">continuous backup system</a>.</p>
+<p>Refer to the <a href="https://github.com/losfair/mvsqlite" target="_blank">readme</a> for a guide on getting mvSQLite up and running!</p>
+
+</div></div></div>
+  </body>
+</html>
