@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://ntietz.com/blog/rust-hashmap-overhead/">Original</a>
+    <h1>Measuring the overhead of HashMaps in Rust</h1>
+    
+    <div id="readability-page-1" class="page"><article>
+    
+
+    <p><strong>Tuesday, November 22, 2022</strong></p>
+
+    <p>While working on <a href="https://sr.ht/%7Entietz/isabella-db/">a project</a> where I was putting a lot of data into a HashMap, I started to notice my hashmaps were taking up a lot of RAM.
+I mean, a <em>lot</em> of RAM.
+I did a back of the napkin calculation for what the minimum memory usage should be, and I was getting <strong>more than twice what I expected</strong> in resident memory.</p>
+<p>I&#39;m aware that HashMaps trade off space for time.
+By using more space, we&#39;re able to make inserts and retrievals much more efficient.
+But how <em>much</em> space do they trade off for that time?</p>
+<p>I didn&#39;t have an answer to that question, so I decided to measure and find out.
+If you <strong>just want to know the answer, skip to the last section</strong>; you&#39;ll know you&#39;re there when you see charts.
+Also, all the <a href="https://git.sr.ht/%7Entietz/rust-hashmap-overhead">supporting code</a> and <a href="https://docs.google.com/spreadsheets/d/1jWv3nzQwncXy0xK_MKmcUkflT8sbQa02skNxP609az4/edit?usp=sharing">data</a> is available if you want to do your own analysis.</p>
+
+<p>Rust takes care of a lot of memory management for you.
+In most cases, you don&#39;t need to think about the allocation behavior:
+Things are created when you ask for them, and they&#39;re dropped when you stop using them.
+The times when you <em>do</em> have to think about it, the borrow checker will usually make that clear to you.</p>
+<p>Sometimes, though, you get into situations where memory allocation behavior matters a lot more for your system.
+This can be the case if you&#39;re very memory constrained (as I was) or if you are trying to avoid the cost of memory allocation.
+In these situations, Rust lets you define your own allocator with the behavior you want!</p>
+<p>The <a href="https://doc.rust-lang.org/std/alloc/struct.System.html">System</a> allocator is the default allocator used by Rust programs if you don&#39;t do anything special.
+It uses the default allocator provided by your operating system, so it&#39;s using <code>malloc</code> under the hood on Linux systems.</p>
+<p>Another one I&#39;ve seen referenced a lot is <a href="https://crates.io/crates/tikv-jemallocator">tikv-jemallocator</a>, which provides a different <code>malloc</code> implementation with some characteristics like avoiding fragmentation.
+It comes from FreeBSD.
+I didn&#39;t explore using this one other than idly trying it in my main project, where it didn&#39;t make any discernible difference in memory overhead.</p>
+<p>There are some other fun allocators, too, and you can do some really neat things with them.
+Here are two that I thought were neat:</p>
+<ul>
+<li><a href="https://crates.io/crates/bumpalo">bumpalo</a> has a cute name and is a bump allocator that can allocate super quickly, but generally cannot deallocate individual objects; niche in use</li>
+<li><a href="https://crates.io/crates/wee_alloc">wee-alloc</a> is also cutely (and descriptively!) named and is a &#34;simple, correct implementation&#34; of an allocator for WASM targets, so it generates small code for allocations</li>
+</ul>
+<p>There are also a few allocators which help you measure overhead.
+But where&#39;s the fun in that???
+Let&#39;s do it ourselves!</p>
+
+<p>It&#39;s tricky writing an allocator that does the useful work of allocation, and there&#39;s a lot of nuance.
+It&#39;s a lot easier to write an allocator that wraps around an existing one and records measurements!
+That&#39;s what we&#39;re doing.</p>
+<p>The thing to know is that we need to implement the <a href="https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html"><code>GlobalAlloc</code></a> trait.
+It has two methods we have to define: <code>alloc</code> and <code>dealloc</code>.
+We will make something very simple which just wraps <code>System</code> without doing anything at all besides passing through data to some record functions.</p>
+<p>We start with a struct.</p>
+<pre><code><span>/// TrackingAllocator records the sum of how many bytes are allocated
+/// and deallocated for later analysis.
+</span><span>struct </span><span>TrackingAllocator</span><span>;
+</span></code></pre>
+<p>Note that our struct doesn&#39;t have any fields.
+We can&#39;t put anything dynamic in it.
+We&#39;ll need some atomic ints and such to track allocations.
+Since we don&#39;t expect to have multiple of these at once, we&#39;ll just put those as statics in the module scope.
+We could put the fields we want in the struct, but it makes constructing it a little more annoying and we won&#39;t have multiple allocators at once, so we&#39;re just going to make those statics.</p>
+<pre><code><span>static </span><span>ALLOC</span><span>:</span><span> AtomicUsize </span><span>= </span><span>AtomicUsize</span><span>::</span><span>new(</span><span>0</span><span>)</span><span>;
+</span><span>static </span><span>DEALLOC</span><span>:</span><span> AtomicUsize </span><span>= </span><span>AtomicUsize</span><span>::</span><span>new(</span><span>0</span><span>)</span><span>;
+</span></code></pre>
+<p>And now we define <code>alloc</code> and <code>dealloc</code> so that <code>TrackingAllocator</code> is <code>GlobalAlloc</code>.
+Implementing <code>GlobalAlloc</code> requires marking things <code>unsafe</code>.
+What we&#39;re doing here isn&#39;t really unsafe, but we satisfy the interface.
+All we&#39;re doing is passing through to <code>System</code> and recording it with some helper functions we&#39;ll define later.</p>
+<pre><code><span>unsafe impl </span><span>GlobalAlloc </span><span>for </span><span>TrackingAllocator {
+    </span><span>unsafe fn </span><span>alloc</span><span>(</span><span>&amp;</span><span>self, layout</span><span>:</span><span> Layout) </span><span>-&gt; </span><span>*mut u8 </span><span>{
+        </span><span>let</span><span> p </span><span>=</span><span> System</span><span>.</span><span>alloc</span><span>(layout)</span><span>;
+        </span><span>record_alloc</span><span>(layout)</span><span>;
+</span><span>        p
+    }
+
+    </span><span>unsafe fn </span><span>dealloc</span><span>(</span><span>&amp;</span><span>self, ptr</span><span>: </span><span>*mut u8</span><span>, layout</span><span>:</span><span> Layout) {
+        </span><span>record_dealloc</span><span>(layout)</span><span>;
+</span><span>        System</span><span>.</span><span>dealloc</span><span>(ptr</span><span>,</span><span> layout)</span><span>;
+    </span><span>}
+}
+</span></code></pre>
+<p>Now we also have to define the helper methods to record allocations.
+They&#39;re as straightforward as can be, just doing a <code>fetch_add</code> to record the size of the allocated or deallocated memory into its corresponding counter.</p>
+<pre><code><span>pub fn </span><span>record_alloc</span><span>(layout</span><span>:</span><span> Layout) {
+    ALLOC</span><span>.</span><span>fetch_add</span><span>(layout</span><span>.</span><span>size</span><span>()</span><span>,</span><span> SeqCst)</span><span>;
+</span><span>}
+
+</span><span>pub fn </span><span>record_dealloc</span><span>(layout</span><span>:</span><span> Layout) {
+    DEALLOC</span><span>.</span><span>fetch_add</span><span>(layout</span><span>.</span><span>size</span><span>()</span><span>,</span><span> SeqCst)</span><span>;
+</span><span>}
+</span></code></pre>
+<p>Now the functionality for the allocator itself is basically in place, and we can move on to using it!</p>
+
+<p>There are two things we need to do to use our allocator: Set it up as the global allocator, and add a little bit of functionality to get <em>useful</em> data out.</p>
+<p>Let&#39;s make it the global allocator first.
+This is the easy bit.
+Somewhere in your program (such as in <code>main.rs</code>), you create an instance and mark it as the global allocator:</p>
+<pre><code><span>#[global_allocator]
+</span><span>static </span><span>ALLOC</span><span>:</span><span> TrackingAllocator </span><span>=</span><span> TrackingAllocator</span><span>;
+</span></code></pre>
+<p>And now that&#39;s done.
+That&#39;s all you need to do to change the global allocator!
+You can see also why we made initialization as easy as possible.</p>
+<p>Now to address the ergonomics of use.
+As it stands, <em>every</em> allocation and deallocation will get recorded.
+That&#39;s not quite what we want.
+We want to isolate certain pieces of the program to measure their allocation separately from test setup and teardown.
+We also want to record stats from multiple separate runs and report them nicely.</p>
+<p>The first thing to do is define a struct for the stats we want to return.
+We want the total allocation and deallocation, and it would also be convenient to have their difference.
+This can be calculated later, but let&#39;s just include it in the struct for now.</p>
+<pre><code><span>pub struct </span><span>Stats </span><span>{
+    </span><span>pub </span><span>alloc</span><span>: </span><span>usize</span><span>,
+    </span><span>pub </span><span>dealloc</span><span>: </span><span>usize</span><span>,
+    </span><span>pub </span><span>diff</span><span>: </span><span>isize</span><span>,
+}
+</span></code></pre>
+<p>And now we need some helper methods to reset the counters, and get our stats out.</p>
+<pre><code><span>
+</span><span>pub fn </span><span>reset</span><span>() {
+    ALLOC</span><span>.</span><span>store</span><span>(</span><span>0</span><span>,</span><span> SeqCst)</span><span>;
+    </span><span>DEALLOC</span><span>.</span><span>store</span><span>(</span><span>0</span><span>,</span><span> SeqCst)</span><span>;
+</span><span>}
+
+
+</span><span>pub fn </span><span>stats</span><span>() </span><span>-&gt;</span><span> Stats {
+    </span><span>let</span><span> alloc</span><span>: </span><span>usize = </span><span>ALLOC</span><span>.</span><span>load</span><span>(SeqCst)</span><span>;
+    </span><span>let</span><span> dealloc</span><span>: </span><span>usize = </span><span>DEALLOC</span><span>.</span><span>load</span><span>(SeqCst)</span><span>;
+    </span><span>let</span><span> diff </span><span>= </span><span>(alloc </span><span>as isize</span><span>) </span><span>- </span><span>(dealloc </span><span>as isize</span><span>)</span><span>;
+
+</span><span>    Stats {
+        alloc</span><span>,
+</span><span>        dealloc</span><span>,
+</span><span>        diff</span><span>,
+    </span><span>}
+}
+</span></code></pre>
+<p>And we have the pieces we need to use this nicely!
+We can call <code>reset()</code> to clear the values before an experiment, and call <code>stats()</code> to get them afterwards.</p>
+
+<p>Let&#39;s put together the pieces now and measure the overhead of <code>HashMap</code>s!
+As a bonus, we&#39;ll also measure the overhead of <code>BTreeMap</code>s.</p>
+<p>First let&#39;s define a helper function that lets us measure and report on the allocations from a test scenario.
+This function should take in another function, which will return some data (this is important so that the data <em>isn&#39;t dropped</em> until after the measurement is complete, or the diff will be inaccurately low).
+The job of this function is to reset the allocator, run the function, report the stats, then drop the data.</p>
+<pre><code><span>pub fn </span><span>run_and_track</span><span>&lt;T&gt;(name</span><span>: </span><span>&amp;str</span><span>, size</span><span>: </span><span>usize</span><span>, f</span><span>:</span><span> impl FnOnce() -&gt; T) {
+    alloc</span><span>::</span><span>reset()</span><span>;
+
+    </span><span>let</span><span> t </span><span>= </span><span>f</span><span>()</span><span>;
+
+    </span><span>let</span><span> Stats {
+        alloc</span><span>,
+</span><span>        dealloc</span><span>,
+</span><span>        diff</span><span>,
+    </span><span>} </span><span>= </span><span>alloc</span><span>::</span><span>stats()</span><span>;
+    </span><span>println!(</span><span>&#34;</span><span>{name}</span><span>,</span><span>{size}</span><span>,</span><span>{alloc}</span><span>,</span><span>{dealloc}</span><span>,</span><span>{diff}</span><span>&#34;</span><span>)</span><span>;
+
+    </span><span>drop</span><span>(t)</span><span>;
+</span><span>}
+</span></code></pre>
+<p>For simplicity we&#39;re just printing the results to <code>stdout</code>, and the CSV header will be defined elsewhere.</p>
+<p>Now let&#39;s define our scenarios.
+For this, we&#39;ll first assume that we have constructed some data:</p>
+<pre><code><span>let</span><span> pairs </span><span>= </span><span>generate_keys_values</span><span>(</span><span>1_000_000</span><span>)</span><span>;
+</span></code></pre>
+<p>There&#39;s a helper function that fills a <code>Vec</code> with as many key/value pairs as we want.
+Each is a pair of a random <code>u64</code> (key) and a 100-byte random <code>u8</code> blob (value).
+The particular data here shouldn&#39;t matter too much, but I picked something of about 100 bytes to match the domain I originally saw this in.</p>
+<p>We&#39;ll also have a list of sizes for the tests; later, we can just assume we have a <code>usize</code> called <code>size</code> which we can use.
+You can see the full details in the <a href="https://git.sr.ht/%7Entietz/rust-hashmap-overhead/tree/main/item/src/main.rs">complete listing</a>.</p>
+<p>Now let&#39;s define the baseline.
+The baseline here is two <code>Vec</code>s, one of the keys and one of the values, constructed with <em>exactly</em> the capacity we need and no more.</p>
+<pre><code><span>run_and_track</span><span>(</span><span>&#34;vec-pair&#34;</span><span>,</span><span> size</span><span>, </span><span>|| {
+    </span><span>let mut</span><span> k</span><span>: </span><span>Vec</span><span>&lt;</span><span>u64</span><span>&gt; </span><span>= </span><span>Vec</span><span>::</span><span>with_capacity(size)</span><span>;
+    </span><span>let mut</span><span> v</span><span>: </span><span>Vec</span><span>&lt;DummyData&gt; </span><span>= </span><span>Vec</span><span>::</span><span>with_capacity(size)</span><span>;
+
+    </span><span>for </span><span>(key</span><span>,</span><span> val) </span><span>in &amp;</span><span>pairs[</span><span>..</span><span>size] {
+        k</span><span>.</span><span>push</span><span>(</span><span>*</span><span>key)</span><span>;
+</span><span>        v</span><span>.</span><span>push</span><span>(</span><span>*</span><span>val)</span><span>;
+    </span><span>}
+
+    (k</span><span>,</span><span> v)
+})</span><span>;
+</span></code></pre>
+<p>And now we can also define our BTree and HashMap scenarios.</p>
+<pre><code><span>run_and_track</span><span>(</span><span>&#34;hashmap&#34;</span><span>,</span><span> size</span><span>, </span><span>|| {
+    </span><span>let mut</span><span> m </span><span>= </span><span>HashMap</span><span>::</span><span>&lt;</span><span>u64</span><span>, DummyData&gt;</span><span>::</span><span>new()</span><span>;
+
+    </span><span>for </span><span>(key</span><span>,</span><span> val) </span><span>in &amp;</span><span>pairs[</span><span>..</span><span>size] {
+        m</span><span>.</span><span>insert</span><span>(</span><span>*</span><span>key</span><span>, </span><span>*</span><span>val)</span><span>;
+    </span><span>}
+
+    m
+})</span><span>;
+
+</span><span>run_and_track</span><span>(</span><span>&#34;btreemap&#34;</span><span>,</span><span> size</span><span>, </span><span>|| {
+    </span><span>let mut</span><span> m </span><span>= </span><span>BTreeMap</span><span>::</span><span>&lt;</span><span>u64</span><span>, DummyData&gt;</span><span>::</span><span>new()</span><span>;
+
+    </span><span>for </span><span>(key</span><span>,</span><span> val) </span><span>in &amp;</span><span>pairs[</span><span>..</span><span>size] {
+        m</span><span>.</span><span>insert</span><span>(</span><span>*</span><span>key</span><span>, </span><span>*</span><span>val)</span><span>;
+    </span><span>}
+
+    m
+})</span><span>;
+</span></code></pre>
+<p>When we run these (with some additional glue code), we&#39;ll get a CSV as output which we can then load into a spreadsheet and analyze.</p>
+
+<p>The results surprised me, because I (naively, perhaps) expected the HashMap to maintain fairly constant, fairly low overhead.
+I was aware that hashmaps in general have a &#34;load factor&#34;, but I didn&#39;t fully understand how it was utilized.
+It is used to define when the HashMap will resize to contain more elements.
+If your load factor is 1, then it will reallocate when the map is full.
+I think the load factor for Rust&#39;s HashMap is something like 7/8. This means that when it has 12.5% capacity remaining, it will reallocate (and probably double, so that the amortized cost of reallocating is O(1)).</p>
+<p>If we do some analysis, we can reach a better estimate than my naive unthinking estimate that it would have 12.5% overhead.
+In fact, it&#39;s much higher than that.
+If the HashMap doubles its capacity when it hits 12.5% remaining (14% overhead), then after doubling it will have 56% free capacity, and the overhead of the extra space is about 125% of the used space.
+On average, we expect the overhead to be somewhere between those, perhaps around 70%.</p>
+<p>How does this compare to what we see in this test?</p>
+<p>First we can see the growth behavior of both containers against the baseline:</p>
+<p><img src="https://ntietz.com/images/hashmap-btree-growth.svg" alt="Chart of growth in memory usage of HashMaps and BTreeMaps against a baseline"/></p>
+<p>Here we can see that BTreeMaps grow smoothly linearly with the size of the data, while HashMaps are growing stepwise.
+Additionally, it looks like HashMaps are almost always using more memory than BTreeMaps.</p>
+<p>We can see the trends more clearly if instead of the direct memory usage, we plot the <em>overhead</em>: as a ratio, how much additional memory is it using compared to the baseline?
+For the baseline, the answer is 0.
+From our analysis, we expect the hashmap to average about 0.7.</p>
+<p><img src="https://ntietz.com/images/hashmap-btree-overhead.svg" alt="Chart of the overhead ratio of HashMaps and BTreeMaps against a baseline"/></p>
+<p>And here we see the behavior more clearly.
+BTreeMaps do indeed have fairly consistent overhead.
+On the other hand, HashMaps&#39; overhead swings wildly.
+It goes up over 1.25 (about what we hypothesized), and drops as low as about 0.125 (also what we hypothesized).</p>
+<p>And if we average it? <strong>0.73</strong>.
+The hypothesis was bang on.</p>
+<p>So in general, you can expect to allocate <strong>nearly twice as much memory as your elements alone</strong> if you put them in a Rust HashMap, and about <strong>50% extra memory</strong> if you put them in a BTreeMap.</p>
+<p>Hashmaps make a clear space-for-time tradeoff, and it&#39;s easier to make that tradeoff effectively if you know how <em>much</em> of each you&#39;re trading off!
+Measuring the time tradeoff is left as an exercise for the reader 😉.</p>
+<hr/>
+
+
+  </article><p>
+    If you have comments, questions, or feedback, please email <a href="mailto:~ntietz/public-inbox@lists.sr.ht">my public inbox</a>.
+    To get new posts, please use my <a href="https://ntietz.com/atom.xml">RSS feed</a>.
+  </p></div>
+  </body>
+</html>
