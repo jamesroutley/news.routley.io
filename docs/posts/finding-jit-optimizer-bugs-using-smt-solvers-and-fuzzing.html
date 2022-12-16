@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.pypy.org/posts/2022/12/jit-bug-finding-smt-fuzzing.html">Original</a>
+    <h1>Finding JIT Optimizer Bugs using SMT Solvers and Fuzzing</h1>
+    
+    <div id="readability-page-1" class="page"><div itemprop="articleBody text">
+      <p>In this blog post I want to describe a recent bug finding technique that I&#39;ve
+added to the PyPy JIT testing infrastructure. This technique uses the Z3
+theorem prover to find bugs in the optimizer of PyPy&#39;s JIT, in particular its
+integer operation optimizations. The approach is
+based on things I have learned from <a href="https://www.cs.utah.edu/~regehr/">John Regehr&#39;s</a> <a href="https://blog.regehr.org/">blog</a> (<a href="https://blog.regehr.org/archives/1122">this post</a> is a
+good first one to read), <a href="https://twitter.com/johnregehr/">Twitter</a>, and on
+his (et al) paper <a href="https://www.cs.utah.edu/~regehr/alive2-pldi21.pdf">Alive2: Bounded Translation Validation for LLVM</a>. The work
+was triggered by a recent miscompilation bug my current bachelor student Nico
+Rittinghaus found.</p>
+<section id="background-python-integers-in-the-pypy-jit"><h2>Background: Python Integers in the PyPy JIT<a href="#background-python-integers-in-the-pypy-jit" title="Permalink to this heading">¶</a></h2>
+<p>The optimizer of PyPy&#39;s JITs operates on traces, which are linear sequences of
+instructions with guards. The instructions in the traces operate on different
+machine-level data types, machine integers, doubles, pointers, bools, etc. In
+this post we&#39;ll be mostly concerned with machine integers.</p>
+<p>To given some wider context I&#39;ll explain a bit how Python ints in the user code
+relate to the types that are used in traces when the PyPy Python implementation
+is used.
+When PyPy turns a regular Python 3 function into a trace, there is a lot of work
+happening in the JIT frontend to try to observe and infer the types that the
+Python function concretely uses at runtime. The traces are generated under these
+typing assumptions. Therefore, code that uses <code>ints</code> in the Python code can
+typically be translated into traces that operate on machine integers. In order
+to make sure that the Python integer semantics are upheld, many of the
+operations in the traces need to check that the integer results of some
+operations still fit into a machine integer. If that is not the case (a rare
+situation for most programs), the trace is left via a guard, execution falls
+back to the interpreter, and there a big integer representation is chosen for
+the too big value (the big integer representation is done via a pointer and
+some storage on the heap).</p>
+<p>All of this machinery is not going to be too relevant for the rest of the
+post. For the post it&#39;s important to know that trace instructions operate on
+machine integers and other low-level types, and some of the operations can
+optionally check whether the
+results still fit into a machine integer. These trace operations are improved by
+the optimizer, which tries to transform the trace into one that behaves the
+same, but is less costly to execute.</p>
+</section><section id="background-bounds-analysis-in-pypy-s-jit"><h2>Background: Bounds Analysis in PyPy&#39;s JIT<a href="#background-bounds-analysis-in-pypy-s-jit" title="Permalink to this heading">¶</a></h2>
+<p>The optimizer of PyPy&#39;s JIT has an analysis based on <a href="https://en.wikipedia.org/wiki/Abstract_interpretation">abstract interpretation</a>
+that tries to find out whether the integer values stored in a variable are
+actually not using the full 64 bit (or 32 bit) range, but instead fit into some
+smaller range. This means that for every integer variable <code>x</code> in a trace, the
+JIT compiler tracks upper and lower bounds of the runtime value of that
+variable: a range <code>[a, b]</code> such that for every concrete runtime value <code>v</code>
+that gets stored in variable <code>x</code>, <code>a &lt;= v &lt;= b</code> must be true.
+<code>a</code> and <code>b</code> start out
+as the most general <code>MININT</code> and <code>MAXINT</code>, but sometimes there is extra
+information that makes it possible to improve these known bounds, and that is
+often useful to optimize the code.</p>
+<p>A typical example is that the JIT knows that the length of a string is
+non-negative, so for this kind of code: <code>x = len(s)</code> where <code>s</code> is a string,
+<code>x</code> gets a range <code>[0, MAXINT]</code> assigned. With this information we could for
+example remove a check <code>x + 10 &lt; 0</code> completely, because it can never be true.</p>
+<p>The bounds information is useful for optimization, but the analysis of the
+bounds is also a source of bugs in the JIT, because the reasoning is often
+subtle and easy to get wrong in corner cases. We already use a number of testing
+techniques to try to make sure that it is correct. A simple one is
+<a href="https://hypothesis.works/articles/what-is-property-based-testing/">property-based testing</a> using <a href="https://github.com/HypothesisWorks/hypothesis">Hypothesis</a> on the operations on bounds. Even
+though Hypothesis is fantastic, it unfortunately does not catch
+absolutely all the bugs even if we&#39;d like it too, as we&#39;ll see in the next
+section.</p>
+</section><section id="motivation-a-jit-miscompilation"><h2>Motivation: A JIT Miscompilation<a href="#motivation-a-jit-miscompilation" title="Permalink to this heading">¶</a></h2>
+<p>I am currently supervising a Bachelor thesis by Nico Rittinghaus, who is
+extending the integer analysis in the JIT. He&#39;ll probably write a separate blog
+post about that soon. In the process of his work, the current bounds analysis
+code got a lot of scrutiny, and we found out that one of the unit tests of the
+bounds analysis was actually incorrect, and the example code in that unit test
+was optimized incorrectly. This case of incorrect optimization is not a big deal
+for regular Python code, because it involved a &#34;wrapping integer addition
+operation&#34;, i.e. one where overflowing results just wrap around to negative
+values. All the additions and other arithmetic operations that the PyPy Python
+frontend generates actually have
+overflow checks (to be able to switch to a big integer representation if
+needed).
+However, it&#39;s still possible to trigger the problem with the
+<code>__pypy__.intop.int_add</code> API which is a function that exposes wraparound
+arithmetic on Python ints.</p>
+<p><a href="https://foss.heptapod.net/pypy/pypy/-/issues/3832">Here&#39;s the miscompilation</a>. The JIT optimizes the following function:</p>
+<div><pre><a id="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-1" name="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_b5de8c4a7d8f419dbae0f617bea5195d-1"></a><span>import</span> <span>__pypy__</span>
+<a id="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-2" name="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_b5de8c4a7d8f419dbae0f617bea5195d-2"></a>
+<a id="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-3" name="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_b5de8c4a7d8f419dbae0f617bea5195d-3"></a><span>def</span> <span>wrong</span><span>(</span><span>x</span><span>):</span>
+<a id="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-4" name="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_b5de8c4a7d8f419dbae0f617bea5195d-4"></a>    <span>a</span> <span>=</span> <span>__pypy__</span><span>.</span><span>intop</span><span>.</span><span>int_add</span><span>(</span><span>x</span><span>,</span> <span>10</span><span>)</span>
+<a id="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-5" name="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_b5de8c4a7d8f419dbae0f617bea5195d-5"></a>    <span>if</span> <span>a</span> <span>&lt;</span> <span>15</span><span>:</span>
+<a id="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-6" name="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_b5de8c4a7d8f419dbae0f617bea5195d-6"></a>        <span>if</span> <span>x</span> <span>&lt;</span> <span>6</span><span>:</span>
+<a id="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-7" name="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_b5de8c4a7d8f419dbae0f617bea5195d-7"></a>            <span>return</span> <span>0</span>
+<a id="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-8" name="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-8" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_b5de8c4a7d8f419dbae0f617bea5195d-8"></a>        <span>return</span> <span>1</span>
+<a id="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-9" name="rest_code_b5de8c4a7d8f419dbae0f617bea5195d-9" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_b5de8c4a7d8f419dbae0f617bea5195d-9"></a>    <span>return</span> <span>2</span>
+</pre></div>
+<p>Into the following code:</p>
+<div><pre><a id="rest_code_8ff2c34bdae148fba5a49350e6dfa868-1" name="rest_code_8ff2c34bdae148fba5a49350e6dfa868-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_8ff2c34bdae148fba5a49350e6dfa868-1"></a><span>import</span> <span>__pypy__</span>
+<a id="rest_code_8ff2c34bdae148fba5a49350e6dfa868-2" name="rest_code_8ff2c34bdae148fba5a49350e6dfa868-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_8ff2c34bdae148fba5a49350e6dfa868-2"></a>
+<a id="rest_code_8ff2c34bdae148fba5a49350e6dfa868-3" name="rest_code_8ff2c34bdae148fba5a49350e6dfa868-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_8ff2c34bdae148fba5a49350e6dfa868-3"></a><span>def</span> <span>wrong</span><span>(</span><span>x</span><span>):</span>
+<a id="rest_code_8ff2c34bdae148fba5a49350e6dfa868-4" name="rest_code_8ff2c34bdae148fba5a49350e6dfa868-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_8ff2c34bdae148fba5a49350e6dfa868-4"></a>    <span>a</span> <span>=</span> <span>__pypy__</span><span>.</span><span>intop</span><span>.</span><span>int_add</span><span>(</span><span>x</span><span>,</span> <span>10</span><span>)</span>
+<a id="rest_code_8ff2c34bdae148fba5a49350e6dfa868-5" name="rest_code_8ff2c34bdae148fba5a49350e6dfa868-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_8ff2c34bdae148fba5a49350e6dfa868-5"></a>    <span>if</span> <span>a</span> <span>&lt;</span> <span>15</span><span>:</span>
+<a id="rest_code_8ff2c34bdae148fba5a49350e6dfa868-6" name="rest_code_8ff2c34bdae148fba5a49350e6dfa868-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_8ff2c34bdae148fba5a49350e6dfa868-6"></a>        <span>return</span> <span>0</span>
+<a id="rest_code_8ff2c34bdae148fba5a49350e6dfa868-7" name="rest_code_8ff2c34bdae148fba5a49350e6dfa868-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_8ff2c34bdae148fba5a49350e6dfa868-7"></a>    <span>return</span> <span>2</span>
+</pre></div>
+<p>Basically the faulty reasoning of the JIT looks like this: if <code>int_add(x, 10) &lt; 15</code>
+then it must follow that <code>x &lt; 5</code>, which is stronger than <code>x &lt; 6</code>, so the
+second <code>if</code> is always true. This sounds good, but is actually wrong
+if the addition <code>+ 10</code> wrapped around. So if <code>x == MAXINT</code>, then
+<code>int_add(x, 10) == MININT + 9 &lt; 15</code>. But <code>MAXINT &lt; 5</code> is not
+correct.</p>
+<p>Note how the same reasoning with overflow-checking addition is correct! If <code>x +
+10 &lt; 15</code> and the <code>+</code> didn&#39;t overflow, then indeed <code>x &lt; 6</code>. And if your
+mind bends starting to think about all this, you understand some of the
+difficulty of getting the JIT correct in this area.</p>
+</section><section id="how-could-we-have-avoided-this-bug"><h2>How could we have avoided this bug?<a href="#how-could-we-have-avoided-this-bug" title="Permalink to this heading">¶</a></h2>
+<p>One <a href="https://twitter.com/cfbolz/status/1482649144099586051">exercise I try to do after finding bugs</a> is to reflect on ways that the
+bug could have been avoided. I think this is particularly important in the JIT,
+where bugs are potentially really annoying to find and can cause very strange
+behaviour in basically arbitrary Python code.</p>
+<p>It&#39;s easy to always answer this question with &#34;try to think more carefully
+when working&#34;, but that approach cannot be relied on in complicated situations,
+because humans don&#39;t concentrate perfectly for long stretches of time.</p>
+<p>A situation-specific problem I identified was the bad design of the range analysis API.
+A range is not just represented by two numbers, instead it&#39;s two numbers
+and two bools that are supposed to represent that some operation did or did not
+underflow/overflow. The meaning of these bools was quite hard to grasp and easy
+to get wrong, so probably they should never have been introduced in the first
+place (and my bugfix indeed removed them).</p>
+<p>But in the rest of this blog post I want to talk about another, systematic
+approach that can be applied to the problem of mis-optimizations of integer
+operations, and that is done by applying an SMT solver to the problem.</p>
+<p>An SMT solver (<a href="https://en.wikipedia.org/wiki/Satisfiability_modulo_theories">Satisfyability Modulo Theories</a>) is a tool that can be used to
+find out whether mathematical formulas are &#34;satisfiable&#34;, i.e. whether
+some chosen set of inputs exists that will make the formulas evaluate to true. SMT solvers are
+commonly used in a wide range of CS applications including program correctness
+proofs, program synthesis, etc. The most widely known one is probably <a href="https://github.com/Z3Prover">Z3</a> by
+Microsoft Research which has the nice advantage of coming with an easy-to-use
+Python binding.</p>
+<p>Going into this I basically knew next to nothing about SMT solvers (despite
+having been embedded in a formal methods research group for years!) so it was an
+interesting new world to learn about.</p>
+<p>As briefly mentioned in the introduction, the approach I took followed a similar
+(but <em>much</em> more properly executed) one applied to LLVM operations, called
+<a href="https://github.com/AliveToolkit/alive2/">Alive2</a>. Krister Waldfridsson has done <a href="https://kristerw.github.io/2022/09/13/translation-validation/">similar work for GCC recently</a>,
+described on his blog.</p>
+</section><section id="z3-proof-of-concept"><h2>Z3 Proof of Concept<a href="#z3-proof-of-concept" title="Permalink to this heading">¶</a></h2>
+<p>The first thing I did was to try to get Z3 find the above bug, by encoding the
+input program into an SMT formula by hand and trying to get Z3 to prove the condition
+that the JIT thinks is always true. The Z3 code for this looks as follows:</p>
+<div><pre><a id="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-1" name="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_d18fc4f68adb4cb297e6abc8b342ff25-1"></a><span>from</span> <span>z3</span> <span>import</span> <span>BitVec</span><span>,</span> <span>Implies</span><span>,</span> <span>prove</span>
+<a id="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-2" name="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_d18fc4f68adb4cb297e6abc8b342ff25-2"></a><span>x</span> <span>=</span> <span>BitVec</span><span>(</span><span>&#39;x&#39;</span><span>,</span> <span>64</span><span>)</span>
+<a id="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-3" name="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_d18fc4f68adb4cb297e6abc8b342ff25-3"></a><span>a</span> <span>=</span> <span>x</span> <span>+</span> <span>10</span>
+<a id="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-4" name="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_d18fc4f68adb4cb297e6abc8b342ff25-4"></a><span>cond1</span> <span>=</span> <span>a</span> <span>&lt;</span> <span>15</span>
+<a id="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-5" name="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_d18fc4f68adb4cb297e6abc8b342ff25-5"></a><span>cond2</span> <span>=</span> <span>x</span> <span>&lt;</span> <span>6</span>
+<a id="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-6" name="rest_code_d18fc4f68adb4cb297e6abc8b342ff25-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_d18fc4f68adb4cb297e6abc8b342ff25-6"></a><span>prove</span><span>(</span><span>Implies</span><span>(</span><span>cond1</span><span>,</span> <span>cond2</span><span>))</span>
+</pre></div>
+<p>Here, <code>x</code> is defined to be a bit vector variable of width 64, which is a
+datatype that can be used to represent bounded machine integers. Addition on
+bit vectors performs wraparound arithmetic, like the <code>__pypy__.intop.int_add</code>
+call in the original code. The JIT optimized the second condition away, so
+essentially it was convinced that the first condition implies the second one.
+The above snippet tries to get Z3 to confirm this.</p>
+<p>When run, the above program prints:</p>
+<pre>counterexample
+[x = 9223372036854775803]</pre>
+<p>Which shows the bug. As a small side-note, I thought it was cool that the
+process of &#34;proving&#34; something in Z3 basically means trying to find an example
+for the negation of the formula. If no counterexample can be found for the
+negation, the original formula is true. If the original formula turns out to be
+false (like here) we get a nice example that shows the problem to go with it.</p>
+<p>It&#39;s not realistic to hand-translate all the hundreds of
+unit-tests into Z3 formulas and then ask Z3 to prove the optimizations. Instead,
+we want to have a program that does this for us.</p>
+</section><section id="smt-checking-of-the-jit-optimizer"><h2>SMT Checking of the JIT Optimizer<a href="#smt-checking-of-the-jit-optimizer" title="Permalink to this heading">¶</a></h2>
+<p>What we want from this program is the following: given an unoptimized trace and
+its optimized version, we want to use Z3 to check whether the optimized trace
+behaves identically to the unoptimized one. One question is what &#34;behaves
+identically&#34; means. What we care about is the outputs of the trace being the
+same values, no matter how they are computed. Also, for every guard we want to
+make sure that it fails in identical ways in the optimized and unoptimized
+versions. A guard is only allowed to be optimized away if it can never fail.
+The code that comes after a guard can assume that the guard has not failed,
+because otherwise execution would have left the trace. All of this should be
+true regardless for the values of the input variables of the trace.</p>
+<p>So in order to check that the two traces are behaving identically, we do the
+following:</p>
+<ul>
+<li><p>We create Z3 variables for every input variable. We use the same input
+variables both for the unoptimized as well as the optimized trace.</p></li>
+<li><p>We align the two traces at the corresponding guards. Thankfully the optimizer
+keeps track of which optimized guard corresponds to which unoptimized input
+guard.</p></li>
+<li><p>All the operations before a guard are translated into Z3 formulas, for both
+versions of the trace.</p></li>
+<li><p>For two corresponding guards, we ask Z3 to prove that the guard conditions are
+identical.</p></li>
+<li><p>For a guard that was optimized away we ask Z3 to prove that the condition is
+always true.</p></li>
+<li><p>After a guard, we tell Z3 that from now on it can assume that the guard
+condition is true.</p></li>
+<li><p>We repeat this, guard for guard, until we reach the end of the trace. There,
+we ask Z3 to prove that the output variables in the unoptimized trace and the
+optimized trace are identical (every trace can return one or many values).</p></li>
+</ul>
+<p>I implemented this, it&#39;s <a href="https://foss.heptapod.net/pypy/pypy/-/blob/branch/default/rpython/jit/metainterp/optimizeopt/test/test_z3checktests.py">not a lot of code</a>, basically a couple of hundred lines
+of (somewhat hacky) Python code. So far I only support integer
+operations. Here are some parts of the code to give you a flavor of what this
+looks like.</p>
+<p>This is the code that translates operations into Z3 formulas:</p>
+<div><pre><a id="rest_code_800f3b929d94477cb13c69538f229023-1" name="rest_code_800f3b929d94477cb13c69538f229023-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-1"></a><span>def</span> <span>add_to_solver</span><span>(</span><span>self</span><span>,</span> <span>ops</span><span>,</span> <span>state</span><span>):</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-2" name="rest_code_800f3b929d94477cb13c69538f229023-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-2"></a>    <span>for</span> <span>op</span> <span>in</span> <span>ops</span><span>:</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-3" name="rest_code_800f3b929d94477cb13c69538f229023-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-3"></a>        <span>if</span> <span>op</span><span>.</span><span>type</span> <span>!=</span> <span>&#39;v&#39;</span><span>:</span> <span># is it an operation with a result</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-4" name="rest_code_800f3b929d94477cb13c69538f229023-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-4"></a>            <span>res</span> <span>=</span> <span>self</span><span>.</span><span>newvar</span><span>(</span><span>op</span><span>)</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-5" name="rest_code_800f3b929d94477cb13c69538f229023-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-5"></a>        <span>else</span><span>:</span> <span># or does it return void</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-6" name="rest_code_800f3b929d94477cb13c69538f229023-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-6"></a>            <span>res</span> <span>=</span> <span>None</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-7" name="rest_code_800f3b929d94477cb13c69538f229023-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-7"></a>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-8" name="rest_code_800f3b929d94477cb13c69538f229023-8" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-8"></a>       <span># ...</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-9" name="rest_code_800f3b929d94477cb13c69538f229023-9" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-9"></a>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-10" name="rest_code_800f3b929d94477cb13c69538f229023-10" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-10"></a>        <span># convert arguments</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-11" name="rest_code_800f3b929d94477cb13c69538f229023-11" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-11"></a>        <span>if</span> <span>op</span><span>.</span><span>numargs</span><span>()</span> <span>==</span> <span>1</span><span>:</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-12" name="rest_code_800f3b929d94477cb13c69538f229023-12" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-12"></a>            <span>arg0</span> <span>=</span> <span>self</span><span>.</span><span>convertarg</span><span>(</span><span>op</span><span>,</span> <span>0</span><span>)</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-13" name="rest_code_800f3b929d94477cb13c69538f229023-13" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-13"></a>        <span>elif</span> <span>op</span><span>.</span><span>numargs</span><span>()</span> <span>==</span> <span>2</span><span>:</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-14" name="rest_code_800f3b929d94477cb13c69538f229023-14" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-14"></a>            <span>arg0</span> <span>=</span> <span>self</span><span>.</span><span>convertarg</span><span>(</span><span>op</span><span>,</span> <span>0</span><span>)</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-15" name="rest_code_800f3b929d94477cb13c69538f229023-15" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-15"></a>            <span>arg1</span> <span>=</span> <span>self</span><span>.</span><span>convertarg</span><span>(</span><span>op</span><span>,</span> <span>1</span><span>)</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-16" name="rest_code_800f3b929d94477cb13c69538f229023-16" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-16"></a>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-17" name="rest_code_800f3b929d94477cb13c69538f229023-17" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-17"></a>        <span># compute results</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-18" name="rest_code_800f3b929d94477cb13c69538f229023-18" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-18"></a>        <span>if</span> <span>opname</span> <span>==</span> <span>&#34;int_add&#34;</span><span>:</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-19" name="rest_code_800f3b929d94477cb13c69538f229023-19" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-19"></a>            <span>expr</span> <span>=</span> <span>arg0</span> <span>+</span> <span>arg1</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-20" name="rest_code_800f3b929d94477cb13c69538f229023-20" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-20"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_sub&#34;</span><span>:</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-21" name="rest_code_800f3b929d94477cb13c69538f229023-21" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-21"></a>            <span>expr</span> <span>=</span> <span>arg0</span> <span>-</span> <span>arg1</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-22" name="rest_code_800f3b929d94477cb13c69538f229023-22" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-22"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_mul&#34;</span><span>:</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-23" name="rest_code_800f3b929d94477cb13c69538f229023-23" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-23"></a>            <span>expr</span> <span>=</span> <span>arg0</span> <span>*</span> <span>arg1</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-24" name="rest_code_800f3b929d94477cb13c69538f229023-24" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-24"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_and&#34;</span><span>:</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-25" name="rest_code_800f3b929d94477cb13c69538f229023-25" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-25"></a>            <span>expr</span> <span>=</span> <span>arg0</span> <span>&amp;</span> <span>arg1</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-26" name="rest_code_800f3b929d94477cb13c69538f229023-26" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-26"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_or&#34;</span><span>:</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-27" name="rest_code_800f3b929d94477cb13c69538f229023-27" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-27"></a>            <span>expr</span> <span>=</span> <span>arg0</span> <span>|</span> <span>arg1</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-28" name="rest_code_800f3b929d94477cb13c69538f229023-28" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-28"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_xor&#34;</span><span>:</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-29" name="rest_code_800f3b929d94477cb13c69538f229023-29" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-29"></a>            <span>expr</span> <span>=</span> <span>arg0</span> <span>^</span> <span>arg1</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-30" name="rest_code_800f3b929d94477cb13c69538f229023-30" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-30"></a>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-31" name="rest_code_800f3b929d94477cb13c69538f229023-31" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-31"></a>        <span># ...  more operations, some shown below</span>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-32" name="rest_code_800f3b929d94477cb13c69538f229023-32" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-32"></a>
+<a id="rest_code_800f3b929d94477cb13c69538f229023-33" name="rest_code_800f3b929d94477cb13c69538f229023-33" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_800f3b929d94477cb13c69538f229023-33"></a>        <span>self</span><span>.</span><span>solver</span><span>.</span><span>add</span><span>(</span><span>res</span> <span>==</span> <span>expr</span><span>)</span>
+</pre></div>
+<p>New Z3 variables are defined by the helper function <code>newvar</code>, which adds the
+operation to a dictionary <code>box_to_z3</code> mapping boxes (=variables) to Z3
+variables. Due to the <a href="https://en.wikipedia.org/wiki/Static_single-assignment_form">SSA</a> property that traces have, a variable must be defined
+before its first use.</p>
+<p>Here&#39;s what <code>newvar</code> looks like (<code>LONG_BIT</code> is a constant that is either
+<code>64</code> or <code>32</code>, depending on the target architecture):</p>
+<div><pre><a id="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-1" name="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-1"></a><span>def</span> <span>newvar</span><span>(</span><span>self</span><span>,</span> <span>box</span><span>,</span> <span>repr</span><span>=</span><span>None</span><span>):</span>
+<a id="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-2" name="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-2"></a>    <span># ... some logic around making the string representation</span>
+<a id="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-3" name="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-3"></a>    <span># somewhat nicer omitted</span>
+<a id="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-4" name="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-4"></a>    <span>result</span> <span>=</span> <span>z3</span><span>.</span><span>BitVec</span><span>(</span><span>repr</span><span>,</span> <span>LONG_BIT</span><span>)</span>
+<a id="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-5" name="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-5"></a>    <span>self</span><span>.</span><span>box_to_z3</span><span>[</span><span>box</span><span>]</span> <span>=</span> <span>result</span>
+<a id="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-6" name="rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_32f4aa1c12dd4eee86b38bb0a9101ada-6"></a>    <span>return</span> <span>result</span>
+</pre></div>
+<p>The <code>convert</code> method turns an operation argument (either a constant or a
+variable) into a Z3 formula (either a constant bit vector or an already defined
+Z3 variable). <code>convertarg</code> is a helper function that takes an operation, reads
+its nth argument and converts it.</p>
+<div><pre><a id="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-1" name="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_a60787e8f1db4f3b8eb21d6e936e3033-1"></a><span>def</span> <span>convert</span><span>(</span><span>self</span><span>,</span> <span>box</span><span>):</span>
+<a id="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-2" name="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_a60787e8f1db4f3b8eb21d6e936e3033-2"></a>    <span>if</span> <span>isinstance</span><span>(</span><span>box</span><span>,</span> <span>ConstInt</span><span>):</span>
+<a id="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-3" name="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_a60787e8f1db4f3b8eb21d6e936e3033-3"></a>        <span>return</span> <span>z3</span><span>.</span><span>BitVecVal</span><span>(</span><span>box</span><span>.</span><span>getint</span><span>(),</span> <span>LONG_BIT</span><span>)</span>
+<a id="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-4" name="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_a60787e8f1db4f3b8eb21d6e936e3033-4"></a>    <span>return</span> <span>self</span><span>.</span><span>box_to_z3</span><span>[</span><span>box</span><span>]</span>
+<a id="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-5" name="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_a60787e8f1db4f3b8eb21d6e936e3033-5"></a>
+<a id="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-6" name="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_a60787e8f1db4f3b8eb21d6e936e3033-6"></a><span>def</span> <span>convertarg</span><span>(</span><span>self</span><span>,</span> <span>box</span><span>,</span> <span>arg</span><span>):</span>
+<a id="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-7" name="rest_code_a60787e8f1db4f3b8eb21d6e936e3033-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_a60787e8f1db4f3b8eb21d6e936e3033-7"></a>    <span>return</span> <span>self</span><span>.</span><span>convert</span><span>(</span><span>box</span><span>.</span><span>getarg</span><span>(</span><span>arg</span><span>))</span>
+</pre></div>
+<p>The lookup of variables in <code>box_to_z3</code> that <code>convert</code> does cannot fail,
+because the variable must have been defined before use.</p>
+<p>Comparisons return the bit vector 0 or bit vector 1, we use a helper function
+<code>cond</code> to turn the Z3 truth value of the comparison into a bit vector:</p>
+<div><pre><a id="rest_code_680dce1729b24d529982785ca1676ca1-1" name="rest_code_680dce1729b24d529982785ca1676ca1-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-1"></a><span>def</span> <span>cond</span><span>(</span><span>self</span><span>,</span> <span>z3expr</span><span>):</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-2" name="rest_code_680dce1729b24d529982785ca1676ca1-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-2"></a>    <span>return</span> <span>z3</span><span>.</span><span>If</span><span>(</span><span>z3expr</span><span>,</span> <span>TRUEBV</span><span>,</span> <span>FALSEBV</span><span>)</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-3" name="rest_code_680dce1729b24d529982785ca1676ca1-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-3"></a>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-4" name="rest_code_680dce1729b24d529982785ca1676ca1-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-4"></a>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-5" name="rest_code_680dce1729b24d529982785ca1676ca1-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-5"></a><span>def</span> <span>add_to_solver</span><span>(</span><span>self</span><span>,</span> <span>ops</span><span>,</span> <span>state</span><span>):</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-6" name="rest_code_680dce1729b24d529982785ca1676ca1-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-6"></a>        <span># ... start as above</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-7" name="rest_code_680dce1729b24d529982785ca1676ca1-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-7"></a>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-8" name="rest_code_680dce1729b24d529982785ca1676ca1-8" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-8"></a>        <span># more cases</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-9" name="rest_code_680dce1729b24d529982785ca1676ca1-9" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-9"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_eq&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-10" name="rest_code_680dce1729b24d529982785ca1676ca1-10" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-10"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>arg0</span> <span>==</span> <span>arg1</span><span>)</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-11" name="rest_code_680dce1729b24d529982785ca1676ca1-11" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-11"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_ne&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-12" name="rest_code_680dce1729b24d529982785ca1676ca1-12" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-12"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>arg0</span> <span>!=</span> <span>arg1</span><span>)</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-13" name="rest_code_680dce1729b24d529982785ca1676ca1-13" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-13"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_lt&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-14" name="rest_code_680dce1729b24d529982785ca1676ca1-14" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-14"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>arg0</span> <span>&lt;</span> <span>arg1</span><span>)</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-15" name="rest_code_680dce1729b24d529982785ca1676ca1-15" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-15"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_le&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-16" name="rest_code_680dce1729b24d529982785ca1676ca1-16" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-16"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>arg0</span> <span>&lt;=</span> <span>arg1</span><span>)</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-17" name="rest_code_680dce1729b24d529982785ca1676ca1-17" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-17"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_gt&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-18" name="rest_code_680dce1729b24d529982785ca1676ca1-18" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-18"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>arg0</span> <span>&gt;</span> <span>arg1</span><span>)</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-19" name="rest_code_680dce1729b24d529982785ca1676ca1-19" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-19"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_ge&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-20" name="rest_code_680dce1729b24d529982785ca1676ca1-20" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-20"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>arg0</span> <span>&gt;=</span> <span>arg1</span><span>)</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-21" name="rest_code_680dce1729b24d529982785ca1676ca1-21" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-21"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_is_true&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-22" name="rest_code_680dce1729b24d529982785ca1676ca1-22" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-22"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>arg0</span> <span>!=</span> <span>FALSEBV</span><span>)</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-23" name="rest_code_680dce1729b24d529982785ca1676ca1-23" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-23"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;uint_lt&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-24" name="rest_code_680dce1729b24d529982785ca1676ca1-24" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-24"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>z3</span><span>.</span><span>ULT</span><span>(</span><span>arg0</span><span>,</span> <span>arg1</span><span>))</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-25" name="rest_code_680dce1729b24d529982785ca1676ca1-25" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-25"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;uint_le&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-26" name="rest_code_680dce1729b24d529982785ca1676ca1-26" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-26"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>z3</span><span>.</span><span>ULE</span><span>(</span><span>arg0</span><span>,</span> <span>arg1</span><span>))</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-27" name="rest_code_680dce1729b24d529982785ca1676ca1-27" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-27"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;uint_gt&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-28" name="rest_code_680dce1729b24d529982785ca1676ca1-28" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-28"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>z3</span><span>.</span><span>UGT</span><span>(</span><span>arg0</span><span>,</span> <span>arg1</span><span>))</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-29" name="rest_code_680dce1729b24d529982785ca1676ca1-29" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-29"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;uint_ge&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-30" name="rest_code_680dce1729b24d529982785ca1676ca1-30" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-30"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>z3</span><span>.</span><span>UGE</span><span>(</span><span>arg0</span><span>,</span> <span>arg1</span><span>))</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-31" name="rest_code_680dce1729b24d529982785ca1676ca1-31" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-31"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_is_zero&#34;</span><span>:</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-32" name="rest_code_680dce1729b24d529982785ca1676ca1-32" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-32"></a>            <span>expr</span> <span>=</span> <span>self</span><span>.</span><span>cond</span><span>(</span><span>arg0</span> <span>==</span> <span>FALSEBV</span><span>)</span>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-33" name="rest_code_680dce1729b24d529982785ca1676ca1-33" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-33"></a>
+<a id="rest_code_680dce1729b24d529982785ca1676ca1-34" name="rest_code_680dce1729b24d529982785ca1676ca1-34" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_680dce1729b24d529982785ca1676ca1-34"></a>        <span># ... rest as above</span>
+</pre></div>
+<p>So basically for every trace operation that operates on integers I had to give a
+translation into Z3 formulas, which is mostly straightforward.</p>
+<p>Guard operations get converted into a Z3 boolean by their own helper function,
+which looks like this:</p>
+<div><pre><a id="rest_code_3f8bba465983413dabf4327dc90b57c5-1" name="rest_code_3f8bba465983413dabf4327dc90b57c5-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-1"></a><span>def</span> <span>guard_to_condition</span><span>(</span><span>self</span><span>,</span> <span>guard</span><span>,</span> <span>state</span><span>):</span>
+<a id="rest_code_3f8bba465983413dabf4327dc90b57c5-2" name="rest_code_3f8bba465983413dabf4327dc90b57c5-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-2"></a>    <span>opname</span> <span>=</span> <span>guard</span><span>.</span><span>getopname</span><span>()</span>
+<a id="rest_code_3f8bba465983413dabf4327dc90b57c5-3" name="rest_code_3f8bba465983413dabf4327dc90b57c5-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-3"></a>    <span>if</span> <span>opname</span> <span>==</span> <span>&#34;guard_true&#34;</span><span>:</span>
+<a id="rest_code_3f8bba465983413dabf4327dc90b57c5-4" name="rest_code_3f8bba465983413dabf4327dc90b57c5-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-4"></a>        <span>return</span> <span>self</span><span>.</span><span>convertarg</span><span>(</span><span>guard</span><span>,</span> <span>0</span><span>)</span> <span>==</span> <span>TRUEBV</span>
+<a id="rest_code_3f8bba465983413dabf4327dc90b57c5-5" name="rest_code_3f8bba465983413dabf4327dc90b57c5-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-5"></a>    <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;guard_false&#34;</span><span>:</span>
+<a id="rest_code_3f8bba465983413dabf4327dc90b57c5-6" name="rest_code_3f8bba465983413dabf4327dc90b57c5-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-6"></a>        <span>return</span> <span>self</span><span>.</span><span>convertarg</span><span>(</span><span>guard</span><span>,</span> <span>0</span><span>)</span> <span>==</span> <span>FALSEBV</span>
+<a id="rest_code_3f8bba465983413dabf4327dc90b57c5-7" name="rest_code_3f8bba465983413dabf4327dc90b57c5-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-7"></a>    <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;guard_value&#34;</span><span>:</span>
+<a id="rest_code_3f8bba465983413dabf4327dc90b57c5-8" name="rest_code_3f8bba465983413dabf4327dc90b57c5-8" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-8"></a>        <span>return</span> <span>self</span><span>.</span><span>convertarg</span><span>(</span><span>guard</span><span>,</span> <span>0</span><span>)</span> <span>==</span> <span>self</span><span>.</span><span>convertarg</span><span>(</span><span>guard</span><span>,</span> <span>1</span><span>)</span>
+<a id="rest_code_3f8bba465983413dabf4327dc90b57c5-9" name="rest_code_3f8bba465983413dabf4327dc90b57c5-9" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-9"></a>
+<a id="rest_code_3f8bba465983413dabf4327dc90b57c5-10" name="rest_code_3f8bba465983413dabf4327dc90b57c5-10" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_3f8bba465983413dabf4327dc90b57c5-10"></a>    <span># ... some more exist, shown below</span>
+</pre></div>
+<p>Some operations are a bit trickier. An important example in the context of
+this blog post are integer operations that check for overflow. The overflow
+operations return a result, but also a boolean whether the operation overflowed
+or not.</p>
+<div><pre><a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-1" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-1"></a><span>def</span> <span>add_to_solver</span><span>(</span><span>self</span><span>,</span> <span>ops</span><span>,</span> <span>state</span><span>):</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-2" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-2"></a>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-3" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-3"></a>        <span># ... more cases</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-4" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-4"></a>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-5" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-5"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_add_ovf&#34;</span><span>:</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-6" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-6"></a>            <span>expr</span> <span>=</span> <span>arg0</span> <span>+</span> <span>arg1</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-7" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-7"></a>            <span>m</span> <span>=</span> <span>z3</span><span>.</span><span>SignExt</span><span>(</span><span>LONG_BIT</span><span>,</span> <span>arg0</span><span>)</span> <span>+</span> <span>z3</span><span>.</span><span>SignExt</span><span>(</span><span>LONG_BIT</span><span>,</span> <span>arg1</span><span>)</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-8" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-8" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-8"></a>            <span>state</span><span>.</span><span>no_ovf</span> <span>=</span> <span>m</span> <span>==</span> <span>z3</span><span>.</span><span>SignExt</span><span>(</span><span>LONG_BIT</span><span>,</span> <span>expr</span><span>)</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-9" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-9" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-9"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_sub_ovf&#34;</span><span>:</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-10" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-10" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-10"></a>            <span>expr</span> <span>=</span> <span>arg0</span> <span>-</span> <span>arg1</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-11" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-11" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-11"></a>            <span>m</span> <span>=</span> <span>z3</span><span>.</span><span>SignExt</span><span>(</span><span>LONG_BIT</span><span>,</span> <span>arg0</span><span>)</span> <span>-</span> <span>z3</span><span>.</span><span>SignExt</span><span>(</span><span>LONG_BIT</span><span>,</span> <span>arg1</span><span>)</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-12" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-12" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-12"></a>            <span>state</span><span>.</span><span>no_ovf</span> <span>=</span> <span>m</span> <span>==</span> <span>z3</span><span>.</span><span>SignExt</span><span>(</span><span>LONG_BIT</span><span>,</span> <span>expr</span><span>)</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-13" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-13" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-13"></a>        <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;int_mul_ovf&#34;</span><span>:</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-14" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-14" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-14"></a>            <span>expr</span> <span>=</span> <span>arg0</span> <span>*</span> <span>arg1</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-15" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-15" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-15"></a>            <span>m</span> <span>=</span> <span>z3</span><span>.</span><span>SignExt</span><span>(</span><span>LONG_BIT</span><span>,</span> <span>arg0</span><span>)</span> <span>*</span> <span>z3</span><span>.</span><span>SignExt</span><span>(</span><span>LONG_BIT</span><span>,</span> <span>arg1</span><span>)</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-16" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-16" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-16"></a>            <span>state</span><span>.</span><span>no_ovf</span> <span>=</span> <span>m</span> <span>==</span> <span>z3</span><span>.</span><span>SignExt</span><span>(</span><span>LONG_BIT</span><span>,</span> <span>expr</span><span>)</span>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-17" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-17" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-17"></a>
+<a id="rest_code_952b1cdbabb74d5190ac1881add9b4b8-18" name="rest_code_952b1cdbabb74d5190ac1881add9b4b8-18" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_952b1cdbabb74d5190ac1881add9b4b8-18"></a>        <span># ...</span>
+</pre></div>
+<p>The boolean is computed by comparing the result of the bit vector operation with
+the result of converting the input bit vectors into an abstract (arbitrary
+precision) integer and the result back to bit vectors. Let&#39;s go through the
+addition case step by step, the other cases work analogously.</p>
+<p>The addition in the first <code>elif</code> that computes <code>expr</code> is an addition on bit
+vectors, therefore it is performing wraparound arithmetic.
+<code>z3.SignExt(LONG_BIT, arg0)</code> sign-extends <code>arg0</code> from a bit vector of
+<code>LONG_BIT</code> bits to an abstract, arbitrary precision integer. The addition in
+the second line is therefore an addition between abstract integers, so it will
+never overflow and just compute the correct result as an integer.</p>
+<p>The condition to check for overflow is now: if the results of the two different
+ways to do the addition are the same, then overflow did not occur. So in order
+to compute <code>state.no_ovf</code> in the addition case the
+code converts the result of the bit vector wraparound addition to
+an abstract integer (using <code>SignExt</code> again), and then compares that to the integer
+result.</p>
+<p>This boolean can then be checked by the guard operations <code>guard_no_overflow</code>
+and <code>guard_overflow</code>.</p>
+<div><pre><a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-1" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-1"></a><span>def</span> <span>guard_to_condition</span><span>(</span><span>self</span><span>,</span> <span>guard</span><span>,</span> <span>state</span><span>):</span>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-2" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-2"></a>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-3" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-3"></a>    <span># ... more cases</span>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-4" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-4"></a>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-5" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-5"></a>    <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;guard_no_overflow&#34;</span><span>:</span>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-6" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-6"></a>        <span>assert</span> <span>state</span><span>.</span><span>no_ovf</span> <span>is</span> <span>not</span> <span>None</span>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-7" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-7"></a>        <span>return</span> <span>state</span><span>.</span><span>no_ovf</span>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-8" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-8" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-8"></a>    <span>elif</span> <span>opname</span> <span>==</span> <span>&#34;guard_overflow&#34;</span><span>:</span>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-9" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-9" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-9"></a>        <span>assert</span> <span>state</span><span>.</span><span>no_ovf</span> <span>is</span> <span>not</span> <span>None</span>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-10" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-10" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-10"></a>        <span>return</span> <span>z3</span><span>.</span><span>Not</span><span>(</span><span>state</span><span>.</span><span>no_ovf</span><span>)</span>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-11" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-11" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-11"></a>
+<a id="rest_code_eac9e69c1f604b7c9d12d568ea008d76-12" name="rest_code_eac9e69c1f604b7c9d12d568ea008d76-12" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_eac9e69c1f604b7c9d12d568ea008d76-12"></a>    <span># ... more cases</span>
+</pre></div>
+</section><section id="finding-the-bug-again"><h2>Finding the Bug, Again<a href="#finding-the-bug-again" title="Permalink to this heading">¶</a></h2>
+<p>Let&#39;s actually make all of this more concrete by applying it to the trace of our
+original bug. The input trace and the incorrectly optimized trace for that look
+like this (differences highlighted):</p>
+<div><pre><a id="rest_code_43f6b4e60b5848afb2509b92c01eea9a-1" name="rest_code_43f6b4e60b5848afb2509b92c01eea9a-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_43f6b4e60b5848afb2509b92c01eea9a-1"></a><span># input                       # optimized</span>
+<a id="rest_code_43f6b4e60b5848afb2509b92c01eea9a-2" name="rest_code_43f6b4e60b5848afb2509b92c01eea9a-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_43f6b4e60b5848afb2509b92c01eea9a-2"></a><span>[</span><span>i0</span><span>]</span>                          <span>[</span><span>i0</span><span>]</span>
+<a id="rest_code_43f6b4e60b5848afb2509b92c01eea9a-3" name="rest_code_43f6b4e60b5848afb2509b92c01eea9a-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_43f6b4e60b5848afb2509b92c01eea9a-3"></a><span>i1</span> <span>=</span> <span>int_add</span><span>(</span><span>i0</span><span>,</span> <span>10</span><span>)</span>          <span>i1</span> <span>=</span> <span>int_add</span><span>(</span><span>i0</span><span>,</span> <span>10</span><span>)</span>
+<a id="rest_code_43f6b4e60b5848afb2509b92c01eea9a-4" name="rest_code_43f6b4e60b5848afb2509b92c01eea9a-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_43f6b4e60b5848afb2509b92c01eea9a-4"></a><span>i2</span> <span>=</span> <span>int_lt</span><span>(</span><span>i1</span><span>,</span> <span>15</span><span>)</span>           <span>i2</span> <span>=</span> <span>int_lt</span><span>(</span><span>i1</span><span>,</span> <span>15</span><span>)</span>
+<a id="rest_code_43f6b4e60b5848afb2509b92c01eea9a-5" name="rest_code_43f6b4e60b5848afb2509b92c01eea9a-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_43f6b4e60b5848afb2509b92c01eea9a-5"></a><span>guard_true</span><span>(</span><span>i2</span><span>)</span>                <span>guard_true</span><span>(</span><span>i2</span><span>)</span>
+<a id="rest_code_43f6b4e60b5848afb2509b92c01eea9a-6" name="rest_code_43f6b4e60b5848afb2509b92c01eea9a-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_43f6b4e60b5848afb2509b92c01eea9a-6"></a><span><span>i3</span> <span>=</span> <span>int_lt</span><span>(</span><span>i0</span><span>,</span> <span>6</span><span>)</span>            <span>jump</span><span>(</span><span>0</span><span>)</span>
+</span><a id="rest_code_43f6b4e60b5848afb2509b92c01eea9a-7" name="rest_code_43f6b4e60b5848afb2509b92c01eea9a-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_43f6b4e60b5848afb2509b92c01eea9a-7"></a><span><span>guard_true</span><span>(</span><span>i3</span><span>)</span>
+</span><a id="rest_code_43f6b4e60b5848afb2509b92c01eea9a-8" name="rest_code_43f6b4e60b5848afb2509b92c01eea9a-8" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_43f6b4e60b5848afb2509b92c01eea9a-8"></a><span><span>jump</span><span>(</span><span>0</span><span>)</span>
+</span></pre></div>
+<p>Note that the trace represents just one of the paths through the control flow
+graph of the original function, which is typical for tracing JITs (the other
+paths could incrementally get added later).</p>
+<p>The first guards in both these traces correspond to each other, so the first
+chunks to check are the first three operations (lines 1-4). Those operations
+don&#39;t get changed by the optimizer at all.</p>
+<p>These two identical traces get translated to the following Z3 formulas:</p>
+<div><pre><a id="rest_code_1b3788fe59e84d448429e8fac646bdde-1" name="rest_code_1b3788fe59e84d448429e8fac646bdde-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_1b3788fe59e84d448429e8fac646bdde-1"></a>i1unoptimized == input_i0 + 10
+<a id="rest_code_1b3788fe59e84d448429e8fac646bdde-2" name="rest_code_1b3788fe59e84d448429e8fac646bdde-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_1b3788fe59e84d448429e8fac646bdde-2"></a>i2unoptimized == If(i1unoptimized &lt; 15, 1, 0)
+<a id="rest_code_1b3788fe59e84d448429e8fac646bdde-3" name="rest_code_1b3788fe59e84d448429e8fac646bdde-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_1b3788fe59e84d448429e8fac646bdde-3"></a>i1optimized == input_i0 + 10
+<a id="rest_code_1b3788fe59e84d448429e8fac646bdde-4" name="rest_code_1b3788fe59e84d448429e8fac646bdde-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_1b3788fe59e84d448429e8fac646bdde-4"></a>i2optimized == If(i1optimized &lt; 15, 1, 0)
+</pre></div>
+<p>To check that the two corresponding guards are the same, the solver is asked to
+prove that <code>(i2unoptimized == 1) == (i2optimized == 1)</code>. This is
+correct, because the formulas for <code>i2unoptimized</code> and <code>i2optimized</code> are
+completely identical.</p>
+<p>After checking that the guards behave the same, we add the knowledge to the
+solver that the guards passed. So the Z3 formulas become:</p>
+<div><pre><a id="rest_code_0aef760fa2224d82821d2a219b2f3bec-1" name="rest_code_0aef760fa2224d82821d2a219b2f3bec-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_0aef760fa2224d82821d2a219b2f3bec-1"></a>i1unoptimized == input_i0 + 10
+<a id="rest_code_0aef760fa2224d82821d2a219b2f3bec-2" name="rest_code_0aef760fa2224d82821d2a219b2f3bec-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_0aef760fa2224d82821d2a219b2f3bec-2"></a>i2unoptimized == If(i1unoptimized &lt; 15, 1, 0)
+<a id="rest_code_0aef760fa2224d82821d2a219b2f3bec-3" name="rest_code_0aef760fa2224d82821d2a219b2f3bec-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_0aef760fa2224d82821d2a219b2f3bec-3"></a>i1optimized == input_i0 + 10
+<a id="rest_code_0aef760fa2224d82821d2a219b2f3bec-4" name="rest_code_0aef760fa2224d82821d2a219b2f3bec-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_0aef760fa2224d82821d2a219b2f3bec-4"></a>i2optimized == If(i1optimized &lt; 15, 1, 0)
+<a id="rest_code_0aef760fa2224d82821d2a219b2f3bec-5" name="rest_code_0aef760fa2224d82821d2a219b2f3bec-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_0aef760fa2224d82821d2a219b2f3bec-5"></a>i1optimized == 1
+<a id="rest_code_0aef760fa2224d82821d2a219b2f3bec-6" name="rest_code_0aef760fa2224d82821d2a219b2f3bec-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_0aef760fa2224d82821d2a219b2f3bec-6"></a>i2optimized == 1
+</pre></div>
+<p>Now we continue with the remaining operations of the two traces (lines 6-8).</p>
+<p>We start by adding the <code>int_lt</code> operation in the unoptimized trace to the Z3
+formulas:</p>
+<div><pre><a id="rest_code_e810d3194af14bb298715a21898628af-1" name="rest_code_e810d3194af14bb298715a21898628af-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_e810d3194af14bb298715a21898628af-1"></a>...
+<a id="rest_code_e810d3194af14bb298715a21898628af-2" name="rest_code_e810d3194af14bb298715a21898628af-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_e810d3194af14bb298715a21898628af-2"></a>i3unoptimized == If(input_i0 &lt; 6, 1, 0)
+</pre></div>
+<p>Because the second guard was optimized away, we need to ask Z3 to prove that
+<code>i3unoptimized == 1</code> is always true, which fails and gives the following
+counterexample:</p>
+<div><pre><a id="rest_code_4c68d97c81814fcfbc1892d042030e73-1" name="rest_code_4c68d97c81814fcfbc1892d042030e73-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_4c68d97c81814fcfbc1892d042030e73-1"></a>input_i0 = 9223372036854775800
+<a id="rest_code_4c68d97c81814fcfbc1892d042030e73-2" name="rest_code_4c68d97c81814fcfbc1892d042030e73-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_4c68d97c81814fcfbc1892d042030e73-2"></a>i1unoptimized = 9223372036854775810
+<a id="rest_code_4c68d97c81814fcfbc1892d042030e73-3" name="rest_code_4c68d97c81814fcfbc1892d042030e73-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_4c68d97c81814fcfbc1892d042030e73-3"></a>i2unoptimized = 0
+<a id="rest_code_4c68d97c81814fcfbc1892d042030e73-4" name="rest_code_4c68d97c81814fcfbc1892d042030e73-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_4c68d97c81814fcfbc1892d042030e73-4"></a>i1optimized = 9223372036854775810
+<a id="rest_code_4c68d97c81814fcfbc1892d042030e73-5" name="rest_code_4c68d97c81814fcfbc1892d042030e73-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_4c68d97c81814fcfbc1892d042030e73-5"></a>i2optimized = 1
+<a id="rest_code_4c68d97c81814fcfbc1892d042030e73-6" name="rest_code_4c68d97c81814fcfbc1892d042030e73-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_4c68d97c81814fcfbc1892d042030e73-6"></a>i3unoptimized = 0
+</pre></div>
+<p>Thus demonstrating the bug. The fact that the Z3-based equivalence check also
+managed to find the original motivating bug without manually translating it to
+a formula is a good confirmation that the approach works.</p>
+</section><section id="second-bug"><h2>Second bug<a href="#second-bug" title="Permalink to this heading">¶</a></h2>
+<p>So with this code I applied the Z3-based equivalence check to all our optimizer
+unit tests. In addition to the bug we&#39;ve been discussing the whole post, it also
+found another buggy test! I had found it too by hand by staring at all the tests
+in the process of writing all the Z3 infrastructure, but it was still a good
+confirmation that the process worked. This bug was in the range analysis for
+<code>int_neg</code>, integer negation. It failed to account that <code><span>-MININT</span> == MININT</code>
+and therefore did a mis-optimization along the following lines:</p>
+<div><pre><a id="rest_code_144d0aa855fa4e37a823ccb82a1e7115-1" name="rest_code_144d0aa855fa4e37a823ccb82a1e7115-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_144d0aa855fa4e37a823ccb82a1e7115-1"></a><span>import</span> <span>__pypy__</span>
+<a id="rest_code_144d0aa855fa4e37a823ccb82a1e7115-2" name="rest_code_144d0aa855fa4e37a823ccb82a1e7115-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_144d0aa855fa4e37a823ccb82a1e7115-2"></a>
+<a id="rest_code_144d0aa855fa4e37a823ccb82a1e7115-3" name="rest_code_144d0aa855fa4e37a823ccb82a1e7115-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_144d0aa855fa4e37a823ccb82a1e7115-3"></a><span>def</span> <span>wrong</span><span>(</span><span>x</span><span>):</span>
+<a id="rest_code_144d0aa855fa4e37a823ccb82a1e7115-4" name="rest_code_144d0aa855fa4e37a823ccb82a1e7115-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_144d0aa855fa4e37a823ccb82a1e7115-4"></a>    <span>a</span> <span>=</span> <span>__pypy__</span><span>.</span><span>intop</span><span>.</span><span>int_sub</span><span>(</span><span>0</span><span>,</span> <span>x</span><span>)</span>
+<a id="rest_code_144d0aa855fa4e37a823ccb82a1e7115-5" name="rest_code_144d0aa855fa4e37a823ccb82a1e7115-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_144d0aa855fa4e37a823ccb82a1e7115-5"></a>    <span>if</span> <span>a</span> <span>&lt;</span> <span>0</span><span>:</span>
+<a id="rest_code_144d0aa855fa4e37a823ccb82a1e7115-6" name="rest_code_144d0aa855fa4e37a823ccb82a1e7115-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_144d0aa855fa4e37a823ccb82a1e7115-6"></a>        <span>if</span> <span>x</span> <span>&gt;</span> <span>0</span><span>:</span>
+<a id="rest_code_144d0aa855fa4e37a823ccb82a1e7115-7" name="rest_code_144d0aa855fa4e37a823ccb82a1e7115-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_144d0aa855fa4e37a823ccb82a1e7115-7"></a>            <span>return</span> <span>0</span>
+<a id="rest_code_144d0aa855fa4e37a823ccb82a1e7115-8" name="rest_code_144d0aa855fa4e37a823ccb82a1e7115-8" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_144d0aa855fa4e37a823ccb82a1e7115-8"></a>        <span>return</span> <span>1</span>
+<a id="rest_code_144d0aa855fa4e37a823ccb82a1e7115-9" name="rest_code_144d0aa855fa4e37a823ccb82a1e7115-9" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_144d0aa855fa4e37a823ccb82a1e7115-9"></a>    <span>return</span> <span>2</span>
+</pre></div>
+<p>Which was wrongly optimized into:</p>
+<div><pre><a id="rest_code_2c1628d104aa4c64a044b75eb5ad94de-1" name="rest_code_2c1628d104aa4c64a044b75eb5ad94de-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_2c1628d104aa4c64a044b75eb5ad94de-1"></a><span>import</span> <span>__pypy__</span>
+<a id="rest_code_2c1628d104aa4c64a044b75eb5ad94de-2" name="rest_code_2c1628d104aa4c64a044b75eb5ad94de-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_2c1628d104aa4c64a044b75eb5ad94de-2"></a>
+<a id="rest_code_2c1628d104aa4c64a044b75eb5ad94de-3" name="rest_code_2c1628d104aa4c64a044b75eb5ad94de-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_2c1628d104aa4c64a044b75eb5ad94de-3"></a><span>def</span> <span>wrong</span><span>(</span><span>x</span><span>):</span>
+<a id="rest_code_2c1628d104aa4c64a044b75eb5ad94de-4" name="rest_code_2c1628d104aa4c64a044b75eb5ad94de-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_2c1628d104aa4c64a044b75eb5ad94de-4"></a>    <span>a</span> <span>=</span> <span>__pypy__</span><span>.</span><span>intop</span><span>.</span><span>int_sub</span><span>(</span><span>0</span><span>,</span> <span>x</span><span>)</span>
+<a id="rest_code_2c1628d104aa4c64a044b75eb5ad94de-5" name="rest_code_2c1628d104aa4c64a044b75eb5ad94de-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_2c1628d104aa4c64a044b75eb5ad94de-5"></a>    <span>if</span> <span>a</span> <span>&lt;</span> <span>0</span><span>:</span>
+<a id="rest_code_2c1628d104aa4c64a044b75eb5ad94de-6" name="rest_code_2c1628d104aa4c64a044b75eb5ad94de-6" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_2c1628d104aa4c64a044b75eb5ad94de-6"></a>        <span>return</span> <span>0</span>
+<a id="rest_code_2c1628d104aa4c64a044b75eb5ad94de-7" name="rest_code_2c1628d104aa4c64a044b75eb5ad94de-7" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_2c1628d104aa4c64a044b75eb5ad94de-7"></a>    <span>return</span> <span>2</span>
+</pre></div>
+<p>This is wrong precisely for <code>x == MININT</code>.</p>
+</section><section id="generating-random-traces"><h2>Generating Random Traces<a href="#generating-random-traces" title="Permalink to this heading">¶</a></h2>
+<p>These two bugs were the only two that the Z3 checker found for existing unit
+tests. To try to find some more bugs I combined PyPy&#39;s existing random trace
+generator with the Z3 optimization checker. The random trace generator has so
+far been mostly used to find bugs in the machine code backends, particularly
+also in the register allocator. So far we haven&#39;t used it with our optimizer,
+but my experiments show that we should have!</p>
+<p>I&#39;m going to describe a little bit how the random trace generator works. It&#39;s
+actually not that complicated, but there&#39;s one neat trick to it.</p>
+<p>The basic idea is straightforward, it starts out with an empty trace with a
+random number of input variables. Then it adds some number of operations to the
+trace, either regular operations or guards. Every operation takes already
+existing variables as input.</p>
+<p>The neat trick is that our random trace generator keeps a concrete random
+example value for every one of the input variables, and an example result for
+every operation. In this way, it is possible to generate guards that are
+consistent with the example values to ensure that running the trace to its end
+is possible with at least one set of values.</p>
+<p>Here&#39;s an example random trace that is generated, together with the random
+example inputs and the results of every operation at the end of every line:</p>
+<pre>[i0, i1, i2, i3, i4, i5] # example values: 9, 11, -8, -95, 46, 57
+i6 = int_add_ovf(i3, i0) # -86
+guard_no_overflow()
+i7 = int_sub(i2, -35/ci) # 27
+i8 = uint_ge(i3, i5) # 1
+guard_true(i8)
+i9 = int_lt(i7, i8) # 0
+i10 = int_mul_ovf(34/ci, i7) # 918
+guard_no_overflow()
+i11 = int_and(i10, 63/ci) # 22
+i12 = int_rshift(i3, i11) # -1
+i13 = int_is_zero(i7) # 0
+i14 = int_is_true(i13) # 0
+guard_false(i13)
+i15 = int_lt(i8, i4) # 1
+i16 = int_and(i6, i0) # 8
+i17 = uint_ge(i6, -6/ci) # 0
+finish()</pre>
+<p>Note how every guard generated is true for the example values.</p>
+<p>I have been running this combination of random trace generation and Z3 checking
+for many nights and it has found some bugs, which I&#39;ll describe in the next
+section. It should probably be run for a lot longer, but still a useful
+exercise already.</p>
+<p>In this mode, I&#39;m giving every Z3 call a time limit to make sure that the random
+tests don&#39;t just take arbitrarily long. This means that asking Z3 to prove
+something can have three outcomes, either it&#39;s proved, or Z3 finds a
+counterexample, or Z3 times out.</p>
+</section><section id="bugs-found"><h2>Bugs Found<a href="#bugs-found" title="Permalink to this heading">¶</a></h2>
+<p>In addition to the two bugs I&#39;ve already described, I&#39;ll briefly list the
+additional bugs that were found by optimizing random traces and then trying to
+prove the equivalence with Z3.</p>
+<p>Most of the bugs were actually identified by optimizing random traces alone, not
+by the Z3 component. They manifested as assert failures in the JIT compiler.</p>
+<ul>
+<li><p>The JIT concluded after <code>12 == int_mul(x, 12)</code> that <code>x == 1</code>, which is
+incorrect if overflow occurred (a counterexample is <code>0x8000000000000001</code>).</p></li>
+<li><p>An amusing bug, where from <code>0 == int_lshift(0x1000000000000000, x)</code> with
+<code>x &lt;= 0 &lt;= 15</code>, the JIT concluded that <code>0x1000000000000000 == 0</code>,
+triggering an assert. This wrong conclusion was again caused by not taking the
+possibility of overflow into account.</p></li>
+<li><p>A corner case in an optimization for chained integer additions with a
+constant, where in complex enough expressions, the wrong IR API was used
+(which works correctly in simple cases). Again, this triggered an assert.</p></li>
+</ul>
+<p>This shows that we should have been fuzzing our JIT optimizer already (not a
+surprising  observation in hindsight, fuzz all the things!).</p>
+<p>Thankfully, there was also one further bug that really failed in the Z3
+verifier. It&#39;s a bug in common subexpression elimination / arithmetic
+simplification, which again does not take overflow correctly into account.</p>
+<p>The buggy trace looks like this (unfortunately it&#39;s not easily possible to show
+this bug in Python code).</p>
+<div><pre><a id="rest_code_05df5274552b4c909cdd7e84d31db9f4-1" name="rest_code_05df5274552b4c909cdd7e84d31db9f4-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_05df5274552b4c909cdd7e84d31db9f4-1"></a>[a, b]
+<a id="rest_code_05df5274552b4c909cdd7e84d31db9f4-2" name="rest_code_05df5274552b4c909cdd7e84d31db9f4-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_05df5274552b4c909cdd7e84d31db9f4-2"></a>c = int_add(a, b)
+<a id="rest_code_05df5274552b4c909cdd7e84d31db9f4-3" name="rest_code_05df5274552b4c909cdd7e84d31db9f4-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_05df5274552b4c909cdd7e84d31db9f4-3"></a>r = int_sub_ovf(c, b)
+<a id="rest_code_05df5274552b4c909cdd7e84d31db9f4-4" name="rest_code_05df5274552b4c909cdd7e84d31db9f4-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_05df5274552b4c909cdd7e84d31db9f4-4"></a>guard_no_ovf()
+<a id="rest_code_05df5274552b4c909cdd7e84d31db9f4-5" name="rest_code_05df5274552b4c909cdd7e84d31db9f4-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_05df5274552b4c909cdd7e84d31db9f4-5"></a>finish(r)
+</pre></div>
+<p>This was optimized to:</p>
+
+<p>Which is incorrect, because the guard can fail given the right inputs.
+But the optimizer concluded that the subtraction is safe, because its the
+inverse of an earlier addition, not taking into account that this earlier
+addition can have overflowed.</p>
+<p>Note that a related optimization is actually correct. Given this code:</p>
+<div><pre><a id="rest_code_79b4af7f05584d85b23ca450fb04cb41-1" name="rest_code_79b4af7f05584d85b23ca450fb04cb41-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_79b4af7f05584d85b23ca450fb04cb41-1"></a>[a, b]
+<a id="rest_code_79b4af7f05584d85b23ca450fb04cb41-2" name="rest_code_79b4af7f05584d85b23ca450fb04cb41-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_79b4af7f05584d85b23ca450fb04cb41-2"></a>c = int_add_ovf(a, b)
+<a id="rest_code_79b4af7f05584d85b23ca450fb04cb41-3" name="rest_code_79b4af7f05584d85b23ca450fb04cb41-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_79b4af7f05584d85b23ca450fb04cb41-3"></a>guard_no_ovf()
+<a id="rest_code_79b4af7f05584d85b23ca450fb04cb41-4" name="rest_code_79b4af7f05584d85b23ca450fb04cb41-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_79b4af7f05584d85b23ca450fb04cb41-4"></a>r = int_sub(c, b)
+<a id="rest_code_79b4af7f05584d85b23ca450fb04cb41-5" name="rest_code_79b4af7f05584d85b23ca450fb04cb41-5" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_79b4af7f05584d85b23ca450fb04cb41-5"></a>finish(r)
+</pre></div>
+<p>It can be optimized to:</p>
+<div><pre><a id="rest_code_211ed2c779f345f9a86ba3a5c64a1717-1" name="rest_code_211ed2c779f345f9a86ba3a5c64a1717-1" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_211ed2c779f345f9a86ba3a5c64a1717-1"></a>[a, b]
+<a id="rest_code_211ed2c779f345f9a86ba3a5c64a1717-2" name="rest_code_211ed2c779f345f9a86ba3a5c64a1717-2" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_211ed2c779f345f9a86ba3a5c64a1717-2"></a>c = int_add_ovf(a, b)
+<a id="rest_code_211ed2c779f345f9a86ba3a5c64a1717-3" name="rest_code_211ed2c779f345f9a86ba3a5c64a1717-3" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_211ed2c779f345f9a86ba3a5c64a1717-3"></a>guard_no_ovf()
+<a id="rest_code_211ed2c779f345f9a86ba3a5c64a1717-4" name="rest_code_211ed2c779f345f9a86ba3a5c64a1717-4" href="https://danluu.com/elon-dave-chappelle/jit-bug-finding-smt-fuzzing.html#rest_code_211ed2c779f345f9a86ba3a5c64a1717-4"></a>finish(a)
+</pre></div>
+</section><section id="future-work-and-conclusion"><h2>Future Work and Conclusion<a href="#future-work-and-conclusion" title="Permalink to this heading">¶</a></h2>
+<p>In the current form the Z3 checker is only a start, even though it has already
+been concretely useful. There are various directions into which we could extend
+it. In addition to generate random tests completely from scratch, we could also
+start from the existing manually written unit-tests and randomly mutate those.</p>
+<p>I also want to extend the Z3 checker with support more operations, heap
+operations in particular (but it&#39;s not quite clear to me how to model garbage
+collection).</p>
+<p>I also want to try to switch the code away from the Z3 API and use the more
+general <a href="https://smtlib.cs.uiowa.edu/">smtlib</a> interface directly, in order to be able to use other SMT
+checkers than Z3, eg <a href="https://cvc4.github.io/">CVC4</a>.</p>
+<p>But all in all this was a fun and not too hard way to find a bunch of bugs in
+our optimizer! And the infrastructure is now in place, which means that we run
+some random test cases every time we execute our tests. This is going to be
+particularly useful when we do further work on the integer reasoning of the JIT
+(like Nico is doing, for example). As of time of writing of this post, all the
+bugs mentioned have been fixed and the Z3 code has landed on the default branch
+and runs as part of PyPy&#39;s CI infrastructure.</p>
+</section><section id="acknowledgements"><h2>Acknowledgements<a href="#acknowledgements" title="Permalink to this heading">¶</a></h2>
+<p>Thanks to <a href="http://saambarati.org/">Saam Barati</a>, <a href="https://bernsteinbear.com">Max Bernstein</a>, <a href="https://www.cs.hhu.de/lehrstuehle-und-arbeitsgruppen/softwaretechnik-und-programmiersprachen/unser-team/team/schmidt">Joshua Schmidt</a> and <a href="https://martinfriedrichberger.net/">Martin
+Berger</a>, for great feedback on drafts of this post!</p>
+</section>
+</div></div>
+  </body>
+</html>
