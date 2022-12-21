@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.npopov.com/2022/12/20/This-year-in-LLVM-2022.html">Original</a>
+    <h1>This Year in LLVM (2022)</h1>
+    
+    <div id="readability-page-1" class="page"><section>
+            <section>
+    <header>
+        <a href="https://www.npopov.com/">« Back to article overview.</a>
+        
+        <time datetime="2022-12-20" pubdate="">
+            20. December 2022
+        </time>
+        
+    </header>
+    <section>
+        <p>Towards the end of last year, I switched from working on PHP at JetBrains, to working on LLVM at Red Hat. While it was already under discussion beforehand, this catalyzed the <a href="https://blog.jetbrains.com/phpstorm/2021/11/the-php-foundation/">creation of the PHP foundation</a>, which now pays multiple people to work on PHP. Special thanks for this go to Roman Pronskiy, who did most of the work to set up the foundation, and keeps it running ever since. Also a shout-out to Alexey Gopachenko, the unsung hero of PHP: As the PhpStorm team lead at the time, he drove JetBrains’ active investment in PHP core development and the community at large.</p>
+
+<p>The <a href="https://www.php.net/releases/8.2/en.php">PHP 8.2 release</a> shipped a couple weeks ago with fairly little contribution from myself. I somehow still managed to make the most controversial change, which is the <a href="https://wiki.php.net/rfc/deprecate_dynamic_properties">deprecation of dynamic properties</a>. And with that out of the way, let me jump into the actual topic of this blog post, which is what I’ve been up to since then.</p>
+
+<h2 id="opaque-pointers">Opaque pointers</h2>
+
+<p>Historically, pointer types in LLVM carried an element type, for example <code>i32*</code>, <code>&lt;4 x i16&gt;*</code> or <code>%struct*</code>. In LLVM 15, these have been consolidated into an opaque <code>ptr</code> type.</p>
+
+<p>The motivation for this change is simple: LLVM IR semantics say that the pointer element type carries no semantic meaning. You can take an <code>i8*</code> pointer, bitcast it into an <code>i32*</code> pointer and load an <code>i32</code> value from it. Optimizations <em>shouldn’t</em> make use of the pointer element type – if they do, they are either suboptimal, or outright wrong. But of course, as long as the element type is available, we can hardly blame optimization authors for trying to make use of it.</p>
+
+<p>In addition to that high-level motivation, there are also practical considerations: Opaque pointers remove the need for pointer bitcasts, which improves memory usage and compile-time. It also improves optimization power, because optimizations can no longer fail to handle bitcasts, or rely on element types as (often wildly inaccurate) optimization hints.</p>
+
+<p>The opaque pointer migration started in 2015 and has been moving slowly for a long time, due to the sheer scope of the change. After I joined Red Hat, I spent a significant fraction of my time for many months on bringing this migration over the finishing line, with help from Arthur Eubanks. Some of the larger pieces of work were:</p>
+
+<ul>
+  <li>
+    <p>Migrating the Clang frontend to support opaque pointers. As the element type is no longer tracked by LLVM, frontends need to keep track of it separately. This work started with <a href="https://reviews.llvm.org/D115725">storing the element type in Address</a>, which had this wonderful comment in it:</p>
+
+    <blockquote>
+      <p>When IR pointer types lose their element type, we should <strong><em>simply</em></strong> store it in Address instead for the convenience of writing code.</p>
+    </blockquote>
+
+    <p>This was followed by weeks of work migrating many hundreds of users of Address and related APIs to pass explicit element types. Simply.</p>
+  </li>
+  <li>
+    <p>Adding support for bitcode auto-upgrade (<a href="https://reviews.llvm.org/D118694">D118694</a>, <a href="https://reviews.llvm.org/D119339">D119339</a>, <a href="https://reviews.llvm.org/D119821">D119821</a>, <a href="https://reviews.llvm.org/D120471">D120471</a>). LLVM generally does not care about backwards-compatibility, with one exception: LLVM must be able to read bitcode produced by previous versions, auto-upgrading it as necessary.</p>
+
+    <p>This was a significant challenge with opaque pointers: While doing an upgrade to opaque pointers is nominally as simple as discarding the unneeded pointer element types, the problem is performing other auto-upgrades at the same time. For example, historically loads were of the form <code>load i32* %p</code>, while now they explicitly specify the loaded type via <code>load i32, ptr %p</code>. When the <code>i32*</code> gets upgraded to <code>ptr</code>, we lose the necessary information to add the load type.</p>
+
+    <p>This is solved by making the bitcode reader keep track of type IDs for all values, as well as which type IDs they contain as subtypes. For example, given a function pointer type like <code>void(i32*)*</code>, a series of contained type ID lookups allows us to determine the pointer element type of the parameter. Unfortunately, this does add significant complexity to the reader.</p>
+  </li>
+  <li>
+    <p>A number of optimization passes were using “structural reasoning”, where struct pointer element types were used to drive optimizations. These optimizations had to be rewritten essentially from scratch to perform offset-based reasoning instead: Analyze at which offsets and with which types the pointer is actually used. This is a requirement for supporting opaque pointers, but also increases optimization power, because it can support bitcasted pointers.</p>
+
+    <p>Examples of this include <a href="https://reviews.llvm.org/D118685">argument promotion</a>, <a href="https://reviews.llvm.org/D117223">global SROA</a> and <a href="https://reviews.llvm.org/D115530">global ctor evaluation</a>.</p>
+  </li>
+  <li>
+    <p>The long tail of “everything else”. There were hundreds of places inspecting pointer element types. Removing some of them was just a matter of switching to a different API, while others needed more substantial work and/or IR changes.</p>
+
+    <p>Once we got to the point of no longer crashing during compilation, this also involved tracking down miscompiles caused by opaque pointers: These were almost always due to a no longer correct assumption that two instructions using the same pointer also operate on the same type. With opaque pointers, this requires an explicit check.</p>
+  </li>
+</ul>
+
+<p>Opaque pointers were <a href="https://reviews.llvm.org/D123300">enabled by default</a> for the LLVM 15 release,
+with a big caveat: We did not convert all LLVM and Clang tests to use opaque pointers. For Clang,
+most tests <a href="https://reviews.llvm.org/D123115">were modified</a> to pass <code>-no-opaque-pointers</code>, while
+LLVM tests auto-detect the opaque pointer mode based on what kind of pointer types are used in the
+test.</p>
+
+<p>Even with <a href="https://gist.github.com/nikic/98357b71fd67756b0f064c9517b62a34">some automation</a>, converting tests to use opaque pointers is very time consuming. There has been good progress on this, but the migration is not yet complete. We will only be able to drop typed pointer support once the test migration is done. I look forward to removing all that pesky pointer bitcasting code.</p>
+
+<p>Opaque pointers have extensive <a href="https://llvm.org/docs/OpaquePointers.html">migration documentation</a>, and I also gave a talk at CGO-LLVM on the topic (<a href="https://www.slideshare.net/nikita_ppv/opaque-pointers-are-coming">slides</a>, <a href="https://www.youtube.com/watch?v=qWHLf31NnNk">recording</a>). See those resources for more information.</p>
+
+<h2 id="constant-expression-removal">Constant expression removal</h2>
+
+<p>My next big project of the year was the <a href="https://discourse.llvm.org/t/rfc-remove-most-constant-expressions/63179">removal of constant expressions</a>. Historically, LLVM has supported a constant expression variant of nearly all instructions.</p>
+
+<div><div><pre><code><span>@g</span> <span>=</span> <span>external</span> <span>global</span> <span>i32</span>
+
+<span>; Instruction</span>
+<span>define</span> <span>ptr</span> <span>@test1</span><span>()</span> <span>{</span>
+  <span>%res</span> <span>=</span> <span>getelementptr</span> <span>i32</span><span>,</span> <span>ptr</span> <span>@g</span><span>,</span> <span>i64</span> <span>1</span>
+  <span>ret</span> <span>ptr</span> <span>%res</span>
+<span>}</span>
+
+<span>; Constant expression</span>
+<span>define</span> <span>ptr</span> <span>@test2</span><span>()</span> <span>{</span>
+  <span>ret</span> <span>ptr</span> <span>getelementptr</span> <span>(</span><span>i32</span><span>,</span> <span>ptr</span> <span>@g</span><span>,</span> <span>i64</span> <span>1</span><span>)</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Some notion of constant expressions is needed for global variable initializers:</p>
+
+<div><div><pre><code><span>@g</span> <span>=</span> <span>external</span> <span>global</span> <span>i32</span>
+<span>@g_end</span> <span>=</span> <span>global</span> <span>ptr</span> <span>getelementptr</span> <span>(</span><span>i32</span><span>,</span> <span>ptr</span> <span>@g</span><span>,</span> <span>i64</span> <span>1</span><span>)</span>
+</code></pre></div></div>
+
+<p>Only a small handful of “relocatable expressions” can actually be used as initializers. These basically come down to adding an offset to a global and, depending on the object file format, computing the offset between two globals.</p>
+
+<p>However, LLVM conflated this initializer concept with general constant folding and allowed (nearly) all instructions to also be used as constant expressions. This also included integer division instructions, which cause undefined behavior when dividing by zero.</p>
+
+<p>The end result was that certain “trapping” constants were non-speculatable, which most code failed to account for, leading to miscompiles. In <a href="https://github.com/llvm/llvm-project/issues/49839">issue #49839</a> I tried to fix an end-to-end miscompile related to this issue, but every time I fixed a bug in one pass, a new variant of it appeared in another.</p>
+
+<p>Ultimately, I came to the conclusion that the only way to fix this problem is by design: The notion of trapping constants has to be removed entirely. Incidentally, constant expressions also cause plenty of other issues, such as incorrect cost-modelling (treating complex expressions as being “free”), some bits of exponential behavior, as well as the need for code to deal with two different representations of the same thing. As such, the proposal was aimed more broadly at removing all non-relocatable constant expressions.</p>
+
+<p>Once again, the main technical complexity of this change lies in <a href="https://reviews.llvm.org/D127729">bitcode auto-upgrade</a>. Constant expressions that are no longer supported need to be expanded into instructions. This is done by decoding all constant expressions into a virtual representation first, which can then be materialized in different places. The notion of (formerly) trapping constants means that this expansion has to happen at exactly the right place, e.g. an expression in a phi node might require critical edge splitting. Once again, this adds some non-trivial complexity to the bitcode reader.</p>
+
+<p>A complicating factor that I encountered here (though not for the first time) is uselistorder preservation. LLVM values maintain a list of uses, and in some cases the order of this list can impact optimization behavior. While LLVM does not preserve it by default, there is an optional mode (<code>-preserve-bc-uselistorder</code>) to retain it.</p>
+
+<p>Uselistorder preservation works by having the bitcode writer “predict” the uselistorder that will result from plain bitcode reading, and then store a shuffle that will convert the predicted order into the actual one. Getting the uselistorder prediction correct when making major changes to bitcode reading is fairly tricky.</p>
+
+<p>Once the base infrastructure was in place, it was possible to <a href="https://reviews.llvm.org/D129148">remove division expressions</a> and with them the notion of trapping constants and their associated miscompiles.</p>
+
+<p>I also removed a few more constant expressions, namely extractvalue, insertvalue, fadd, fsub, fmul, fdiv, frem and fneg. However, there are still quite a few expressions left, and I haven’t done recent work on this. Each removal requires significant effort to remove all users of the respective constant expression API. I expect I’ll come back to this on an as-needed basis.</p>
+
+<h2 id="callbr-representation">Callbr representation</h2>
+
+<p>LLVM represents <a href="https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html#GotoLabels">asm goto</a> using the callbr terminator in IR. Historically, this made use of block addresses:</p>
+
+<div><div><pre><code><span>%res</span> <span>=</span> <span>callbr</span> <span>i32</span> <span>asm</span> <span>&#34;...&#34;</span><span>,</span> <span>&#34;=r,r,i&#34;</span><span>(</span><span>i32</span> <span>%x</span><span>,</span> <span>ptr</span> <span>blockaddress</span><span>(</span><span>@foo</span><span>,</span> <span>%indirect</span><span>))</span>
+         <span>to</span> <span>label</span> <span>%fallthrough</span> <span>[</span><span>label</span> <span>%indirect</span><span>]</span>
+</code></pre></div></div>
+
+<p>Block addresses were originally introduced for use by <code>indirectbr</code>, which is LLVM’s representation of <a href="https://gcc.gnu.org/onlinedocs/gcc/Labels-as-Values.html">computed goto</a>. <code>indirectbr</code> stores a list of potential jump targets, while the actual jump target is passed in as a block address.</p>
+
+<p>The use of block addresses imposes an unusual restrict on <code>indirectbr</code>: It’s successors cannot be updated. Doing so would also require updating blockaddresses corresponding to successors, and this is not generally possible. For example, consider unrolling an <code>indirectbr</code>: This would produce a clone of the instruction pointing to cloned blocks, and there is no sensible way to update blockaddress references (which of the blocks should they refer to?)</p>
+
+<p>Many control-flow transforms want to update successors, and <code>indirectbr</code> is very rare, so this is a semi-regular source of assertion failures. The implementation of <code>callbr</code> originally adopted the same design, and as such inherited all its problems. For the asm goto use-case, this is unnecessarily restrictive, because all blockaddresses will be direct operands of callbr, and as such <em>can</em> be updated.</p>
+
+<p>As such, I <a href="https://reviews.llvm.org/D129288">changed</a> the callbr design to remove the blockaddress operands, and instead introduce a new asm constraint modifier <code>!</code>, which indicates that a certain asm operand should be taken from the callbr indirect label list, rather than the call arguments:</p>
+
+<div><div><pre><code><span>%res</span> <span>=</span> <span>callbr</span> <span>i32</span> <span>asm</span> <span>&#34;...&#34;</span><span>,</span> <span>&#34;=r,r,!i&#34;</span><span>(</span><span>i32</span> <span>%x</span><span>))</span>
+         <span>to</span> <span>label</span> <span>%fallthrough</span> <span>[</span><span>label</span> <span>%indirect</span><span>]</span>
+</code></pre></div></div>
+
+<p>This representation change both removes optimization limitations, and makes them more robust, because callbr can now be essentially treated like any other control-flow, without unusual restrictions. The one remaining restriction is that the callbr result can only be used on the fallthrough edge, but there is ongoing work to <a href="https://discourse.llvm.org/t/rfc-syncing-asm-goto-with-outputs-with-gcc/65453">remove this limitation</a>.</p>
+
+<p>As a side note, I think there is an opportunity to improve the <code>indirectbr</code> situation by making blockaddress references not refer to a block, but rather to a certain indirectbr successor, along the lines of <code>indirectbrsuccessor(some_indirectbr_identifier, 0)</code>. This would not allow cloning of indirectbr, but permit most other CFG transforms and critical edge splitting in particular.</p>
+
+<h2 id="memory-effect-modelling">Memory effect modelling</h2>
+
+<p>The last major IR change of the year was a <a href="https://discourse.llvm.org/t/rfc-unify-memory-effect-attributes/65579">revamp of memory effect modelling</a>. Historically, LLVM specified memory effects of functions using a combination of two attributes families: readnone/readonly/writeonly specify what kind of access is allowed, and argmemonly/inaccessiblememonly/inaccessiblemem_or_argmemonly specify which locations can be accessed.</p>
+
+<p>This modelling has two core problems: First, it does not allow specifying the read/write kind per location. For example, it’s not possible to precisely model a function that can read any memory but only write arguments. Second, it makes it hard/impossible to add new memory location kinds, because this would require an exponential number of attributes to encode different combinations.</p>
+
+<p>The new representations uses a single <code>memory(...)</code> attribute, which is internally backed by the <code>MemoryEffects</code> class (formerly known as the <code>FunctionModRefBehavior</code>). The attribute specifies which access kind is allowed for each memory location. Examples are:</p>
+
+<div><div><pre><code><span>; Same access kind for all locations</span>
+<span>declare</span> <span>void</span> <span>@foo</span><span>(</span><span>ptr</span> <span>%p</span><span>)</span> <span>memory</span><span>(</span><span>none</span><span>)</span>
+<span>declare</span> <span>void</span> <span>@foo</span><span>(</span><span>ptr</span> <span>%p</span><span>)</span> <span>memory</span><span>(</span><span>read</span><span>)</span>
+<span>declare</span> <span>void</span> <span>@foo</span><span>(</span><span>ptr</span> <span>%p</span><span>)</span> <span>memory</span><span>(</span><span>write</span><span>)</span>
+
+<span>; Specific access kinds for specific locations</span>
+<span>declare</span> <span>void</span> <span>@foo</span><span>(</span><span>ptr</span> <span>%p</span><span>)</span> <span>memory</span><span>(</span><span>argmem:</span> <span>write</span><span>)</span>
+<span>declare</span> <span>void</span> <span>@foo</span><span>(</span><span>ptr</span> <span>%p</span><span>)</span> <span>memory</span><span>(</span><span>inaccessiblemem:</span> <span>readwrite</span><span>)</span>
+<span>declare</span> <span>void</span> <span>@foo</span><span>(</span><span>ptr</span> <span>%p</span><span>)</span> <span>memory</span><span>(</span><span>argmem:</span> <span>read</span><span>,</span> <span>inaccessiblemem:</span> <span>write</span><span>)</span>
+
+<span>; Default access kind, plus specific access kind for some locations</span>
+<span>declare</span> <span>void</span> <span>@foo</span><span>(</span><span>ptr</span> <span>%p</span><span>)</span> <span>memory</span><span>(</span><span>read</span><span>,</span> <span>argmem:</span> <span>readwrite</span><span>)</span>
+<span>declare</span> <span>void</span> <span>@foo</span><span>(</span><span>ptr</span> <span>%p</span><span>)</span> <span>memory</span><span>(</span><span>readwrite</span><span>,</span> <span>argmem:</span> <span>none</span><span>,</span> <span>inaccessiblemem:</span> <span>none</span><span>)</span>
+</code></pre></div></div>
+
+<p>The new representation was implemented in a patch stack ending at <a href="https://reviews.llvm.org/D135780">this patch</a>. This was another somewhat annoying change, in that it required updating many places working with memory attributes, and even more tests, in an atomic commit.</p>
+
+<p>While the new representation already provides some benefits in itself (such as accurate materialization of inference results, and as such better optimization), a large part of the motivation for this change is the ability to track new memory locations in the future.</p>
+
+<p>Currently, we only track arguments, inaccessible memory and “everything else”. The somewhat oxymoronic notion of inaccessible memory refers to memory that is not visible to the current module. Intrinsic side-effects are commonly modelled as a read and write of inaccessible memory.</p>
+
+<p>This could be refined to, for example, separately consider accesses to global variables, as well as captured/escaped pointers. Furthermore, explicitly modelling thread identity as a memory location would properly address issues related to the fact that thread identity can change inside a coroutine function.</p>
+
+<h2 id="allocator-support">Allocator support</h2>
+
+<p>This was not my own proposal, but I was involved in the work, so I’ll mention it here as well. LLVM supports quite a few optimizations on memory allocation functions, such as removing unused allocations. Historically, these were based on a hardcoded list of allocator functions.</p>
+
+<p>The <a href="https://discourse.llvm.org/t/rfc-attributes-for-allocator-functions-in-llvm-ir/61464">allocator attributes proposal</a> encodes the necessary information using attributes instead, which allows frontends (and in particular Rust) to teach LLVM about their custom allocation functions, without having to patch LLVM. Previously, Rust included such a patch in rustup-distributed binaries, but the same optimization was not available in distro-provided binaries.</p>
+
+<p>We might as well use the Rust allocator functions as an example for how the new attributes look like:</p>
+
+<div><div><pre><code><span>declare</span> <span>noalias</span> <span>ptr</span> <span>@__rust_alloc</span><span>(</span><span>i64</span> <span>%size</span><span>,</span> <span>i64</span> <span>allocalign</span> <span>%align</span><span>)</span>
+    <span>allockind</span><span>(</span><span>&#34;alloc,uninitialized,aligned&#34;</span><span>)</span>
+    <span>allocsize</span><span>(</span><span>0</span><span>)</span>
+    <span>&#34;alloc-family&#34;</span><span>=</span><span>&#34;__rust_alloc&#34;</span>
+
+<span>declare</span> <span>noalias</span> <span>ptr</span> <span>@__rust_alloc_zeroed</span><span>(</span><span>i64</span> <span>%size</span><span>,</span> <span>i64</span> <span>allocalign</span> <span>%align</span><span>)</span>
+    <span>allockind</span><span>(</span><span>&#34;alloc,zeroed,aligned&#34;</span><span>)</span>
+    <span>allocsize</span><span>(</span><span>0</span><span>)</span>
+    <span>&#34;alloc-family&#34;</span><span>=</span><span>&#34;__rust_alloc&#34;</span>
+
+<span>declare</span> <span>noalias</span> <span>ptr</span> <span>@__rust_realloc</span><span>(</span><span>ptr</span> <span>allocptr</span> <span>%ptr</span><span>,</span> <span>i64</span> <span>%old_size</span><span>,</span> <span>i64</span> <span>allocalign</span> <span>%align</span><span>,</span> <span>i64</span> <span>%new_size</span><span>)</span>
+    <span>allockind</span><span>(</span><span>&#34;realloc,uninitialized,aligned&#34;</span><span>)</span>
+    <span>allocsize</span><span>(</span><span>3</span><span>)</span>
+    <span>&#34;alloc-family&#34;</span><span>=</span><span>&#34;__rust_alloc&#34;</span>
+
+<span>declare</span> <span>void</span> <span>@__rust_dealloc</span><span>(</span><span>ptr</span> <span>allocptr</span> <span>%ptr</span><span>,</span> <span>i64</span> <span>%size</span><span>,</span> <span>i64</span> <span>%align</span><span>)</span> 
+    <span>allockind</span><span>(</span><span>&#34;free&#34;</span><span>)</span>
+    <span>&#34;alloc-family&#34;</span><span>=</span><span>&#34;__rust_alloc&#34;</span>
+</code></pre></div></div>
+
+<p>There’s quite a few different attributes involved here! Here’s what they are for:</p>
+
+<ul>
+  <li><code>noalias</code> on the return indicates that the allocator returns a pointer with fresh provenance.
+There is no (well-defined) way to read or write the allocated memory except by going through that
+pointer. (This is a pre-existing attribute.)</li>
+  <li><code>allocsize</code> indicates the number of the argument that specifies the allocation size. The allocator must return a null pointer, or a pointer that is dereferenceable for that many bytes. (This is also a pre-existing attribute.)</li>
+  <li><code>allocalign</code> indicates the argument that specifies the allocation alignment. The allocator must return a pointer aligned to that value.</li>
+  <li><code>allockind</code> specifies which kind of allocation function this is (alloc/realloc/free) and which properties it has. <code>uninitialized</code> means that the initial value of the allocation is uninitialized, <code>zeroed</code> means that it is zero.</li>
+  <li><code>allocptr</code> marks the argument that is being reallocated/freed.</li>
+  <li><code>&#34;alloc-family&#34;</code> marks the functions as being part of one family: Pairs of allocation functions can only be removed if they belong to the same family. Otherwise, we may run into issues when allocation functions are partially inlined.</li>
+</ul>
+
+<p>My own involvement in this work (apart reviewing the patches) was in adjusting optimizations to query specific allocator properties they rely on, rather than performing a generic “is this an allocator?” check, which is not really compatible with the fine-grained attribute encoding.</p>
+
+<p>For example, a lot of optimizations really only care about the provenance implications of allocators, and as such should be checking for the presence of a <code>noalias</code> return value, and nothing else.</p>
+
+<p>We are not entirely clean on this front, mainly because there are a number of optimizations which are not, strictly speaking, correct.</p>
+
+<h2 id="integer-minmax-intrinsics">Integer min/max intrinsics</h2>
+
+<p>Historically, LLVM has represented integer min/max operations as an icmp+select sequence. For example, a umin would be <code>a &lt; b ? a : b</code>. This is known as the “select pattern flavor” (SPF) representation.</p>
+
+<p>Representing min/max operations as icmp and select has the big advantage that all existing optimizations on icmp and select instructions automatically work on them.</p>
+
+<p>It also has the big disadvantage that all existing optimizations work on them: We very much don’t want to break up canonical min/max patterns, to ensure that the backend can recognize and efficiently lower them. As such, there is a continuous tension between trying to optimize icmps and selects, while also trying to not break min/max patterns. The outcome has been many infinite transform loops.</p>
+
+<p>One of the other motivations for moving away from this representation is that, thanks to the peculiar semantics of <a href="https://llvm.org/docs/LangRef.html#undefined-values">undef values</a>, some common-sense properties do not hold in SPF representation. For example, <code>min(x, 7) &amp; 7</code> could not be legally folded into <code>min(x, 7)</code> if <code>x</code> is an undef value (<a href="https://alive2.llvm.org/ce/z/-xnUTT">proof</a>). The reason is that the value of undef can be separately chosen in the icmp and select instructions (one of the reasons why we are moving away from undef).</p>
+
+<p>Long story short, a few years ago the <code>llvm.umin</code>, <code>llvm.umax</code>, <code>llvm.smin</code>, <code>llvm.smax</code> and <code>llvm.abs</code> intrinsics were introduced. However, it took us quite a while to ensure that all optimizations on the SPF representation also work on the intrinsic representation. Last year, I addressed the final missing folds, and then enabled <a href="https://reviews.llvm.org/D98152">canonicalization</a> from SPF to intrinsic representation.</p>
+
+<h2 id="branch-on-poison">Branch on poison</h2>
+
+<p>Moving on from IR representation, let’s talk about semantics instead! LLVM has a notion of <a href="https://llvm.org/docs/LangRef.html#poison-values">poison values</a>, which are essentially delayed undefined behavior. Immediate undefined behavior only occurs once the poison value is passed to certain operations. Where possible, we prefer to define IR semantics in terms of poison values, because this allows operations to be speculated (undefined behavior renders operations non-speculatable).</p>
+
+<p>One of the operations that turns poison values into immediate undefined behavior are conditional branches. However, while this was already specified in the LLVM IR specification for a long time, we were aware of many optimizations that introduce new branches on poison. As such, we were not willing to actually exploit branch on poison UB except where it was grandfathered in.</p>
+
+<p>These issues are usually easy to fix and tend to come in two flavors. First, when introducing new branches, the branch condition needs to be frozen:</p>
+
+<div><div><pre><code>  <span>%res</span> <span>=</span> <span>select</span> <span>i1</span> <span>%c</span><span>,</span> <span>i32</span> <span>%x</span><span>,</span> <span>i32</span> <span>%y</span>
+
+  <span>; convert into</span>
+
+  <span>%c.fr</span> <span>=</span> <span>freeze</span> <span>i1</span> <span>%c</span>
+  <span>br</span> <span>i1</span> <span>%c.fr</span><span>,</span> <span>label</span> <span>%if</span><span>,</span> <span>label</span> <span>%else</span>
+<span>if:</span>
+  <span>br</span> <span>label</span> <span>%join</span>
+<span>else:</span>
+  <span>br</span> <span>label</span> <span>%join</span>
+<span>join:</span>
+  <span>%res</span> <span>=</span> <span>phi</span> <span>i32</span> <span>[</span> <span>%x</span><span>,</span> <span>%if</span> <span>],</span> <span>[</span> <span>%y</span><span>,</span> <span>%else</span> <span>]</span>
+</code></pre></div></div>
+
+<p>Freeze converts the poison value in an arbitrary (but fixed) well-defined value, in this case either true or false. Inserting freeze is necessary here, due to the difference in poison semantics between select and br: Select on a poison condition returns poison, while branch on a poison condition is immediate undefined behavior. (A freeze is not needed when converting br to select, which is the much more common transform.)</p>
+
+<p>The second case occurs when merging conditions, for example converting two separate branches into an and:</p>
+
+<div><div><pre><code>  <span>br</span> <span>i1</span> <span>%c1</span><span>,</span> <span>label</span> <span>%if1</span><span>,</span> <span>label</span> <span>%else</span>
+<span>if1:</span>
+  <span>br</span> <span>i1</span> <span>%c2</span><span>,</span> <span>label</span> <span>%if2</span><span>,</span> <span>label</span> <span>%else</span>
+
+  <span>; convert into</span>
+  <span>%and</span> <span>=</span> <span>select</span> <span>i1</span> <span>%c1</span><span>,</span> <span>i1</span> <span>%c2</span><span>,</span> <span>i1</span> <span>false</span>
+  <span>br</span> <span>i1</span> <span>%and</span><span>,</span> <span>label</span> <span>%if2</span><span>,</span> <span>label</span> <span>%else</span>
+</code></pre></div></div>
+
+<p>Converting this into <code>%and = and i1 %c1, %c2</code> would be incorrect, because if <code>%c1 == false</code> and <code>%c2 == poison</code>, this would also make <code>%and</code> poison and cause immediate undefined behavior, which was not present in to the original program. Instead we create a “logical” and, which does not propagate poison from the second operand, if the first one is already false. There is also a logical or operation:</p>
+
+<div><div><pre><code><span>and</span> <span>i1</span> <span>%c1</span><span>,</span> <span>%c2</span>                 <span>; Bitwise And</span>
+<span>select</span> <span>i1</span> <span>%c1</span><span>,</span> <span>i1</span> <span>%c2</span><span>,</span> <span>i1</span> <span>false</span> <span>; Logical And</span>
+<span>or</span> <span>i1</span> <span>%c1</span><span>,</span> <span>%c2</span>                  <span>; Bitwise Or</span>
+<span>select</span> <span>i1</span> <span>%c1</span><span>,</span> <span>i1</span> <span>true</span><span>,</span> <span>i1</span> <span>%c2</span>  <span>; Logical Or</span>
+</code></pre></div></div>
+
+<p>Much to the chagrin of certain parts of the Rust community, the fact that it’s easy to “fix” is not enough: When it comes to largely theoretical miscompiles, the baseline expectation is that a reasonable effort is made to mitigate the optimization impact of the change. Just slapping <code>freeze</code> on everything is easy, but analyzing and mitigating the optimization regressions this results in requires a large amount of work.</p>
+
+<p>In this case, work was required mainly in three areas. The first is scalar evolution (SCEV), which is the analysis framework for loop optimizations. If a loop has exactly two exits, one after <code>%n</code> iterations, and one after <code>%m</code> iterations, then the exit count of the loop is not <code>%n umin %m</code>, but rather <code>%n umin_seq %m</code>. The distinction is that if <code>%n</code> is zero, then a poison value from <code>%m</code> does not propagate. If the first exit exits on the first iteration, then the second condition will never get evaluated.</p>
+
+<p>Before making that <a href="https://reviews.llvm.org/D124910">change</a>, I had to implement a number of improvements to <code>umin_seq</code> analysis. For example, we can use <a href="https://reviews.llvm.org/D124921">poison implication reasoning</a> to convert <code>umin_seq</code> into <code>umin</code>.</p>
+
+<p>The second area is optimization of logical and/or. While we already did a substantial amount of work to support these operations throughout the optimization pipeline, I still ran into multiple optimization regressions related to them. The most important change here is probably to <a href="https://github.com/llvm/llvm-project/commit/45226d04f016cf2fdfa8e4d84b31650b975c58e1">consolidate</a> the logic for optimizing bitwise and logical and/or of icmps, which then allows us to enable <a href="https://github.com/llvm/llvm-project/commit/c0e06c7448a2dd16796e210a66de68f269363e31">reassociating folds</a>, and makes it easy to <a href="https://github.com/llvm/llvm-project/commit/a7c079aaa227d55ad9cb6b916500d99b4fdf26d2">spot and fix</a> cases where handling for logical operations is missing.</p>
+
+<p>Last but not least is freeze optimization. Analysis generally cannot look through freeze instructions, so we try push it upwards in the instruction chain. <code>freeze (icmp X, 0)</code> is essentially an opaque value, while <code>icmp freeze(X), 0</code> can be analyzed and optimized. We were already mostly doing this, but were failing to push through freezes that are <a href="https://reviews.llvm.org/D127960">part of a recurrence</a>. In this case, we want to move the freeze to the start value of the recurrence, rather than freezing the value on each loop iteration.</p>
+
+<p>Additionally, if <code>freeze %x</code> is used, we want to make sure that all other uses of <code>%x</code> are <a href="https://reviews.llvm.org/D125321">also frozen</a>. Nominally, this may seem like a an anti-optimization, because we’re replacing uses of <code>%x</code> with <code>freeze %x</code>. However, this is beneficial in practice, because it allows transforms based on value identity to work. If a fold is looking for some value <code>V</code> in two different places, we can’t have one of those be <code>%x</code> and the other <code>freeze %x</code>.</p>
+
+<p>With all issues fixed and optimization regressions addressed, we can finally rely on the specified semantics. The most important change is to <a href="https://reviews.llvm.org/D125299">exploit this</a> to prove that a certain value <em>cannot</em> be poison without causing UB. This is particularly important for SCEV, and part of the reason why I started working on this in the first place.</p>
+
+<h2 id="rust">Rust</h2>
+
+<p>As usual, I performed the upgrades to <a href="https://github.com/rust-lang/rust/pull/93577">LLVM 14</a> and <a href="https://github.com/rust-lang/rust/pull/99464">LLVM 15</a> in Rust. Since Google started <a href="https://buildkite.com/llvm-project/rust-llvm-integrate-prototype">testing</a> Rust HEAD against LLVM HEAD, these upgrades have become somewhat simpler, because any necessary changes to LLVM bindings have already happened. Despite that, these updates never <em>just work</em>, because of issues on non-x86 or non-Linux platforms.</p>
+
+<p>For example, LLVM 14 <a href="https://github.com/rust-lang/compiler-builtins/pull/455">broke ABI</a> for certain builtins on Win64. LLVM 15 <a href="https://github.com/rust-lang/rust/pull/99512">exposed some issues</a> in rustc’s management of LLVM worker threads, and changed handling of <a href="https://reviews.llvm.org/D120026">atomics on thumbv6</a> in a way that required the addition of a new <a href="https://reviews.llvm.org/D130480">target feature</a> to support Rust’s desired semantics.</p>
+
+<p>Usually, a good part of the work is to just get LLVM building on all CI images. To be compatible with old glibc and kernel versions, these often use very old compiler toolchains, which LLVM supports only theory, but not in fact. LLVM 16 raises the minimum requirement to GCC 7.1, and Josh Stone has been doing great work getting rustc ready for this change, including a <a href="https://github.com/rust-lang/rust/pull/95026">raise in baseline requirements</a> for linux-gnu targets, which is necessary to get sufficiently recent cross-compilation toolchains.</p>
+
+<p>Apart from LLVM upgrades, I also try to address any (LLVM-related) miscompiles or assertion failures that get reported against rustc, and look into optimization problems. Some new optimizations targeted at Rust are:</p>
+
+<ul>
+  <li>Support for <a href="https://reviews.llvm.org/D134803">peeling loops with non-latch exits</a>. This was motivated by an optimization problem with <a href="https://github.com/rust-lang/rust/issues/101814">iter().skip()</a>, but should fix a number other performance issues with exterior iteration over iterator adaptors as well.</li>
+  <li>Support for <a href="https://reviews.llvm.org/D133192">load-only scalar promotion</a> in the presence of aliasing loads, motivated by an optimization problem with <a href="https://github.com/rust-lang/rust/issues/101082">array::IntoIter</a>.</li>
+  <li>Improved support for <a href="https://github.com/llvm/llvm-project/commit/779fd3968412dd2c8b75a0f5884d39bd5ba29bfd">pushing operations across phi nodes</a>, motivated by an optimization issue with <a href="https://github.com/rust-lang/rust/issues/101048">iter().fold()</a>. This was my most cursed revision: It went through five revert cycles before it stuck.</li>
+  <li>Improved support for <a href="https://reviews.llvm.org/D129214">removing</a> phi nodes of single-iteration loops and <a href="https://reviews.llvm.org/D129293">simplifying</a> the result. This was motived by an optimization issue with <a href="https://github.com/rust-lang/rust/issues/85872">slice::reverse()</a>.</li>
+</ul>
+
+<p>There’s certainly a pattern here: optimizing iterators is hard. Apart from that, there’s some new bounds/overflow check optimizations (e.g. with.overflow <a href="https://reviews.llvm.org/D137713">support in IPSCCP</a>), as well as minor improvements to memcpy elimination (e.g. support for <a href="https://reviews.llvm.org/D135886">moving lifetime intrinsics</a>, addressing regressions from MIR inlining). Iterators, bounds checks and memcpy are the trifecta of Rust optimization.</p>
+
+<h2 id="fedora">Fedora</h2>
+
+<p>While I work at Red Hat, I haven’t actually done any work directly on <a href="https://en.wikipedia.org/wiki/Red_Hat_Enterprise_Linux">RHEL</a> yet. I did package LLVM 15 for Fedora 37, which then serves as the template for the RHEL packages. This was new to me, as I haven’t done any packaging work before.</p>
+
+<p>Incidentally, both LLVM and Fedora release major versions twice a year, so each version of Fedora comes with a new LLVM version. This starts with a <a href="https://fedoraproject.org/wiki/Changes/LLVM-15">self-contained change proposal</a>. Once release candidates are available, these get built in <a href="https://copr.fedorainfracloud.org/coprs/g/fedora-llvm-team/llvm15/">COPR</a>, and once the GA release is available, the Fedora <a href="https://src.fedoraproject.org/rpms/llvm">RPM repositories</a> get updated, and builds are produced inside a <a href="https://docs.fedoraproject.org/en-US/rawhide-gating/multi-builds/">side-tag</a>, which is then merged by <a href="https://bodhi.fedoraproject.org/updates/FEDORA-2022-1e2cd856ca">bodhi</a>.</p>
+
+<p>A side-tag is basically a temporary fork of Fedora, which allows building multiple packages, and making sure these only get merged together. If we update to llvm-15.0.0, we also need to update to clang-15.0.0 at the same time. Fedora actually packages 16 different LLVM subprojects, so these all get pushed out as part of the same update.</p>
+
+<p>Because the LLVM and Fedora release cycles are somewhat misaligned, the LLVM update goes in rather late (after the Fedora beta release), long after the package mass-rebuild. To avoid the need to rebuild all packages against the new LLVM version, compatibility packages (like llvm14) are provided. These provide the libraries needed by already built packages, and can be used to produce new builds if a rebuild against the new LLVM version is not feasible.</p>
+
+<p>Updating LLVM in Fedora was a good bit more work than I expected. Part of this comes down to the fact that Fedora uses standalone builds, where each LLVM subproject is built separately (and links against <code>libLLVM.so</code> etc), while the standard LLVM build configuration is a monolithic build that produces everything from LLVM over clang to libcxx in one go. As a non-default build configuration, LLVM developers always find new and exciting ways to break standalone builds.</p>
+
+<h2 id="compile-time">Compile-time</h2>
+
+<p>I maintain the <a href="https://llvm-compile-time-tracker.com/">LLVM compile-time tracker</a> (see <a href="https://www.npopov.com/2020/05/10/Make-LLVM-fast-again.html">original blog post</a>) and make sure that any significant compile-time regressions at least get an investigation. In many cases just informing the patch author is sufficient, and they will work on mitigating the impact themselves.</p>
+
+<p>Significant regressions start at around 0.1%. The background to keep in mind here is that individual optimization passes often only take up a fraction of total compile-time, so an end-to-end regression of 0.1% is often a large regression in a single pass. It’s also quite common though, that regressions occur due to second order effects – for example, an optimization pushes a function over an inlining threshold, and that has major impact down the line. Such cases are generally considered uninteresting.</p>
+
+<p>I recently added support for showing <a href="https://llvm-compile-time-tracker.com/graphs.php?startDate=2021-12-01&amp;interval=100&amp;relative=on">long-term</a> compile-time changes, which look as follows since December 2021 (in percent since start):</p>
+
+<p><img src="https://www.npopov.com/images/llvm_geomean_2022.png" alt="LLVM geomean instruction count changes since December 2021"/></p>
+
+<p>I think this is the first time in quite a few releases where we end up with an overall regression. However, the situation is not quite as bad as it looks.</p>
+
+<p>In particular, the <a href="https://llvm-compile-time-tracker.com/compare.php?from=047c7aa96dadf8a2c71a29e2df610d628d9e7e3e&amp;to=3e99b8d947ac024831e59be2b604ac67a24fed94&amp;stat=instructions%3Au">large regression</a> on the right is due to <a href="https://reviews.llvm.org/D131465">enabling C++17</a> by default. The close to two times slowdown in 7zip <code>O0</code> builds comes down to STL headers becoming 2-3 times as large in C++17.</p>
+
+<p>While this is sad, and I had to edit out some choice words on the C++ standardization committee (I hear that this gets even worse in C++20), at least this does not affect non-clang compilers (e.g. Rust) and C code.</p>
+
+<p>The <a href="https://llvm-compile-time-tracker.com/compare.php?from=23e8a4d16018076e6eed4aa821c020b7fe348c69&amp;to=6a605b97a2006bd391f129a606483656b7c6fb28&amp;stat=instructions%3Au">large regression</a> in optimized debug builds (green line) on the left is due to more precise debuginfo <a href="https://discourse.llvm.org/t/debuginfo-rfc-enabling-instruction-referencing-variable-locations-for-x86-64/59249">variable location tracking</a> in the backend getting enabled. This originally landed with a 6% geomean regression, but after work from both the patch author and myself, the regression was <a href="https://llvm-compile-time-tracker.com/compare.php?from=30420bc344151eaea6fa9d32cd23a64feee5401b&amp;to=6e03a68b776dc06826dacbdab26d24a90bb2173b&amp;stat=instructions%3Au">reduced to 2%</a> when the change was relanded.</p>
+
+<p>A big win in this period was a <a href="http://llvm-compile-time-tracker.com/compare.php?from=0f050528fd087bc579320c3c01f9273860eaa1bf&amp;to=846d10f16a573401191e406d3752b6f60c7d6459&amp;stat=instructions%3Au">2% improvement</a> from <a href="https://github.com/llvm/llvm-project/commit/846d10f16a573401191e406d3752b6f60c7d6459">not rerunning</a> the function simplification pipeline on unchanged functions when reprocessing an SCC (strongly connected component) in the call graph.</p>
+
+<p>One of my own optimizations leading to an <a href="http://llvm-compile-time-tracker.com/compare.php?from=a6d238536d95e5c9c49ef2acf1916c95ab087240&amp;to=29fada4a3d3db309f11f7fa7a0c61cd4021e9947&amp;stat=instructions%3Au">0.5% improvement</a> was to support <a href="https://reviews.llvm.org/D121381">lazy use optimization</a> in MemorySSA, which improved EarlyCSE performance.</p>
+
+<h2 id="whats-next">What’s next?</h2>
+
+<p>With the opaque pointer migration finished, I’m only aware of one remaining <em>major</em> design issue in LLVM, which is the <a href="https://llvm.org/docs/GetElementPtr.html"><code>getelementptr</code> instruction</a>. While it ultimately just adds an offset to a pointer, it is specified in a type-based/structural way. Here are three ways to write the same getelementptr instruction:</p>
+
+<div><div><pre><code><span>%struct</span> <span>=</span> <span>type</span> <span>{</span> <span>i32</span><span>,</span> <span>{</span> <span>i32</span><span>,</span> <span>{</span> <span>[</span><span>2</span> <span>x</span> <span>i32</span><span>]</span> <span>}</span> <span>}</span> <span>}</span>
+
+<span>%ptr</span> <span>=</span> <span>getelementptr</span> <span>%struct</span><span>,</span> <span>ptr</span> <span>%base</span><span>,</span> <span>i64</span> <span>1</span><span>,</span> <span>i32</span> <span>1</span><span>,</span> <span>i32</span> <span>1</span><span>,</span> <span>i32</span> <span>0</span><span>,</span> <span>i64</span> <span>1</span>
+<span>%ptr</span> <span>=</span> <span>getelementptr</span> <span>i32</span><span>,</span> <span>ptr</span> <span>%base</span><span>,</span> <span>i64</span> <span>7</span>
+<span>%ptr</span> <span>=</span> <span>getelementptr</span> <span>i8</span><span>,</span> <span>ptr</span> <span>%base</span><span>,</span> <span>i64</span> <span>28</span>
+</code></pre></div></div>
+
+<p>However, while these are equivalent, optimizations have to go out of their way to treat them as such. Many GEP optimizations don’t bother and will only handle cases where the source element type (the first argument) is the same.</p>
+
+<p>The situation here has become slightly worse with opaque pointers, because typed pointers at least provided some constraints on source/result pointer types and thus resulted in more consistent type use.</p>
+
+<p>Ultimately though, the current representation is just bad, because it is completely divorced from the actual semantics of the instruction. A better representation would be an instruction that adds an offset to a pointer:</p>
+
+<div><div><pre><code><span>%ptr</span> <span>=</span> <span>ptradd</span> <span>ptr</span> <span>%base</span><span>,</span> <span>i64</span> <span>28</span>
+</code></pre></div></div>
+
+<p>This would make many optimizations that work with address calculations much simpler, more reliable, and also faster (an embarrassingly large amount of time is spent converting GEP indices into offsets).</p>
+
+<p>I have some hope that doing this change will be significantly simpler than the opaque pointer migration, mainly because we can both make getelementptr IRBuilder APIs emit ptradd instead, and pretend that ptradd is an i8 GEP, which will allow many things to work without changes. Of course, it would still be quite a complex change, and require another set of massive test updates.</p>
+
+<p>On a different note, an area that deserves much more investment than it gets is compile-time. In the past year, my compile-time work was mostly focussed on mitigating regressions, not so much on improving things. I would like to start working on this more actively again. I think there is a lot of value in reducing compile-times, probably more than in adding increasingly low-impact optimizations.</p>
+
+<p>I know that I’m not great at making long term plans, so I’ll leave it at those two items. Usually, things just turn up along the way. And in between, there are always miscompiles and assertion failures to fix, even though those don’t make for nice blog posts.</p>
+
+<p>As a final note, I’ll mention that I’ve recently written a blog post on <a href="https://developers.redhat.com/articles/2022/12/20/how-contribute-llvm">contributing to LLVM</a>. It may be helpful if you want to start working on LLVM as well :)</p>
+
+
+    </section>
+    
+</section>
+
+        </section></div>
+  </body>
+</html>
