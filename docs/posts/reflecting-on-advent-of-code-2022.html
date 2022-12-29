@@ -41,7 +41,7 @@ Day 12: **     BFS, path finding
 Day 13: **     parsing, recursion
 Day 14: **     2D grid manipulation, state machines
 Day 15: **     intervals, manhattan distance
-Day 16: *[]    graph traversal, optimization, ??
+Day 16: *[*]   graph creation, traversal, trimming
 Day 17: **     2D grid manipulation, state machines, cycles
 Day 18: **     3D grid navigation
 Day 19: [][]   optimization, ??
