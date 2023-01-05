@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.channable.com/tech/parallel-streaming-in-haskell-part-1-fast-efficient-fun">Original</a>
+    <h1>Parallel streaming in Haskell: Part 1 – Fast, efficient, and fun</h1>
+    
+    <div id="readability-page-1" class="page"><div><div><p>Channable is a feed processing tool where users define rules to organize and modify their product data.  We process over 156 billion items per day, roughly 1.8 million items per second on average.  These items range from shirts to screens to self-knitted dolls.  As you can imagine, speedy execution is of the essence for us.</p>
+<p>Over the last 2 years, we moved our inherently sequential data processing engine, written in Haskell, to a parallel version.  Running the parallel version of our system barely increases CPU time, while the wall time (time from start to end) is significantly reduced.</p>
+<p>This post explains how we parallelized our system without incurring any significant overhead costs, allowing us to linearly speed-up our workloads with the number of cores available (up to a plateau, see plot below).  We had the following requirements for our design:</p>
+<ul>
+<li>We want our algorithm to be deterministic, regardless of the number of threads that are being used.  Having reproducible results helps with testing, but is also desirable for our customers.</li>
+<li>We want to be able to dynamically scale the system, allocating and releasing cores at any moment.  The system should also scale well, meaning that with increased cores should come increased performance.</li>
+<li>Finally, the system should be responsive, getting results as fast as possible with low latency.  We accomplished all of this in our new design and will share what we learned in this blog post.</li>
+</ul>
+<p>There&#39;s a lot to say about this topic, so we&#39;ve written four separate blog posts for you to enjoy.  The first post (this one) explains the problem and the core ideas.  It uses Haskell examples, but we tried to keep it beginner-friendly.  In the next 3 weeks we will publish the other blog posts.  There we&#39;ll discuss some of the highlights, technical details and interesting things we discovered along the way, for instance why <code>TMVar</code> is faster than <code>MVar</code> for our approach.</p>
+<ul>
+<li><a href="https://www.channable.com/tech/parallel-streaming-in-haskell-part-1-fast-efficient-fun" title="Parallel streaming in Haskell: Part 1 - Fast, efficient, and fun!">Parallel streaming in Haskell: Part 1 - Fast, efficient, and fun!</a></li>
+<li>Parallel streaming in Haskell: Part 2 - Optimized parallel aggregations (to be published soon)</li>
+<li>Parallel streaming in Haskell: Part 3 - A parallel work consumer (to be published soon)</li>
+<li>Parallel streaming in Haskell: Part 4 - Conditionals and non-blocking evaluation (to be published soon)</li>
+</ul>
+<h2 id="how-do-we-process-rules">How do we process rules</h2>
+<p>Channable is a product feed processing tool.  Our customers have a business, like a store, and they want to expose their products to the world.  We import these items every day, process them according to the customers wishes and export them to multiple platforms, such as online marketplaces, price comparison sites, advertisers, etc.</p>
+<p>Customers modify their data using <code>IF ... THEN ... ELSE ...</code> rules.  These rules are sent to our data processing engine.  Our data processing engine executes these rules and returns the results for other services to use.</p>
+<p>This engine is running on dedicated servers that receive requests through a REST api.  The requests contain all information about how the data should be processed.  Any request that comes in, is parsed into an AST for our internal language.  The internal language consists of many layers, but we&#39;ll focus on actions and expressions.</p>
+<p>Values in our language can be booleans, texts, numbers, hashmaps or lists.  In all cases they&#39;re immutable, so an expression takes input values and produces a new output value.  These expressions support generic concepts such as <code>Let</code> and <code>If</code>, but also more domain-specific functions such as <code>StringCamelCase</code> or <code>DecimalRound</code>.  An example of an expression is <code>SetField(item, &#34;foo&#34;, 3)</code>, which does not change <code>item</code> but returns a new item which has field <code>foo</code> set to 3.</p>
+<p>While expressions work on individual values or items, actions work on the level of all items.  It is possible for an action to process all items at once or one at a time.  The simplest actions are <code>Map</code> and <code>Filter</code>.  A more complicated action would be deduplication, which removes all duplicate items.  This is a simplification of our actual AST of course <a href="#footnote-1" id="footnote-1-backlink"><sup>[1]</sup></a></p>
+<pre><code><span><span>data</span> <span>Action</span></span>
+  = <span>MapAction</span> <span>Expression</span>
+    
+  | <span>Filter</span> <span>Expression</span>
+    
+  | <span>DeduplicateAction</span> <span>Expresssion</span>
+    
+  ...</code></pre>
+<p>Once we compiled an AST for the request, we submit this as a <em>job</em><a href="#footnote-2" id="footnote-2-backlink"><sup>[2]</sup></a> to our scheduler.  The scheduler decides when to run these jobs and how many resources (CPU cores) they&#39;re allowed to use.  The scheduler tries to maximize throughput and minimize latencies.</p>
+<p>One of the things that this scheduler takes into account when planning which Job can go next is its priority. We have 2 categories of Jobs:</p>
+<ul>
+<li>Jobs where a user of our tool is waiting for the results.  In this case, we want to produce the results as fast as possible.  Free CPU cores usually go to these jobs, if they can use them.</li>
+<li>Jobs where automated systems are waiting for the results.  In this case, higher priority jobs should go first, as automated systems usually have more patience.</li>
+</ul>
+<p>Now we have a compiled AST in our scheduler.  Once the scheduler decides it needs to run our Job, the actual purpose of this blog can start: How do we get the results as fast as possible without any overhead?</p>
+<h2 id="naive-evaluation">Naive evaluation</h2>
+<p>Let&#39;s start with a naive evaluator of the datatype described above.</p>
+<pre><code><span>eval</span> :: [<span>Action</span>] -&gt; [<span>Item</span>] -&gt; [<span>Item</span>]
+<span>eval</span> (<span>MapAction</span> e : rest) items = eval rest (map (expectItem . evalExpr e) items)
+<span>eval</span> (<span>FilterAction</span> e : rest) items = eval rest (filter (expectBool . evalExpr e) items)
+<span>eval</span> (<span>DeduplicateAction</span> e : rest) items = eval rest (nubBy (\i1 i2 -&gt; evalExpr e i1 == evalExpr e i2) items)
+
+<span>evalExpr</span> :: <span>Expr</span> -&gt; <span>Item</span> -&gt; <span>Value</span>
+<span>evalExpr</span> = ...
+
+<span>expectItem</span> :: <span>Value</span> -&gt; <span>Item</span>
+<span>expectItem</span> = ...
+
+<span>expectBool</span> :: <span>Value</span> -&gt; <span>Bool</span>
+<span>expectBool</span> = ...</code></pre>
+<p>This evaluator executes the actions as described above, though not very efficiently.  In the next section we will get rid of all the intermediate lists to make it faster.  This code is also entirely sequential, but we can quite easily parallelize <code>MapAction</code>s and <code>FilterAction</code>s.  In this blog we&#39;ll show how we do this by splitting up the whole list of items into smaller chunks and evaluating each chunk on its own thread.  We have a mostly-parallel implementation for <code>DeduplicateAction</code> as well.  It&#39;s a bit more complicated than the implemenations for <code>MapAction</code> and <code>FilterAction</code>, so we&#39;ll discuss that in our next blog post.</p>
+<h2 id="streaming-evaluation">Streaming evaluation</h2>
+<p>In the example above, each action acts as a function from <code>[Item]</code> to <code>[Item]</code>.  If we want to apply multiple actions, we basically get something like this.</p>
+<p><img src="https://media.graphassets.com/FcR22UloRQKkzzs4gNXK" alt=""/></p>
+<p>A big issue with this approach is that intermediate results are stored in memory in their entirety.  These intermediate results don&#39;t just cost space but they also present a big challenge for the garbage collector (GC) that needs to inspect all the values inside.  In some situations laziness may prevent this problem.  We don&#39;t want to rely on laziness, however, because it&#39;s easy to get wrong and it&#39;s hard to ensure that it always works.</p>
+<p>The standard solution to this is to use a <em>streaming</em> implementation.  Instead of applying action 1 on all items then action 2 on all items and so forth, we do all actions on item 1, then all actions on item 2, etc. until all items are dealt with.  Only one item is actively being worked on at any given time, so there is less data that the garbage collector needs to look at.</p>
+<p><img src="https://media.graphassets.com/CiwGvVuiQW2ZkubXTcWG" alt=""/></p>
+<p>Examples of this approach are numerous within the Haskell ecosystem and computer science literature, for instance <a target="_blank" rel="noop" href="https://wiki.haskell.org/Correctness_of_short_cut_fusion">short cut fusion for lists</a> and streaming implementations of many functions in <a target="_blank" rel="noop" href="https://hackage.haskell.org/package/vector-0.13.0.0">Data.Vector</a> and <a target="_blank" rel="noop" href="https://hackage.haskell.org/package/text-2.0.1/docs/Data-Text.html">Data.Text</a>.  All of these are fairly specific to the corresponding types, but it shows that the idea is valid.</p>
+<h3 id="conduits">Conduits</h3>
+<p>In our implementation we chose a more direct way to represent streaming components using the <a target="_blank" rel="noop" href="https://hackage.haskell.org/package/conduit">Conduit</a> library.  Central to this library is the <code>ConduitT</code> type, which we&#39;ll colloquially refer to as &#39;a conduit&#39;.  We&#39;ll give a short overview of the parts that we&#39;re going to use, hopefully that&#39;s enough to help you through this blog post.</p>
+<p>A conduit of type <code>ConduitT i o m ()</code> can be seen as a machine that consumes inputs of type <code>i</code> and produces/yields outputs of type <code>o</code>.  In other words they act as a stream transformer, because they turn a stream of <code>i</code>s into a stream of <code>o</code>s.</p>
+<p>Some typical examples of conduits:</p>
+<pre><code>
+<span>Conduit</span>.map :: <span>Monad</span> m =&gt; (i -&gt; o) -&gt; <span>ConduitT</span> i o m ()
+
+
+
+<span>Conduit</span>.filter :: <span>Monad</span> m =&gt; (a -&gt; <span>Bool</span>) -&gt; <span>ConduitT</span> a a m ()
+
+
+
+<span>Conduit</span>.yieldMany :: <span>Monad</span> m =&gt; [o] -&gt; <span>ConduitT</span> i o m ()</code></pre>
+<p>A conduit can perform monadic actions in the monad <code>m</code>.  For instance, <code>mapM</code> could perform some monadic action every time an <code>o</code> is requested.</p>
+<pre><code><span>Conduit</span>.mapM :: <span>Monad</span> m =&gt; (i -&gt; m o) -&gt; <span>ConduitT</span> i o m ()</code></pre>
+<p>In addition to the stream of outputs, a conduit can return one final result at the very end.  The last type parameter of <code>ConduitT</code> is used for that:</p>
+<pre><code>
+<span>Conduit</span>.sum :: <span>Monad</span> m =&gt; <span>ConduitT</span> <span>Int</span> o m <span>Int</span>
+
+
+<span>Conduit</span>.sinkList :: <span>Monad</span> m =&gt; <span>ConduitT</span> i o m [i]</code></pre>
+<p>If one conduit yields values of some type <code>b</code> and another conduit consumes values of that same type, that producer and consumer can be connected together with the <code>.|</code> (fuse) operator.  For example, <code>Conduit.map f .| Conduit.map g</code> makes a new conduit that applies the function <code>f . g</code> to every value.  The same <code>ConduitT</code> type is used to represent single components or whole pipelines with multiple components.</p>
+<pre><code>(.|) :: <span>Monad</span> m =&gt; <span>ConduitT</span> a b m () -&gt; <span>ConduitT</span> b c m r -&gt; <span>ConduitT</span> a c m r</code></pre>
+<p>Conduits can be evaluated only if they don&#39;t yield any outputs or consume any inputs.  In the <code>runConduit</code> function below, the input type <code>()</code> and output type <code>Void</code> enforce this property <a href="#footnote-3" id="footnote-3-backlink"><sup>[3]</sup></a>.  The conduit <em>can</em> deliver a single end result of type <code>r</code>.  This means that, if any part of the conduit is producing outputs (with <code>yield</code>) they must be consumed by a later part of the conduit to get something that can be evaluated.</p>
+<pre><code><span>runConduit</span> :: <span>ConduitT</span> () <span>Void</span> <span>IO</span> r -&gt; <span>IO</span> r</code></pre>
+<p>With all of this, we can run a simple conduit:</p>
+<pre><code>λ&gt; runConduit (<span>Conduit</span>.yieldMany [<span>1</span>,<span>2</span>,<span>3</span>] .| <span>Conduit</span>.map (*<span>2</span>) .| <span>Conduit</span>.sum)
+<span>12</span></code></pre>
+<p>The chain of actions from the earlier map/filter/map example can be written as:</p>
+<pre><code><span>let</span> example = <span>Conduit</span>.yieldMany [<span>1.</span><span>.8</span>] .| <span>Conduit</span>.map (+<span>1</span>) .| <span>Conduit</span>.filter odd .| <span>Conduit</span>.map (*<span>2</span>) .| <span>Conduit</span>.sinkList</code></pre>
+<p>If we call the above example, we get a conduit. Once we call <code>runConduit</code>, the results are evaluated.</p>
+<pre><code>λ&gt; runConduit example
+[<span>6</span>,<span>10</span>,<span>14</span>,<span>18</span>]</code></pre>
+<h3 id="pull-based-evaluation">Pull-based evaluation</h3>
+<p>Conduits (and many other streaming implementations) are pull-based, meaning that we pull at the end of the conduit for an item and only then will the conduit do the work necessary to produce that item.  If you do not consume any items from a stream, no work is executed.  The conduit may produce the items by itself (as <code>yieldMany</code> does) or it may request one or more items from earlier conduits first (for instance <code>Conduit.map</code> and <code>Conduit.filter</code>).</p>
+<p>Looking closely at the map/filter/map example, we see that running this conduit involves:</p>
+<ul>
+<li><code>runConduit</code> asks the consumer (at the end of the conduit) to work towards an end result</li>
+<li>The consumer asks the <code>map *2</code> block for an item,</li>
+<li>which asks the <code>filter odd</code> block for an item,</li>
+<li>which asks the <code>map +1</code> block for an item,</li>
+<li>which asks the producer at the start for an item, this one takes an item from the input list</li>
+<li>the item is handed back via <code>map +1</code>, <code>filter odd</code> and <code>map *2</code> to the consumer.</li>
+</ul>
+<p><img src="https://media.graphassets.com/4pVDu1VSbS5VLSycIm7U" alt=""/></p>
+<h3 id="efficient-item-storage">Efficient item storage</h3>
+<p>Instead of taking the streaming approach one might try to use a better data type to store the intermediate results.  Of course, there are data types other than <code>[Item]</code> that will use less GC time, but as soon as a GC pass over your data type takes <code>O(n)</code> time, you&#39;ll run into trouble.</p>
+<p>If all your elements have a constant memory size this might be feasible, you could fit everything in an <a target="_blank" rel="noop" href="https://hackage.haskell.org/package/vector-0.13.0.0/docs/Data-Vector-Unboxed.html">unboxed vector</a> which is super cheap for the garbage collector.  This doesn&#39;t help us though, as our items mostly consist of textual data of varying sizes.  In an <a href="https://www.channable.com/tech/lessons-in-managing-haskell-memory">earlier blog post</a> we discussed this problem and presented a solution with compact regions to get rid of these GC times quite effectively.  This solution comes at the cost of pure writing speed so we don&#39;t want to do that after every single action, but only when it&#39;s really necessary.</p>
+<p>Within our job processing system, a single job usually starts and ends with one of those GC-friendly compact-region-based data sets.  The data sets at the beginning and end are stored in a big cache and they&#39;re worth the extra work of storing them in a compact region (for which the garbage collector has to check fewer pointers).  In between we try not to store our items at all, and since we only have one live item at a time, it can be represented in a way that is efficient for evaluating actions.</p>
+<p><img src="https://media.graphassets.com/RniuNdn4QRyxbHoEtEEz" alt=""/></p>
+<p>Not all actions can be performed in a completely streaming fashion.  A typical example is the sorting action, where you can&#39;t know the first item that must be yielded before looking at all the input items.  These actions will inevitably require some form of in-memory storage and we go to great lengths to do that in a GC-friendly manner.</p>
+<h2 id="parallelism-with-streams">Parallelism with streams</h2>
+<p>Our use case for these streams involves a lot of <a target="_blank" rel="noop" href="https://en.wikipedia.org/wiki/Embarrassingly_parallel">embarrassingly parallel</a> work like maps and filters.  By running our jobs with multiple threads, we would hope to be able to apply these actions on multiple values in parallel, which should reduce waiting times for our customers.</p>
+<p>It&#39;s not so easy though, because a stream implemented with conduits is fundamentally a single threaded component.  It&#39;s impossible to use multiple threads to pull values from a single conduit at the same time (they could take turns, but all the work still happens sequentially).  Internally, conduits are evaluated in a stepwise fashion and each step gives you a <em>new</em> conduit that can be evaluated further.  Any conduit evaluation function will necessarily have to go through the steps in order, and there is no way to do the steps in parallel.</p>
+<p>Next, we will show how we can get all the benefits from streaming, while running the evaluation on multiple threads.</p>
+<h3 id="parallel-streams">Parallel streams</h3>
+<p>As a first step, we split the incoming data into chunks and create a stream for each of those.  Those streams can be represented by a conduit that yields items, but doesn&#39;t consume anything:</p>
+<pre><code><span><span>type</span> <span>ParallelStream</span> = <span>ConduitT</span> () <span>Item</span> <span>IO</span> ()  </span></code></pre>
+<p>As a simple prototype, we could use lists of <code>ParallelStream</code>s and it might look something like this:</p>
+<pre><code>
+<span>splitIntoListOfStreams</span> :: <span>Int</span> -&gt; [<span>Item</span>] -&gt; [<span>ParallelStream</span>]
+
+<span>runStreamList</span> :: [<span>ParallelStream</span>] -&gt; <span>IO</span> [<span>Item</span>]</code></pre>
+<p>The <code>runStreamList</code> can be implemented to use multiple threads.  A single thread could take all the streams from the top-level list and assign each <code>ParallelStream</code> to a thread that becomes responsible for evaluating it.  Only at the end it does it need to concatenate all results together to produce a single list of items.  This relies on the ability to push most of the significant work into the parallelizable streams, whereas the top-level list must be cheap to evaluate because it happens sequentially.</p>
+<p>A naive implementation might add all the items to a single big list as soon as a thread finishes work on a stream.  This is unlikely to do what you want, because the threads will not finish their work in a predetermined order.  For deterministic results, the implementation should carefully maintain the order of the streams when concatenating their results.  The items from stream 1 should go before the items from stream 2, which should go before the items from stream 3, and so forth.  One way we could do this, is by letting <code>runStreamList</code> reserve a spot (like an <code>MVar</code>) for the data when a <code>ParallelStream</code> comes in.</p>
+<p>By using lists of <code>ParallelStream</code>s, we can implement actions like map and filter quite easily and in a way that doesn&#39;t interfere with the parallelism of the streams.</p>
+<pre><code><span>mapListOfStreams</span> :: (<span>Item</span> -&gt; <span>Item</span>) -&gt; [<span>ParallelStream</span>] -&gt; [<span>ParallelStream</span>]
+<span>filterListOfStreams</span> :: (<span>Item</span> -&gt; <span>Bool</span>) -&gt; [<span>ParallelStream</span>] -&gt; [<span>ParallelStream</span>]</code></pre>
+<p>By adjusting our running example to use these parallel streaming functions with chunks of size 4 we get something like below, with two threads that each run one conduit that processes 4 items:</p>
+<p><img src="https://media.graphassets.com/lq85q31lQCK5SokfijbI" alt=""/></p>
+<h3 id="work-propagation">Work propagation</h3>
+<p>Sometimes we have work that should be done in parallel, <em>without</em> directly producing items.</p>
+<p>Consider an example like this:</p>
+<p><img src="https://media.graphassets.com/qT1B6ZYaTHmQIC7QFStz" alt=""/></p>
+<p>The group action drastically reduces the number of items.  It might receive 10,000 parallel streams, but since it only produces a few items, it should ideally only produce a single <code>ParallelStream</code>.  The problem is that the amount of parallelism in our <code>runStreamList</code> function directly corresponds to the number of <code>ParallelStreams</code> that it gets.  If it only receives one <code>ParallelStream</code> then it can only use one thread to evaluate the whole pipeline.</p>
+<p>Additionally, the group action needs to consume all the incoming items before it knows what the first output item will be.  So <em>before</em> even giving you the first <code>ParallelStream</code>, a group action has to do a whole lot of work including the consumption of all the <code>ParallelStream</code>s that it receives.  Most of this work, certainly the consumption of those streams, can in principle be done in parallel.  We&#39;ll explain more about that in the blog about aggregations (to be published soon).</p>
+<p>To get all that parallel work evaluated, we simply pass it along just like <code>ParallelStream</code>s.  For this we introduce a new data type:</p>
+<pre><code><span><span>data</span> <span>WorkOr</span> a</span>
+  = <span>WOWork</span> (<span>IO</span> ())   
+                     
+  | <span>WOValue</span> a
+  <span>deriving</span> (<span>Functor</span>, <span>Foldable</span>, <span>Traversable</span>)</code></pre>
+<p>Where we used to have a <code>ParallelStream</code> type, we now wrap it in a <code>WOValue</code> constructor and get a <code>WorkOr ParallelStream</code>.  The <code>WOWork</code> constructor contains some arbitrary <code>IO ()</code> that can be executed in parallel with other <code>WOWork</code>.  This <code>IO ()</code> does not return any value, so it is by itself responsible for storing the result of the computation, using an <code>IORef</code> or an <code>MVar</code>, for example.</p>
+<p>In principle we could lift any <code>IO ()</code> into a <code>ParallelStream</code> that runs that IO without yielding any items, but we find an explicit representation to be more convenient.  It also allows for some more optimizations, as we don&#39;t care about the order of <code>WOWork</code>, but do care about the order of <code>WOValue</code>.</p>
+<p>Since we want to lazily unroll the top-level list, we replace it with a conduit so that we get more control over when it gets evaluated.  The typical usage pattern is now to have two layers of conduits.  For instance, a parallel map now produces a conduit that both consumes and produces <code>WorkOr ParallelStream</code>:</p>
+<pre><code><span>parallelMap</span> :: (<span>Item</span> -&gt; <span>Item</span>) -&gt; <span>ConduitT</span> (<span>WorkOr</span> <span>ParallelStream</span>) (<span>WorkOr</span> <span>ParallelStream</span>) <span>IO</span> ()</code></pre>
+<p>This new parallel map still applies the mapping function to each item in every stream, and, in addition to that, any parallel work (<code>WOWork</code> constructors) are passed along unaltered.</p>
+<p>Many actions will simply pass along the work, but some will create new parallel work.  We&#39;ll see a few examples of these later.</p>
+<p>All our conduits get connected together and at the very end, the parallel work is consumed and evaluated using multiple threads.  We define a special <code>runConduitWithWork</code> function to evaluate these work-producing conduits.  Whereas the <code>runConduit</code> function does not allow the conduit to produce anything at all (besides the end result), this new function does allow it to produce <code>WOWork</code> parallel work units.</p>
+<pre><code>
+<span>runConduit</span> :: <span>ConduitT</span> () <span>Void</span> <span>IO</span> r -&gt; <span>IO</span> r
+
+
+<span>runConduitWithWork</span> :: <span>Int</span> -&gt; <span>ConduitT</span> () (<span>WorkOr</span> <span>Void</span>) <span>IO</span> r -&gt; <span>IO</span> r</code></pre>
+<p>In an earlier variation we used a separate conduit of type <code>ConduitT (WorkOr a) a IO ()</code> to consume the work.  By adding such a work consuming conduit at the end, we were able to use the regular <code>runConduit</code> function to evaluate everything.  There are some drawbacks to that approach for our specific situation, but we&#39;ll discuss that and the inner workings of this function later in Parallel streaming in Haskell: Part 3 - A parallel work consumer (to be published soon).  For now we ask you to trust us that we have good reasons to have a dedicated <code>runConduitWithWork</code> function.</p>
+<h3 id="converting-actions-to-parallel-streams">Converting actions to parallel streams</h3>
+<p>Let&#39;s practice a bit with how our new work-enabled conduits can be used.  To start with, this is what a filter action might look like:</p>
+<pre><code><span>parallelFilter</span> :: (<span>Item</span> -&gt; <span>Bool</span>) -&gt; <span>ConduitT</span> (<span>WorkOr</span> <span>ParallelStream</span>) (<span>WorkOr</span> <span>ParallelStream</span>) <span>IO</span> ()
+<span>parallelFilter</span> filterFunction =
+  <span>let</span>
+    filterStream :: <span>ParallelStream</span> -&gt; <span>ParallelStream</span>
+    filterStream parallelStream = parallelStream .| <span>Conduit</span>.filter filterFunction
+  <span>in</span> <span>Conduit</span>.map (fmap filterStream)  </code></pre>
+<p>All of the parallel work units are passed through unmodified, because the <code>fmap</code> does not touch them.  Each incoming <code>ParallelStream</code> is adjusted to apply the filter action at the end.  <code>filterFunction</code> is not yet executed when you run the top-level conduit.  Only when a consumer runs one of the <code>ParallelStream</code> conduits that we modified here, is the work done.  This property is important because the top-level conduit gets evaluated sequentially while the <code>ParallelStream</code>s (and hence the execution of the <code>filterFunction</code>) get evaluated in parallel.</p>
+<p>In a similar fashion we can define a parallel <code>map</code> or <code>mapM</code>.  Both pass along the parallel work unmodified and just adjust the <code>ParallelStream</code>s.  The only difference between the implementations of <code>parallelFilter</code>, <code>parallelMap</code>, or <code>parallelMapM</code> is the conduit we attach to the end of the <code>ParallelStream</code>.</p>
+<pre><code><span>parallelMap</span> :: (<span>Item</span> -&gt; <span>Item</span>) -&gt; <span>ConduitT</span> (<span>WorkOr</span> <span>ParallelStream</span>) (<span>WorkOr</span> <span>ParallelStream</span>) <span>IO</span> ()
+<span>parallelMap</span> f =
+  <span>let</span> mapStream parallelStream = parallelStream .| <span>Conduit</span>.map f
+  <span>in</span> <span>Conduit</span>.map (fmap mapStream)
+
+<span>parallelMapM</span> :: (<span>Item</span> -&gt; <span>IO</span> <span>Item</span>) -&gt; <span>ConduitT</span> (<span>WorkOr</span> <span>ParallelStream</span>) (<span>WorkOr</span> <span>ParallelStream</span>) <span>IO</span> ()
+<span>parallelMapM</span> f =
+  <span>let</span> mapMStream parallelStream = parallelStream .| <span>Conduit</span>.mapM f
+  <span>in</span> <span>Conduit</span>.map (fmap mapMStream)</code></pre>
+<p>We can define a helper function to generalize this pattern.  An actual implementation is left as an exercise to the reader.</p>
+<pre><code><span>liftConduit</span> :: <span>ConduitT</span> i o m r -&gt; <span>ConduitT</span> (<span>WorkOr</span> i) (<span>WorkOr</span> o) m r</code></pre>
+<p>The <code>parallelMapM</code> function can now be defined in terms of <code>liftConduit</code>.</p>
+<pre><code><span>parallelMapM</span> f = liftConduit (<span>Conduit</span>.mapM f)</code></pre>
+<p>These <code>ParallelStream</code>s don&#39;t come out of thin air, so we need some way to produce them.  Let&#39;s say that we start with a list of items and that we have a <code>toChunks</code> function of type <code>Int -&gt; [Item] -&gt; [[Item]]</code> that splits the list into chunks of the given size.  Now we can define a function that converts every chunk into one parallel stream:</p>
+<pre><code><span>yieldParallel</span> :: <span>Int</span> -&gt; [<span>Item</span>] -&gt; <span>ConduitT</span> i (<span>WorkOr</span> <span>ParallelStream</span>) <span>IO</span> ()
+<span>yieldParallel</span> chunkSize =
+  <span>Conduit</span>.yieldMany . map chunkToStream . toChunks chunkSize
+  <span>where</span>
+    chunkToStream :: [<span>Item</span>] -&gt; <span>WorkOr</span> <span>ParallelStream</span>
+    chunkToStream chunk = <span>WOValue</span> (<span>Conduit</span>.yieldMany chunk)</code></pre>
+<p>Here we have a <code>Conduit.yieldMany</code> on two different levels.  One is for the outer conduit and the other is for the inner conduits (the <code>ParallelStream</code>s).</p>
+<p>The items that each stream will yield is completely fixed from the start.  For example with a chunk size of 100 the first stream will always yield items 1-100, the second stream will always yield items 101-200 and so forth.  This is always the same, regardless of the order in which the streams actually get evaluated.</p>
+<p>To ensure that parallelism works well, the top-level conduit must be fast to evaluate, which includes the <code>toChunks</code> function.  Reading the chunks is done within the <code>ParallelStream</code>, so it&#39;s less of a problem if that&#39;s a bit slower.  In the real implementation, instead of using a simple lists of items, we specialized the data format for efficient chunking, while de-prioritizing reading.  In some cases, the <code>toChunks</code> implementation will even postpone some of its work until you actually stream the chunk.</p>
+<h3 id="consuming-parallel-streams">Consuming parallel streams</h3>
+<p>We&#39;ve talked about consuming parallel work and how to produce <code>ParallelStream</code>s, but we&#39;re still missing the connection between these two.</p>
+<p>The <code>sinkItems</code> function is a way to bridge the two:</p>
+<pre><code><span>sinkItems</span> :: <span>ConduitT</span> (<span>WorkOr</span> <span>ParallelStream</span>) (<span>WorkOr</span> o) <span>IO</span> [<span>Item</span>]</code></pre>
+<p>This function consumes all incoming streams and produces a single list of items at the end.  It&#39;s a bit similar to what a <code>Conduit.sinkList</code> combined with a <code>concat</code> would do.  We have to be a bit careful though, we have to ensure that evaluating the top-level conduit does not do all of the work we&#39;ve built up in the parallel streams.  Instead, this <code>sinkItems</code> function will produce <code>WOWork</code> parallel work units that will each consume a <code>ParallelStream</code> and produce a chunk of items.  All these work units can be run at the same time, and once they&#39;re all done, the <code>sinkItems</code> function can de-chunk and return the complete list of items in order.</p>
+<p>To make this all a bit more concrete, we show a working implementation of <code>sinkItems</code>.  It builds up a list of <code>chunkVars :: [MVar [Item]]</code> that will contain the result of every individual stream in the precise order that they came in, regardless of when they are actually evaluated.  This makes the order of the results completely deterministic, just as we saw before with <code>runStreamList</code>.</p>
+<pre><code><span>sinkItems</span> :: <span>ConduitT</span> (<span>WorkOr</span> <span>ParallelStream</span>) (<span>WorkOr</span> o) <span>IO</span> [<span>Item</span>]
+<span>sinkItems</span> =
+  loop []
+  <span>where</span>
+    loop :: [<span>MVar</span> [<span>Item</span>]] -&gt; <span>ConduitT</span> (<span>WorkOr</span> <span>ParallelStream</span>) (<span>WorkOr</span> o) <span>IO</span> [<span>Item</span>]
+    loop chunkVars = <span>do</span>
+      <span>Conduit</span>.await &gt;&gt;= \<span>case</span>
+
+        
+        <span>Just</span> (<span>WOValue</span> stream) -&gt; <span>do</span>
+          chunkVar &lt;- newEmptyMVar
+
+          
+          
+          <span>let</span> work = <span>do</span>
+                chunk &lt;- runConduit (stream .| <span>Conduit</span>.sinkList)
+                putMVar chunkVar chunk
+          <span>Conduit</span>.yield (<span>WOWork</span> work)
+
+          loop (chunkVars ++ [chunkVar])
+
+        
+        <span>Just</span> (<span>WOWork</span> w) -&gt; <span>do</span>
+          <span>Conduit</span>.yield (<span>WOWork</span> w)
+          loop chunkVars
+
+        
+        
+        
+        <span>Nothing</span> -&gt;
+          fmap concat $ traverse (liftIO . takeMVar) chunkVars</code></pre>
+<h3 id="demo">Demo</h3>
+<p>We now finally have all the pieces to use our parallel streams.  In particular, the <code>yieldParallel</code> and <code>sinkItems</code> conduits can be combined to obtain a conduit that fits perfectly in our <code>runConduitWithWork</code> function:</p>
+<pre><code><span>yieldAndSink</span> :: [<span>Item</span>] -&gt; <span>ConduitT</span> i (<span>WorkOr</span> o) <span>IO</span> [<span>Item</span>]
+<span>yieldAndSink</span> items = yieldParallel <span>100</span> items .| sinkItems
+
+
+<span>runConduitWithWork</span> :: <span>Int</span> -&gt; <span>ConduitT</span> () (<span>WorkOr</span> <span>Void</span>) <span>IO</span> r -&gt; <span>IO</span> r</code></pre>
+<p>With this, we can write a very convoluted parallel map.  The <code>demo</code> function receives the chunk size that you want and the number of threads to use, and it will run some &#39;slowComputation&#39; on every item.</p>
+<pre><code><span>demo</span> :: <span>Int</span> -&gt; <span>Int</span> -&gt; <span>IO</span> ()
+<span>demo</span> chunkSize numThreads = <span>do</span>
+  <span>let</span>
+    items = [<span>&#34;1&#34;</span>, <span>&#34;2&#34;</span>, <span>&#34;3&#34;</span>, <span>&#34;4&#34;</span>, <span>&#34;5&#34;</span>, <span>&#34;6&#34;</span>, <span>&#34;7&#34;</span>, <span>&#34;8&#34;</span>, <span>&#34;9&#34;</span>]
+
+    slowComputation :: <span>Item</span> -&gt; <span>IO</span> <span>Item</span>
+    slowComputation item = <span>do</span>
+      threadDelay <span>1000000</span>  
+      putStr item        
+      pure item
+
+    theConduit :: <span>ConduitT</span> i (<span>WorkOr</span> o) <span>IO</span> [<span>Item</span>]
+    theConduit =
+      yieldParallel chunkSize items .| parallelMapM slowComputation .| sinkItems
+
+  putStrLn $ <span>&#34;Evaluating with chunk size &#34;</span> &lt;&gt; show chunkSize &lt;&gt;
+             <span>&#34; on &#34;</span> &lt;&gt; show numThreads &lt;&gt; <span>&#34; threads:&#34;</span>
+  r &lt;- runConduitWithWork numThreads theConduit
+
+  putStrLn $ <span>&#34;\nEnd result: &#34;</span> &lt;&gt; show r</code></pre>
+<p>Using one thread, all the items are processed sequentially and it takes 9 seconds:</p>
+<p>Increasing the number of threads reduces the time spent, but the end result remains the same. Do note that the order in which it prints the results varies, but the final result remains constant:</p>
+<p>With a chunk size of 3, each chunk still takes 3 seconds to run.  That puts a lower bound on the run time regardless of the number of threads, so to decrease the run time further you need smaller chunks:</p>
+<p>In the real world you want the chunks to be big enough that you&#39;re not spending all your time in the sequential sections of the code, but small enough to allow a fair distribution of work over the threads.</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>As shown in this blog, we have designed and implemented a scalable approach to dealing with parallelism.</p>
+<p>Instead of working on all items at once, we use parallel streams to reduce memory pressure.  This is based on the principle of streaming, where few items are kept in memory at any given moment.  All other items are in GC friendly datastructures, allowing us to have huge datasets without any memory problems.  Using the parallel streams and parallel work, we can implement a large variety of actions, such as <code>MAP</code>, <code>FILTER</code> and <code>DEDUPLICATION</code> (which we&#39;ll show in Parallel streaming in Haskell: Part 2 - Optimized parallel aggregations (to be published soon)).</p>
+<p>Actions are defined in a modular fashion.  An action implementation doesn&#39;t need to know what actions come before or after, they just need to worry about implementing their own logic in terms of manipulating the streams that come in.  Many parallel actions are very simple to implement on these conduits with parallel streams.</p>
+<p>The approach of using a <code>Conduit</code> as a dynamic work producer allows us to scale easily.  The work is divided into small chunks, allowing us to easily distribute the work over multiple, independent threads.  We can consume these streams with any number of threads and can even dynamically adjust the number of running threads during execution.  The evaluator does the heavy lifting, pulling on the streams and evaluating the work.</p>
+<h3 id="plots">Plots</h3>
+<p>This implementation of parallelism works really well in practice.  We had two big, somewhat competing, requirements:</p>
+<ul>
+<li>Run times should be as short as possible, we want low latency for our end users</li>
+<li>We don&#39;t want to ruin the throughput on our servers (computation costs money)</li>
+</ul>
+<p>Below we&#39;ve plotted the run times vs number of threads for five example jobs.  All of them follow a neat exponential decay towards a plateau, which is precisely what you want to see in a good implementation of parallellism.  The height of the plateau depends on how many parallelizable parts there are and on the overhead of the parallelism implementation.  Here we see that Job 2 doesn&#39;t parallelize at all, while Job 5 is around 5 times as fast.  An important property here is that the run times never <em>increase</em> when we add more threads.  <img src="https://media.graphassets.com/G3K7NUoERnmdAY4sBas7" alt=""/></p>
+<p>Throughput is the number of jobs that the server can run in a given time period.  For most jobs the main bottleneck is the CPU (which is why it makes sense to parallelize), so as long as the addition of threads doesn&#39;t increase the CPU time too much we should see similar throughput.</p>
+<p>For example, if we compare using 1 CPU for 16 seconds or using 8 CPUs for 2 second, we get the same total of 16 CPU seconds so total throughput on the server remains the same.  The latter will have a lower latency so using multithreading is a no-brainer.  If the parallel implementation is a bit less efficient and has to use 8 CPUs for 4 seconds (32 CPU seconds total), the additional threads still give a good improvement of latency but you&#39;re halving the throughput on the server.</p>
+<p>In the plot for actual CPU time spent vs the number of threads, we see that parallel jobs do use a bit more CPU time but it remains quite reasonable.  At some point adding more threads isn&#39;t worth it anymore, because the run time barely decreases while the CPU time keeps climbing.  <img src="https://media.graphassets.com/lZH0mbhTTiKAuX2zvjyD" alt=""/></p>
+<h3 id="next-up">Next up!</h3>
+<p>The next part in this series is Parallel streaming in Haskell: Part 2 - Optimized parallel aggregations (to be published soon), where we will explain in detail how we implemented parallel aggregations, such as deduplication, sorting and grouping.</p>
+<p><a id="footnote-1" href="#footnote-1-backlink">1</a>: Our actual AST has more layers than just actions and expressions and more actions than mentioned here. At the moment of writing, we have 29 possible actions, as well as over 70 different expression constructs. <a href="#footnote-1-backlink">↩</a></p></div></div></div>
+  </body>
+</html>
