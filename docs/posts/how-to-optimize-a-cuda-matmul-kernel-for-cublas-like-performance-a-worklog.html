@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://siboehm.com/articles/22/CUDA-MMM">Original</a>
+    <h1>How to Optimize a CUDA Matmul Kernel for CuBLAS-Like Performance: A Worklog</h1>
+    
+    <div id="readability-page-1" class="page"><article>
+
+<p>
+December 31, 2022:
+
+
+</p>
+<p>In this post, I’ll iteratively optimize an implementation of matrix multiplication written in CUDA.
+My goal is not to build a cuBLAS replacement, but to deeply understand the most important performance characteristics of the GPUs that are used for modern deep learning.
+This includes coalescing global memory accesses, shared memory caching and occupancy optimizations, among others.<label for="3"></label><span>You can download the code for all kernels from <a href="https://github.com/siboehm/SGEMM_CUDA">Github</a>. Also checkout <a href="https://github.com/wangzyon/NVIDIA_SGEMM_PRACTICE">wangzyon’s repo</a> which I used as a starting point for my re-write.</span> <label for="1"></label><span>This post is less polished than my normal uploads, and includes many more sidenotes. I used it as notepad for ideas and scribbles while writing the kernels. That’s why I called it a worklog :)</span></p>
+
+<p>Matrix multiplication on GPUs may currently be the most important algorithm that exists, considering it makes up almost all the FLOPs during the training and inference of large deep-learning models.
+So how much work is it to write a performant CUDA SGEMM<label for="2"></label><span>SGEMM performs <code>C=αAB+βC</code> at single (=32b) precision.</span> from scratch?
+I’ll start with a naive kernel and step-by-step apply optimizations until we get within 80% of the performance of cuBLAS (NVIDIA’s official matrix library):<label for="4"></label><span>cuBLAS at FP32 that is. In my setting, doing the matmul using TF32 or BF16 precision allows cuBLAS to use the tensor cores, which increases FLOPS by 2.5x or 3.5x. I may look into tensor cores / warp matrix functions in a future post.</span></p>
+<table>
+<thead>
+<tr>
+<th>Kernel</th>
+<th>GFLOPs</th>
+<th>Performance relative to cuBLAS (fp32)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1: Naive</td>
+<td>309</td>
+<td>1.3%</td>
+</tr>
+<tr>
+<td>2: GMEM Coalescing</td>
+<td>2006</td>
+<td>8.2%</td>
+</tr>
+<tr>
+<td>3: SMEM Blocktiling</td>
+<td>2984</td>
+<td>12.2%</td>
+</tr>
+<tr>
+<td>4: 1D Warptiling</td>
+<td>8626</td>
+<td>35.3%</td>
+</tr>
+<tr>
+<td>5: 2D Warptiling</td>
+<td>16134</td>
+<td>66.0%</td>
+</tr>
+<tr>
+<td>6: Vectorize loads</td>
+<td>20358</td>
+<td>83.2%</td>
+</tr>
+<tr>
+<td>0: cuBLAS</td>
+<td>24441</td>
+<td>100.0%</td>
+</tr>
+</tbody>
+</table>
+<h2 id="kernel-1-naive-implementation">Kernel 1: Naive Implementation</h2>
+<p>In the CUDA programming model, computation is ordered in a three-level hierarchy.
+Each invocation of a CUDA kernel creates a new grid, which consists of multiple blocks.
+Each block consists of up to 1024 individual threads.<label for="5"></label><span>These constants can be looked-up in the <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities">CUDA Programming guide</a>.</span>
+Threads that are in the same block have access to the same shared memory region (SMEM).</p>
+<p>The number of threads in a block can be configured using a variable normally called <code>blockDim</code>, which is a vector consisting of three ints.
+The entries of that vector specify the sizes of <code>blockDim.x</code>, <code>blockDim.y</code> and <code>blockDim.z</code>, as visualized below:</p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/CUDA_thread_hierarchy.png" alt=""/></p>
+<p>Similarly, the number of blocks in a grid is configurable using the <code>gridDim</code> variable.
+When we launch a new kernel from the host<label for="6"></label><span>In accelerator lingo, <em>host</em> refers to the CPU and <em>device</em> is the accelerator, here the GPU.</span>, it creates a single grid, containing the blocks and threads as specified.<label for="7"></label><span>From here on I’ll only be talking about 2D grids and blocks, partly because the 3D-structure is seldom used and because drawing in 3D is too hard.</span>
+It’s important to keep in mind that the thread hierarchy we just talked about mostly concerns program correctness.
+For program performance, as we’ll see later, it’s not a good idea to treat all threads in the same block as equals.</p>
+<p>For our first kernel, we’ll use the grid, block and thread hierarchy to assign each thread a unique entry in the result matrix C.
+Then that thread will compute the dot product of the corresponding row of A and column of B, and write the result to C.
+Due to each location of C being written to by only one thread, we have to do no synchronization.
+We’ll launch the kernel like so:</p>
+<div><div><pre><code><span>// create as many blocks as necessary to map all of C</span>
+<span>dim3</span> <span>gridDim</span><span>(</span><span>CEIL_DIV</span><span>(</span><span>M</span><span>,</span> <span>32</span><span>),</span> <span>CEIL_DIV</span><span>(</span><span>N</span><span>,</span> <span>32</span><span>),</span> <span>1</span><span>);</span>
+<span>// 32 * 32 = 1024 thread per block</span>
+<span>dim3</span> <span>blockDim</span><span>(</span><span>32</span><span>,</span> <span>32</span><span>,</span> <span>1</span><span>);</span>
+<span>// launch the asynchronous execution of the kernel on the device</span>
+<span>// The function call returns immediately on the host</span>
+<span>sgemm_naive</span><span>&lt;&lt;&lt;</span><span>gridDim</span><span>,</span> <span>blockDim</span><span>&gt;&gt;&gt;</span><span>(</span><span>M</span><span>,</span> <span>N</span><span>,</span> <span>K</span><span>,</span> <span>alpha</span><span>,</span> <span>A</span><span>,</span> <span>B</span><span>,</span> <span>beta</span><span>,</span> <span>C</span><span>);</span>
+</code></pre></div></div>
+<p>CUDA code is written from a single-thread perspective.
+In the code of the kernel, we access the <code>blockIdx</code> and <code>threadIdx</code> built-in variables.
+These will contain return different values based on the thread that’s accessing them.<label for="8"></label><span>In our example, <code>threadIdx.x</code> and <code>threadIdx.y</code> will vary from 0 to 31 based on the position of the thread in the grid. Same for <code>blockIdx.x</code> and <code>blockIdx.y</code>, which will vary from 0 to <code>CEIL_DIV(N, 32)</code> or <code>CEIL_DIV(M, 32)</code> based on the position of the thread’s block in the grid.</span> <label for="9"></label><span>We’ll do a lot of indexing into strided in-memory representations of matrices. Edward Yang’s post on <a href="http://blog.ezyang.com/2019/05/pytorch-internals/">PyTorch Internals</a> contains a good explanation of strided tensors.</span></p>
+<div><div><pre><code><span>__global__</span> <span>void</span> <span>sgemm_naive</span><span>(</span><span>int</span> <span>M</span><span>,</span> <span>int</span> <span>N</span><span>,</span> <span>int</span> <span>K</span><span>,</span> <span>float</span> <span>alpha</span><span>,</span> <span>const</span> <span>float</span> <span>*</span><span>A</span><span>,</span>
+                            <span>const</span> <span>float</span> <span>*</span><span>B</span><span>,</span> <span>float</span> <span>beta</span><span>,</span> <span>float</span> <span>*</span><span>C</span><span>)</span> <span>{</span>
+  <span>// compute position in C that this thread is responsible for</span>
+  <span>const</span> <span>uint</span> <span>x</span> <span>=</span> <span>blockIdx</span><span>.</span><span>x</span> <span>*</span> <span>blockDim</span><span>.</span><span>x</span> <span>+</span> <span>threadIdx</span><span>.</span><span>x</span><span>;</span>
+  <span>const</span> <span>uint</span> <span>y</span> <span>=</span> <span>blockIdx</span><span>.</span><span>y</span> <span>*</span> <span>blockDim</span><span>.</span><span>y</span> <span>+</span> <span>threadIdx</span><span>.</span><span>y</span><span>;</span>
+
+  <span>// `if` condition is necessary for when M or N aren&#39;t multiples of 32.</span>
+  <span>if</span> <span>(</span><span>x</span> <span>&lt;</span> <span>M</span> <span>&amp;&amp;</span> <span>y</span> <span>&lt;</span> <span>N</span><span>)</span> <span>{</span>
+    <span>float</span> <span>tmp</span> <span>=</span> <span>0.0</span><span>;</span>
+    <span>for</span> <span>(</span><span>int</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>K</span><span>;</span> <span>++</span><span>i</span><span>)</span> <span>{</span>
+      <span>tmp</span> <span>+=</span> <span>A</span><span>[</span><span>x</span> <span>*</span> <span>K</span> <span>+</span> <span>i</span><span>]</span> <span>*</span> <span>B</span><span>[</span><span>i</span> <span>*</span> <span>N</span> <span>+</span> <span>y</span><span>];</span>
+    <span>}</span>
+    <span>// C = α*(<a href="https://siboehm.com/cdn-cgi/l/email-protection" data-cfemail="d1909193">[email protected]</a>)+β*C</span>
+    <span>C</span><span>[</span><span>x</span> <span>*</span> <span>N</span> <span>+</span> <span>y</span><span>]</span> <span>=</span> <span>alpha</span> <span>*</span> <span>tmp</span> <span>+</span> <span>beta</span> <span>*</span> <span>C</span><span>[</span><span>x</span> <span>*</span> <span>N</span> <span>+</span> <span>y</span><span>];</span>
+  <span>}</span>
+<span>}</span>
+</code></pre></div></div>
+<p>To visualize this simple kernel:<label for="10"></label><span>If the size of the matrix is not divisible by the size of the block, we’ll have to launch extra blocks to process the remainder. For example, in the picture below, we’ll create 9 blocks of equal threadsize, but only 4 of those fully utilize their 1024 threads. This artifact is called <a href="https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#tile-quant">tile quantization</a>, and appears whenever we try to map a fixed-sized volume across a variable-sized input.<img src="https://siboehm.com/assets/img/CUDA-MMM/Tile_quantization.png" alt=""/></span></p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/naive-kernel.png" alt=""/></p>
+<p>This kernel takes about 0.5s to process three 4092² fp32 matrices on my A6000 GPU.
+Let’s do some non-implementation-specific calculations:</p>
+<h3 id="lower-bounding-the-fastest-possible-runtime">Lower Bounding the Fastest Possible Runtime</h3>
+<p>For a matrix multiplication of two 4092² matrices, followed by an addition of a 4092² matrix (to make the <a href="https://en.wikipedia.org/wiki/Basic_Linear_Algebra_Subprograms#Level_3">GEMM</a>):</p>
+<ol>
+<li>Total FLOPS:<label for="11"></label><span>For each of the 4092² entries of C, we have to perform a dot product of two vectors of size 4092, involving a multiply and an add at each step. “Multiply then add” is often mapped to a single assembly instruction called FMA (fused multiply-add), but still counts as two FLOPs.</span> <code>2*4092³ + 4092² = 137 GFLOPS</code></li>
+<li>Total data to read (minimum!): <code>3 * 4092² * 4B = 201MB</code></li>
+<li>Total data to store: <code>4092² * 4B = 67MB</code></li>
+</ol>
+<p>So 268MB is the absolute minimum of memory that any implementation would have to transfer from/to global GPU memory,<label for="12"></label><span>Global memory is the GPU’s main memory region. If Nvidia sells you a GPU advertised with 80GB of memory and 1TB/s of bandwidth, they’re talking about the capacity and bandwidth of global memory. Later we’ll talk about other memory regions on the GPU, like the shared memory, which is physically distinct and has very different performance characteristics.</span> assuming it has a big enough cache.<label for="13"></label><span>The cuBLAS kernel loads a total of 500MB of GMEM during the whole calculation. We’ll see later how increasing arithmetic intensity allows us to achieve an access volume that low.</span>
+Let’s calculate some upper bounds on kernel performance.
+The GPU is advertised with 30TFLOPs/s of fp32 compute throughput and 768GB/s of global memory bandwidth.
+If we achieved those numbers,<label for="14"></label><span>Reminder that peak FLOPs is a reductionist metric, since it depends on the instruction mix. There’s no way you’d reach those 30TFLOPs/s if your FLOP of choice is DIV. However, since matmul uses mainly FMA instructions, which tends to be the fastest FLOPs, we have a good chance of actually getting close to that peak FLOP value.</span> <label for="15"></label><span>Similar story for the bandwidth: Peak bandwidth can only be reach if the access pattern suits the hardware.</span> we’d need 4.5ms for the calculation and 0.34ms for the memory transfers.
+So in our napkin math, the calculation takes ~10x more time than the memory accesses.
+This means our final optimized kernel will be compute-bound, as long as we end up having to transfer &lt;10x the absolute minimum memory volume of 278MB.<label for="16"></label><span>The A6000 is advertised with 309TFLOPs/s of tensor core performance. If we could use tensor cores for our fp32 matmul, the calculation would only take 0.44ms, and an optimized kernel doing 4092^2 matrix mul would almost surely still be memory bound. This puts into perspective just how fast the tensor cores are.</span></p>
+<p>Now that we’ve calculated some lower bounds for our fp32 GEMM calculation, let’s get back to the kernel on hand, to figure out why it’s so much slower than it could be.</p>
+<h3 id="memory-access-pattern-of-the-naive-kernel">Memory Access Pattern of the Naive Kernel</h3>
+<p>In our kernel, two threads in the same block with ThreadIds (0, 0) and (0, 1) will load the same column of B but different rows of A.
+If we assume the worst case of zero caching, then each thread has to load <code>2*4092+1</code> floats from global memory.
+As we have 4092² threads total, this would result in 548GB of memory traffic.</p>
+<p>Below is a visualization of the memory access pattern of our naive kernel, taking two threads A (red) and B (green) as an example:</p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/naive_kernel_mem_access.png" alt=""/></p>
+<p>So to recap, when I run this kernel on an A6000 GPU it achieves ~300GFLOPs when multiplying two 4092x4092 float32 matrices.
+Pretty bad, considering that the A6000 is advertised as being able to achieve almost 30 TFLOPs.<label for="17"></label><span>Just for comparison, 300 GFLOPs is also roughly the performance achieved by the optimized BLAS library on the 2015 Haswell CPU that I used in my <a href="https://siboehm.com/articles/22/Fast-MMM-on-CPU">earlier post</a> on CPU matmul.</span>
+So how can we start to make this faster?
+One way is to optimize the memory access pattern of our kernel such that global memory accesses can be coalesced (=combined) into fewer accesses.</p>
+<h2 id="kernel-2-global-memory-coalescing">Kernel 2: Global Memory Coalescing</h2>
+<p>Before we get into global memory coalescing, we need to learn about the concept of a warp.
+For execution, the threads of a block are grouped into so-called warps, consisting of 32 threads.
+A warp is then assigned to a warp scheduler, which is the physical core that executes the instructions.<label for="18"></label><span>Before the Volta architecture, it used to be the case that all threads of a warp were fed from the same instruction stream. On a branch, the threads that didn’t take the branch were inactived using the so-called active mask. However, since Volta, it’s no longer a good idea to rely on this ‘warp-synchronous’ behaviour, as instructions from different branches may be interleaved even for the same threads within a warp.</span>
+There are four warp schedulers per multiprocessor.
+The grouping into warps happens based on a consecutive <code>threadId</code>.
+If we set the <code>blockDim</code> to be multi-dimension, then the threadId is calculated like so:</p>
+<div><div><pre><code>threadId = threadIdx.x+blockDim.x*(threadIdx.y+blockDim.y*threadIdx.z)
+</code></pre></div></div>
+<p>Then, threads with neighbouring <code>threadId</code> become part of the same warp.
+Below I tried to illustrate this, using a smaller “warpsize” of 8 threads (real warps always contain 32 threads):<label for="19"></label><span>I like to think of the three dimensions <code>x,y,z</code> of <code>threadId</code> as being “column-major”, due to the first dimension <code>x</code> being the one that’s continuous in “warpspace”. I don’t know if others use that term, but it makes the concept more clear to me.</span></p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/threadId_to_warp_mapping.png" alt=""/></p>
+<p>The concept of a warp is relevant for this second kernel, as sequential memory accesses by threads that are part of the same warp can be grouped and executed as one.
+This is referred to as <strong>global memory coalescing</strong>.
+It’s the most important thing to keep in mind when optimizing a kernel’s GMEM memory accesses toward achieving the peak bandwidth.</p>
+<p>Below is an example, where consecutive memory accesses by threads in the same warp are grouped, allowing each warp to execute 8 memory accesses using only 2 32B loads:</p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/GMEM_coalescing.png" alt=""/></p>
+<p>In reality, the GPU supports 32B, 64B and 128B memory accesses.
+So, if each thread is loading a 32bit float from global memory, the warp scheduler (probably the MIO) can coalesce this <code>32*4B=128B</code> load into a single transaction.
+This is only possible if the floats loaded are consecutive in memory, and if access is aligned.<label for="20"></label><span>In that way, optimizing for global memory coalescing on GPU has a lot of similarities to optimizing for cache line utilization on CPU. Interestingly, to allow coalescing the threads within a warp have to access consecutive addresses, but the accesses don’t have to be consecutive within-warp. Illustrated below: <img src="https://siboehm.com/assets/img/CUDA-MMM/random_access_coalescing.png" alt=""/></span>
+If they aren’t, or if access cannot be coalesced for some other reason, then the GPU will execute as many 32B loads as necessary to fetch all floats, leading to a lot of wasted bandwidth.
+Profiling our naive kernel, we can observe the detrimental effect of non-coalesced access as we achieve only 15GB/s of GMEM throughput.</p>
+<p>Looking back at the previous kernel, we assigned threads their entry of C like so:</p>
+<div><div><pre><code><span>const</span> <span>uint</span> <span>x</span> <span>=</span> <span>blockIdx</span><span>.</span><span>x</span> <span>*</span> <span>blockDim</span><span>.</span><span>x</span> <span>+</span> <span>threadIdx</span><span>.</span><span>x</span><span>;</span>
+<span>const</span> <span>uint</span> <span>y</span> <span>=</span> <span>blockIdx</span><span>.</span><span>y</span> <span>*</span> <span>blockDim</span><span>.</span><span>y</span> <span>+</span> <span>threadIdx</span><span>.</span><span>y</span><span>;</span>
+</code></pre></div></div>
+<p>Hence, threads of the same warp (those with consecutive <code>threadIdx.x</code>) were loading the rows of A non-consecutively from memory.
+The naive kernel’s pattern of accessing the memory of A looked more like so:</p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/Naive_kernel_mem_coalescing.png" alt=""/></p>
+<p>To enable coalescing, we can change how we assign positions of the result matrix C to threads.
+This change in the global memory access pattern is illustrated below:</p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/Naive_kernel_improved_access.png" alt=""/></p>
+<p>To implement this, we only need to change the first two lines:</p>
+<div><div><pre><code><span>const</span> <span>int</span> <span>x</span> <span>=</span> <span>blockIdx</span><span>.</span><span>x</span> <span>*</span> <span>BLOCKSIZE</span> <span>+</span> <span>(</span><span>threadIdx</span><span>.</span><span>x</span> <span>/</span> <span>BLOCKSIZE</span><span>);</span>
+<span>const</span> <span>int</span> <span>y</span> <span>=</span> <span>blockIdx</span><span>.</span><span>y</span> <span>*</span> <span>BLOCKSIZE</span> <span>+</span> <span>(</span><span>threadIdx</span><span>.</span><span>x</span> <span>%</span> <span>BLOCKSIZE</span><span>);</span>
+
+<span>if</span> <span>(</span><span>x</span> <span>&lt;</span> <span>M</span> <span>&amp;&amp;</span> <span>y</span> <span>&lt;</span> <span>N</span><span>)</span> <span>{</span>
+  <span>float</span> <span>tmp</span> <span>=</span> <span>0.0</span><span>;</span>
+  <span>for</span> <span>(</span><span>int</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>K</span><span>;</span> <span>++</span><span>i</span><span>)</span> <span>{</span>
+    <span>tmp</span> <span>+=</span> <span>A</span><span>[</span><span>x</span> <span>*</span> <span>K</span> <span>+</span> <span>i</span><span>]</span> <span>*</span> <span>B</span><span>[</span><span>i</span> <span>*</span> <span>N</span> <span>+</span> <span>y</span><span>];</span>
+  <span>}</span>
+  <span>C</span><span>[</span><span>x</span> <span>*</span> <span>N</span> <span>+</span> <span>y</span><span>]</span> <span>=</span> <span>alpha</span> <span>*</span> <span>tmp</span> <span>+</span> <span>beta</span> <span>*</span> <span>C</span><span>[</span><span>x</span> <span>*</span> <span>N</span> <span>+</span> <span>y</span><span>];</span>
+<span>}</span>
+</code></pre></div></div>
+<p>And we call it like so:<label for="21"></label><span>This wasn’t immediately obvious to me, but enabling GMEM coalescing changes nothing in the assembly, see the SASS output on <a href="https://godbolt.org/#z:OYLghAFBqd5TKALEBjA9gEwKYFFMCWALugE4A0BIEAZgQDbYB2AhgLbYgDkAjF%2BTXRMiAZVQtGIHgBYBQogFUAztgAKAD24AGfgCsp5eiyahUAV0wtyKxqiIEh1ZpgDC6embZMQAJnLOAGQImbAA5TwAjbFJfWQAHdCViByY3Dy9fcgSk%2ByEgkPC2KJifWRtsOxSRIhZSIjTPbz9yyqFq2qJ8sMjo2OsauoaM5oHO4O6i3tKASmt0M1JUTi4AUh8AZjjSFmA2FgBqISWVrQBBE/ON4NQPHH2V9ZdxJRU6h9wLtfXr2%2Bx7x9QSiIhHQ70%2BVyYNwsfweTyBmHoBAiYLOXx%2B0P%2BTzMESMSgA%2BgA3HwAOiQKMu30hv0x5kseNIZmEBA4pPJFzxeOA9HQEQkHP2BPQBEw%2ByUwGwbDYnO5vPoeI4UowEmwSiWEGCRH2AFlyPsNftQrr9QBpXU0bksTUSOJIKwXfYOx1O50u11ul0YJhA/bm9CW/YAKlOus93t9/oDACFyPb3XH4/Hw5qojUzRbNQGXNN7gB2SOx/WRgIAeRcxpEAEkAFofdYAEXWPge%2BbODtDmv1qAASugAO7/Ov7HHoVAAawrmHUxPUgf2RdL5eruHuPkj%2BwgRCQpGwLEwE6nM4A9HOS2XKzXps3Y%2B29cJ9qg0gOh9yx/viQBPWfzs9Lldrjdbjue6TtOK4AKwngu564Je6wtucrb7Iex4EDQoo1EQErMB2Sj7CESwvLUn4kPseyjn8m7BMAuG9mQo77IyOCkPs9iMPsACOZjGPYABelopAWaEQN2faYtqK4AGxrBJ96PrCBrZiseaxg6SYsWwcRPloxJaFeiGqWQ676gQWnNnqYnGmZaz5quBCKcp%2BmOkQGl/g8g7nGBkYif2Ab7Maf56isYGDr5%2BaeSZvmhAFD7uEFdZ6acTpKfFjkuEFXk9j5BrRWkcVPtatqzs5mnWUO2A1LOaWed5s5RaVMX0HFCUOslnw5nWXCzPQ3Bgfw3hcDo5DoNwLgKHWiVpaupVKPMiwwhsfDkEQ2idbMSBAb0ECzKOsTEgAnAdh1HUdEmGNw0h9StQ3cPwSggFoS0rbMcCwCgGAaQw0SUNQ71xJ9MRMASqCoDwPA5uQOAEgQSwAGoENgvbFnEzBXXQ9CYaQd0QBEV0RMERHcIt70cMIxZMPQ75XTgewmJIA38IQ26VASKpXdg6gVGYmGE/wGrYN19OGEi2ykO%2Bbg4FdRCkMyPOzOaOxKHDCNIyjvD8IIwhiMqUiyBrigqBoV36DwhjGKYFhWIiER3ZAszoHEuRetwAC0xbrPszt1qEda4JGCgAOIe874ohNsmHOxgOBubUqBkvWv1c9geIABynZH2BuelCeYSnp1KFKqd5c7zsO%2BoLBKM79uO0obnOwSHvwm5qDWdZYO3fzFSO04TCuO4jQGIE4yFMUBjZMkQhDN4Jtj47XTD70JstI77SDH3GSLx3rRMCvYwFD0MSL6Mk8GECHRz/vUizDNCxLL4XU9ZdgvDVwBowy4Lj7KDxI5jp674MQhkvg%2BGmPwZa9NphrQ2jELa5AdqlH2sdRBB1ToCwuuQfqg1n63Xuo9cB5AXrIDQFgPAhASAUCoLQT6rAOA8zkJrcQkgZB0P1moTQgt9B%2BCMCYNAFtrCby7hAZwx8/CDz3pMEo8REjj1SGvJoWQpGzyHhfUofDbDLyPrIzIS8qijHPuIvop9V7pDkYY3eEwR4zDmDfZYXwtg7D2IcSEGdUSoghFCO4sJnivCIGyNx1JPHwgcL4yk7iYQAnhFbYJ6IPEAmxLiQkJI44fFcSE/xsS6QMiZCyJJnwzgci5DyPkeIBRChFGKCUUoCmynlBKPEjIlSMFVNgTA6o7w6lvJqQ0HS/Jpj9FaegNo7SOQTCMkZN41JBhDEIMM6ZAzRhUqMxZcY1IpisD6WZmZ7LwQdIWU8i4axuUbM1e80yOx3hqm5Z8I5xwgRnKFPZ0EAoAW3LuN8M41gQW/PsmCxybydjkvWK5r4QKfnuVBX8pVnlATeUhSCP4LwJVjMhPUaFT6YRJjhPCFQVRKCIixdApEWDkRYkgKiNE6IMR7tEFin0OJcSZHxR2gl1wXMeOJaS0lZLuDEqELZCy1LFS0jpY5BlmKtI7KZOC5l5KWSlS3WyfLhnqRKlNQFHkMqiV8v5UqBA8qhXShFbK9VcrBRFbmFKiVHRVQ1VlOqq4uWNWCvlAZhVfKCtKqsyqWdMq1RyrFU1cFYytVRO1TqZ0uC9XQVdZ%2Bo1xr7EmjZNc185orkbKAp6kDdybW2rtJBSCUHnX4GwEA6wf5gSjU/G61gcFgJ0M9RAEA3roA%2BowchP1m1/VbSAQGwNQbg0htDbAStEbIwwerBgGMsY40FnjVgotaHE2wmTCmVMJRmzpoNRmncCAszuoLdmnNuZq0oMIfmV0rYizFsQyW0ti1qzlkYaiw6Vb9UWnrLWjDdbyGUKwo2mQuHm0sELa28A7YOxSHu127tPbe19gHIOIdoiWmwBHYh0dFhxzrNnJOqdyDp0ztVDtidc7WALlJJ1xdS7l0ruB6Ztd67O0bvHeVkY26qO3Y4QRPdj4m1EeYhe8icgpB44J6ReiR4bzUTojoIntFtF0Uo/Rh8ZOaOU3UcTC8r6zVvjwe%2BEbH6YO4K/d%2Bn8eDf1/hAf%2BZDU26fTeAzNTFqA5vgXmxBBauBoLHddLg2CHq1tWuGnwRaQBgW0snHge0JI5h8DwdYoNpA5jAuWrzWDcF1vwQ2htKAB1LG%2BsJDt/1QjsGWKEN%2BH8v4/0Gs0gB0tMAGHfQwzgTC9Y/sNuwrR/CUjd17sYgePcNMH1E47ETM8UgDZPp1%2BTKneuSY49vBTYiJP9Gm/3NTZj54H1mFLbA2BhT3T05GlL3A6zYChksfYw7qWlZMxVizVnAELV1G4Ft1KgEgLSwF9aWboE5ukBJYkElwtA54MDoH4a0HFp4FoB6R2fPVr809DL8BG0gBy9gPLv1CvFe4Nd8rZnKv8Gq2QvbfgGva2a9%2Bg2bDBrG3Y1vbrIm%2BMbdHgo4TqmhtjcU0tuT82Vvrzp%2Bos%2BXOBOmNkwt/jm2lrbl23VrQB2DP8Gfids7fxLvMVx6Z8zWg/6kIe42J7BXW02fe/5iB5AvuOZgTtMC6xiRxdByDx3ydOGFvIJD6HFbDNw7ugj%2BzgXgvSD2sSEHWhGw5lTsnZOYFSgSVOrDuzdac1Q4egLdYCvvMJ4CyzTGXXpBAA%3D%3D">Godbolt</a>. Access coalescing is done at kernel runtime by the hardware. This makes sense since coalescing requires aligned access, which cannot be guaranteed at compile time as we pass the matrix pointers as function arguments. Also: the assembly features partial unrolling of our inner loop even though the loop count <code>K</code> is not known at compile time. Exciting!</span></p>
+<div><div><pre><code><span>// gridDim stays the same</span>
+<span>dim3</span> <span>gridDim</span><span>(</span><span>CEIL_DIV</span><span>(</span><span>M</span><span>,</span> <span>32</span><span>),</span> <span>CEIL_DIV</span><span>(</span><span>N</span><span>,</span> <span>32</span><span>));</span>
+<span>// make blockDim 1-dimensional, but don&#39;t change number of threads</span>
+<span>dim3</span> <span>blockDim</span><span>(</span><span>32</span> <span>*</span> <span>32</span><span>);</span>
+<span>sgemm_coalescing</span><span>&lt;&lt;&lt;</span><span>gridDim</span><span>,</span> <span>blockDim</span><span>&gt;&gt;&gt;</span><span>(</span><span>M</span><span>,</span> <span>N</span><span>,</span> <span>K</span><span>,</span> <span>alpha</span><span>,</span> <span>A</span><span>,</span> <span>B</span><span>,</span> <span>beta</span><span>,</span> <span>C</span><span>);</span>
+</code></pre></div></div>
+<p>Global memory coalescing increases memory throughput from 15GB/s to 110GB/s.
+Performance reaches 2000 GFLOPS, a big improvement compared to the 300 GFLOPS of the first, naive kernel.
+For the next kernel, we’ll use the GPU’s fast on-chip memory, called shared memory, to cache data that will be re-used.</p>
+
+<p>Next to the large global memory, a GPU has a much smaller region of memory that is physically located on the chip, called shared memory (SMEM).
+Physically, there’s one shared memory per SM.<label for="22"></label><span>Here’s a helpful illustration of the memory hierarchy on an A100 GPU (<a href="https://developer.nvidia.com/blog/cuda-refresher-cuda-programming-model/">source</a>):<img src="https://siboehm.com/assets/img/CUDA-MMM/memory-hierarchy-in-gpus.png" alt=""/></span>
+Logically, this shared memory is partitioned among the blocks.
+This means that a thread can communicate with the other threads in its block via the shared memory chunk.
+On my A6000 GPU, each block has access to a maximum of 48KB of shared memory.<label for="23"></label><span>The amount of SMEM is configurable, by trading off a larger shared memory for a smaller L1 cache. For specifics, see the <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capability-8-x">compute capability documentation</a>. Also, it’s possible to use more than 48KB of SMEM per thread by utilizing dynamic shared memory.</span></p>
+<p>As the shared memory is located on-chip, it has a much lower latency and higher bandwidth than global memory.
+I couldn’t find good benchmark results for the Ampere architecture but for Volta (released in 2017) the benchmarks performed in <a href="https://arxiv.org/abs/1804.06826">this paper</a> report 750GiB/s of global memory bandwidth, and 12,080GiB/s of shared memory bandwidth.<label for="24"></label><span>It doesn’t look like these numbers have changed much since Volta. Nvidia reports ~750GB of max GMEM bandwidth for my A6000 (Ampere).</span></p>
+<p>So for this next kernel, we’ll load a chunk of A and a chunk of B from global memory into shared memory.
+Then we’ll perform as much work as possible on the two chunks, with each thread still being assigned one entry of C.
+We’ll move the chunks along the columns of A and the rows of B performing partial sums on C until the result is computed.</p>
+<p>This is illustrated below:</p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/cache-blocking.png" alt=""/></p>
+<p>The important parts of the code are below, with variable names corresponding to the plot above:<label for="25"></label><span>In general, I didn’t write the code to work for arbitrary sizes of M, N and K, as the condition checking introduces a lot of clutter and isn’t very interesting. To make sure the kernel works correctly, I test it with random data and a few different matrix sizes by comparing to cuBLAS.</span></p>
+<div><div><pre><code><span>// advance pointers to the starting position for this block</span>
+<span>A</span> <span>+=</span> <span>cRow</span> <span>*</span> <span>CHUNKSIZE</span> <span>*</span> <span>K</span><span>;</span>                    <span>// row=cRow, col=0</span>
+<span>B</span> <span>+=</span> <span>cCol</span> <span>*</span> <span>CHUNKSIZE</span><span>;</span>                        <span>// row=0, col=cCol</span>
+<span>// the pointer to the output location stays fixed during the loop</span>
+<span>C</span> <span>+=</span> <span>cRow</span> <span>*</span> <span>CHUNKSIZE</span> <span>*</span> <span>N</span> <span>+</span> <span>cCol</span> <span>*</span> <span>CHUNKSIZE</span><span>;</span> <span>// row=cRow, col=cCol</span>
+
+<span>// allocate buffer for current chunk of A and chunk of B in shared mem</span>
+<span>// the amoung of SMEM required by this kernel is fixed at compile time</span>
+<span>// this will become important for occupancy calculations later on.</span>
+<span>__shared__</span> <span>float</span> <span>As</span><span>[</span><span>CHUNKSIZE</span> <span>*</span> <span>CHUNKSIZE</span><span>];</span>
+<span>__shared__</span> <span>float</span> <span>Bs</span><span>[</span><span>CHUNKSIZE</span> <span>*</span> <span>CHUNKSIZE</span><span>];</span>
+
+<span>float</span> <span>tmp</span> <span>=</span> <span>0.0</span><span>;</span>
+<span>// the outer loop advances A along the columns and B along</span>
+<span>// the rows until we have fully calculated the result in C.</span>
+<span>for</span> <span>(</span><span>int</span> <span>outer</span> <span>=</span> <span>0</span><span>;</span> <span>outer</span> <span>&lt;</span> <span>numBlockSteps</span><span>;</span> <span>++</span><span>outer</span><span>)</span> <span>{</span>
+  <span>// Have each thread load one of the elements in A &amp; B from</span>
+  <span>// global memory into shared memory.</span>
+  <span>// Make the innerRow (=threadIdx.x) the consecutive index</span>
+  <span>// to allow for global memory access coalescing</span>
+  <span>Ab</span><span>[</span><span>innerCol</span> <span>*</span> <span>CHUNKSIZE</span> <span>+</span> <span>innerRow</span><span>]</span> <span>=</span> <span>A</span><span>[</span><span>innerCol</span> <span>*</span> <span>K</span> <span>+</span> <span>innerRow</span><span>];</span>
+  <span>Bb</span><span>[</span><span>innerCol</span> <span>*</span> <span>CHUNKSIZE</span> <span>+</span> <span>innerRow</span><span>]</span> <span>=</span> <span>B</span><span>[</span><span>innerCol</span> <span>*</span> <span>N</span> <span>+</span> <span>innerRow</span><span>];</span>
+
+  <span>// block threads in this block until cache is fully populated</span>
+  <span>__syncthreads</span><span>();</span>
+
+  <span>// advance pointers onto next chunk</span>
+  <span>A</span> <span>+=</span> <span>CHUNKSIZE</span><span>;</span>
+  <span>B</span> <span>+=</span> <span>CHUNKSIZE</span> <span>*</span> <span>N</span><span>;</span>
+
+  <span>// execute the dotproduct on the currently cached chunk</span>
+  <span>for</span> <span>(</span><span>int</span> <span>inner</span> <span>=</span> <span>0</span><span>;</span> <span>inner</span> <span>&lt;</span> <span>CHUNKSIZE</span><span>;</span> <span>++</span><span>inner</span><span>)</span> <span>{</span>
+    <span>tmp</span> <span>+=</span>
+        <span>Ab</span><span>[</span><span>innerCol</span> <span>*</span> <span>CHUNKSIZE</span> <span>+</span> <span>inner</span><span>]</span> <span>*</span> <span>Bb</span><span>[</span><span>inner</span> <span>*</span> <span>CHUNKSIZE</span> <span>+</span> <span>innerRow</span><span>];</span>
+  <span>}</span>
+  <span>// need to sync again at the end, to avoid faster threads</span>
+  <span>// fetching the next chunk into the cache before slower threads are done</span>
+  <span>__syncthreads</span><span>();</span>
+<span>}</span>
+<span>C</span><span>[</span><span>innerCol</span> <span>*</span> <span>N</span> <span>+</span> <span>innerRow</span><span>]</span> <span>=</span> <span>alpha</span> <span>*</span> <span>tmp</span> <span>+</span> <span>beta</span> <span>*</span> <span>C</span><span>[</span><span>innerCol</span> <span>*</span> <span>N</span> <span>+</span> <span>innerRow</span><span>];</span>
+</code></pre></div></div>
+<p>This kernel achieves ~2200 GFLOPS, a 50% improvement over the previous version.<label for="26"></label><span>There’s only a 50% improvement partly because our previous kernel already had pretty good L1 cache hit rates.</span>
+We’re still far away from hitting the ~30 TFLOPs that the GPU can provide.
+This is obvious from the roofline plot below:<label for="27"></label><span>Notice how we’re achieving a higher memory bandwidth than cuBLAS. But because we’re doing much less work per byte loaded from memory (=lower arithmetic intensity), overall performance is worse.</span></p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/roofline_kernel_3.png" alt="Roofline analysis of kernel 3"/></p>
+<p>At a CHUNKSIZE of 32, this uses <code>2*32*32*4B=8KB</code> of shared memory space.<label for="28"></label><span>This info can also be obtained by compiling with <code>--ptxas-options=-v</code>, which outputs: <code>Used 37 registers, 8192 bytes smem, 400 bytes cmem[0]</code>.</span>
+My A6000 GPU has a maximum of 48KB of shared memory space available for each block, so we’re far away from hitting that limit.
+This is not necessarily a problem, as there are downsides to increasing per-block shared-memory usage.
+Each multiprocessor (SM) has a maximum of 100KB of SMEM available.
+This means that if we’d modify our kernel to use the full 48KB of SMEM available, each SM could only keep two blocks loaded at the same time.
+In CUDA parlance, increasing per-block SMEM utilization can decrease <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy">occupancy</a>.
+Occupancy is defined as the ratio between the number of active warps per SM and the maximum possible number of active warps per SM.</p>
+<p>High occupancy is useful because it allows us to hide the high latency of our operations, by having a bigger pool of issue-able instructions available.<label for="29"></label><span>On GPUs, math operations like FMA have a latency of 4 cycles which is equal to 2.6ns at a 1.5GHz clock. Compare this to a recent x86 CPU, where FMA has a 6 cycle latency or 1.8ns at a 3.5GHz clock.</span>
+There are three main limits to keeping more active blocks loaded on an SM: register count, warp count and SMEM capacity.
+Let’s do an example calculation for our current kernel.</p>
+<h3 id="occupancy-calculation-for-kernel-3">Occupancy Calculation for Kernel 3</h3>
+<p>Here are the relevant hardware stats for my GPU, obtained from the <code>cudaGetDeviceProperties</code> API (Multiprocessors are the SMs we talked about earlier):<label for="30"></label><span>The amount of shared memory is configurable by using a feature called <code>SharedMemoryCarveout</code>. The so-called unified data cache is partitioned into L1 cache and shared memory, so we can trade-off less shared-memory for more L1 cache.</span></p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Name</td>
+<td>NVIDIA RTX A6000</td>
+</tr>
+<tr>
+<td>Compute Capability</td>
+<td>8.6</td>
+</tr>
+<tr>
+<td>max threads per block</td>
+<td>1024</td>
+</tr>
+<tr>
+<td>max threads per multiprocessor</td>
+<td>1536</td>
+</tr>
+<tr>
+<td>threads per warp</td>
+<td>32</td>
+</tr>
+<tr>
+<td>warp allocation granularity</td>
+<td>4</td>
+</tr>
+<tr>
+<td>max regs per block</td>
+<td>65536</td>
+</tr>
+<tr>
+<td>max regs per multiprocessor</td>
+<td>65536</td>
+</tr>
+<tr>
+<td>reg allocation unit size</td>
+<td>256</td>
+</tr>
+<tr>
+<td>reg allocation granularity</td>
+<td>warp</td>
+</tr>
+<tr>
+<td>total global mem</td>
+<td>48685 MB</td>
+</tr>
+<tr>
+<td>max shared mem per block</td>
+<td>48 KB</td>
+</tr>
+<tr>
+<td>CUDA runtime shared mem overhead per block</td>
+<td>1024 B</td>
+</tr>
+<tr>
+<td>shared mem per multiprocessor</td>
+<td>102400 B</td>
+</tr>
+<tr>
+<td>multiprocessor count</td>
+<td>84</td>
+</tr>
+<tr>
+<td>max warps per multiprocessor</td>
+<td>48</td>
+</tr>
+</tbody>
+</table>
+<p>And here are the resource demands for our kernel:</p>
+<table>
+<tbody>
+<tr>
+<td>Registers per Thread</td>
+<td>37</td>
+</tr>
+<tr>
+<td>SMEM per Block</td>
+<td>8192 B</td>
+</tr>
+<tr>
+<td>Threads per Block</td>
+<td>1024</td>
+</tr>
+</tbody>
+</table>
+<p>Work is scheduled onto the SMs on a block granularity.
+Each SM will load more blocks, as long as it has enough resources to accommodate them.
+Calculation:<label for="31"></label><span>I found lots of official and unofficial occupancy calculators, but no official formulae as how to calculate the occupancy. The results are correct (I checked using NVIDIA’s official tools), but there may be small errors eg in the application of rounding.</span></p>
+<ul>
+<li><strong>Shared memory</strong>: 8192B/Block + 1024B/Block for CUDA runtime usage = 9216B/Block. (102400B per SM) / (9216B per Block) = 11.11 ⇒ 11 Blocks upper limit.</li>
+<li><strong>Threads</strong>: 1024 Threads per Block, max 1536 threads per SM ⇒ Upper limit 1 block.</li>
+<li><strong>Registers</strong>: 37 regs per thread * 32 threads per warp = 1184 regs per warp. Register allocation granularity is 256 regs on a warp level, hence rounding up to 1280 regs per warp. We have (1024 threads / 32) = 32 warps per block, hence 1280 regs per warp * 32 warps per block = 40960 regs per block. Max 65536 regs per SM ⇒ upper limit 1 block.</li>
+</ul>
+<p>So this kernel is limited by the number of threads per block, and the number of registers per thread.
+We cannot load more than one block per SM, giving us a final occupancy of 32 active warps / 48 max active warps = 66%.</p>
+<p>A 66% occupancy is not too bad, so this doesn’t explain why our kernel runs so slow.
+Looking at the profiler gives us some hints. First, if we look at the mix of executed instructions, most of them are memory loads:<label for="32"></label><span><code>LDS</code> are shared memory loads. <code>FMA</code> is our fused multiply add. <code>IADD3</code> is a “3 input integer addition”, which we need for moving the pointers along the K dimension.</span></p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/kernel_3_profiler_instr_mix.png" alt=""/></p>
+<p>Our inner loop looks like this in PTX (<a href="https://godbolt.org/#z:OYLghAFBqd5TKALEBjA9gEwKYFFMCWALugE4A0BIEAZgQDbYB2AhgLbYgDkAjF%2BTXRMiAZVQtGIHgBYBQogFUAztgAKAD24AGfgCsp5eiyahUAV0wtyKxqiIEh1ZpgDC6embZMQAVgBs5M4AMgRM2AByngBG2KQgAMwA7OQADuhKxA5Mbh5evgFpGfZCIWGRbDFxSdbYtsVMIkQspEQ5nt7SyTbYdlmNzUSlEdGxCV1NLW15ndYTg6HDFaNJAJTW6GakqJxcAKQATPGhqB44ANS78S4SwGTESGyXuLtaAIIHR0wnFtgXV6hKIiEdBPF7vQ7HU6/S4uAFA%2BgEKKgt4fSE/P6wsxRIxKAD6ADd9gA6JDI8Gfb7nGHmSy40hmYQEDgkslgj44OhhM4uXAASSCuIAIryAGoQACy5DO4RWZyg4tlBwAQnKZQBaHiygD0qpWbLeuNxwHo6CiEkNZ3x6AImDOSmA2DYbFxSiQzWwmFxHGd2PQqAA1hBQkQzpKzsHpVKIwBpKU0E0sEMSFJu8hgs4ZzNZ7M53N5zMYJiAs7x9CJs4AKleUsLxdL5YrSrTb3zrbb%2BfrIZiTTjCZDFZcisSSvTZ1rIYjSqCAHkXNGRLyAFrPeKC%2BL7S4jlsXbdanVEJC/DZEFJmLsmgNnA/lgDuvxvxhDJDH6DYp6Iv1CV6QBCU39I2AsJgvoBqO45nGYEaoAASugN5/IKZwgf6vKYOoRLqJuYFCMWkHCGOOQIUhF4oWhRIAJ5YSiu46hIF6Jr8URmDQNCxCWZBjpsAH4ch4ZMCWLDFq67q2t6o57naboAaJjrhn%2BwnSUh2BEHezBnHR/6AZgf5fiwxF%2Bv6o6GgpHoWp2ZyvEouw%2BEqU6zvOS64JWZx2XOC7LtZgpUa8GbGVJpm4iWfYuVZNmuQ5y7OeF7nPD4XnxFu7w0d%2Bn5MGEpBnKQcEXPsfgvvQ363tgYBcAB6moNsSgZCYfHfr%2BmlAdhRYhnhT5IABQGEZciEHh1mCoeh6g5T4Lkzm5jneRm4GtQ1mCwfB3WzQNGFnDq0UTQl%2Bo%2BattGYPixjbGcaTBrEf7PgevyAgMoTAEd6SZDho4%2Bcqi0wdlFajfZMXOdGm7tnmElZTe3VvTeNbuN1WijiqL2rgR7hRWNEUriq/2toDcGQ%2BD9Agzko4uDlI5w6DiNfY5znhIT8MFR960eQlO2ZZjq6g9juMQ9R23mUQb5EVoRJQ5t26CBlQY8aRQ2LYLKpRBLGJnL9DOywNhOLXTuBDolWYSQAEiw%2BK/IBqBILNZwJraQhHjQKVnLUjrMEQOn8c9uUuaOGYSeKLD%2Br8F2zYREDdb1WnLeosp%2B7WPRngQBt8TgmHbh7%2B7oOp9AmvBxqmhIZzemQ5HlZVf4YBI2BKKgN3uxZoVKsHQHzaT42Rcq/sQ3FRHvDZtdze9CtU13eNxZNmZKtXXf17TSPfc3/et4havWTX7VaeP0p90vnWz95lcSbxXdO3Vf68Qy9gFeIxufn%2BNBmGn%2BdpKeRgfpglfGeRXx7xAepC9tGYu0TiHq0PDMMN9h/0%2Bo3JyH1whb0TozbA6go4fhtpgdAJ4sqYDMHYM4QgbbmFINxIg9B85n0PLaZClcRZygjMgogKspZ/WobQq4YDkZ/ReiAhhaFNaVwzDzFIqs4aWQXmPHu6sqYcMwm3Cs3C8wjwXuIhuyM159QHvFLWmZdiJC8jAiSYQPRXhTkoV%2BqB1LABYLpNqhsmCYClM%2BfW1pbQ0EEh%2BDKe9t46lYkQY2N0bZhHUOeAyfFzqHjHCwc%2BSkRaXXTmxPe6kyrILCM/F0Rj36fzURorR20XBCPXt3eCkClFaRUQhaRyY3TOV4VTbsekPpZM7jklelNp45JUVvTRXA1j0G4D4fg3guA6HIOgbgLgFCCh8lkkBzclAbC2NCQ4fByBEG0O0tYh4gKjA/uQf0vgtCGG4NIHpSyBncH4EoEAOzFl9PaeQOAsAUAYDfAwWIlBqD3JSI8uITB8QVR4DwZIOB8QEG2CKAg2AbzThSMwQ5dB6DONORAKIhyoihGaORbg8z7kcGENOJghDDk4DYMYY0Ox%2BmEAAr0A2pzLmBHgeYD8aL%2BAnU6VShEURSAorcDgQ5RBSBMnpWseMLBgBKGBaC8FkLeD8EEMIMQJcpCyClYoFQGhDn6H2IYQlaALBWBZacyAax0ApHqJSk5dteiOAgM4KY3geCBCsUMcolQDCFAetkdw7QnX3XqPakYcQbXdDNQ0OYVqDD%2BvqP0Fo3qli%2BtmAMYNfq5iRsdZqdYmxthSA6V0g5VLBlcGlCKFwBMflEkSALOU%2BBiAcQ%2BJqfgFydArBWVpdZawtk%2BB2Uy/Z5Ben9JzScs5Cyln1t2VwfY/A2AgGkPzPwPhEgAE5DhaH2IkeIWgfAzp8D4Tthye39suWsG5yAQD/MBdgZ5EBXnvPCOwHY4R82Fp4MWgW/APQVp5ZgAwCqZWSBkHIYQyg1CaCpaqmodQshOCscG6QAAOW1mBE2jB4D4G1zr6hxtSJ6rIcHfXSBncBnoYag1uumNB0NfQE0LAdfBxDMbJiEetdR%2BYZQfVypnWsbl2BsA2jORmrg3TN3Zu4IKbAALDoirvBlG9BazhFpLVoMthASAZSrVKNwDzGCKcOPsFYNaB0NrWXEDZWyeBaDbXs0dvgZ1EniNIfYWhEh%2BBnYkXKM6J2yC7fwbdpzzk6c2VIYzQ74hZu7ccndda1gG1IBkRw0ggA%3D">Godbolt link</a>):</p>
+<div><div><pre><code><span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f91</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>3456</span><span>];</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f92</span><span>,</span> <span>[</span><span>%</span><span>r7</span><span>+</span><span>108</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f93</span><span>,</span> <span>%</span><span>f92</span><span>,</span> <span>%</span><span>f91</span><span>,</span> <span>%</span><span>f90</span><span>;</span>
+</code></pre></div></div>
+<p>That’s not good, given that a memory load is bound to have a higher latency than a simple FMA, and given that we know our kernel should be compute bound.
+We see this effect when looking at the profiler’s sampling of warp states.
+This quantifies how many cycles were spent in each state per executed instruction:<label for="33"></label><span><code>Stall Not Selected</code> means that the warp was eligible to be scheduled, but the scheduler selected another eligible warp instead. This adds evidence to our earlier hypothesis that occupancy is currently not a problem.</span></p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/kernel_3_profiler_warp_stalls.png" alt=""/></p>
+<p>The meaning of the states is documented in the <a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-reference">Kernel Profiling Guide</a>.
+For <code>Stall MIO Throttle</code> it reads:</p>
+<blockquote>
+<p>Warp was stalled waiting for the MIO (memory input/output) instruction queue to be not full. This stall reason is high in cases of extreme utilization of the MIO pipelines, which include special math instructions, dynamic branches, as well as shared memory instructions</p>
+</blockquote>
+<p>We’re not using special math instructions, nor dynamic branches, so it’s clear that we’re stalling waiting for our SMEM accesses to return.
+So how do we make our kernel issue less SMEM instructions?
+One way is to have each thread compute more than one output element, which allows us to perform more of the work in registers and relying less on SMEM.</p>
+<h2 id="kernel-4-1d-blocktiling-for-calculating-multiple-results-per-thread">Kernel 4: 1D Blocktiling for Calculating Multiple Results per Thread</h2>
+<p>So this next kernel works like our last kernel, but adds a new inner loop, for calculating multiple C entries per thread.
+We now use a SMEM cache size of <code>BM*BK + BN*BK = 64*8 + 64*8 = 1024</code> floats, for a total of 4KB per block.
+Below a visualization.
+I have highlighted two of the threads and the values they access in the inner loop in orange and red.</p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/kernel_4_1D_blocktiling.png" alt=""/></p>
+<p>All of the important changes for this kernel happen in the inner loop.
+The loading for GMEM to SMEM stays largely the same as before.
+Let’s have a look:<label for="34"></label><span><a href="https://godbolt.org/#z:OYLghAFBqd5TKALEBjA9gEwKYFFMCWALugE4A0BIEAZgQDbYB2AhgLbYgDkAjF%2BTXRMiAZVQtGIHgBYBQogFUAztgAKAD24AGfgCsp5eiyahUAV0wtyKxqiIEh1ZpgDC6embZMQs5wBkCJmwAOU8AI2xSEAB2LXIAB3QlYgcmNw8vHwSklKEAoNC2CKjY62xbeyERIhZSInTPb1kbbDtU6tqifJDwyJi4pRq6hszmoa7AnqK%2B2IBKa3QzUlROLgBSACYAZkDUDxwAajWtlwlgMmIkNmPcNa0AQU2dpj2LbCOT8SUVOpu7x%2B2u3272OLlQg0I6D%2BDyeQLeHzBEPoBDC0IBz1eh1B5jCRiUAH0AG4bAB0SDRsJewIR5ks%2BNIZmEBA4ZIpMO2ODoQQOLlwAEk/PiACJ8gBqEAAsuQDsFZgcoBK5ZsAELy2UAWh4coA9GrZv9/vj8cB6OgwhIjQdCegCJgDkpgNg2GweEKAOq1eIAFQYgWAEECRAOUoOgZl0rDAGlpTRTSwgxJ4kgrP8Dmn0xnM1ns1mMExBgdY%2Bh4wcAFT3aV5gtFkul5UxuNBiI1cipnPtjtZmtB0suJXRZUGh5pqtBsPKiUfIUHABs0mOg%2BHB1HoeEB2VwSns/nW0X9xHQgL48jW4AHAu2yuw17J8dp%2Bfd23tbq%2BTQDgB3d6xgjxA7qA7GHaACeBxIJE7yfgcjpBgAflsWibAArAcjDfAc8SRIIpBsMYKyFmQKG1I6Bw4UQpAECsSgkk%2BupemBy5LKQzBENK8FIYWLCDJEy5CHQwBLPGqQHMwShLNgSgHEQyZNqaqAANYSe%2Blz2tgACOZjMQQEg0QcuLoPJfJChJLCoJREkYBk%2BYHOgb6qio6maRI9BAdK75IAw7xKMm5EmJJ9FKOw7ykOg77WW%2B9zUUuz4HHRnmmp%2BpA8UwfECZUTAfos9B2l5tTvBZjQSTZBwVrpZgJqZ4kSYG6DrhlZhZTpEQHEwQjqvZGlMhIJIHCINVSV%2BnFENxeYpaQglCKBnG6dgRBDYlSjxIJEgofpEjEEBOmAaBzB4SwUFMfG3F%2BBsoHEAcY1DZF%2B5JQWZhhqgABKIVbnpBmYOoJIbY%2BS4rnda6oOkL2yXJfLvSS6gXjCP2HkGf1BiQNT0A94n1UQSjKsD9iMFuE5luuwSQ9d0X7lJB12gQElMQth4otjWHLhI5hGPYvk3sJjAcMIVXpf1umYx5l4wwccPNZ4dFk%2Bj/PY3eknoIjyOifQaMY/pclY%2B8tESoTOkK6jSiqJEKvyQcuq60r%2BuROL2AsHad4y1bNsW6QRtyW2nE/EQEBMGLSASy76tTjLr1yUKzLg/q32PFFurW6gSAfp6H4MPQDP0Ezh0HFsGylmz5ROsxSiucpWfTX6fl5e4jS1AchBsFdB75mOa6k9brjuFuLc26DH3/uxG6Ew3R7N77rdPaFMud5g3fgyb%2BPa9HAH0LJGcLSZX4Ebz5ikExa7BwHgQ9RKuBa0uRo5UxmCWt2xVKGsiHKrjpbrpGd9CgPBxn952CX/ihaNuut977KhPE/fuiE36Rx0hKdAhJ3h7w8rLaawBAhMDLkVe4YAuCU2eltZUmDzKVy8G2fcKoZaPWeqAycT8X6RzTKqUhWxpwA3bqAgmtCeRHA2IORhy4x540fjKThqpmEp1YfPImuoSCYHQCAACmBdBmALFJCmiDY7x0noguMdo2Cox/NjZi5FxIASYJgRqM05rCXUPEU0Z1N4mX8gQAAXuJN23xIiewEcAwOPDg6hzruoCOe40zu3cRADc/CTx2x8cDPx4d36/TDCgyI6QSE8MntPXuGxkLAIXCbXU75PTqkYLAlOABxI%2Bk4MASHEqgP0gtG7C0SUwIIpAx6pOnOksG/5dQ5PYQktcSTSDpHoWkkeXcumcOyWw1U0UCmkHiEU7AJSDjlOPjxapShakmHqbdJpLSx4jI6WMqeEyenTKHBIxey8hp%2BTJkU1aKdxBx3XolKmetVznWwMgripA6CMDbNfSeZs0Z32VDeV%2BW41gDi0CSBC0QIF7h0osCxpp0C/hgdxYOkkPK3yXPTCAIswgg3eluBCu5dLEt7icA4NDVREu7kImWwD%2BxBPTNFRI8R6oZ15iICpDNnm4uumme4gDlSDLaREoRq4WkpIhTLR499xUhX3NQqVgzZXgPfnQ0VSr3yqlYWq5pyT3CDnATjUFur9WCJVNK419BTUIrbGmM%2BQEXiTyUBAQJFyMzRRtoSXCcCpbYCdcVRlPDemsroWG6cXin7nKhkKvJqd043IwqQdUGi3nmxDfikW0iiAMplmS1U%2BbC3UojYyrhpb3ospDWmWZ7wcJyXeLzfN8RgqYDMHYFaaLy7WTKskQ4qL4iuXcnHDitTkQ1CGoKrM0UmKKPeEVXmyoJIGJch%2BMd8dILiHSk8%2BiB89pEDYL%2Bf1pB66ZkBSenGorq3/gNTaye6RX5avTLmsMVMy3TmLZ8pQZaXAxS1uS0hXDP01qOAOOt6YgUo2zffMDEMzUMLfkuDsIrQUQCBRQwDUqENylAZErhNc5bdwhU/Y98RX1pihShxNNGQ0urdccj1Xqlz0YTfW/J5EbnIr7VmkFeKCIEo/eJL9Bwf0IYRIB3JIHlR4Yg5GnkGGsOhSfmzG18m41Sqfe4OVjCoPBPoEmPa5HjnAtFQhuVXCDPTRqHjFwymzPYfU0RzT1qiM6foC%2B9h7HHjwq4PMeg3BEL8G8FwHQ5AZFcBcAoIU%2B4HPWaI0oRYywQTbD4OQIg2gAvzDAjbPonryByRAIhOIQWuDSH4GwHw0gSSnnq1sGcTWNjRGkAATliHOcgYWItRf4EoEAcQsvhYC%2BQOAsAUAYBPR5CgVAIBTfiDNkATBCSmR4DwaI5AcCEgotgUUBBsDvgAPIYR6/wP5c0BsQDCNl8gYRAi1CAtwDLU3OZECO0wZyt2cA4RMJIEbW2CBMTaLAgbAPsDqFaGVVYGXAzlFu8iMIY1SBATcDgW7ZFmTPdG7GFgwAlD7cOyd5g2O5DCDENUqQshBDCGUGoTQAP9AbEMMYUwFgrCI4G5AeYaK0pg/VEdrYBx1RCmCEKXAyoFClOF%2BqR0LTDrqgwDgO8tQ453gW9D/Ep4ZzkCV8G/T98NdDS1zrpQbATcQvVOqeIRB1CcXVLz1It9GHqkJMLiE6vZMbf63nNojgIDOBGN4Hg5B/CTEKMUAwiRkhpSD1HnIaVugR76CHlofumAdGGIQ4PZQKjtHGEn3oURU/jDjyXzohfpjF/mMlpYKwDAFOECdgtyUot8EC8F0Lt2osylFC4AD62STRFhfKfAxACJPC1PwYbOhZi5dbgVjvFWqsgC2DwEkPANgtdPIhU80hpDRD39ELY3Xu/cH64NzL2X5jjeQCAZFnKWJzYWzN4IgVuDBD7wP9fw%2BIvf3H%2BRJgAYDTqIOIJIDIGTooCoBoLdkzuQO%2BGNPENjkviFqfgDlFkdmVI/mFL3v3gcIPr/vKG4NNowIlE8BsLMNPtfkvpVuQNVtsCSG1vVkfohC1tEDwKeBsFoJtmdpFuftYJfjPjlkViVmVtwFsF3ugfwUITfogBACgNtrtpQNQC/qQW/hwB/l/vgT/rCvwP/iQIAcAfIBTuAdTvIHTjAYziAMzmnmlE4CYmXqHiYpXpHiHtHrkGkNnvHjHqkC4Snrnq0GlJnvUF4anr7kEQXuHkXgYIMJ0I4bEXUH4dXplkxNgLaINigZIb1twEKEsrtgcITglLgd/kPiPhAGPgYZwmvtKMQYtqQVURQVQSNnPuQHljgFEIVsVqVoYNwLQbwX1gIUNtQT0VwBsCvjwFoHEP0dIcMbAqQMkI4NIEAA%3D%3D%3D">Godbolt link</a>.</span></p>
+<div><div><pre><code><span>// allocate thread-local cache for results in registerfile</span>
+<span>float</span> <span>threadResults</span><span>[</span><span>TM</span><span>]</span> <span>=</span> <span>{</span><span>0.0</span><span>};</span>
+
+<span>// outer loop over block tiles</span>
+<span>for</span> <span>(</span><span>uint</span> <span>bkIdx</span> <span>=</span> <span>0</span><span>;</span> <span>bkIdx</span> <span>&lt;</span> <span>K</span><span>;</span> <span>bkIdx</span> <span>+=</span> <span>BK</span><span>)</span> <span>{</span>
+  <span>// populate the SMEM caches (same as before)</span>
+  <span>As</span><span>[</span><span>innerRowA</span> <span>*</span> <span>BK</span> <span>+</span> <span>innerColA</span><span>]</span> <span>=</span> <span>A</span><span>[</span><span>innerRowA</span> <span>*</span> <span>K</span> <span>+</span> <span>innerColA</span><span>];</span>
+  <span>Bs</span><span>[</span><span>innerRowB</span> <span>*</span> <span>BN</span> <span>+</span> <span>innerColB</span><span>]</span> <span>=</span> <span>B</span><span>[</span><span>innerRowB</span> <span>*</span> <span>N</span> <span>+</span> <span>innerColB</span><span>];</span>
+  <span>__syncthreads</span><span>();</span>
+
+  <span>// advance blocktile for outer loop</span>
+  <span>A</span> <span>+=</span> <span>BK</span><span>;</span>
+  <span>B</span> <span>+=</span> <span>BK</span> <span>*</span> <span>N</span><span>;</span>
+
+  <span>// calculate per-thread results</span>
+  <span>for</span> <span>(</span><span>uint</span> <span>dotIdx</span> <span>=</span> <span>0</span><span>;</span> <span>dotIdx</span> <span>&lt;</span> <span>BK</span><span>;</span> <span>++</span><span>dotIdx</span><span>)</span> <span>{</span>
+    <span>// we make the dotproduct loop the outside loop, which facilitates</span>
+    <span>// reuse of the Bs entry, which we can cache in a tmp var.</span>
+    <span>float</span> <span>Btmp</span> <span>=</span> <span>Bs</span><span>[</span><span>dotIdx</span> <span>*</span> <span>BN</span> <span>+</span> <span>threadCol</span><span>];</span>
+    <span>for</span> <span>(</span><span>uint</span> <span>resIdx</span> <span>=</span> <span>0</span><span>;</span> <span>resIdx</span> <span>&lt;</span> <span>TM</span><span>;</span> <span>++</span><span>resIdx</span><span>)</span> <span>{</span>
+      <span>threadResults</span><span>[</span><span>resIdx</span><span>]</span> <span>+=</span>
+          <span>As</span><span>[(</span><span>threadRow</span> <span>*</span> <span>TM</span> <span>+</span> <span>resIdx</span><span>)</span> <span>*</span> <span>BK</span> <span>+</span> <span>dotIdx</span><span>]</span> <span>*</span> <span>Btmp</span><span>;</span>
+    <span>}</span>
+  <span>}</span>
+  <span>__syncthreads</span><span>();</span>
+<span>}</span>
+</code></pre></div></div>
+<p>This kernel achieves ~8600 GFLOPs, 2.2x faster than our previous kernel.
+Let’s calculate how many memory accesses each thread performed in our previous kernel, where each thread calculated one result:</p>
+<ul>
+<li>GMEM: K/32 iterations of outer loop * 2 loads</li>
+<li>SMEM: K/32 iterations of outer loop * BLOCKSIZE (=32) * 2 loads</li>
+<li>Memory accesses per result: K/16 GMEM, K*2 SMEM</li>
+</ul>
+<p>And for our new kernel, where each thread calculates eight results:</p>
+<ul>
+<li>GMEM: K/8 iterations of outer loop * 2 loads</li>
+<li>SMEM: K/8 iterations of outer loop * BK(=8) * (1 + TM(=8))</li>
+<li>Memory accesses per result: K/32 GMEM, K*9/8 SMEM</li>
+</ul>
+<p>As expected, we now spend much fewer cycles per instruction stalling due to memory pressure:<label for="35"></label><span>Careful: The axis has changed compared to the previous plot.</span></p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/Kernel_4_profiler_warp_stalls.png" alt=""/></p>
+<h3 id="sidenote-on-compiler-optimizations">Sidenote on Compiler Optimizations</h3>
+<p>Above we explicitly cached the entry of B into <code>Btmp</code> and reordered the two inner loops for efficiency.
+If we don’t do that, then the code looks like this:</p>
+<div><div><pre><code><span>for</span> <span>(</span><span>uint</span> <span>resIdx</span> <span>=</span> <span>0</span><span>;</span> <span>resIdx</span> <span>&lt;</span> <span>TM</span><span>;</span> <span>++</span><span>resIdx</span><span>)</span> <span>{</span>
+  <span>for</span> <span>(</span><span>uint</span> <span>dotIdx</span> <span>=</span> <span>0</span><span>;</span> <span>dotIdx</span> <span>&lt;</span> <span>BK</span><span>;</span> <span>++</span><span>dotIdx</span><span>)</span> <span>{</span>
+    <span>threadResults</span><span>[</span><span>resIdx</span><span>]</span> <span>+=</span>
+      <span>As</span><span>[(</span><span>threadRow</span> <span>*</span> <span>TM</span> <span>+</span> <span>resIdx</span><span>)</span> <span>*</span> <span>BK</span> <span>+</span> <span>dotIdx</span><span>]</span> <span>*</span> <span>Bs</span><span>[</span><span>dotIdx</span> <span>*</span> <span>BN</span> <span>+</span> <span>threadCol</span><span>];</span>
+  <span>}</span>
+<span>}</span>
+</code></pre></div></div>
+<p>Interestingly, this has no adverse effect on performance.
+This is surprising since our inner two loops now incur BK (=8) * TM (=8) * 2 = 128 SMEM accesses, instead of the previous 72.
+Looking at the assembly (<a href="https://godbolt.org/#z:OYLghAFBqd5TKALEBjA9gEwKYFFMCWALugE4A0BIEAZgQDbYB2AhgLbYgDkAjF%2BTXRMiAZVQtGIHgBYBQogFUAztgAKAD24AGfgCsp5eiyahUAV0wtyKxqiIEh1ZpgDC6embZMQAVnLOAGQImbAA5TwAjbFIQAHYtcgAHdCViByY3Dy9fJJS0oSCQ8LYomPjrbFt7IREiFlIiTM9vPxtsO3Ta%2BqJCsMjouISlOoam7NaRnuC%2BkoH4gEprdDNSVE4uAFIAJgBmYNQPHABqDZ2XCWAyYiQ2U9wNrQBBbb2mA4tsE7PxJRUGu4ez12%2B0On1OLlQw0I6ABTxeII%2BXwhUPoBAisKBr3ex3B5giRiUAH0AG5bAB0SAx8LeoKR5kshNIZmEBA4FKpcN2ODoISOLlwAEkAoSACICgBqEAAsuQjqF5kcoFKFdsAEKK%2BUAWh4CoA9Br5oDAYTCcB6OgIhITUdiegCJgjkpgNg2GweCKAOr1RIAFQYwWAEGCRCOMqOwblsojAGlZTRzSwQxJEkgrICjhnM1nsznczmMExhkd4%2BhE0cAFSPWUFoslsvl1VxhMhqJ1cjpvOdrs5ush8suFWxVVGp4ZmshiOqqVfEVHABs0lOw9HR3H4eER1VoRn88XO2XjzHQiLk%2BjO4AHEuO2uIz7p6dZ5f9x3dfqBTQjgB3T7xgiJI7qEcxgOgAnkcSDRJ835HM6IYAH47Fo2w%2BEcjC/EciTRIIpBsMYazFmQqH1M6Ry4UQpAEGsShki%2B%2Bo%2BhBq4rKQzBELKiHIcWLDDNEq5CHQwArIm6RHMwSgrNgShHEQqYtuaqAANaSZ%2B1yOtgACOZgsQQEi0Uc%2BLoApAoipJLCoFRkkYFkhZHOgH7qioGlaRI9AgbKn5IAwnxKKmFEmFJDFKOwnykOgn42R%2Bjw0Sur5HPRXnmt%2BpC8Uw/GCdUTBfss9AOt59SfJZzSSbZRxVnpZhJmZEmScG6CbplZjZbpURHEwQiag5mkshIZJHCItXST%2BXFEDxBapaQQlCOBXF6dgRDDUlSiJEJEioQZEjECBunAeBzD4SwMHMYmPEBFs4HEEc43DVFh7JUWZgRqgABKoU7vphmYOoZKbc%2BK5rvdG6oJkr1yfJAofWS6hXnCv3HiG/0hiQdT0I9EkNUQSiqiD9iMDuU4VpuoRQzdMWHtJh0OgQknMYtx5ojj2GrhI5hGPYfl3iJjAcMI1UZQNelY5516w0c8MtZ49HkxjAs4w%2BUnoEjKNifQ6OYwZ8nY58dFSkTumK2jSiqNEqsKUc%2Bp68rBvRBL2AsA6D6y9btuW6QxvyR2XF/EQEBMOLSCS67GszrLb3ySKrIQ4aP3PNF%2Bo26gSBft6X4MPQjP0MzR1HDsWzluzlQuixShuSp2czQG/n5e4zT1EchBsNdR6FhOG5kzbrjuDure22Dn2ARxW5E43J4t37bfPWFstd5gPcQ6bBM6zHQH0HJmeLaZP6EXz5ikMxG4h4HwS9VKuDayuJq5cxmDWr2JVKBsPiqnj5abtG98ioPRznz52BX4SxbNpuO%2BD9VRnmfgPHw78o66SlOgYknx96eTljNYAwQmDl2Ko8MAXAqYvW2qqLBFkq5eA7IeNUssnovTAdOZ%2Br8o4ZnVGQnYs5AYdzAYTOhfIThbGHEw1c498ZPzlFw9ULDU5sIXsTfUJBMDoBAEBTAugzBFmkpTJBccE5TyQQmB0bA0Z/hxixCiEkgJMEwE1Wa80RLqESOac6W9TIBQIAALwku7X40QvaCJAUHXhIcw713UJHA8GYPYeIgFuARZ57a%2BJBv4iOH8/oRlQdETIpDeFTxnn3LYKEQFLlNvqT83pNSMDganAA4sfacGAJASVQAGIWTcRZJKYCEUg480mzgyeDQC%2BpckcMSRuZJpBMgMPSaPbu3SuE5PYeqGKhTSCJGKdgUpRwKkn14jUpQdSTANLus01p49RmdPGdPSZvSZkjkkUvFew1/Lk2KWtVO4h44byStTfW64LrYBQdxUgdBGAdhvlPc26N76qjvG/HcGwhxaDJEhWIkCDy6WWJY806B/ywJ4iHKSnk74rgZhAUWERQYfR3EhfcekSV9zOEcWh6piU92EbLEBg5gmZhiskRIDVM58xEJUxmLy8U3QzI8IBqohntMicI9crTUmQtls8B%2BErQqHhodKoZcqIEf3oWK5Vn51RsPVS0lJ7hhwQNxmCvVBqhFqhlSa%2BgZrEUdgzOfECbwp5KAgEEy5WYYq22JHheB0tsDOpKky3hfS2X0PDbObxz8LnQ2FQRJKhKIzU0ZbLcl6p02kvBLFbWFKyHcJzYEk4Q5Q0ZgJaLGRRAM28KzbXeWdaXAvzyUW1UNae6sorZmYFqMLZgpLfK7h9sVxdlFWCiAwLKH5ulSWhUYConcMbbWj6kKwFis7aSw1tqp6ZDftqzM0L35jrLSepNrr3UnM9d6lcx6fX5K/BRW5KKK5fKVqC/FhFU0bhLWSvJf680QsLSO4tEku1lqjXySd06wrP3Zra%2Bd%2BNty7pOfu81o6k1ZmTKmfGfaP1iqHRhkdp6sytn2s/FwMGTn8Pg/eZdSH43Sr3e4A9HD71wgRVwRY9BuA%2BH4N4LgOhyCyK4C4BQIpDxUdA/ZZYqwwS7D4OQIg2huOLAgrbAYXryDyV8AkXjXBpD8DYCAaQ0gyTnkszsOcNmtixGkAATniAucggnhOif4EoEACQVNCe4%2BQOAsAUAYDYIkTyFAqAQBC2FxgMQmDEjMjwHgsRyA4GJJRbA4oCDYE/AAeUwm5/g/z5peYgBEVT5AIjBHqCBbgSmQtcyILlpgLkKs4FwiYSQfnUsEGYh0OBXnuvYHUO0cq6wlPBkqBV1EERxqkBAm4HAFXyKsjq/5%2BMLBgBKCyzl/LzA1tyGEGIGpUhZCCGEMoNQmhuv6C2IYYwpgLBWBm15yAix0XpUG5qXLOwjiahFKEEUuBVQKDKX9zUzpWlHU1BgHAD56jxwfNFsbhJzxznILDkNTCwXI%2BGqj9HSg2D48hZqTUiQiDqC4pqD76Q75MM1MSP7UIkftuS55/OHRHAQGcGMbwPB/CmN6MUUoBhkipHSrz0XeR0pC/6DEfnbROdMC6KMIhfOKhVE6JMWXsx5fWEmJLhX2vpjC4GDqJYKw1gGEKcIfLtaUqib4DxvjAmKuiblOKFwLaktkliHCxU%2BBiCEReDqfgvmdDzHU23LTzvDPGZADsHgZIeBbDs%2BeHw54zOxEz7EHYrm3fcE8955TqnFiBeQCAFFXLWKRei%2BF0IQVuChE997pPfvhM/yDxRTABhzuiHEJIGQh3FAqA0BV275BPzjUSGt2P/H8/ddE7l8q1fwoe690cH37fFRuFC%2BFrh2d5hh9L7Hoz5ATO7DJA5yzOefB2diDwc8WwtApcKyJwv1hi/h7UzpvThhuA7Cu6L4f7f5l6IAQAoBpYZaUDUB16xYN4cBN4t6b5t5wr8Cd4kDd697yDHaD5nbyCXZj43YgB3aK7pROCmKG4C6YA64i785i75AZBq5S7i7pC0Fm4a7tDpQq6NDMEK4c7cHG5FBy4GDDDdBUFiENDsHy6LDkTYDYD2jeZz5AHubcAijLIZZHA7aJTr6t6%2B7%2B4QCB6YEH7858joB76xYH5bBH4l5%2BaR7kAaY4AxDaa6Y%2BD6bcBn5v4eaf4%2BYn7/5cBbDx48BaAJBeEgF%2BFwKkCpCODSBAA%3D">Godbolt link</a>) has the answer:</p>
+<div><div><pre><code><span>// first inner-most loop</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f45</span><span>,</span> <span>[</span><span>%</span><span>r9</span><span>];</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f46</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f47</span><span>,</span> <span>%</span><span>f46</span><span>,</span> <span>%</span><span>f45</span><span>,</span> <span>%</span><span>f212</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f48</span><span>,</span> <span>[</span><span>%</span><span>r9</span><span>+</span><span>256</span><span>];</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f49</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>4</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f50</span><span>,</span> <span>%</span><span>f49</span><span>,</span> <span>%</span><span>f48</span><span>,</span> <span>%</span><span>f47</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f51</span><span>,</span> <span>[</span><span>%</span><span>r9</span><span>+</span><span>512</span><span>];</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f52</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>8</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f53</span><span>,</span> <span>%</span><span>f52</span><span>,</span> <span>%</span><span>f51</span><span>,</span> <span>%</span><span>f50</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f54</span><span>,</span> <span>[</span><span>%</span><span>r9</span><span>+</span><span>768</span><span>];</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f55</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>12</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f56</span><span>,</span> <span>%</span><span>f55</span><span>,</span> <span>%</span><span>f54</span><span>,</span> <span>%</span><span>f53</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f57</span><span>,</span> <span>[</span><span>%</span><span>r9</span><span>+</span><span>1024</span><span>];</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f58</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>16</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f59</span><span>,</span> <span>%</span><span>f58</span><span>,</span> <span>%</span><span>f57</span><span>,</span> <span>%</span><span>f56</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f60</span><span>,</span> <span>[</span><span>%</span><span>r9</span><span>+</span><span>1280</span><span>];</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f61</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>20</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f62</span><span>,</span> <span>%</span><span>f61</span><span>,</span> <span>%</span><span>f60</span><span>,</span> <span>%</span><span>f59</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f63</span><span>,</span> <span>[</span><span>%</span><span>r9</span><span>+</span><span>1536</span><span>];</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f64</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>24</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f65</span><span>,</span> <span>%</span><span>f64</span><span>,</span> <span>%</span><span>f63</span><span>,</span> <span>%</span><span>f62</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f66</span><span>,</span> <span>[</span><span>%</span><span>r9</span><span>+</span><span>1792</span><span>];</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f67</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>28</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f212</span><span>,</span> <span>%</span><span>f67</span><span>,</span> <span>%</span><span>f66</span><span>,</span> <span>%</span><span>f65</span><span>;</span>
+<span>// second inner-most loop</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f68</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>32</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f69</span><span>,</span> <span>%</span><span>f68</span><span>,</span> <span>%</span><span>f45</span><span>,</span> <span>%</span><span>f211</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f70</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>36</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f71</span><span>,</span> <span>%</span><span>f70</span><span>,</span> <span>%</span><span>f48</span><span>,</span> <span>%</span><span>f69</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f72</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>40</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f73</span><span>,</span> <span>%</span><span>f72</span><span>,</span> <span>%</span><span>f51</span><span>,</span> <span>%</span><span>f71</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f74</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>44</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f75</span><span>,</span> <span>%</span><span>f74</span><span>,</span> <span>%</span><span>f54</span><span>,</span> <span>%</span><span>f73</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f76</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>48</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f77</span><span>,</span> <span>%</span><span>f76</span><span>,</span> <span>%</span><span>f57</span><span>,</span> <span>%</span><span>f75</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f78</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>52</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f79</span><span>,</span> <span>%</span><span>f78</span><span>,</span> <span>%</span><span>f60</span><span>,</span> <span>%</span><span>f77</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f80</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>56</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f81</span><span>,</span> <span>%</span><span>f80</span><span>,</span> <span>%</span><span>f63</span><span>,</span> <span>%</span><span>f79</span><span>;</span>
+<span>ld</span><span>.</span><span>shared</span><span>.</span><span>f32</span>   <span>%</span><span>f82</span><span>,</span> <span>[</span><span>%</span><span>r8</span><span>+</span><span>60</span><span>];</span>
+<span>fma</span><span>.</span><span>rn</span><span>.</span><span>f32</span>      <span>%</span><span>f211</span><span>,</span> <span>%</span><span>f82</span><span>,</span> <span>%</span><span>f66</span><span>,</span> <span>%</span><span>f81</span><span>;</span>
+<span>// ... continues like this for inner-loops 3-8 ...</span>
+</code></pre></div></div>
+<p>The compiler unrolls both loops<label for="36"></label><span>The compiler can unroll them since the loop count is known at compile time.</span> and then eliminates the repeated SMEM loads of the <code>Bs</code> entries, so we end up with the same amount of SMEM accesses as our optimized CUDA code.</p>
+<p>When the PTX is compiled to SASS, the SMEM loads from <code>As</code> are vectorized:<label for="37"></label><span>This already hints at an optimization we’ll perform later: Transposing <code>Bs</code> such that we can also vectorize those loads.</span></p>
+<div><div><pre><code><span>LDS</span>     <span>R26</span><span>,</span> <span>[</span><span>R35</span><span>.</span><span>X4</span><span>+</span><span>0x800</span><span>]</span> <span>// a 32b load from Bs</span>
+<span>LDS</span><span>.</span><span>128</span> <span>R8</span><span>,</span>  <span>[</span><span>R2</span><span>]</span>           <span>// a 128b load from As</span>
+<span>LDS</span><span>.</span><span>128</span> <span>R12</span><span>,</span> <span>[</span><span>R2</span><span>+</span><span>0x20</span><span>]</span> 
+<span>LDS</span>     <span>R24</span><span>,</span> <span>[</span><span>R35</span><span>.</span><span>X4</span><span>+</span><span>0x900</span><span>]</span> 
+<span>LDS</span><span>.</span><span>128</span> <span>R20</span><span>,</span> <span>[</span><span>R2</span><span>+</span><span>0x60</span><span>]</span> 
+<span>LDS</span>     <span>R36</span><span>,</span> <span>[</span><span>R35</span><span>.</span><span>X4</span><span>+</span><span>0xb00</span><span>]</span> 
+<span>LDS</span><span>.</span><span>128</span> <span>R16</span><span>,</span> <span>[</span><span>R2</span><span>+</span><span>0x40</span><span>]</span> 
+<span>LDS</span><span>.</span><span>128</span> <span>R4</span><span>,</span>  <span>[</span><span>R2</span><span>+</span><span>0x80</span><span>]</span> 
+<span>LDS</span>     <span>R38</span><span>,</span> <span>[</span><span>R35</span><span>.</span><span>X4</span><span>+</span><span>0xd00</span><span>]</span> 
+</code></pre></div></div>
+<h3 id="areas-of-improvement-arithmetic-intensity">Areas of Improvement: Arithmetic Intensity</h3>
+<p>Our current kernel still suffers from the same stalling-for-memory problem as kernel 3, just to a lesser extent.
+So we’ll just apply the same optimization again: computing even more results per thread.
+The main reason this makes our kernel run faster is that it increases arithmetic intensity.<label for="38"></label><span>Defined as the number of FLOPs executed per byte transferred (load + store!) between GMEM and SMEM.</span>
+Below I tried to make it more immediately obvious why calculating more results per thread raises arithmetic intensity:<label for="39"></label><span>It’s more efficient to calculate a square of results per thread than a column of results because we can share more of the inputs: <img src="https://siboehm.com/assets/img/CUDA-MMM/1d_warp_tiling.png" alt=""/></span></p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/raising_arith_inten.png" alt=""/></p>
+<p>In conclusion, all our kernels perform the same number of FLOPs, but we can reduce the number of GMEM accesses by calculating more results per thread.
+We’ll continue optimizing arithmetic intensity for as long as we’re still memory bound.</p>
+<h2 id="kernel-5-increasing-arithmetic-intensity-via-2d-blocktiling">Kernel 5: Increasing Arithmetic Intensity via 2D Blocktiling</h2>
+<p>The basic idea for kernel 5 will be to compute a grid of 8*8 elements of C per thread.
+The first stage of the kernel is for all threads to work together to populate the SMEM cache.
+We’ll have each thread load multiple elements.
+This code looks like so:<label for="40"></label><span>Here’s a graphical representation of the GMEM loading:<img src="https://siboehm.com/assets/img/CUDA-MMM/kernel_5_GMEM_loading.png" alt=""/></span></p>
+<div><div><pre><code><span>for</span> <span>(</span><span>uint</span> <span>loadOffset</span> <span>=</span> <span>0</span><span>;</span> <span>loadOffset</span> <span>&lt;</span> <span>BM</span><span>;</span> <span>loadOffset</span> <span>+=</span> <span>strideA</span><span>)</span> <span>{</span>
+  <span>As</span><span>[(</span><span>innerRowA</span> <span>+</span> <span>loadOffset</span><span>)</span> <span>*</span> <span>BK</span> <span>+</span> <span>innerColA</span><span>]</span> <span>=</span>
+      <span>A</span><span>[(</span><span>innerRowA</span> <span>+</span> <span>loadOffset</span><span>)</span> <span>*</span> <span>K</span> <span>+</span> <span>innerColA</span><span>];</span>
+<span>}</span>
+<span>for</span> <span>(</span><span>uint</span> <span>loadOffset</span> <span>=</span> <span>0</span><span>;</span> <span>loadOffset</span> <span>&lt;</span> <span>BK</span><span>;</span> <span>loadOffset</span> <span>+=</span> <span>strideB</span><span>)</span> <span>{</span>
+  <span>Bs</span><span>[(</span><span>innerRowB</span> <span>+</span> <span>loadOffset</span><span>)</span> <span>*</span> <span>BN</span> <span>+</span> <span>innerColB</span><span>]</span> <span>=</span>
+      <span>B</span><span>[(</span><span>innerRowB</span> <span>+</span> <span>loadOffset</span><span>)</span> <span>*</span> <span>N</span> <span>+</span> <span>innerColB</span><span>];</span>
+<span>}</span>
+<span>__syncthreads</span><span>();</span>
+</code></pre></div></div>
+<p>Now that the SMEM cache is populated, we have each thread multiply it’s relevant SMEM entries and accumulate the result into local registers.
+Below I illustrated the (unchanged) outer loop along the input matrices, and the three inner loops for the dot product and the <code>TN</code> and <code>TM</code> dimension:</p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/kernel_5_2D_blocktiling.png" alt=""/></p>
+<p>The interesting parts of the code look like this:<label for="41"></label><span><a href="https://godbolt.org/#z:OYLghAFBqd5TKALEBjA9gEwKYFFMCWALugE4A0BIEAZgQDbYB2AhgLbYgDkAjF%2BTXRMiAZVQtGIHgBYBQogFUAztgAKAD24AGfgCsp5eiyahUAV0wtyKxqiIEh1ZpgDC6embZMQAZnLOAGQImbAA5TwAjbFIQAE5ZAAd0JWIHJjcPL19yJJT7ISCQ8LYomPjrbFt8phEiFlIiDM9vPxtsOzTa%2BqJCsMjouNklOoamrNaRnuC%2BkoH4gEprdDNSVE4uAFIAJh9g1A8cAGoNnxcJYDJiJDYT3A2tAEFt3aZ9i2xj0/ElFQbb%2B6eOz2Bw%2BJxcqGGhHQ/0ez2B70%2B4Mh9AIERhgJebyOYPMESMSgA%2BgA3LYAOiQ6LhrxBiPMlgJpDMwgIHHJlNhOxwdBChxcuAAkgECQARfkANQgAFlyIdQvNDlBJfLtgAhBVygC0PHlAHp1fMAQCCQTgPR0BEJMbDkT0ARMIclMBsGw2FthQB1eoJAAqDGCwAgwSIh2lhyDspl4YA0jKaGaWMGJAkkFYAYd0xnM1nsznsxgmMNDnH0AnDgAqB4y/OF4ulssq2Px4NROrkNO5jud7O14NllzKgDsKvb1eD4ZVks%2BwsOPC2AA4TsPHunR2HhIcVaEpzP54uR0JC%2BOo9uFz4lw8Vwex%2BvvZOTtPT%2BfLwXr8HvVv74dH/uX4czOHUAAJXQAB3bc8XQVAAGt%2BUwdRSQATz3ZdDlXf911QDJwLNaDYPg9RkKeFC0PDEg6noQDsCUMx6CIJQVRwqD7EYbcJ3LDdQkI9MdT1C8iCQUhsBYe0CCUQ5BKUJIC1RFjBFIVCJHMIx7BMQ5bzLd9DkqZ1mDotdDn4j4IOg5jsB/Qt0ODJhPG9AShMwejGNM7cyIkSjqNoxzIKYhgPj1CBb3Y98DTPQ0UJ4w53JoujVGiBjvMOPUos82LSFswThKnT90vspRUvi6D2xYH5oiICBrLYHLhK8kzfKynxp2MqDhRZUl1BC892wizcdU0%2BoPkMw4KtKQ50BoAy7Oqgz0AdBJjEOFhUPcZpzNfCaMtcdwXMmzA8La44tgAVgVTdErUuUuKW39SJ24CwM/fiNr29QzogU69WCwiur1CQcITD5JJYNYizICaPnMUhBPXJrnOCB0OBuFDjSUFNBMwK0e0OB4lA2Q6VTYssNyjXHhUu5HUewdGCSLJsNxxvGVWPQnNxJr7wr1SV0CJIynLqkhDiiYBgiYf1RvGh4wC4MTSFAhamHtFVJbEjBMiYdsL1VT8gNl5nJ0J4nQpQtVNYa1CsOZzjDYvXkDuHU3tbA3X2I/LY1UwraLbZ62IvEeglITUXBuCQg1jE/jS340T1vsw4QIYehDnjEThBmkRJVwSVVr/cNheiO6NdNx77Oes7Gcukj11z0gMgL6ci%2BEkvtmOsure4vVff9ogqLBob%2BnksbxNAsSB%2BxibS36gXsFFpPKf0xaUhMFjhmwBJvoFhCFodf0WKarPLIdIhSDtbBa97yqdpqnyWL1Funyuiyc6YEJSDu43C52kub8tu%2BK%2BvZ%2BMjfnXD%2BcF9pNw4pdCKckBboH4ljMSxgFZiRAh8ECxhgxCVQEgROJZ7T80BkwHuNAaIJxVs0DUcdMD8VjGQNeLYu7yQAOLp0nBgCQVFUCiwgMVUaCRcizzwXNJ%2BosiH0ATjLEC5C7SwIQWGehAcTBryBjLH4S1VZKANMRK82d1zDCPjgQBZ8qoOQKlfPy4CrbtjbgtURkF/rR2EhqP6JCgZIA%2BFAiS0UxJw0EkLZepA6CMHbJjeumBkp0VxiqQKhN3wk23BsIcWhSRaHiaTVuiU9Q%2BNEvQhSmDu5QNHjIlUOMUKYx8ZnPGt5YmfniSqRJySBypLvqU7AwBOIVLadOapCSkkpK9lY5Y9CNRsGSMGM06AEijW5vJJqBlfLFOtlAiA%2B8IgwTgtuZJZ4BarJemCQ4Bs1QrLwrbT8jNBx3ysUkBINE7GDTThnHJrj5mZkWfvJOAB5GgNAVDBk/BstU7zPnfMRBuTOmyAVfOwD812n5dHHweGcyxGZsYRMDE/POoENau2wcJD5EKiDymZseVUa5/7uCeIdTpDVEXZnJSqVFz98622xZgXF3yCV7KZVXGurM0npl6ShdMLzwzgqBb8xczLWWQuBbfCVgKpUm2nLC/RCKBUZiKSiqur8mUishey06xKuXuGHBSrKqrszGrpZq0CxssU6vxc7TlaLq5Gp5ec44DTEXIwQq8EJSgIAdTCtbKxwkiTGGBjDXyiLMV22nDKzMEVhncyJqo5oYcZpH2AEgIgiKbUxuTYTb%2B6TDiJo%2BIzQeIExKYFAmrWEqqfaKWuV3Q4CRogahCeJKinjEVCvXFWogRyxWbL7QO04RNxWa1dsOuCKqg0ZgijMoM6aWlZOiE8rMPaxzrPFQQYFlTNkTpVAQGduYykRIIFU02yK8YQBCXdIKd4sVHvYmW4lU6CIUsupmfls7BWgyWTnLdmyd27Jifu6Frsn01OpRmHxbTD0XtjfTFUb7n0uzVCE8251OWuug9%2B7sf794STwneU2fyO1KGI7u0FubVREbgkqd1brnkEfDHR9QH5SPirYxxlw51x3gZVNx49HZb2ds8hEtjessPEu41U6FVKzUdlPXjSTsTCawYk1RPCHTP1Zjw3pj1qr9Ppi9T6i%2B/rLrfrXiBI%2BTaBk9w8eJkpLH1yScA2qNzIHqPHNdpJ4Tv75L/tc1puCHHpxke47uwtB6hOMegy4FFt6dZqQfR5kL6gGMFqZRhj20msWyZNfeaDmYkwpnYqJjy4SVPpak5pGT6WOnHMU5mFsi1CYJevUlx2KWmV%2BYdcSnLCdolofI9pnDRnDPWysw0rgix6DcEOvwbwXAdDkHQNwFwChhQXgSwJh0yxVigh2HwcgRBtCzcWK44SAx/XkCgiAQ6WhDDcGkPwNgIBpDSFJHOH7PgABsAOtgDmkLEAcWg/uyGW6t9bXB%2BBKBAE9s7K3ZvkDgLAFAGA2AJF8hQKgEBMfY8YDEJgRJUCoB4DwAc5AcBEgIGsMUBBsAgTeS2qH/AAn0PhxACI53yARGCPUBC3ATuY44MIN5TB6BC%2BR9T50xhTTrFW4QQSHRubw5l9gdQ7QzBd2F/wIMlRecogiKQQXbgcC88PiyPXiw4wsGAEoBnTOWfMD13IYQYg2FSFkIIYQyg1CaBl/oLYhh5doAsFYY38PICLHGdUdXGo3k%2BEOBqYUoRhS4BVAoBhKeNROmfv9DUGAcD3nqJg%2B8BOdfYAJHOP75Bi9mSpXjSvXca916UGwNvsSNQagSEQdQxUNRx7SDjBqGoiQp8hBXg9lO4faQ6I4CAzgxjeB4P4eWvRiilAMLkVIQgV87%2BSHvpgm%2B%2B4GDaAvmokwD9r4v9ULoDRT%2BzBiLf6/y0siv%2B6E/7f2olgrDWAYKguLn3vyEwIIDbs9lwItuQGzmttwLKGKC4LxhTqSAOEkgqPgMQKDM8NqPwEjjoPMJdvZDdnNi9m9r4DwKSLOEDnOIdHOJ9gOPQQOH4LATDnDgjqdudosGjsgCAAMlckQJQNQATjjqEOwOsKEIgcgZQWgatpTFgXogYL7qIL7JwDIO7ooCoBoLzsHuQDZiwAkBAfNlAUtrzjDm8jrgIWLAgUgTODIegRAG4FjjjgdD4FsPMHgVwaQVwK9uQO9jsKSLED9kwYdEDgODwHOFsFoFTqwdwOwYjl4Xdg9k9sYT4KYTLmwZwcjtwYgBACgDTnTtgEIfjugM4UTmIRwNwJIbYSgbIfwPISQIoWvsoZ7pIOocof7toUHiACHnfmkE4PLDfuvpgN/gMGvrvtUEMRMWkKMS/hUFUJ0G/qrOfvPvfpMLMefksc0JsV/tMFvmMYsIfNgFPJgAjt4dAbEVwMKNgLTsDE7sgvJNUdIagQ4ZgY0a4WvryKUYTtEK4e4Z4dkUQddjELdvdo9pAb4ZcfEVkQQd4VsOQTwFoE9lCTCRduQFMikI4NIEAA">Godbolt link</a></span></p>
+<div><div><pre><code><span>// allocate thread-local cache for results in registerfile</span>
+<span>float</span> <span>threadResults</span><span>[</span><span>TM</span> <span>*</span> <span>TN</span><span>]</span> <span>=</span> <span>{</span><span>0.0</span><span>};</span>
+<span>// register caches for As and Bs</span>
+<span>float</span> <span>regM</span><span>[</span><span>TM</span><span>]</span> <span>=</span> <span>{</span><span>0.0</span><span>};</span>
+<span>float</span> <span>regN</span><span>[</span><span>TN</span><span>]</span> <span>=</span> <span>{</span><span>0.0</span><span>};</span>
+
+<span>// outer-most loop over block tiles</span>
+<span>for</span> <span>(</span><span>uint</span> <span>bkIdx</span> <span>=</span> <span>0</span><span>;</span> <span>bkIdx</span> <span>&lt;</span> <span>K</span><span>;</span> <span>bkIdx</span> <span>+=</span> <span>BK</span><span>)</span> <span>{</span>
+  <span>// populate the SMEM caches</span>
+  <span>for</span> <span>(</span><span>uint</span> <span>loadOffset</span> <span>=</span> <span>0</span><span>;</span> <span>loadOffset</span> <span>&lt;</span> <span>BM</span><span>;</span> <span>loadOffset</span> <span>+=</span> <span>strideA</span><span>)</span> <span>{</span>
+    <span>As</span><span>[(</span><span>innerRowA</span> <span>+</span> <span>loadOffset</span><span>)</span> <span>*</span> <span>BK</span> <span>+</span> <span>innerColA</span><span>]</span> <span>=</span>
+        <span>A</span><span>[(</span><span>innerRowA</span> <span>+</span> <span>loadOffset</span><span>)</span> <span>*</span> <span>K</span> <span>+</span> <span>innerColA</span><span>];</span>
+  <span>}</span>
+  <span>for</span> <span>(</span><span>uint</span> <span>loadOffset</span> <span>=</span> <span>0</span><span>;</span> <span>loadOffset</span> <span>&lt;</span> <span>BK</span><span>;</span> <span>loadOffset</span> <span>+=</span> <span>strideB</span><span>)</span> <span>{</span>
+    <span>Bs</span><span>[(</span><span>innerRowB</span> <span>+</span> <span>loadOffset</span><span>)</span> <span>*</span> <span>BN</span> <span>+</span> <span>innerColB</span><span>]</span> <span>=</span>
+        <span>B</span><span>[(</span><span>innerRowB</span> <span>+</span> <span>loadOffset</span><span>)</span> <span>*</span> <span>N</span> <span>+</span> <span>innerColB</span><span>];</span>
+  <span>}</span>
+  <span>__syncthreads</span><span>();</span>
+
+  <span>// advance blocktile</span>
+  <span>A</span> <span>+=</span> <span>BK</span><span>;</span>     <span>// move BK columns to right</span>
+  <span>B</span> <span>+=</span> <span>BK</span> <span>*</span> <span>N</span><span>;</span> <span>// move BK rows down</span>
+
+  <span>// calculate per-thread results</span>
+  <span>for</span> <span>(</span><span>uint</span> <span>dotIdx</span> <span>=</span> <span>0</span><span>;</span> <span>dotIdx</span> <span>&lt;</span> <span>BK</span><span>;</span> <span>++</span><span>dotIdx</span><span>)</span> <span>{</span>
+    <span>// load relevant As &amp; Bs entries into registers</span>
+    <span>for</span> <span>(</span><span>uint</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>TM</span><span>;</span> <span>++</span><span>i</span><span>)</span> <span>{</span>
+      <span>regM</span><span>[</span><span>i</span><span>]</span> <span>=</span> <span>As</span><span>[(</span><span>threadRow</span> <span>*</span> <span>TM</span> <span>+</span> <span>i</span><span>)</span> <span>*</span> <span>BK</span> <span>+</span> <span>dotIdx</span><span>];</span>
+    <span>}</span>
+    <span>for</span> <span>(</span><span>uint</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>TN</span><span>;</span> <span>++</span><span>i</span><span>)</span> <span>{</span>
+      <span>regN</span><span>[</span><span>i</span><span>]</span> <span>=</span> <span>Bs</span><span>[</span><span>dotIdx</span> <span>*</span> <span>BN</span> <span>+</span> <span>threadCol</span> <span>*</span> <span>TN</span> <span>+</span> <span>i</span><span>];</span>
+    <span>}</span>
+    <span>// perform outer product on register cache, accumulate</span>
+    <span>// into threadResults</span>
+    <span>for</span> <span>(</span><span>uint</span> <span>resIdxM</span> <span>=</span> <span>0</span><span>;</span> <span>resIdxM</span> <span>&lt;</span> <span>TM</span><span>;</span> <span>++</span><span>resIdxM</span><span>)</span> <span>{</span>
+      <span>for</span> <span>(</span><span>uint</span> <span>resIdxN</span> <span>=</span> <span>0</span><span>;</span> <span>resIdxN</span> <span>&lt;</span> <span>TN</span><span>;</span> <span>++</span><span>resIdxN</span><span>)</span> <span>{</span>
+        <span>threadResults</span><span>[</span><span>resIdxM</span> <span>*</span> <span>TN</span> <span>+</span> <span>resIdxN</span><span>]</span> <span>+=</span>
+            <span>regM</span><span>[</span><span>resIdxM</span><span>]</span> <span>*</span> <span>regN</span><span>[</span><span>resIdxN</span><span>];</span>
+      <span>}</span>
+    <span>}</span>
+  <span>}</span>
+  <span>__syncthreads</span><span>();</span>
+<span>}</span>
+</code></pre></div></div>
+<p>In the inner loop, we can reduce the number of SMEM accesses by making <code>dotIdx</code> the outer loop, and explicitly loading the values we need for the two inner loops into registers.
+Below is a drawing of the <code>dotIdx</code> loop across time, to visualize which SMEM entries get loaded into thread-local registers at each step:<label for="42"></label><span>I had to reduce some dimensions to make it easier to draw. In the kernel: <code>BK=TM=TN=8</code>.</span></p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/kernel_5_reg_blocking.png" alt=""/></p>
+<p>Resulting performance: 16TFLOPs, another 2x improvement.
+Let’s repeat the memory access calculation.
+We’re now calculating <code>TM*TN = 8*8 = 64</code> results per thread.</p>
+<ul>
+<li>GMEM: K/8 (outer loop iters) * 2 (A+B) * 1024/256 (sizeSMEM/numThreads) loads</li>
+<li>SMEM: K/8 (outer loop iters) * 8 (dotIdx) * 2 (A+B) * 8 loads</li>
+<li>Memory accesses per result: K/64 GMEM, K/4 SMEM</li>
+</ul>
+<p>Slowly performance is reaching acceptable levels, however, warp stalls due to memory pipeline congestion are still too frequent.
+For kernel 6 we’ll take two measures to try to improve that: Transposing <code>As</code> to enable auto-vectorization of SMEM loads, and promising the compiler alignment on the GMEM accesses.</p>
+<h2 id="kernel-6-vectorize-smem-and-gmem-accesses">Kernel 6: Vectorize SMEM and GMEM Accesses</h2>
+<p>The first optimization that I already hinted at earlier is to transpose <code>As</code>.
+This will allow us to load from <code>As</code> using vectorized SMEM loads (<code>LDS.128</code> in SASS).
+Below the same visualization of the three inner loops as for kernel 5, but now with <code>As</code> transposed in memory:</p>
+<p><img src="https://siboehm.com/assets/img/CUDA-MMM/kernel_6_As_transpose.png" alt=""/></p>
+<p>Looking at the assembly<label for="43"></label><span><a href="https://godbolt.org/#z:OYLghAFBqd5TKALEBjA9gEwKYFFMCWALugE4A0BIEAZgQDbYB2AhgLbYgDkAjF%2BTXRMiAZVQtGIHgBYBQogFUAztgAKAD24AGfgCsp5eiyahUAV0wtyKxqiIEh1ZpgDC6embZMQADnLOAGQImbAA5TwAjbFIQAE4ecgAHdCViByY3Dy9fJJS0oSCQ8LYomPjrbFt7IREiFlIiTM9vPxtsO3Ta%2BqJCsMjouISlOoam7NaRnuC%2BkoH4gEprdDNSVE4uAFIAJgBmYNQPHABqDZ2XCWAyYiQ2U9wNrQBBbb2mA4tsE7PxJRUGu4ez12%2B0On1OLlQw0I6ABTxeII%2BXwhUPoBAisKBr3ex3B5giRiUAH0AG5bAB0SAx8LeoKR5kshNIZmEBA4FKpcN2ODoISOLlwAEkAoSACICgBqEAAsuQjqF5kcoFKFdsAEKK%2BUAWh4CoA9Br5oDAYTCcB6OgIhITUdiegCJgjkpgNg2GwtiKAOr1RIAFQYwWAEGCRCOMqOwblsojAGlZTRzSwQxJEkgrICjhnM1nsznczmMExhkd4%2BhE0cAFSPWUFoslsvl1VxhMhqJ1cjpvOdrs5ush8suFUAdlVHZrIYjqqlXxFRx4Wx8pxHTwzY/DwiOqtC09n88Xo6ERYn0e3C52S8eK4P4/XPqnpxnp/Pl8L15DPq396Oj/3L6OZgjqAAEroAA7tu%2BLoKgADWAqYOoZIAJ57suRyrv%2B66oJk4HmtBsHweoyHPChaERiQdT0IB2BKGY9BEEoqo4VB9iMNuk4VhuoSERmur6heRBIKQ2AsA6BBKEcglKMkhZoixgikKhEjmEY9gmEct7lu%2BRyVC6zB0WuRz8Z8EHQcx2A/kW6Ehkwng%2BgJQmYPRjGmduZESJR1G0Y5kFMQwnz6hAt7se%2BhpnkaKE8Uc7k0XRqjRAx3lHPqUWebFpC2YJwnTp%2B6X2UoqXxdBHYsL80REBA1lsDlwleSZvlZTsM7GVBIqsmS6gheeHYRZuuqafUnyGUcFWlEc6A0AZdnVQZ6COokxhHCwqHuM05mvhNGWuO4LmTZgeFtScWwAKyKpuiVqfKXFLb%2BpE7cBYGfvxG17eoZ0QKd%2BrBYRXX6hIOGJp8kksGsxZkBNnzmKQgnrk1znBI6HC3ChJpKKmgmYNavZHI8SgbIdqpseWG7RrjIqXcjqPYOjhLFs2G443jqrHoTm4k194X6lK6DEkZTl1SQRxRMAwRMAGo3jY8YBcGJpCgQtTAOqqktiRgWRMB2F5qp%2BQGy8zU6E8ToUoeqmsNahWHM5xhsXnyB0jqb2tgbr7Efls6qYVtFts9bEXiPQSmJqLg3BIQaxifxZb8aJ632UcIEMPQRwJiJwgzSIUq4FKq1/hGwvRHdGum499nPWdjOXSR6656QmQFzORfCSX2zHWXVvcfqvv%2B0QVFg0N/TyWN4mgWJA/YxNZb9QL2Ci0nlP6YtqQmCxwzYIk30CwhC2OgGLFNVnlmOkQpD2tgte95VO01T5LH6i3T5XRZOdMCEpB3cbhc7SXN%2BW3fFfXs/mRvzrh/OC%2B0m4cUuhFOSAt0D8SxmJYwCsxIgU%2BCBYwIYhKoCQInUsDp%2BaAyYD3GgNEE4q2aJqOOmB%2BJxjIGvVsXd5IAHF05TgwBIKiqBRYQGKqNRIyQVC4JmvgkWqkiH0ATjLEC5D7SwIQeGehAcTBryBjLX4S1VZKENMRK82d1zDCPjgQBZ8qoOQKlfPy4CrYdjbgtMRkF/rR2EpqP6JCgZIE%2BFAiS0UxJw0EkLZepA6CMA7JjeumBkp0VxqqQKhN3wk23BsYcWgyRaASaTVuiV9S%2BNEvQhSmDu5QNHrI1UOMUKY18ZnPGt44mfgSaqJJKTBxpLvmU7AwBOKVPaTOGpiTkmpK9tY5Y9DNRsBSCGc06BEijW5vJJqBlfIlOtlAiA%2B8IgwTgtuFJZ4BZrJeuCI4Bt1SrLwrbT8jMhx32sckRINF7GDTThnXJbiFlZiWfvJOAB5GgNAVAhk/Js9UHyvk/KRBuTOWzAXfOwL812n49HH0eOcqxmZsaRKrjXdibE1SKirvnW22DhKfMhUQQ0h0ukNSRTmZ4eMgxPzzqBDWrt8WYEJT8hU%2Bs8VovcFSppSK%2BkoQzK8iMELgV/MXEyllUKQW33FUCyVJsZxwoMYi/lmZimRJpc/V%2BeLhVQrZRxDltLq7uBHKSrKKqcwmtVBqulIFjaMp1cS52Br/7GtZukjMfLrYZmRghN4oSlAQA6mFL1GSFqYGJMYYGMNfJIoZXbGc0qswRRGdzImajmhhxmkfYASAiBIrtfGtNhNv6hpTZ8Rmg8QJiUwKBNWcIVU%2B0UjcruRxEjRE1KE8SVEvFIsFeuGtRBjmiq2QOodZwiZis1q7UdcFlUhusbM4MWbWnZOiM87MfbxwbLFQQEFVStlTtVAQOdeZymouqabFFeMZ0vSdli0Jd0gp3kZQQN1FzMyep7KDZZOdt1bN3Xs2JB6YWu2PScYcFLMy%2BPaUei9Cb6aqhvRil26pQnm3Ohyt9kHP0bu/fvCSeE7ym3%2BV2pQhG91goLWqAjcFlTgffS8vDEYaPqA/MRsVLG2MuHOpOkDqpOMns7A%2B7tnlIksb1hhrFnHqkwvJeazsZ68bibiYTaDYmqJ4U6ZdHMOGsy6fA6TFVPq/UX0DZdT1a8QJHxbYMnunjROlKY%2BucTf71QucA5Rk5rtxOCYFU5kMnHXOkc03ukth6BP0cgy4dVD6dZqWfW5jTtG9UoYcZtBOMTUvSdNfeSDWZkypnYsJjyESlNJfUBJzSUnyudJOfJrMrZFqE2i9S2Ljt4t4p806%2B9O10NVcZdlnlKqcMWcaVwRY9BuCHX4N4LgOhyDoG4C4BQIoLzRb446ZYqwwS7D4OQIg2hxuLDccJAYgbyBQRAIdLQhhuDSH4GwEA0hpBkh8G9nYAA2L7WxBzSFiIOLQH3ZCzfm4trg/AlAgBuwdub43yBwFgCgDAbBEi%2BQoFQCAyPUeMBiEwYkqBUA8B4IOcgOBiQEDWOKAg2AQLvLbSD/ggT6GQ4gBEQ75AIjBHqAhbge3kccGEO8pg9Aeew9Jy6YwZp1jzcIIJDo3NIdi%2BwOodoZgu68/4MGSo7PUQRFINztwOB2eH1ZBrxY8YWDACUFTmndPmAa7kMIMQbCpCyEEMIZQahNBi/0FsQwku0AWCsLryHkBFgTOqIWbgmp3k7COJqEUoQRS4FVAoBh8fNTOmfv9TUGAcD3nqJg%2B8WO1fYEJD4D75A89mXJXjEvXdy%2BV6UGwRvcTNSakSEQdQxVNQR/SDjBqmpiTx6hMXw9xOIfaQ6I4CAzgxjeASIEaYxRSgGD4fkDIy1sgJHX5H3oK%2BBhDCn5Hroowt8L4qFUTokx999wMMMbo8/783%2BX3fnUSwVhrAMKgwXneBRMEEDN1uy4Gm3IAZwW24DlHFBcG4yJzJEHGSUVHwGIFBheB1H4Bhx0HmGO3sjOwmzuwexAB2B4DJDnB%2Bx8EOh8Ge0HCoMHB2DAPZzBwhyh320O0WAR2QBAEGWuSIEoGoCxzR1CHYHWFCGgNgJIIQPm0phQP0QMHd1EF9k4BkEd0UBUA0HZ193ICsxYESCAMmxAJm0YO4HeTVx4LFigJgNnAkMQIgDcBRzRwOh2C2HmAwLYPwK4Hu3IEe12DJFiDe1oMOh%2B0HB4B8C2C0BJ3AKYOsBYMwKOwuyuxu30J2EMLFyiNiPYMQAgBQDJwp2wD4Mx3QHsJxyEI4G4FEMsLgMkP4GkJIFkISHkOd0kGUPkM93UJ9xAD9zaGn28Fn3lif0X3llv1mBiB3zyEj36NyFSD31f2GPv2P2v0f3PzmKvxqBfyKDf2sEmAmIfwaCGNX3f0PmwCnkwCh3cNAMiO4BFGwHJ2Bht2QXknKPEPgJsOQNqMcISD5EKOx2iEcOcNcNh2wPIBOxwBiHO0u2u2AM8IuPB2iOhzcOAK2EIJ4C0Bu2hP%2BKwMWGmVSEcGkCAA">Godbolt link</a></span> we see that loading <code>As</code> into the registers, which used to be a 32b <code>LDS</code> load, is now also a 128b <code>LDS.128</code> load, just like it had already been for <code>Bs</code>.
+This gives us a 500GFLOPs speedup, or ~3%.</p>
+<p>Next, we’ll vectorize all loads and stores from/to GMEM using <a href="https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/">vector datatypes</a>, namely <code>float4</code>.</p>
+<p>The code looks like this:<label for="44"></label><span><a href="https://godbolt.org/#z:OYLghAFBqd5TKALEBjA9gEwKYFFMCWALugE4A0BIEAZgQDbYB2AhgLbYgDkAjF%2BTXRMiAZVQtGIHgBYBQogFUAztgAKAD24AGfgCsp5eiyahUAV0wtyKxqiIEh1ZpgDC6embZMQAJlnOAGQImbAA5TwAjbFIpHgAOcgAHdCViByY3Dy9fWWTU%2ByEgkPC2KJieeOtsWwKmESIWUiJMz28/Kpr0%2BsaiIrDI6NiEpQamluz2kZ6%2BkrKhgEprdDNSVE4uAFIfAGZg1A8cAGoN7ZcJYDJiJDYT3A2tAEEt3aZ9i2xj0/ElFSbb%2B6eOz2Bw%2BJxcqBGhHQ/0ez2B70%2B4Mh9AIERhgJebyOYPMESMSgA%2BgA3HwAOiQ6LhrxBiPMlgJpDMwgIHHJlNhOxwdBChxcuAAkgECQARfkANQgAFlyIdQvNDlBJfKtgAhBVygC0PHlAHp1fMAQCCQTgPR0BEJMbDkT0ARMIclMBsGw2GLsHZLgAvbAQYJEQ7Sw5%2B2Uy4MAaRlNDNLH9EkSSCshyj6BjhwAVA9yADDjnc3n8wXC7nk6m0yrI9H/VEGhWU/60y5lQB2FXZw4YJgjIPCQ4qyWfYWHHg%2BOInVuPHMdrvBlWhAdDkdjttT/0zsPz0fbccPSdCac9gAq/ZOg83293ndXh7nJ8OZ7by73/rMwdQACV0AB3ed49CoADW/KYOopIAJ5LhO7ZPocL49qgmQ/maAFASB6gQU8kErjBwYkA09BvtgShmPQRBKCqSH/vYjDzn26a9qE6E5jqeo7kQSCkNgLD2gQSiHBxSjJJ2qLUYIpDthI5hGPYJiHEeaYHnO1TOswpHdocbEfL%2BAFUdgj6XthPZMJ4B7sZxmBkRROnzrhEgEURJEWX%2BlEMB8eoQEedEKQaW6GpBzGHHZxGkao0TkU5hx6oFDkhaQJkcVxA63nFZlKDFYUAW2LA/NERAQEZbDJVxjnaS5iXbIOWn/sKLKkuo3nbm2/mzjqCmHI0HwaYc%2BVlIc6A0OpplFep6AOokxhtVBWRMHp%2B7%2Bmx8WuO41mDZgKG1ccPgAKwKrOEWyXKjFQfpOErR%2B363vNZlreoe0QLtepeehjV6hISExh8AksGsSZkANHzmKQHE9pVVnBA6HA3JBxpKAmHGYFaJb%2Bg8SgbJtKq0WmvZhqjwqHdDsPYPDBJJpWvYo2jKrrpjs4409fl6pK6BEpplmlSQhxRMAwRMMEwC9f1DxgFwvGkF%2BbVMPaKpC7xGBTW2O6qre75i9T/aY9jPmQWqivle2CHUwxms7ryG2trryvfqrdE3j4arwUtBt08b/niPQkkxrzf3doQay8WxqZsTxA0LYcn4MPQhzRtxwgjSIkq4JKz2h9gQv0BHUcLnEETEHt2w%2BNn/q3tIhxKRwwi8Yk0TB2ZbX%2BpxqBIA6RDYIkM3PsG3PRGdCu65dXHXbdlN7dI9VtwZV4hKQmQ94OfercB61bNtd3rnqI%2BHS7EnEe9ftIB83VV31fFfrxR/IwNqbtRz2Ce1HhNqSwDq89RIwt0nESgRNqQmNRlVj7B/pRafnqKQO02AZ4KnyoVcy6VnLUUxiPPalNDpYQAd2SeZ1ta9xWgPNy91DjryNheLsaDO5T3cFg2eOCF43SXjtOca9R70x%2BmJCI6A2KHHPsYSWvFPwfE/MYOuX1G4Z3Zp9JgXsaDEQjrLVoGow6YDYpGMg79sBEGbmJAA4vHfsGAJCEVQJ7CAWVeqJDyPfMRY0mA8xklItOx9PzyLtBw7hQYNEexMEnL6osfiTVaEoA0mFoJoKASAsBlCurGRWsVOBrl6HDyYRhZ2L005/netXLiGo3oyOER8USfFCJBV4mDDiXNX6kDoIwNsiMMmYCiqRVGKoPKYwUjjecGwWxaFJFoDpuMiEkzrAU4Aic0ZHjabeDpKouk9KbH088AzUylIYqM5Zg4JmdO6b0p2TE9TLA0RqNgKR/RmnQIkXqzNWEUXUi5FGkF8kQDQREQCwF5w9K3BzZ5tDTiHA1mqJ5KFTa3kps2eZOzDjJESNvZuXs44J3Eg3QibYwVEFIMYASKQPg7k/EgUqUdPbECRQsogxciBsDOSeQleYOJ%2BmiIkDiRACTfCIGCRGxc0y3AgFsAAbE8NGZDu50XXKqdB0Rp50WkDjA0aMembTmYS5GjTfTWNFe4HcCDTaHC0PKK2wr%2BVfl5Ws3uZLaqHRzAqtGSrJ5ivVcK7UdFaK6uVaQbu4yjWJDAqazh5MVSWpVfQNVBCNU%2BG1b2Y8tsRXOv1a62exrPSevNT6sh1rA3Cu2CGh14a9WfgNdZY1n5tm5h1OyyCuZMYAHVQHST5jnEx40mSizTvfE5ZyEy8LICocF0RRJsGMGsGUURxBmA7TnTA6BCJMCFsyktOZMbADMI0QR2APgSAIMAJgZd/RH06lHW5xtS1k0aVmtUBsNVJooeKjVMrDW42nXRXMrY%2BVOswdbU9TrMjHpTeGq9nr7XeqPfam2aoz30A/cXW10bKWY3vYep9X4P2AYje%2Bi94HZU/upn%2B2Dn4P27UdVa89Nrw0%2BAg7eqDOYH0qn/ZjBDwHQNBtpv0/dKoMMYLgwB19eGQPIfDdsYje6Z15nI5R2U7G/W0dTfR0FM6dS%2BT49S4QtL6WMqysy04rL0wcu5UxmDLGsNsdw6J8VkrGlXsSre3McmNF0rUUpkYLLKxso0z4LlgnMPwZE%2BQzjCCjPSok4S6GoFXhzyUBARJhL/JcSJL2lmTkdLysBbrZB7y8z%2BUOczLGfivB%2BxGqA4ASAp18e1rbIFVNZRjginqVLHwh5AN4qOz801YTTs3m7KFHxK6kA1HPAp9kGnTvuWg0dRAAW3jeWqQbw3vmJcK62W243gIgspeVjmVy/TZewGUjRu6Cz9Y7q8srBBESyUTu8xWtsCALbMzmUpIyKPRq9Y0ubN0dXhrnmdTyYagO%2BbM1sszO2ewHZG/tw7rSTtFbOxdvjVL1vLNu7Kmi3rHt6ZeytfW%2B1T1fch8cWZi2/uAMIihY8utRvdYJ8D4703VT8QJxDosuOSfARvETsrVOGfA8NhT22LP1Byix5Jgsr3CkOUaVztWaPhVc9WfFm9mOizXeF/j4CIzByYyWfLpQKFVk/tzD9zHOu8x69zP5wL0SQuHR10nT8laPh7K9vxIp1TfoPODCLvb7yXdgiO8zhX6gPu3jtZMwldOJeu7VMHj3IPQ/e8A0XGn%2BZ/IZxcNad0JAxKraGTxTbOP7PqTJfOCzCnrNMrs3WBz2xcCcsu9rpzLhFWvZVkdjVIuQ0Ibnqj1q4uo/eamRjgs/l2vdsOJohO/YzCJEsNCkp63FukvdV8wccYEx0QFz171LuWkIYl%2BM8N1ZH6YxnyahjuZ9%2Bf1vAv3ftT6mr%2B96L9v4aw/hp4Fvv5ajz/H61/vz084z9L9OoLhpaM18xc78o86M4dhUd8l9Y13880v96B4xX9f8V81dSd19G8QDxMwDt8X9ID3V81D8wVLdiBNIvp/xFt89SArMGUi9VNs92Uy8K8Zcq8uUa8LU69LYG8O91dFdm8NVW8HYgDI8uDucu8TMKVK8cwZ9PUDdzdZkuBFh6BuBNp%2BBvAuAdByB0BuAXAFBhQdwa8wc1QlBlhVhQQdg%2BByAiBtA5DFg94uJBgQtyB/wQBNotBDBuBpB%2BA2AQBpBpBSQ4g/DtguVAifAmxpAABOJsLQLlWQFQtQjQrgfgJQEAFwiw1QuQ8gOAWAFADAMlFyCgKgCAbIxIXIkAJgIkVAVACoJscgHAIkAgNYMUAgbAT8AAeUrhiP4EqU22oAiEsPIGzlYFIFAm4DMOyI3WaKYHoCGNSOqOdGMFNHWDUMIA4jsAIGZkSOmOwHUHdDMGbmGP4BpQUOmJRAiFRUGLcBwF6JRRZD2MWCjBYGACUAaKaNaOYD2LkGEDEH0SkFkEEGEGUDUE0GmP0B8EMDmLQAsCsGOMSMgEWFOVqHWI1GaO2EOA1GFFCGFFwBVAUE0RRI1CdEnneg1AwBwBPEaAbhPEKJ2OwAJDiC5XIGJN0nKkaUpObhpLpKUDYDZLaQ1A1ESCIHUCyg1DhPSBRnKg1CJBRMhApNOxVB4CbASKUhWMcAgGcHGG8B4HIECGCH6FKEGA1LyDSCEDVIMANNqBmAGHKA6GTy6FGGaHcFaAMBsGtKEG6CaHNN1MtKmDGHtOyA1K9N6G1NmD1MWEMJWDWAMAEWEFaKGyYEEBuNcK4CUPIHaPUO4FlDFBcETwqFJCbG6QVHwGIF%2BmeG1H4BSJ0HmGsLMjsPkLcI8JAG2B4FJGHGCLiE2jiG8KbHbKbG2GTN6LiISKSPMMsMWAyOQBAD2UhSIEoGoEKNyNCHYHWFCAzKzMbNzLUMJkLNAUwAMF%2BNEFdk4BkHeMUBUA0F6OBPIEtxYESHjMOKTJTLiOaJ2MnP5nTMzKHFXLzIgDcByMYDEmeGDVLOHJrK4HcPIE8J2FJFCL8K7M2mCKbHiB8C0CqPvO4AHOSKAocKcJcMOO2GUL7NQqHNSJHMQAgBQBqLqOwGnIKPQB/OiHnI4G4CXLfOzLXP4A3JTztB3PkE%2BMkEPN3P%2BNPKBN8CtKVO8BVIlmNI1K1OKAtJAC5XgqSBSENIyB9PVMUvyHSHdLmHkr9MVNqFdLtKmkdL0ptOmEDNkvkpcP9MkusFtK0sGEssWBRSXU4q1QTLvPwq4GFGwFqO%2BieL4TEiYpXJzM/ILJTw2gbJlG/KKN/IioAsIvLMrNsJiHsMcOcITNApQviOsEHLLKsITJ8DrJ4C0BcKysAqIsWAuVSEcGkCAA%3D">Godbolt link</a> for the full kernel</span></p>
+<div><div><pre><code><span>float4</span> <span>tmp</span> <span>=</span>
+    <span>reinterpret_cast</span><span>&lt;</span><span>float4</span> <span>*&gt;</span><span>(</span><span>&amp;</span><span>A</span><span>[</span><span>innerRowA</span> <span>*</span> <span>K</span> <span>+</span> <span>innerColA</span> <span>*</span> <span>4</span><span>])[</span><span>0</span><span>];</span>
+<span>// transpose A during the GMEM to SMEM transfer</span>
+<span>As</span><span>[(</span><span>innerColA</span> <span>*</span> <span>4</span> <span>+</span> <span>0</span><span>)</span> <span>*</span> <span>BM</span> <span>+</span> <span>innerRowA</span><span>]</span> <span>=</span> <span>tmp</span><span>.</span><span>x</span><span>;</span>
+<span>As</span><span>[(</span><span>innerColA</span> <span>*</span> <span>4</span> <span>+</span> <span>1</span><span>)</span> <span>*</span> <span>BM</span> <span>+</span> <span>innerRowA</span><span>]</span> <span>=</span> <span>tmp</span><span>.</span><span>y</span><span>;</span>
+<span>As</span><span>[(</span><span>innerColA</span> <span>*</span> <span>4</span> <span>+</span> <span>2</span><span>)</span> <span>*</span> <span>BM</span> <span>+</span> <span>innerRowA</span><span>]</span> <span>=</span> <span>tmp</span><span>.</span><span>z</span><span>;</span>
+<span>As</span><span>[(</span><span>innerColA</span> <span>*</span> <span>4</span> <span>+</span> <span>3</span><span>)</span> <span>*</span> <span>BM</span> <span>+</span> <span>innerRowA</span><span>]</span> <span>=</span> <span>tmp</span><span>.</span><span>w</span><span>;</span>
+
+<span>reinterpret_cast</span><span>&lt;</span><span>float4</span> <span>*&gt;</span><span>(</span><span>&amp;</span><span>Bs</span><span>[</span><span>innerRowB</span> <span>*</span> <span>BN</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span><span>])[</span><span>0</span><span>]</span> <span>=</span>
+    <span>reinterpret_cast</span><span>&lt;</span><span>float4</span> <span>*&gt;</span><span>(</span><span>&amp;</span><span>B</span><span>[</span><span>innerRowB</span> <span>*</span> <span>N</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span><span>])[</span><span>0</span><span>];</span>
+<span>__syncthreads</span><span>();</span>
+</code></pre></div></div>
+<p>This leads to the 32b GMEM load instructions (<code>LDG.E</code> and <code>STG.E</code>) being replaced with 128b counterparts (<code>LDG.E.128</code> and <code>STG.E.128</code>).
+Initially, I was confused as to why running this:</p>
+<div><div><pre><code><span>reinterpret_cast</span><span>&lt;</span><span>float4</span> <span>*&gt;</span><span>(</span><span>&amp;</span><span>Bs</span><span>[</span><span>innerRowB</span> <span>*</span> <span>BN</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span><span>])[</span><span>0</span><span>]</span> <span>=</span>
+    <span>reinterpret_cast</span><span>&lt;</span><span>float4</span> <span>*&gt;</span><span>(</span><span>&amp;</span><span>B</span><span>[</span><span>innerRowB</span> <span>*</span> <span>N</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span><span>])[</span><span>0</span><span>];</span>
+</code></pre></div></div>
+<p>would be any faster than just manually unrolling the access (or using <code>pragma unroll</code>):</p>
+<div><div><pre><code><span>Bs</span><span>[</span><span>innerRowB</span> <span>*</span> <span>BN</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span> <span>+</span> <span>0</span><span>]</span> <span>=</span> <span>B</span><span>[</span><span>innerRowB</span> <span>*</span> <span>N</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span> <span>+</span> <span>0</span><span>];</span>
+<span>Bs</span><span>[</span><span>innerRowB</span> <span>*</span> <span>BN</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span> <span>+</span> <span>1</span><span>]</span> <span>=</span> <span>B</span><span>[</span><span>innerRowB</span> <span>*</span> <span>N</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span> <span>+</span> <span>1</span><span>];</span>
+<span>Bs</span><span>[</span><span>innerRowB</span> <span>*</span> <span>BN</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span> <span>+</span> <span>2</span><span>]</span> <span>=</span> <span>B</span><span>[</span><span>innerRowB</span> <span>*</span> <span>N</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span> <span>+</span> <span>2</span><span>];</span>
+<span>Bs</span><span>[</span><span>innerRowB</span> <span>*</span> <span>BN</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span> <span>+</span> <span>3</span><span>]</span> <span>=</span> <span>B</span><span>[</span><span>innerRowB</span> <span>*</span> <span>N</span> <span>+</span> <span>innerColB</span> <span>*</span> <span>4</span> <span>+</span> <span>3</span><span>];</span>
+</code></pre></div></div>
+<p>Shouldn’t the compiler just be able to coalesce the 2nd version and also generate 128b loads?
+I think the reason is that the compiler has no way to verify that the <code>float* B</code> pointer that is passed to the kernel is 128b aligned, which would be a requirement for using <code>LDG.E.128</code>.
+So the <code>reinterpret_cast</code>’s only purpose is to promise the compiler that the <code>float* B</code> pointer will be aligned.<label for="45"></label><span>Compare this to SMEM loads, where the compiler automatically generates vectorized loads because that memory is not user-managed.</span></p>
+<p>Kernel 6 achieves 20TFLOPs, which is as close to the 24TFLOPs of the cuBLAS implementation as well get for now.</p>
+<h2 id="kernel-7-tbd">Kernel 7: TBD</h2>
+<p>I wrote this post as my worklog while I optimized the SGEMM kernel from scratch.
+As such, these are the optimizations I want to experiment with next:</p>
+<ul>
+<li><strong>Bank conflicts</strong>: Kernel 6 runs into SMEM bank conflicts while loading from <code>As</code> &amp; <code>Bs</code>. I should try to find a way to avoid this.</li>
+<li><strong>Increasing register usage</strong>: Kernel 6 has higher occupancy than necessary. Each warp spends 1.5 cycles per instruction stalling while waiting to get scheduled. Therefore it should be possible to use more registers which will lower occupancy but may make it possible to use double buffering our increase arithmetic intensity.</li>
+</ul>
+<h2 id="conclusion">Conclusion</h2>
+<p>Writing this post was a similar experience to my previous post on <a href="https://siboehm.com/articles/22/Fast-MMM-on-CPU">optimizing SGEMM on CPU</a>: Optimizing SGEMM iteratively is one of the best ways to deeply understand the performance characteristics of the hardware.
+For writing the CUDA programs I was surprised by how easy it was to implement the code once I had made a good visualization of how I wanted the kernel to work.</p>
+<p>As always, all my code is available on <a href="https://github.com/siboehm/SGEMM_CUDA">Github</a>.</p>
+<p>Lastly, a big thanks to the creators of <a href="https://godbolt.org/">Godbolt.org</a> (for looking at PTX and SASS assembly) and <a href="https://excalidraw.com/">Excalidraw</a> (for drawing the kernels)!
+Both of these tools are a joy to use and have helped me learn much faster.</p>
+<h2 id="further-resources-and-references">Further Resources and References</h2>
+<ul>
+<li>I started writing this post because I stumbled over <a href="https://github.com/wangzyon/NVIDIA_SGEMM_PRACTICE">wangzyon’s Github repository</a>, first experimenting with his kernels and then rewriting everything from scratch. Also relevant is this <a href="https://developer.nvidia.com/blog/cutlass-linear-algebra-cuda/">Nvidia Blogpost about the CUTLASS library</a>.</li>
+<li>Mandatory references: the official <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html">CUDA Toolkit Programming Guide</a> and the <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide">CUDA Best Practices Guide</a>. The <a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html">Kernel Profiling Guide</a> contains even more info on low-level hardware details like caches and pipelines, and on the various metrics that can be collected.</li>
+<li>Onur Mutlu is a professor at ETH who uploads his lectures to Youtube. Particularly relevant for this post are <a href="https://www.youtube.com/playlist?list=PL5Q2soXY2Zi-Mnk1PxjEIG32HAGILkTOF">Computer Architecture</a> and <a href="https://www.youtube.com/playlist?list=PL5Q2soXY2Zi_OwkTgEyA6tk3UsoPBH737">Acceleration on Heterogeneuous Systems</a>.</li>
+<li><a href="https://www2.eecs.berkeley.edu/Pubs/TechRpts/2016/EECS-2016-143.pdf">Understanding Latency Hiding on GPUs</a>, a Ph.D. thesis that goes in-depth on how to design workloads such that they fully utilize memory bandwidth and computation.</li>
+<li>Lei Mao (an engineer at Nvidia) has good CUDA content on his <a href="https://leimao.github.io/tags/CUDA/">blog</a>, including about <a href="https://leimao.github.io/blog/Proper-CUDA-Error-Checking/">proper CUDA error handling</a>.</li>
+<li>It seems like there aren’t any good official resources for understanding SASS. There’s <a href="https://docs.nvidia.com/cuda/cuda-binary-utilities/index.html">Nvidia’s Docs on CUDA binary utilities</a>. More useful might be looking at Open Source SASS assemblers, like Da Yan’s <a href="https://github.com/daadaada/turingas">turingas</a>.</li>
+</ul>
+</article></div>
+  </body>
+</html>
