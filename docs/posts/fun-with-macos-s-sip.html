@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://metalbear.co/blog/fun-with-macoss-sip/">Original</a>
+    <h1>Fun with macOS&#39;s Sip</h1>
+    
+    <div id="readability-page-1" class="page"><article><div><p>While developing mirrord, which heavily relies on injecting itself into other people’s binaries, we ran into some challenges posed by macOS’s SIP (System Integrity Protection). This post details how we ultimately overcame these challenges, and we hope it can be of help to other people hoping to learn about SIP, as we’ve learned the hard way that there’s very little written about this subject on the internet.</p><h2 id="what-is-mirrord">What is mirrord? <a href="#what-is-mirrord" aria-hidden="true">#</a></h2><p><a href="https://mirrord.dev">mirrord</a> lets you run a local process in the context of a cloud service, which means we can test our code on our staging cluster without actually deploying it there. This leads to shorter feedback loops (you don’t have to wait on long CI processes to test your code in staging conditions) and a more stable staging environment (since untested services aren’t being deployed there). There is a detailed overview of mirrord in <a href="https://metalbear.co/blog/mirrord-3.0-is-out/">this</a> blog post.</p><h2 id="what-is-sip-and-why-does-mirrord-care-about-it">What is SIP and why does mirrord care about it? <a href="#what-is-sip-and-why-does-mirrord-care-about-it" aria-hidden="true">#</a></h2><p>Apple introduced <a href="https://en.wikipedia.org/wiki/System_Integrity_Protection">SIP</a> in 2015 to prevent tampering with system binaries because those usually have high permissions and entitlements.
+mirrord works by injecting its library (.dylib or .so) into the local process, the one you want to “mirror” into the cloud. In order to inject itself into binaries, it uses <code>LD_PRELOAD</code> on Linux and <code>DYLD_INSERT_LIBRARIES</code> on macOS.
+One of the features of SIP is that it disallows the use of <code>DYLD_INSERT_LIBRARIES</code> with protected binaries. Bummer - we can’t use mirrord to locally run e.g. <code>bash</code> or <code>ls</code> in a cloud context. we can’t run <code>mirrord exec bash</code> or <code>mirrord exec ls</code>. We’ll have to find a way to get around SIP!</p><h2 id="detecting-if-a-binary-is-sip-protected">Detecting if a binary is SIP-protected <a href="#detecting-if-a-binary-is-sip-protected" aria-hidden="true">#</a></h2><p>In order to start bypassing SIP, we needed to find a way to check if a binary is even SIP protected to begin with. We initially used pretty coarse heuristic, assuming that a binary is SIP-protected if it’s in one of these locations:</p><ul><li><p>/System</p></li><li><p>/bin</p></li><li><p>/usr</p></li><li><p>/sbin</p></li><li><p>/var</p></li></ul><p>However, we found that the “stat” function can return a flag called <code>RESTRICTED</code> which we read could be related, and decided to use that instead<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup>. The code is quite simple:</p><pre><code>       let metadata = std::fs::metadata(&amp;complete_path)?;
+       if (metadata.st_flags() &amp; SF_RESTRICTED) &gt; 0 {
+           return Ok(SipStatus::SomeSIP(complete_path, None));
+       }
+</code></pre><h2 id="shebang">Shebang! <a href="#shebang" aria-hidden="true">#</a></h2><p>Detection was simple enough when mirrord was run directly on a SIP-protected binary. However, we soon ran into a less trivial (but common) scenario - an interpreter script that starts with a shebang pointing to a SIP-protected binary, for example <code>yarn</code>/<code>npm</code>/<code>pyenv</code>. If we look at <code>npm</code> for instance, it points to a file which starts with the following code:</p><pre><code>#!/usr/bin/env node
+require(&#39;../lib/cli.js&#39;)(process)
+</code></pre><p>In this example it will execute env, which will execute node with the next line.
+The problem? <code>/usr/bin/env</code> is SIP protected, meaning it will strip our <code>DYLD_INSERT_LIBRARIES</code> then run node without mirrord. Thanks for nothing SIP!
+So we also needed to check whether the file is a “shebang” file (i.e starts with #!), what file the shebang points to, and whether that file is a SIP-protected binary.</p><h2 id="bypassing-sip">Bypassing SIP <a href="#bypassing-sip" aria-hidden="true">#</a></h2><p>Now that we found a way to detect whether we’re being run on a SIP-protected binary, we need to figure out how to bypass SIP and let mirrord load into the binary with <code>DYLD_INSERT_LIBRARIES</code>. When googling around, we found people saying you can bypass SIP by copying the binary to another directory and re-signing it. We found that to be partially true.
+Why partially? Because if you tried to do it on Apple Silicon (arm), it wouldn’t work. This is because beginning with M1, macOS ships with arm64e binaries. The <code>e</code> indicates an arm64 extension that adds pointer authentication. It’s another security measurement added by Apple (kudos to Apple for having great security, too bad it affects us).
+We won’t go into details about what pointer authentication does, but you can read more about it <a href="https://googleprojectzero.blogspot.com/2019/02/examining-pointer-authentication-on.html">here</a>.
+So why was this a problem? First, mirrord is written in Rust, which doesn’t support compiling arm64e binaries. The other problem is that only Apple-signed binaries can run with arm64e architecture.
+This is what happens if we try the “old” trick:
+➜ /tmp cp /usr/bin/env /tmp/env
+➜ /tmp codesign -f -s - /tmp/env
+/tmp/env: replacing existing signature
+➜ /tmp /tmp/env
+[1] 20114 killed /tmp/env</p><p>Killed! And it was so young. :(
+Recording using Console (macOS’s built in log viewer) while running the binary reveals the reason:</p><figure><img src="https://metalbear.co/blog/fun-with-macoss-sip/console.png" alt="screenshot from console saying exec_mach_imgact: not running binary env built against preview arm64e ABI" width="100%" height="100%"/></figure><p>From Apple’s point of view, arm64e is preview only, i.e the ABI can change and they don’t want a third party building on top of it, as it’s not guaranteed to work. You can enable running third party executables with arm64e ABI only if you boot into recovery mode and change the settings, which is not something we want to ask our users to do.</p><h2 id="handling-arm64e">Handling arm64e <a href="#handling-arm64e" aria-hidden="true">#</a></h2><p>Initially we tried to convert the arm64e ABI into arm64 on the fly. Yes, people familiar with how this ABI works probably think we’re insane, but we were optimistic.. and it actually worked! for example, if you take <code>/usr/bin/env</code> and just change the file headers to say it’s arm64, you’d be able to re-sign it and run it normally! We actually do it for our binaries to be able to load to arm64e binaries:</p><pre><code># from our release.yaml https://github.com/metalbear-co/mirrord/blob/main/.github/workflows/release.yaml
+    - name: build mirrord-layer macOS arm/arm64e
+      # Editing the arm64 binary, since arm64e can be loaded into both arm64 &amp; arm64e
+      # &gt;&gt; target/debug/libmirrord_layer.dylib: Mach-O 64-bit dynamically linked shared library arm64
+      # &gt;&gt; magic bits: 0000000 facf feed 000c 0100 0000 0000 0006 0000
+      # &gt;&gt; After editing using dd -
+      # &gt;&gt; magic bits: 0000000 facf feed 000c 0100 0002 0000 0006 0000
+      # &gt;&gt; target/debug/libmirrord_layer.dylib: Mach-O 64-bit dynamically linked shared library arm64e
+      run: |
+        cargo +nightly build --release -p mirrord-layer --target=aarch64-apple-darwin
+        cp target/aarch64-apple-darwin/release/libmirrord_layer.dylib target/aarch64-apple-darwin/release/libmirrord_layer_arm64e.dylib
+        printf &#39;\x02&#39; | dd of=target/aarch64-apple-darwin/release/libmirrord_layer_arm64e.dylib bs=1 seek=8 count=1 conv=notrunc
+</code></pre><p>It didn’t work for all binaries though (<code>ls</code> for example) and when we started digging we found out that there are a lot of new features being used in arm64e, for example specific relocations that contain pointer authentication stuff. We decided to give up on ABI conversion for the time being.
+Luckily, Apple ships fat binaries on both architecture machines. Fat binaries are Apple’s name for Mach-O files containing two different binaries, each built for a different architecture, so the runtime can decide which one it will use. By default, it will choose arm64e, but we can do something nice with the x64 binary.</p><pre><code>/bin/ls: Mach-O universal binary with 2 architectures: [x86_64:Mach-O 64-bit executable x86_64] [arm64e:Mach-O 64-bit executable arm64e]
+/bin/ls (for architecture x86_64):    Mach-O 64-bit executable x86_64
+/bin/ls (for architecture arm64e):    Mach-O 64-bit executable arm64e
+</code></pre><p>The idea is that we take the binary we want to load ourself into, extract only the x64 binary (on arm), re-sign it, and run it. The only downside here is that we require Rosetta<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup> to be installed on the system and there’s a performance impact - but usually system binaries are used for simple operations like <code>env</code> or <code>bash</code> (see the shebang case).</p><h2 id="putting-it-all-together">Putting it all together <a href="#putting-it-all-together" aria-hidden="true">#</a></h2><ol><li><p>Detect SIP (Shebang/Restricted)</p></li><li><p>Patch</p><p>a. Extract x64 binary into a new file</p><p>b. chmod +x it</p><p>c. Sign it</p></li><li><p>Execute</p></li></ol><pre><code>   /// Read the contents (or just the x86_64 section in case of a fat file) from the SIP binary at
+   /// `path`, write it into `output`, give it the same permissions, and sign the new binary.
+   fn patch_binary&lt;P: AsRef&lt;Path&gt;, K: AsRef&lt;Path&gt;&gt;(path: P, output: K) -&gt; Result&lt;()&gt; {
+       let data = std::fs::read(path.as_ref())?;
+       let binary_info = BinaryInfo::from_object_bytes(&amp;data)?;
+
+
+       let x64_binary = &amp;data[binary_info.offset..binary_info.offset + binary_info.size];
+       std::fs::write(output.as_ref(), x64_binary)?;
+       // Give the new file the same permissions as the old file.
+       std::fs::set_permissions(
+           output.as_ref(),
+           std::fs::metadata(path.as_ref())?.permissions(),
+       )?;
+       codesign::sign(output)
+   }
+</code></pre><p>Integration into mirrord took two steps:</p><ol><li><p>When using mirrord directly on a SIP-protected binary, do the patch</p></li><li><p>When using mirrord on a process, and that process executes a SIP-protected binary, replace it on the fly. This was done by having mirrord hook <code>execve</code> in the process</p></li></ol><p><code>execve</code> hook:</p><pre><code>
+/// Hook for `libc::execve`.
+///
+/// Patch file if it is SIPed, use new path if patched.
+/// If any args in argv are paths to mirrord&#39;s temp directory, strip the temp dir part.
+/// So if argv[1] is &#34;/var/folders/1337/mirrord-bin/opt/homebrew/bin/npx&#34;
+/// Switch it to &#34;/opt/homebrew/bin/npx&#34;
+/// then call normal execve with the possibly updated path and argv and the original envp.
+#[hook_guard_fn]
+pub(crate) unsafe extern &#34;C&#34; fn execve_detour(
+   path: *const c_char,
+   argv: *const *const c_char,
+   envp: *const *const c_char,
+) -&gt; c_int {
+   // Do unsafe part of path conversion here.
+   let rawish_path = (!path.is_null()).then(|| CStr::from_ptr(path));
+   let mut patched_path = CString::default();
+   let final_path = patch_if_sip(rawish_path)
+       .and_then(|s| match CString::new(s) {
+           Ok(c_string) =&gt; {
+               patched_path = c_string;
+               Success(patched_path.as_ptr())
+           }
+           Err(err) =&gt; Error(Null(err)),
+       })
+       .unwrap_or(path); // Continue even if there were errors - just run without patching.
+
+
+   let argv_arr = Nul::new_unchecked(argv);
+
+
+   // If we intercept args, we create a new array.
+   // execve takes a null terminated array of char pointers.
+   // ptr_vec will own the vector that will be passed to execve as an array.
+   let mut ptr_vec: Vec&lt;*const c_char&gt; = Vec::new();
+   let final_argv = intercept_tmp_dir(argv_arr)
+       .map(|new_vec| {
+           ptr_vec = new_vec; // Make sure vector still lives when we pass the pointer to execve.
+           ptr_vec.as_ptr()
+       })
+       .unwrap_or(argv);
+
+// Call execve&#39;s default implementation
+   FN_EXECVE(final_path, final_argv, envp)
+}
+</code></pre><h2 id="bonus-content-why-is-this-possible">Bonus content: Why is this possible? <a href="#bonus-content-why-is-this-possible" aria-hidden="true">#</a></h2><p>You might be asking yourself, “If this is a security feature by Apple, why is it possible to just bypass it that way?” The answer is that we do not bypass the security feature, just the problem it created for us. Apple operating systems have the concept of <a href="https://developer.apple.com/documentation/bundleresources/entitlements">“entitlements”</a>, which are definitions of which special operations an executable is allowed to perform, and which special resources it should have access to. Before released applications can have entitlements, they need to go through some approval process with Apple. Shared libraries get the entitlements of the host executable, so if we could load any library to any process, a non-Apple-approved library could enjoy entitlements it shouldn’t have by loading into an entitled process. That would be a pretty straight forward privilege escalation of that library’s code. SIP and the <a href="https://developer.apple.com/documentation/security/hardened_runtime">hardened runtime</a> prevent that from happening.</p><p>When we, in our bypassing mechanism, copy an executable and resign it, it loses its entitlements. So it is still guaranteed that our dynamic library could not run with any ungranted entitlements. The integrity of granted entitlements is preserved.
+The loss of entitlements is not a problem for mirrord, because we do not expect to ever execute with mirrord any application that requires Apple entitlements. So we give up the mirrored application’s entitlements (which do not exist or are not needed), in order to be able to load our library into that application.</p><h2 id="afterword">Afterword <a href="#afterword" aria-hidden="true">#</a></h2><p>You’re welcome to check out the full implementation in our <a href="https://github.com/metalbear-co/mirrord/tree/main/mirrord/sip">GitHub repository</a>, Join our <a href="https://discord.gg/pSKEdmNZcK">Backend Engineers Discord</a> community, subscribe to our newsletter and of course use mirrord!</p></div></article></div>
+  </body>
+</html>
