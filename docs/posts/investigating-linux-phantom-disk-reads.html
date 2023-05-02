@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://questdb.io/blog/investigating-linux-phantom-disk-reads/">Original</a>
+    <h1>Investigating Linux phantom disk reads</h1>
+    
+    <div id="readability-page-1" class="page"><article><p>Not so long ago, one of our users reached out for a case of weird hardware
+utilization. They were using our ILP (InfluxDB Line Protocol)
+<a href="https://questdb.io/docs/reference/clients/overview/">client</a> to insert rows into their QuestDB
+database, but along with disk writes, they also observed significant disk reads.
+That&#39;s definitely not expected from a write-only workload, so we had to get to
+the bottom of this problem. Today we share this story, full of rises and falls,
+as well as Linux kernel magic.</p><figure><img alt="Logo of Linux and QuestDB" height="234" src="https://questdb.io/img/blog/2023-05-02/banner.png" width="528"/></figure><h2><a aria-hidden="true" tabindex="-1" id="the-problem-unexpected-reads"></a>The problem: unexpected reads<a href="#the-problem-unexpected-reads" title="Direct link to heading">#</a></h2><p>As you may already know, QuestDB has an append-only columnar
+<a href="https://questdb.io/docs/concept/storage-model/">storage format</a> for data persistence. In
+practice, this means that as the database writes a new row, it appends its
+column values to several column files.</p><p>This creates high disk write rates due to the sequential write pattern. When
+handling a write-only load, the database is not expected to read much from the
+disk. This is why the particular issue was surprising to us.</p><p>After a few attempts, we managed to reproduce the issue. The symptoms looked
+like the following <code>iostat</code> output:</p><figure><img alt="iostat utility output with a high number of disk reads" height="469" src="https://questdb.io/img/blog/2023-05-02/iostat-phantom-reads.png" width="1056"/></figure><p>Here we have 10-70MB/s for disk writes while reads are as high as 40-50MB/s.
+Read utilization should be close to zero in ingest-only scenarios. The high read
+volume is, therefore, very much unexpected.</p><h2><a aria-hidden="true" tabindex="-1" id="using-linux-utilities-to-investigate"></a>Using Linux utilities to investigate<a href="#using-linux-utilities-to-investigate" title="Direct link to heading">#</a></h2><p>The first thing we wanted to understand was the exact files that were read by
+the database. Luckily, nothing is impossible in Linux. The <code>blktrace</code> utility
+combined with <code>blkparse</code> can be used to collect all reads on the given disk:</p><p>The above command prints all disk-read events happening on the system. The
+output looks something like the following:</p><p>Each line here stands for a different event. For simplicity, let&#39;s consider the
+first line:</p><p>The relevant parts are the following:</p><ul><li><strong>425548</strong> - this event was generated with pid 425548.</li><li><strong>Q RA</strong> - this event stands for a disk read request added (queued) to the I/O
+queue. The &#34;A&#34; suffix is not well documented, but it stands for potential
+readahead operation. We&#39;ll learn what readahead is a bit later.</li><li><strong>536514808 + 8</strong> - this read operation starts at block 536514808 and is 8
+blocks in size.</li><li><strong>[questdb-ilpwrit]</strong> - the operation was started by a QuestDB&#39;s ILP writer
+thread.</li></ul><p>Armed with this knowledge, we can use <code>debugfs</code> to follow the block number to
+find the corresponding inode:</p><p>Finally, we can check what stands for the inode 8270377:</p><p>These steps must be done per read event, although writing a script to automate
+it is easy. After looking at the events, we found that the disk reads correspond
+to the column files. So, while the database was writing these append-only files,
+somehow, we ended up with disk reads.</p><p>Another interesting fact is that the user had quite a few tables, around 50 of
+them, each holding a few hundred columns. As a result, the database had to cope
+with lots of column files. We were pretty confident that our ILP code wasn&#39;t
+supposed to be reading from these files but only writing to them.</p><p>Who might be reading the files? Maybe the OS?</p><h2><a aria-hidden="true" tabindex="-1" id="meet-the-linux-kernel"></a>Meet the Linux kernel<a href="#meet-the-linux-kernel" title="Direct link to heading">#</a></h2><p>Like many other databases, QuestDB uses buffered I/O, such as
+<a href="https://man7.org/linux/man-pages/man2/mmap.2.html" target="_blank" rel="noopener noreferrer"><code>mmap</code></a>,
+<a href="https://man7.org/linux/man-pages/man2/read.2.html" target="_blank" rel="noopener noreferrer"><code>read</code></a>, and
+<a href="https://man7.org/linux/man-pages/man2/write.2.html" target="_blank" rel="noopener noreferrer"><code>write</code></a>, to deal with disk
+operations. This means that whenever we write something to a file, the kernel
+writes the modified data to a number of pages in the page cache and marks them
+as dirty.</p><p>The page cache is a special transparent in-memory cache used by Linux to keep
+recently read data from the disk and recently modified data to be written to the
+disk. The cached data is organized in pages that are 4KB in size on most
+distributions and CPU architectures.</p><p>It&#39;s also impossible to limit the amount of RAM for the page cache as the kernel
+tries to use all available RAM for it. Older pages are evicted from the page
+cache to allow new page allocation for applications or the OS. In most cases,
+this happens transparently for the application.</p><p>With the default
+<a href="https://questdb.io/docs/reference/configuration/#cairo-engine"><code>cairo.commit.mode</code></a> value,
+QuestDB doesn&#39;t make explicit <code>fsync</code>/<code>msync</code> calls to flush the column files
+data to the disk, so it entirely relies on the kernel to flush the dirty pages.
+Hence, we need to understand better what to expect from the kernel before
+hypothesizing on our &#34;phantom reads&#34; case.</p><p>As we already know, the OS doesn&#39;t write file data modifications to the disk
+immediately. Instead, it writes them to the page cache. This is called the
+write-back caching strategy. A write-back assumes that a background process is
+responsible for writing the dirty pages back to the disk. In Linux, that&#39;s done
+by <code>pdflush</code>, a set of kernel threads responsible for the dirty page writeback.</p><p>There are several <code>pdflush</code> settings available for configuring. Here are the
+most significant ones:</p><ul><li><code>dirty_background_ratio</code> - while the percentage of dirty pages is less than
+this setting, dirty pages stay in memory until they&#39;re old enough. Once the
+number of dirty pages exceeds this ratio, the kernel proactively wakes up
+<code>pdflush</code>. On Ubuntu and other Linux distros, this setting defaults to <code>10</code>
+(10%).</li><li><code>dirty_ratio</code> - when the percentage of dirty pages exceeds this ratio, the
+writes are no longer asynchronous. This means that the writing process (the
+database process in our case) will synchronously write pages to the disk. When
+this happens, the corresponding thread is put into &#34;uninterruptable sleep&#34;
+status (<code>D</code> status code in <code>top</code> utility). This setting usually defaults to
+<code>20</code> (20%).</li><li><code>dirty_expire_centisecs</code> - this defines the age in centiseconds for dirty
+pages to be old enough for the writeback. This setting usually defaults to
+<code>3000</code> (30 seconds).</li><li><code>dirty_writeback_centisecs</code> - defines the interval to wake up the pdflush
+process. This setting usually defaults to <code>500</code> (5 seconds).</li></ul><p>The current values of the above settings can be checked via the <code>/proc</code> virtual
+file system:</p><p>It&#39;s also important to note that the above percentages are calculated based on
+the total reclaimable memory, not the total RAM available on the machine. If
+your application doesn&#39;t produce a lot of dirty pages and there is plenty of
+RAM, all disk writes are done asynchronously by <code>pdflush</code>.</p><p>However, if the amount of memory available to the page cache is low, <code>pdflush</code>
+would be writing the data most of the time with high chances of the application
+being put into the &#34;uninterruptable sleep&#34; status and blocked on writes.</p><p>Tweaking these values didn&#39;t give us much. Remember that the user was writing to
+a high number of columns? This means the database had to allocate some memory
+per column to deal with
+<a href="https://questdb.io/blog/2022/11/25/questdb-6.6.1-dynamic-commits/#questdbs-data-structure-and-out-of-order-data-ingestion">out-of-order</a>
+(O3) writes, leaving less memory available to the page cache. We first checked
+that, and indeed most of the RAM was used by the database process. Tweaking
+<code>cairo.o3.column.memory.size</code> from the default 16MB to 256KB helped to reduce
+the disk read rate significantly, so indeed the problem had something to do with
+the memory pressure. Do not worry if you don&#39;t understand this paragraph in
+detail. Here is the most important bit: Decreasing the database memory usage
+reduced the number of reads. That&#39;s a useful clue.</p><p>But what was the exact reason for the disk reads?</p><p>To answer this question, we need to understand the disk reading part of the page
+cache better. To keep things simple, we&#39;ll focus on <code>mmap</code>-based I/O. As soon as
+you <code>mmap</code> a file, the kernel allocates page table entries (PTEs) for the
+virtual memory to reserve an address range for your file, but it doesn&#39;t read
+the file contents at this point. The actual data is read into the page when you
+access the allocated memory, i.e. start reading (<code>LOAD</code> instruction in x86) or
+writing (<code>STORE</code> instruction in x86) the memory.</p><p>When this happens for the first time, the
+<a href="https://en.wikipedia.org/wiki/Memory_management_unit" target="_blank" rel="noopener noreferrer">memory management unit</a>
+(MMU) of your CPU signals a special event called &#34;page fault.&#34; A page fault
+means that the accessed memory belongs to a PTE with no allocated physical
+memory. The kernel handles a page fault in two different ways:</p><ul><li>If the page cache already has the relevant file data in memory, perhaps
+belonging to the same file opened by another process, the kernel simply
+updates the PTE to map to the existing page. This is called a minor page
+fault.</li><li>If the file data isn&#39;t cached yet, the kernel has to block the application,
+read the page, and only then update the PTE. This is called a major page
+fault.</li></ul><p>As you might guess, major page faults are much more expensive than minor ones,
+so Linux tries to minimize their number with an optimization called
+<a href="https://lwn.net/Articles/888715/" target="_blank" rel="noopener noreferrer">readahead</a> (sometimes it&#39;s also referred to
+as &#34;fault-ahead&#34; or &#34;pre-fault&#34;).</p><p>At the conceptual level, the readahead is responsible for reading the data that
+the application hasn&#39;t explicitly requested. When you first access (either read
+or write) a few bytes of a just-opened file, a major page fault happens, and the
+OS reads the data corresponding to the requested page plus several pages before
+and after the file. This is called &#34;read-around.&#34; If you keep accessing the
+subsequent pages of the file, the kernel recognizes the sequential access
+pattern and starts readahead, trying to read the subsequent pages in batches
+ahead of time.</p><p>By doing this, Linux tries to optimize for sequential access patterns as well as
+to increase the chances of hitting an already cached page in case of random
+access.</p><p>Remember the disk read event from the <code>blktrace</code> output? The &#34;A&#34; suffix in the
+&#34;RA&#34; operation type suggested that the disk read was a part of the readahead.
+However, we knew that our workload was write-only, dealing with a large number
+of files. The issue was much more noticeable when there was not much memory left
+for page cache purposes.</p><p>What if the pages were evicted from the page cache too early, leading to
+redundant readahead reads on the subsequent page access?</p><p>We can check this hypothesis by disabling the readahead. This is as simple as
+making the <a href="https://man7.org/linux/man-pages/man2/madvise.2.html" target="_blank" rel="noopener noreferrer"><code>madvise</code></a>
+system call with the <code>MADV_RANDOM</code> flag. This hint tells the kernel that the
+application is going to access the mmapped file randomly, so it should disable
+readahead for the mmapped file.</p><p>That was it! No more &#34;phantom reads&#34;:</p><figure><img alt="iostat utility output with a low number of disk reads" height="469" src="https://questdb.io/img/blog/2023-05-02/iostat-no-phantom-reads.png" width="1056"/></figure><h2><a aria-hidden="true" tabindex="-1" id="the-happy-ending"></a>The happy ending<a href="#the-happy-ending" title="Direct link to heading">#</a></h2><p>As a result, we found a sub-optimal kernel readahead behavior. Ingestion of a
+high number of column files under memory pressure led to the kernel starting
+readahead disk read operations, which you wouldn&#39;t expect from a write-only
+load. The rest was as simple as
+<a href="https://github.com/questdb/questdb/pull/2583" target="_blank" rel="noopener noreferrer">using</a> <code>madvise</code> in our code to
+disable the readahead in table writers.</p><p>What&#39;s the moral of this story? First, we wouldn&#39;t be able to fix this issue if
+we weren&#39;t aware of how buffered I/O works in Linux. When you know what to
+expect from the OS and what to check, finding and using the right utilities is
+trivial. Second, any user complaint, even one that is hard to reproduce, is an
+opportunity to learn something new and make QuestDB better.</p><p>As usual, we encourage you to try out the latest QuestDB release and share your
+feedback with our <a href="https://slack.questdb.io/" target="_blank" rel="noopener noreferrer">Slack Community</a>. You can also
+play with our <a href="https://demo.questdb.io/" target="_blank" rel="noopener noreferrer">live demo</a> to see how fast it executes
+your queries. And, of course, contributions to our
+open-source <a href="https://github.com/questdb/questdb" target="_blank" rel="noopener noreferrer">project on GitHub</a> are more
+than welcome.</p></article></div>
+  </body>
+</html>
