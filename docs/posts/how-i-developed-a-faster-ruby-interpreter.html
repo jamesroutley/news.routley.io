@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://developers.redhat.com/articles/2022/11/22/how-i-developed-faster-ruby-interpreter">Original</a>
+    <h1>How I developed a faster Ruby interpreter</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+			<div>
+									
+								<div>
+					<p>In this article, I will describe my efforts to implement a faster interpreter for CRuby, the <a href="https://developers.redhat.com/topics/ruby/all">Ruby</a> language interpreter, using a dynamically specialized internal representation (IR). I believe this article will interest developers trying to improve the interpreter performance of dynamic programming languages (e.g., <a href="https://github.com/python/cpython">CPython</a> developers).</p>
+
+<p>I will cover the following topics:</p>
+
+<ul><li>
+	<p>Existing CRuby interpreter and just-in-time (JIT) compilers for Ruby—MJIT, YJIT, and the MIR-based CRuby JIT compiler at the very early stages of development—along with my motivation to start this project and my initial expectations for the project outcome.</p>
+	</li>
+	<li>
+	<p>The general approach to performance improvement by specialization and the specializations used in my project to implement a faster CRuby interpreter. I will describe a new dynamically specialized internal representation called SIR, which speeds up the CRuby interpreter in the CRuby virtual machine (VM).</p>
+	</li>
+	<li>
+	<p>Implementation and current status.</p>
+	</li>
+	<li>
+	<p>Performance results in comparison with the base interpreter and other CRuby JIT compilers.</p>
+	</li>
+	<li>
+	<p>My future plans for this project and the significance of my work for developers.</p>
+	</li>
+</ul><h2 id="the-project-motivation">The project motivation</h2>
+
+<p>About four years ago, I started a MIR project to address shortcomings of the current CRuby JIT compiler, <a href="https://bugs.ruby-lang.org/projects/ruby/wiki/MJIT">MJIT</a>. I started MIR as a lightweight, universal JIT compiler, which could be useful for implementing JIT compilers for Ruby and other programming languages.</p>
+
+<p>MIR is already used for the JIT compilers of several programming languages.</p>
+
+<p>Still, I realize that we can&#39;t use the current state of MIR to implement good JIT compilers for dynamic programming languages. Therefore, I&#39;ve been working on new features. You can read about these features in my previous article, <a href="https://developers.redhat.com/articles/2022/02/16/code-specialization-mir-lightweight-jit-compiler">Code specialization for the MIR lightweight JIT compiler</a>. In brief, these features include:</p>
+
+<ul><li>A generalized approach of propagation of dynamic properties of source code based on <em>lazy basic block versioning</em> and generation of specialized code according to the properties</li>
+	<li><em>Trace</em> generation and optimization based on basic block cloning</li>
+	<li>A <em>metatracing</em> MIR C compiler, the project&#39;s ultimate goal</li>
+</ul><p>Implementation of these features has taken me many years. The recent success of Shopify&#39;s <a href="https://github.com/Shopify/yjit">YJIT</a> compiler made me rethink my strategy and find a faster way to implement a MIR-based JIT compiler for CRuby.</p>
+
+<p>To implement a decent MIR-based JIT compiler, I decided earlier to develop some features with a design specific to CRuby. I use dynamically specialized instructions for the CRuby VM and generate machine code from the instructions using the MIR compiler in its current state.</p>
+
+<p>Implementing a dynamically specialized IR and an interpreter for it is beneficial, even without a JIT compiler. The resulting design permits the implementation of a faster CRuby without the complexity of JIT compilers and their portability issues.</p>
+
+<p>YJIT is a very efficient JIT compiler, so I have been assessing its features and asking what other features could make a compiler better.</p>
+
+<p>It is essential to start by understanding how much code is covered by a type of optimization. Some optimizations are limited to a single VM instruction.</p>
+
+<p>Most optimizations work within a <em>basic block</em>, a group of instructions that run sequentially without internal loops or conditional statements. In Ruby, each basic block is enclosed within braces and is often the body of an innermost loop or an <code>if</code> statement. Optimizations that span more than a single basic block are much more difficult.</p>
+
+<p>For each stack instruction in the VM, YJIT currently generates the best machine code seen in the field. YJIT generates even faster code than the leading open source C compilers, <a href="https://gcc.gnu.org/">GCC</a> and <a href="https://llvm.org/">LLVM Clang</a>, for a single VM instruction in the interpreter.</p>
+
+<p><strong>Note</strong>: YJIT was initially written in C but was rewritten in <a href="https://developers.redhat.com/topics/rust">Rust</a> to simplify the porting of YJIT to new architectures. The Rust implementation employs abstractions provided currently by the Shopify Ruby team. In my opinion, the best tool to implement a portable YJIT would have been the <a href="https://luajit.org/dynasm.html">DynASM</a> C library.</p>
+
+<p>Another compiler technique used by YJIT is <em>basic block versioning</em>, a powerful technique for dynamically executed languages such as Python and Ruby. I&#39;ll describe basic block versioning in the upcoming section, <a href="#specialization-by-lazy-bb-versioning">Lazy basic block versioning</a>. The essential idea is that many versions, each with different compiler instructions, exist for each basic block. Some versions are specialized for certain conditions, such as particular data types, and are more efficient than the non-specialized versions when the right conditions hold. The compiler can use the more efficient versions when possible and fall back on less efficient versions under different conditions.</p>
+
+<p>But YJIT&#39;s code generation does not span multiple VM instructions. Register transfer language (RTL) is another technique available to compilers, which optimizes code across several stack VM instructions. So I started my new project hoping that, if I implement RTL and use basic block versioning similar to YJIT for some benchmarks, I can match the performance of YJIT even in the interpreter.</p>
+
+<p>I will reveal what I achieved later in this article.</p>
+
+<h3>Code specialization</h3>
+
+<p>I have mentioned &#34;code specialization&#34; several times, but what is specialization? The Merriam-Webster dictionary provides the following definition of the word which is suitable for our purposes: <em>to</em> <em>design, train, or fit for one particular purpose.</em></p>
+
+<p>If we generate code optimized for a particular purpose that happens to be a frequent use case, our code will work faster in most cases. Specialization is one common approach to generating faster code. Even static compilers generate specialized code. For instance, they can generate code specialized for a particular processor model, such as a matrix multiplication that fits a particular size of processor cache.</p>
+
+<p>Specialized code also exists in CRuby. For example, the CRuby VM has specialized instructions for calling methods that operate on numbers, the most frequently used data types. The instructions have specialized names such as <code>opt_plus</code>.</p>
+
+<p>The compiler can accomplish code specialization statically or dynamically during program execution. Dynamic specialization adds execution time but is hopefully more efficient because interpreters and JIT compilers have more data during the run to help select a particular case for specialization. That is why JIT compilers usually do more specialization than static compilers.</p>
+
+<p>You can specialize <em>speculatively</em> even when you cannot guarantee that particular conditions for specialization will always be true. For instance, if a Ruby variable is set to an integer once, you can safely speculate that future assignments to that variable will also be integers. Of course, this assumption will occasionally prove untrue in a dynamically typed language such as Ruby.</p>
+
+<p>Therefore, during speculative specialization, you need guards to check if the initial conditions for specialization still hold true. If these conditions are not true, you switch to less efficient code that does not require those conditions for correct execution. Such code switching is commonly called <em>deoptimization</em>. Guards are described in the upcoming sections, <a href="#specialization-by-lazy-bb-versioning">Lazy basic block versioning</a> and <a href="#profile-based-specialization">Profile-based specialization</a>.</p>
+
+<p>The more dynamic a programming language, the more specialization and the more speculative specialization you need to achieve performance close to static programming languages.</p>
+
+<h2>8 Optimization techniques</h2>
+
+<p>The following subsections describe the eight techniques I have added to my interpreter and MIR-based JIT compiler.</p>
+
+<ol><li>Dynamically specialized CRuby instructions</li>
+	<li>RTL code instructions</li>
+	<li>Hybrid stack/RTL instructions</li>
+	<li>Type-specialized instructions</li>
+	<li>Lazy basic block versioning</li>
+	<li>Profile-based specialization</li>
+	<li>Specialized iterator instructions</li>
+	<li>Dynamic flow of specialized instructions</li>
+</ol><h3 id="dynamically-specialized-cruby-instructions">1. Dynamically specialized CRuby instructions</h3>
+
+<p>All the specialization I am implementing for CRuby is done <em>dynamically</em> and <em>lazily</em>. Currently, I optimize only on the level of a basic block.</p>
+
+<p>I use specialized hybrid stack/RTL instructions. This kind of specialization could be done at compile time, but my interpreter does it lazily as part of a larger technique of generating several different specialized basic blocks. Laziness helps to save memory and time spent on RTL generation. I will explain later why I use hybrid stack/RTL instructions instead of pure RTL.</p>
+
+<p>I also generated <em>type-specialized</em> instructions. This can be done by <a href="https://arxiv.org/abs/1411.0352">lazy basic block versioning</a>, invented by Maxime Chevalier-Boisvert, and used as a major optimization mechanism in YJIT. This optimization is cost-free, and no special guards are needed for checking the value types of instruction input operands. Type specialization is also based on profiling program execution. In this case, the interpreter needs guards to check the types of instruction input operands. Such type of specialization helps to improve cost-free type specialization even further.</p>
+
+<p>Other specializations are based on profile information. Additionally, I included specialized instructions for method calls and accesses to array elements, instance variables, and attributes. The most interesting case is iterator specialization, which I will describe later.</p>
+
+<h3 id="rtl">2. RTL code instructions</h3>
+
+<p>CRuby uses stack instructions in its VM. Such VM instructions address values implicitly. We can also use VM instructions addressing values explicitly. A set of such instructions is called a register transfer language (RTL).</p>
+
+<p>Here is an example of how the addition of two values is represented by stack instructions and by the RTL instructions generated by my compiler. The number sign (#) is used to start a comment in both languages:</p>
+
+<table><tbody><tr><td>Stack instructions</td>
+			<td>RTL instructions</td>
+		</tr><tr><td>
+			<p>getlocal v1 # push v1</p>
+
+			<p>getlocal v2 # push v2</p>
+
+			<p>opt_plus # pop v1 and v2 push v1 + v2</p>
+
+			<p>setlocal res # pop stack value and assign it to res</p>
+			</td>
+			<td>
+			
+
+			
+
+			<p>sir_plusvvv res, v1, v2 # assign v1 + v2 to res</p>
+			</td>
+		</tr></tbody></table><p>As a rule, RTL code contains fewer instructions than stack-based instructions, and as result spends less time in interpreter instruction dispatch code. But RTL sometimes spends more time in operand decoding. More importantly, RTL code results in less memory traffic, because local variables and stack values are addressed directly by RTL instructions. Therefore, stack pushes and pops of local variable values are not as necessary as they are when using stack instructions.</p>
+
+<p>In many cases, CRuby works with values in a stack manner. For example, when pushing values for method calls. So pure RTL has its own disadvantages in such cases and might result in larger code that decodes operands more slowly. Another Ruby-specific problem in RTL lies in implementing fast addressing of Ruby local variables and stack values. Figure 1 shows a typical frame from a Ruby method.</p>
+
+<div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/stack2.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_floated/public/stack2.png?itok=gqIjWorB" width="380" height="226" alt="The ep pointer separates the local variables from the stack variables in a Ruby method frame" typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+
+
+<p>Addressing values in this kind of stack frame is simple. You just use an index relative to <code>ep</code> (environment pointer): Negative indices for local variables and positive indices for stack values.</p>
+
+<p>Unfortunately, a method&#39;s frame could also look like Figure 2.</p>
+
+<div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/stack3.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_floated/public/stack3.png?itok=RD1WYOnP" width="520" height="226" alt="Another type of frame has the same layout, but inserts an unpredictable distance between the ep pointer and the stack variables" typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+
+
+<p>For this kind of frame, you need to use <code>ep</code> for local variables and <code>sp</code> (stack pointer) for the stack. Other ways of addressing could be used, but they all depend on addressing local and stack variables differently. This means a lot of branches for addressing instruction values.</p>
+
+<p>Still, I used RTL about four years ago, and at that time it gave about a 30% improvement on average on a set of microbenchmarks.</p>
+
+<h3 id="hybrid-stack-rtl-instructions">3. Hybrid stack/RTL instructions</h3>
+
+<p>Based on my previous experience, I modified my old approach of using RTL and started to use hybrid stack/RTL instructions. These instructions can address some operands implicitly and others explicitly.</p>
+
+<p>RTL instructions are generated only on the level of a basic block, and only lazily on the first execution of a basic block. Figure 3 shows the RTL instructions I added.</p>
+
+
+<figure role="group"><div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/JIT-fig3.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_floated/public/JIT-fig3.png?itok=UoK68-Up" width="544" height="662" alt="RTL instructions naming format." typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+<figcaption></figcaption></figure>
+
+<p>Here, the suffix (final letter) holds the following meanings:</p>
+
+<ul><li><code>s</code>: The value is on the stack.</li>
+	<li><code>v</code>: The value is in a local variable.</li>
+	<li><code>i</code>: The value is an immediate operand.</li>
+</ul><p>Some combinations of suffixes are not used. For example, the suffix <code>sss</code> is not used because an instruction with such a suffix would actually be an existing CRuby stack instruction.</p>
+
+<p>It seems that adding many new VM instructions might result in worse code locality in the interpreter. But in practice, the benefits of reduced dispatching and stack memory traffic outweigh code locality problems. In general code, locality is less important than data locality in modern processors. Just the introduction of hybrid stack/RTL instructions can improve the performance of some benchmarks by 50%.</p>
+
+<h3 id="type-specialized-instructions">4. Type-specialized instructions</h3>
+
+<p>Integers in the CRuby VM are represented by <a href="https://gmplib.org/">multi-precision integers</a> or by <code>fixnum</code>, a <a href="https://stackoverflow.com/questions/33843393/how-does-ruby-differentiate-value-with-value-and-pointer">tagged</a> integer value that fits in one machine word. Floating-point numbers are represented where possible by tagged <a href="https://standards.ieee.org/ieee/754/6210/">IEEE-754</a> double values called <code>flonum</code>, and otherwise by IEEE-754 values in the CRuby heap.</p>
+
+<p>Many CRuby VM instructions are designed to work on primitive data types like a <code>fixnum</code>. The instructions make a lot of checks before executing the actual operation. For example, <code>opt_plus</code> checks that input data is <code>fixnum</code> and that the Ruby <code>+</code> operator is not redefined for integers. If the checks fail, a general <code>+</code> method is called.</p>
+
+<p>Type-specialized instructions allowed me to remove the checks and the call code. The optimization resulted in faster and slimmer VM instructions and better interpreter code locality. The new type-specialized instructions are shown in Figure 4.</p>
+
+
+<figure role="group"><div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/JIT-fig4.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_full_width_1440px_w/public/JIT-fig4.png?itok=NqE4UKjv" width="1440" height="414" alt="The type-specialized instructions naming format." typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+<figcaption></figcaption></figure>
+
+<p>The prefix takes on the following meanings:</p>
+
+<p><code>sir_i</code>: Denotes instructions specialized for <code>fixnum</code> (integers).</p>
+
+<p><code>sir_f</code>: Denotes instructions specialized for <code>flonum</code> (floating-point numbers).</p>
+
+<p><code>sir_ib</code>: Used for branch and <code>fixnum</code> compare instructions.</p>
+
+<p>To guarantee that type-specialized instructions are passed data of the expected types, lazy basic block versioning can be used.</p>
+
+<p>The type-specialized instructions can be also generated from the profile information. In this case, type guards guarantee data of the expected types.</p>
+
+<p>If an exceptional event prevents the remainder of a basic block from executing, the interpreter deoptimizes code by switching to RTL code for the basic block, which is not type-specialized. An example of an exceptional event could be a <code>fixnum</code> overflow, which requires a multi-precision number result instead of the expected <code>fixnum</code>. Hybrid stack/RTL and type-specialized instructions are designed not to do any instruction data moves before the switch, which would require pushing variable values on the stack.</p>
+
+<p>The same deoptimization happens if a standard Ruby operator, such as integer <code>+</code>, is redefined. The deoptimization removes all basic block clones containing type-specialized instructions for this operation, because there is a tiny probability that these basic block clones will be used in the future.</p>
+
+<p>Instructions specialized for <code>flonum</code> values hardly improve interpreter performance, because most of the instruction execution time is spent tagging and untagging <code>flonum</code> values, requiring many shifts and logical operations. Therefore, I included the instructions specialized for <code>flonum</code> values mostly for a future MIR-based JIT compiler, which will remove redundant floating-point number tagging and untagging.</p>
+
+<h3 id="specialization-by-lazy-bb-versioning">5. Lazy basic block versioning</h3>
+
+<p>This technique is easiest to explain by an example. Take the following <code>while</code> loop:</p>
+
+<pre><code>while i &lt; 100 do
+  i += 1
+end</code></pre>
+
+<p>Figure 5 illustrates basic block versioning for this loop.</p>
+
+
+<figure role="group"><div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/bbv.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_full_width_1440px_w/public/bbv.png?itok=ty8wm4Oj" width="740" height="860" alt="Basic block versioning creates several alternative ways to step through a basic block." typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+<figcaption></figcaption></figure>
+
+<p>Upon its first encounter with the basic block, the interpreter doesn&#39;t know the types of values on the stack or in variables. But when we execute <code>BB1</code> for the first time (see the first diagram), we can easily figure out that the value type of <code>i</code> became <code>fixnum</code>.</p>
+
+<p>In the top left diagram, the successor of <code>BB1</code> is <code>BB3</code> and there is only one version of <code>BB3</code>, which has no knowledge of variable value types. So we clone <code>BB3</code> to create <code>BB3v2</code>, in which the value type of <code>i</code> is always <code>fixnum</code>. We make <code>BB3v2</code> a successor of <code>BB1</code> (see the second diagram) and start executing <code>BB3v2</code>.</p>
+
+<p>From <code>BB3v2</code>, since we haven&#39;t completed the loop, we go to <code>BB4</code>. No variable value is changed in <code>BB3v2</code>. So at the end of <code>BB3v2</code> the value type of <code>i</code> is still <code>fixnum</code>. Therefore, we can create <code>BB4v2</code> and make it a successor of <code>BB3v2</code>. Because we know that the value type of <code>i</code> is <code>fixnum</code> at the beginning of <code>BB4v2</code>, we can easily deduce that the type of <code>i</code> at the end of <code>BB4v2</code> is also <code>fixnum</code>. We need a version of <code>BB4v2</code>&#39;s successor in which the type of <code>i</code> is <code>fixnum</code>. Fortunately, such a version already exists: <code>BB3v2</code>. So we just change the successor of <code>BB4v2</code> to <code>BB3v2</code> (see the third diagram) and execute <code>BB3v2</code> again.</p>
+
+<p>In short, knowing the type of <code>i</code> permits the interpreter to specialize instructions in <code>BB3v2</code> and <code>BB4v2</code>.</p>
+
+<p>As you can see, we create basic block versions only when a preceding block is actually executed at run time. This is why such basic block versioning is called <em>lazy</em>. Usually, we create only a few versions of each basic block. But in pathological cases (which can be demonstrated) a huge number of versions can be created. Therefore, we place a limit on the maximum number of versions for one basic block. When we reach this number, we use an already existing basic block version (usually a version with unknown value types) instead of creating a new one.</p>
+
+<p>Basic block versioning can be also used for other specialization techniques besides type-specialization.</p>
+
+<h3 id="profile-based-specialization">6. Profile-based specialization</h3>
+
+<p>When the interpreter can&#39;t find out the input data types from basic block versioning (e.g., when handling the result of a polymorphic type method call), we insert a <code>sir_inspect_stack_type</code> or <code>sir_inspect_type</code> profiling instruction to inspect the types of the stack values or local variables. After the number of executions of a basic block version reaches some threshold, we generate a basic block version with speculatively type-specialized instructions for the data types we found, instead of profiling instructions. Figure 6 shows the format of names of speculatively type-specialized instructions.</p>
+
+<div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/speculative-insns-1.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_floated/public/speculative-insns-1.png?itok=zL0iWxC7" width="600" height="261" alt="Speculative instructions" typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+
+
+<p>The speculative instructions check the value types of the operands. If the operand doesn&#39;t have the expected type, the instruction switches to a non-type specialized version of the basic block.</p>
+
+<p>Figure 7 shows some possible changes made from <code>sir_inspect_type</code>, used for profiling the types of local variable values.  Instructions <code>sir_inspect_type</code>, <code>sir_inspect_fixtype</code>, and <code>sir_inspect_flotype</code> are self-modified.  Depending on the types of the inspected values at the profiling stage, instead of <code>sir_inspect_type</code> we will have <code>sir_inspect_fixtype</code> (if we observed only fixnum types), <code>sir_inspect_flotype</code> (if we observed only flonum types) or <code>nop</code> in all other cases.  After the profiling stage we removes all inspect instructions and nops and can generate speculative instructions from non-type-specialized RTL instructions affected by the inspect instructions, e.g. we can generate speculative instruction <code>sir_simultsvv</code> instead of non-type-specialized RTL instruction <code>sir_multsvv</code> if we observed that the instruction input values were only of fixnum type.</p>
+
+<div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/inspect-new_0.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_floated/public/inspect-new_0.png?itok=v6xmC7rJ" width="600" height="302" alt="Possible changes made from sir_inspect_type, used for profiling types of local variable values" typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+
+
+<p>The speculative instructions check data types lazily, only when we do something with the data except data moves. Speculatively type-specialized instructions permit the interpreter to use more of the new non-speculative type-specialized instructions in a basic block version. In these cases, the speculative instructions act as type guards for values used in the subsequent instructions.</p>
+
+<p>Additionally, based on the profile information, the original VM call instructions can be specialized to instructions for C function calls, calls to an iseq (a sequence of VM instructions), or accesses to instance variables.</p>
+
+<h3 id="iterators">7. Specialized iterator instructions</h3>
+
+<p>Many standard Ruby methods are implemented in C. Some of these methods accept a Ruby block represented by an iseq and behave as iterators.</p>
+
+<p>To execute the Ruby block for each iteration, the C code calls the interpreter. This is a very expensive procedure involving a call to <code>setjmp</code> (also used to implement CRuby exception handling). We can avoid invoking the interpreter by replacing the method call with specialized iterator instructions:</p>
+
+<pre><code>                              sir_iter_start start_func
+sir_cfunc_send   =&gt;    Lcont: sir_iter_body Lexit, block_bbv, cond_func
+                              sir_iter_cont Lcont, arg_func
+                       Lexit:</code></pre>
+
+<p>The iterator instructions are:</p>
+
+<ul><li>
+	<p><code>sir_iter_start start_func</code></p>
+
+	<p><code>start_func</code> checks the receiver type and sets up block arguments.</p>
+	</li>
+	<li>
+	<p><code>sir_iter_body exit_label, block_bbv, cond_func</code></p>
+
+	<p><code>cond_func</code> finishes the iteration or calls <code>block_bbv</code>.</p>
+	</li>
+	<li>
+	<p><code>sir_iter_cont cont_label, arg_func</code></p>
+
+	<p><code>arg_func</code> updates block arguments and permits a goto to <code>cont_label</code>.</p>
+	</li>
+</ul><p>Iterator instructions keep their temporary data on the stack. An example of such data is the current array index for an array <code>each</code> method.</p>
+
+<p>Currently, iterator instructions are implemented only for the <code>fixnum</code> <code>times</code> method and for the range and array <code>each</code> methods. Adding other iterators is easy and straightforward. Usually, you just need to write three very small C functions.</p>
+
+<p>Such specialized iterator instructions can significantly improve performance of Ruby&#39;s built-in iterator methods.</p>
+
+<h3 id="dynamic-flow-of-specialized-instructions">8. Dynamic flow of specialized instructions</h3>
+
+<p>CRuby&#39;s front-end, just like the one in CRuby&#39;s original implementation, compiles source code into iseq sequences. For each iseq we also create a <em>stub</em>, an instruction that is executed once and provides the starting point for executing the iseq.</p>
+
+<p>Most executions of basic blocks can rely on assumptions we make about data types during compilation and execution. If we find, during execution, that our speculative assumptions do not hold, we switch back to non-type-specialized hybrid stack/RTL instructions.</p>
+
+<p>For the speculatively type-specialized instructions, the switch can happen when the input value types are not of the expected types. An example situation that violates a speculative assumption for type-specialized instructions is an integer overflow that switches the result type from a <code>fixnum</code> to a multi-precision number.</p>
+
+<p>Figure 8 shows the flow through a basic block. The downward arrows show the flow that takes place so long as assumptions about data types are valid. When an assumption is invalidated, the path shown by the upward arrows is taken.</p>
+
+<div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/sirflow.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_floated/public/sirflow.png?itok=4SR2HhBD" width="600" height="495" alt="The interpreter creates type-specialized instructions and reverts to non-specialized instructions when necessary" typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+
+
+<p>Execution of a stub creates hybrid stack/RTL instructions for the first basic block of the iseq. At this point, we also generate type-specialized instructions from type information that we know, and profile instructions for values of unknown type. These type-specialized instructions will be the new execution starting point of the iseq during further iterations.</p>
+
+<p>After that, execution continues from the new type-specialized instructions in the basic block. Possible continuations of the basic block at this point are also stubs for successor basic blocks. When the stub of a successor basic block runs, we create hybrid stack/RTL instructions and instructions specialized by type information collected from types in the predecessor basic block. Profiling instructions are also added here. Execution then proceeds with the new basic blocks.</p>
+
+<p>After a specified number of executions of the same basic block, we generate type-specialized instructions and instructions specialized from the collected profile information. And this is now the new starting point of the basic block. The type-specialized and profile-specialized basic block is also a starting point for the MIR-based JIT compiler I am working on. The current MIR-based compiler generates code from the type-specialized and profile-specialized instructions of one basic block. In the future, the compiler will also generate code from the type-specialized and profile-specialized instructions of the entire method.</p>
+
+<h2 id="implementation-and-the-current-status">Current status of the implementation</h2>
+
+<p>My interpreter and MIR-based JIT compiler that use the specialized IR can be found in <a href="https://github.com/vnmakarov/ruby">my GitHub repository</a>. The current state is good only for running the benchmarks I discuss later. Currently, specialized IR generation and execution is implemented in about 3,500 lines of C code. The generator of C code for MIR is about 2,500 lines. The MIR-based JIT compiler needs to build and install the <a href="https://github.com/vnmakarov/mir/tree/bbv">MIR library</a>, whose size is about 900KB of machine code. Although his library can be shrunk.</p>
+
+<p>To use the interpreter with the specialized IR, run a program with the <code>--sir</code> option. There is also an <code>--sir-max-versions=<em>n</em></code> option for setting the maximum number of versions of a basic block.</p>
+
+<p>To use the interpreter with the specialized IR and MIR JIT compiler, run a program with the <code>--mirjit</code> option.</p>
+
+<p>You can also enable the <code>--sir-debug</code> and <code>--mirjit-debug</code> debugging options, but please be aware that the debugger output, even for a small Ruby program, will be pretty big.</p>
+
+<h2 id="benchmarking">Benchmarking the faster interpreter</h2>
+
+<p>I have benchmarked the faster interpreter against the base CRuby interpreter, YJIT, MJIT, and the MIR-based JIT compiler using the following options:</p>
+
+<ul><li>Interpreter with SIR: <code>--sir</code></li>
+	<li>YJIT: <code>--yjit-call-threshold=1</code></li>
+	<li>MJIT: <code>--jit-min-calls=1</code></li>
+	<li>SIR+MIR: <code>--mirjit</code></li>
+</ul><p>The run time of each benchmark varies from half a minute to a couple of minutes. The run-time options for each JIT compiler are chosen to generate machine code as soon as possible and thus get the best result for that compiler.</p>
+
+<p>I did the benchmarking on an Intel Core i7-9700K with 16GB memory under Linux Fedora Core 32, using my own microbenchmarks which can be found in the <a href="https://github.com/vnmakarov/ruby/tree/sir-mirjit/sir-bench">sir-bench directory of my repository</a> and <a href="https://github.com/mame/optcarrot">Optcarrot</a>. Each benchmark was run three times and the best result was chosen.</p>
+
+<p>Note that the MIR-based JIT compiler is in the very early stage of development, and I am expecting significant performance improvements in the future.</p>
+
+<h3 id="micro-benchmarks">Results from microbenchmarks</h3>
+
+<p>Figure 9 shows the wall times for various microbenchmarks.</p>
+
+
+<figure role="group"><div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/JIT-fig9.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_full_width_1440px_w/public/JIT-fig9.png?itok=28cJTzcA" width="1172" height="668" alt="A bar graph shows the wall times for various microbenchmarks." typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+<figcaption></figcaption></figure>
+
+<p>The following points explain some of the results:</p>
+
+<ol><li>
+	<p>On Geomean, my new interpreter achieved 109% of the performance of the base CRuby interpreter, but was 6% slower than YJIT.</p>
+	</li>
+	<li>
+	<p>RTL with type specialization makes the <code>while</code> benchmark run faster than YJIT. Using RTL decreases the number of executed instructions per iteration from 8 (stack instructions) to 2 (RTL instructions) and removes 5 CRuby stack accesses.</p>
+	</li>
+	<li>
+	<p>Iterator specialization permits my interpreter to execute the <code>ntimes</code><em> </em>(nested times) benchmark without leaving and entering the major <code>vm_exec_core</code> interpreter function. Avoiding that switch results in better code performance. As I wrote earlier, entering the function is very expensive, as it requires a call to the <code>setjmp</code> C function.</p>
+	</li>
+	<li>
+	<p>Method calls are where the interpreter&#39;s specialization does not work well. YJIT-generated code for the <code>call</code> benchmark works twice as fast as my interpreter with the specialized IR. YJIT generates code that is already specialized for the call&#39;s particular characteristics. For instance, YJIT can reflect the number of arguments and the local variables of the called method. I could add call instructions specialized for these parameters too, but doing so would hugely increase the number of specialized instructions. So I decided not to even try this approach, especially as such specialization will be solved by the MIR-based JIT compiler.</p>
+	</li>
+</ol><p>People often measure only wall time for benchmarks. But CPU use is important too. It reflects how much energy is spent executing the code. CPU time improvements are given in Figure 10.</p>
+
+<div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/sir-cpu-new.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_floated/public/sir-cpu-new.png?itok=j78af0ta" width="576" height="480" alt="CPU time is similar to wall time except for the MJIT compiler." typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+
+
+<p>Differences in CPU usage are comparable to differences in wall time for the microbenchmarks, except for MJIT. MJIT generates machine code using GCC or LLVM in parallel with Ruby program execution. GCC and LLVM do a lot of optimizations and spend a lot of time in them.</p>
+
+<p>YJIT-based and MIR-based JIT compilers do not generate code in parallel. When they decide to JIT-compile some VM instructions, code execution stops until the machine code for these instructions is ready.</p>
+
+<p>Figure 11 shows the maximum resident memory use of my fast interpreter and different JIT compilers, relative to the basic interpreter.</p>
+
+<div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/sir-mem-new_1.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_floated/public/sir-mem-new_1.png?itok=tkalQRld" width="576" height="480" alt="YJIT&#39;s maximum memory usage is high" typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+
+
+<p>YJIT reserves a big pool of memory for its work. This memory is often not fully used. I assume this YJIT behavior can be improved.</p>
+
+<h3 id="optcarrot">Optcarrot benchmark results</h3>
+
+<p>Optcarrot, a Nintendo game computer emulator, is a classic benchmark for Ruby. Figure 12 shows the best frame per second (FPS) values when 3,000 frames are generated by Optcarrot.</p>
+
+
+<figure role="group"><div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/carrot-new.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_full_width_1440px_w/public/carrot-new.png?itok=tjIRQaUN" width="576" height="480" alt="The new interpreter performs better than the basic interpreter on Optcarrot." typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+<figcaption></figcaption></figure>
+
+<p>The specialized IR shows a 45% improvement over the basic interpreter.</p>
+
+<p>In the optimized version of Optcarrot (Figure 13), a huge method is generated before execution. Basically, the method is a substitute for aggressive method inlining. Because there are a lot fewer method calls, for which specialization in the interpreter is not as good as for JIT compilers, the interpreter with the specialized IR generates the second-best result, right after the MIR-based JIT compiler.</p>
+
+
+<figure role="group"><div>
+  <article><p><a href="https://developers.redhat.com/sites/default/files/optcarrot-new.png" data-featherlight="image"><img loading="lazy" src="https://developers.redhat.com/sites/default/files/styles/article_full_width_1440px_w/public/optcarrot-new.png?itok=nRXefVdz" width="576" height="480" alt="The new interpreter performs much better than the basic interpreter on optimized Optcarrot." typeof="foaf:Image"/></a>
+</p>
+      </article></div>
+<figcaption></figcaption></figure>
+
+<p>YJIT behavior is the worst on this benchmark. I did not investigate why YJIT has such low performance in this case. I have heard that the reason might be that YJIT did not implement the <code>opt_case_dispatch</code> instruction used by the optimized Optcarrot.</p>
+
+<p>Although MJIT produces a decent FPS result, it takes forever to finish the benchmark. Running with MJIT, Ruby terminates only when compilation finishes for all methods currently being compiled by GCC or LLVM. This trait is a specific limitation of the current parallel MJIT engine. Because the huge method requires a lot of time for GCC to compile, the method in this benchmark is actually being executed by the interpreter. The benchmark finishes in a reasonable amount of time, but MJIT is still waiting for the method compilation to finish, even though the generated machine code is never used.</p>
+
+<h2 id="conclusion">The significance of this prototype for Ruby and Python</h2>
+
+<p>The faster CRuby interpreter described in this article is only a very early prototype. Much needs to be added, and there are still many bugs. I am going to finish the work this year and continue my work on a MIR-based CRuby JIT compiler using the specialized IR. There are still many bugs to fix in the JIT compiler and a lot of work must be done to generate better code.</p>
+
+<p>The specialization described here is useful for developers who already use classical approaches to speed up dynamic programming language interpreters and now want to achieve even better interpreter performance. Currently, I consider the specialized IR and the MIR-based CRuby JIT compiler more as research projects for me than as candidates for production use. The enhancements in the projects demonstrate what can be accomplished with the MIR project.</p>
+
+<h2>What&#39;s next?</h2>
+
+<p>Because there is too much technical debt in my different code bases, I probably cannot provide maintenance and adaptation of the code for future CRuby releases. Anyone can use and modify my code for any purpose. I welcome such work. I will provide help where I can, but unfortunately, I cannot commit to this work. However, I am fully committed to maintaining and improving the MIR project.</p>
+
+<p>Currently, CPython developers are working on speeding up their interpreter. Some techniques described here (particularly RTL and basic block versioning) are not used in their project. But these techniques might prove even more profitable than CRuby because CPython uses reference counts for garbage collection. It may be easier to implement the techniques I developed in CPython. Although CPython supports concurrency, it does not have real parallelism as CRuby does.</p>
+
+<p>You can comment below if you have questions. Your feedback is welcome. Developers can also get some practice with hands-on labs in <a href="https://developers.redhat.com/developer-sandbox/activities/learn-kubernetes-using-red-hat-developer-sandbox-openshift">Developer Sandbox for Red Hat OpenShift</a> for free.</p>
+					
+															
+				</div>
+			</div>
+		</div></div>
+  </body>
+</html>
