@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html">Original</a>
+    <h1>How to do distributed locking (2016)</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+            <div id="content">
+                
+
+                
+                <p>Published by Martin Kleppmann on 08 Feb 2016.</p>
+                
+
+                <p>As part of the research for <a href="http://dataintensive.net/">my book</a>, I came across an algorithm called <a href="http://redis.io/topics/distlock">Redlock</a> on the
+<a href="http://redis.io/">Redis</a> website. The algorithm claims to implement fault-tolerant distributed locks (or rather,
+<a href="https://pdfs.semanticscholar.org/a25e/ee836dbd2a5ae680f835309a484c9f39ae4e.pdf" title="Cary G Gray and David R Cheriton. Leases: An Efficient Fault-Tolerant Mechanism for Distributed File Cache Consistency. SOSP 1989">leases</a> [1]) on top of Redis, and the page asks for feedback from people who are into
+distributed systems. The algorithm instinctively set off some alarm bells in the back of my mind, so
+I spent a bit of time thinking about it and writing up these notes.</p>
+
+<p>Since there are already <a href="http://redis.io/topics/distlock">over 10 independent implementations of Redlock</a> and we don’t know
+who is already relying on this algorithm, I thought it would be worth sharing my notes publicly.
+I won’t go into other aspects of Redis, some of which have already been critiqued
+<a href="https://aphyr.com/tags/Redis">elsewhere</a>.</p>
+
+<p>Before I go into the details of Redlock, let me say that I quite like Redis, and I have successfully
+used it in production in the past. I think it’s a good fit in situations where you want to share
+some transient, approximate, fast-changing data between servers, and where it’s not a big deal if
+you occasionally lose that data for whatever reason. For example, a good use case is maintaining
+request counters per IP address (for rate limiting purposes) and sets of distinct IP addresses per
+user ID (for abuse detection).</p>
+
+<p>However, Redis has been gradually making inroads into areas of data management where there are
+stronger consistency and durability expectations – which worries me, because this is not what Redis
+is designed for. Arguably, distributed locking is one of those areas. Let’s examine it in some more
+detail.</p>
+
+<h2 id="what-are-you-using-that-lock-for">What are you using that lock for?</h2>
+
+<p>The purpose of a lock is to ensure that among several nodes that might try to do the same piece of
+work, only one actually does it (at least only one at a time). That work might be to write some data
+to a shared storage system, to perform some computation, to call some external API, or suchlike. At
+a high level, there are two reasons why you might want a lock in a distributed application:
+<a href="https://research.google.com/archive/chubby.html" title="Mike Burrows. The Chubby lock service for loosely-coupled distributed systems. OSDI 2006">for efficiency or for correctness</a> [2]. To distinguish these cases, you can ask what
+would happen if the lock failed:</p>
+
+<ul>
+  <li><strong>Efficiency:</strong> Taking a lock saves you from unnecessarily doing the same work twice (e.g. some
+expensive computation). If the lock fails and two nodes end up doing the same piece of work, the
+result is a minor increase in cost (you end up paying 5 cents more to AWS than you otherwise would
+have) or a minor inconvenience (e.g. a user ends up getting the same email notification twice).</li>
+  <li><strong>Correctness:</strong> Taking a lock prevents concurrent processes from stepping on each others’ toes
+and messing up the state of your system. If the lock fails and two nodes concurrently work on the
+same piece of data, the result is a corrupted file, data loss, permanent inconsistency, the wrong
+dose of a drug administered to a patient, or some other serious problem.</li>
+</ul>
+
+<p>Both are valid cases for wanting a lock, but you need to be very clear about which one of the two
+you are dealing with.</p>
+
+<p>I will argue that if you are using locks merely for efficiency purposes, it is unnecessary to incur
+the cost and complexity of Redlock, running 5 Redis servers and checking for a majority to acquire
+your lock. You are better off just using a single Redis instance, perhaps with asynchronous
+replication to a secondary instance in case the primary crashes.</p>
+
+<p>If you use a single Redis instance, of course you will drop some locks if the power suddenly goes
+out on your Redis node, or something else goes wrong. But if you’re only using the locks as an
+efficiency optimization, and the crashes don’t happen too often, that’s no big deal. This “no big
+deal” scenario is where Redis shines. At least if you’re relying on a single Redis instance, it is
+clear to everyone who looks at the system that the locks are approximate, and only to be used for
+non-critical purposes.</p>
+
+<p>On the other hand, the Redlock algorithm, with its 5 replicas and majority voting, looks at first
+glance as though it is suitable for situations in which your locking is important for <em>correctness</em>.
+I will argue in the following sections that it is <em>not</em> suitable for that purpose. For the rest of
+this article we will assume that your locks are important for correctness, and that it is a serious
+bug if two different nodes concurrently believe that they are holding the same lock.</p>
+
+<h2 id="protecting-a-resource-with-a-lock">Protecting a resource with a lock</h2>
+
+<p>Let’s leave the particulars of Redlock aside for a moment, and discuss how a distributed lock is
+used in general (independent of the particular locking algorithm used). It’s important to remember
+that a lock in a distributed system is not like a mutex in a multi-threaded application. It’s a more
+complicated beast, due to the problem that different nodes and the network can all fail
+independently in various ways.</p>
+
+<p>For example, say you have an application in which a client needs to update a file in shared storage
+(e.g. HDFS or S3). A client first acquires the lock, then reads the file, makes some changes, writes
+the modified file back, and finally releases the lock. The lock prevents two clients from performing
+this read-modify-write cycle concurrently, which would result in lost updates. The code might look
+something like this:</p>
+
+<figure><pre><code data-lang="js"><span>// THIS CODE IS BROKEN</span>
+<span>function</span> <span>writeData</span><span>(</span><span>filename</span><span>,</span> <span>data</span><span>)</span> <span>{</span>
+    <span>var</span> <span>lock</span> <span>=</span> <span>lockService</span><span>.</span><span>acquireLock</span><span>(</span><span>filename</span><span>);</span>
+    <span>if</span> <span>(</span><span>!</span><span>lock</span><span>)</span> <span>{</span>
+        <span>throw</span> <span>&#39;</span><span>Failed to acquire lock</span><span>&#39;</span><span>;</span>
+    <span>}</span>
+
+    <span>try</span> <span>{</span>
+        <span>var</span> <span>file</span> <span>=</span> <span>storage</span><span>.</span><span>readFile</span><span>(</span><span>filename</span><span>);</span>
+        <span>var</span> <span>updated</span> <span>=</span> <span>updateContents</span><span>(</span><span>file</span><span>,</span> <span>data</span><span>);</span>
+        <span>storage</span><span>.</span><span>writeFile</span><span>(</span><span>filename</span><span>,</span> <span>updated</span><span>);</span>
+    <span>}</span> <span>finally</span> <span>{</span>
+        <span>lock</span><span>.</span><span>release</span><span>();</span>
+    <span>}</span>
+<span>}</span></code></pre></figure>
+
+<p>Unfortunately, even if you have a perfect lock service, the code above is broken. The following
+diagram shows how you can end up with corrupted data:</p>
+
+<p><img src="https://martin.kleppmann.com/2016/02/unsafe-lock.png" width="550" height="200" alt="Unsafe access to a resource protected by a distributed lock"/></p>
+
+<p>In this example, the client that acquired the lock is paused for an extended period of time while
+holding the lock – for example because the garbage collector (GC) kicked in. The lock has a timeout
+(i.e. it is a lease), which is always a good idea (otherwise a crashed client could end up holding
+a lock forever and never releasing it). However, if the GC pause lasts longer than the lease expiry
+period, and the client doesn’t realise that it has expired, it may go ahead and make some unsafe
+change.</p>
+
+<p>This bug is not theoretical: HBase used to <a href="http://www.slideshare.net/enissoz/hbase-and-hdfs-understanding-filesystem-usage" title="Enis Söztutar. HBase and HDFS: Understanding filesystem usage in HBase. HBaseCon 2013">have this problem</a> [3,4]. Normally,
+GC pauses are quite short, but “stop-the-world” GC pauses have sometimes been known to last for
+<a href="https://blog.cloudera.com/blog/2011/02/avoiding-full-gcs-in-hbase-with-memstore-local-allocation-buffers-part-1/" title="Todd Lipcon. Avoiding Full GCs in Apache HBase with MemStore-Local Allocation Buffers: Part 1. 2011">several minutes</a> [5] – certainly long enough for a lease to expire. Even so-called
+“concurrent” garbage collectors like the HotSpot JVM’s CMS cannot fully run in parallel with the
+application code – even they <a href="http://mechanical-sympathy.blogspot.co.uk/2013/07/java-garbage-collection-distilled.html" title="Martin Thompson. Java Garbage Collection Distilled. 2013">need to stop the world</a> from time to time [6].</p>
+
+<p>You cannot fix this problem by inserting a check on the lock expiry just before writing back to
+storage. Remember that GC can pause a running thread at <em>any point</em>, including the point that is
+maximally inconvenient for you (between the last check and the write operation).</p>
+
+<p>And if you’re feeling smug because your programming language runtime doesn’t have long GC pauses,
+there are many other reasons why your process might get paused. Maybe your process tried to read an
+address that is not yet loaded into memory, so it gets a page fault and is paused until the page is
+loaded from disk. Maybe your disk is actually EBS, and so reading a variable unwittingly turned into
+a synchronous network request over Amazon’s congested network. Maybe there are many other processes
+contending for CPU, and you hit a <a href="https://twitter.com/aphyr/status/682077908953792512">black node in your scheduler tree</a>. Maybe someone
+accidentally sent SIGSTOP to the process. Whatever. Your processes will get paused.</p>
+
+<p>If you still don’t believe me about process pauses, then consider instead that the file-writing
+request may get delayed in the network before reaching the storage service. Packet networks such as
+Ethernet and IP may delay packets <em>arbitrarily</em>, and <a href="https://queue.acm.org/detail.cfm?id=2655736" title="P Bailis and K Kingsbury. The Network is Reliable. ACM Queue 12(7), 2014.">they do</a> [7]: in a famous
+<a href="https://github.com/blog/1364-downtime-last-saturday" title="Mark Imbriaco. Downtime last Saturday. 2012">incident at GitHub</a>, packets were delayed in the network for approximately 90
+seconds [8]. This means that an application process may send a write request, and it may reach
+the storage server a minute later when the lease has already expired.</p>
+
+<p>Even in well-managed networks, this kind of thing can happen. You simply cannot make any assumptions
+about timing, which is why the code above is fundamentally unsafe, no matter what lock service you
+use.</p>
+
+<h2 id="making-the-lock-safe-with-fencing">Making the lock safe with fencing</h2>
+
+<p>The fix for this problem is actually pretty simple: you need to include a <em>fencing token</em> with every
+write request to the storage service. In this context, a fencing token is simply a number that
+increases (e.g. incremented by the lock service) every time a client acquires the lock. This is
+illustrated in the following diagram:</p>
+
+<p><img src="https://martin.kleppmann.com/2016/02/fencing-tokens.png" width="550" height="200" alt="Using fencing tokens to make resource access safe"/></p>
+
+<p>Client 1 acquires the lease and gets a token of 33, but then it goes into a long pause and the lease
+expires. Client 2 acquires the lease, gets a token of 34 (the number always increases), and then
+sends its write to the storage service, including the token of 34. Later, client 1 comes back to
+life and sends its write to the storage service, including its token value 33. However, the storage
+server remembers that it has already processed a write with a higher token number (34), and so it
+rejects the request with token 33.</p>
+
+<p>Note this requires the storage server to take an active role in checking tokens, and rejecting any
+writes on which the token has gone backwards. But this is not particularly hard, once you know the
+trick. And provided that the lock service generates strictly monotonically increasing tokens, this
+makes the lock safe. For example, if you are using ZooKeeper as lock service, you can use the <code>zxid</code>
+or the znode version number as fencing token, and you’re in good shape [3].</p>
+
+<p>However, this leads us to the first big problem with Redlock: <em>it does not have any facility for
+generating fencing tokens</em>. The algorithm does not produce any number that is guaranteed to increase
+every time a client acquires a lock. This means that even if the algorithm were otherwise perfect,
+it would not be safe to use, because you cannot prevent the race condition between clients in the
+case where one client is paused or its packets are delayed.</p>
+
+<p>And it’s not obvious to me how one would change the Redlock algorithm to start generating fencing
+tokens. The unique random value it uses does not provide the required monotonicity. Simply keeping
+a counter on one Redis node would not be sufficient, because that node may fail. Keeping counters on
+several nodes would mean they would go out of sync. It’s likely that you would need a consensus
+algorithm just to generate the fencing tokens. (If only <a href="https://twitter.com/lindsey/status/575006945213485056">incrementing a counter</a> was
+simple.)</p>
+
+<h2 id="using-time-to-solve-consensus">Using time to solve consensus</h2>
+
+<p>The fact that Redlock fails to generate fencing tokens should already be sufficient reason not to
+use it in situations where correctness depends on the lock. But there are some further problems that
+are worth discussing.</p>
+
+<p>In the academic literature, the most practical system model for this kind of algorithm is the
+<a href="http://courses.csail.mit.edu/6.852/08/papers/CT96-JACM.pdf" title="TD Chandra and S Toueg. Unreliable Failure Detectors for Reliable Distributed Systems. JACM 43(2):225–267, 1996">asynchronous model with unreliable failure detectors</a> [9]. In plain English,
+this means that the algorithms make no assumptions about timing: processes may pause for arbitrary
+lengths of time, packets may be arbitrarily delayed in the network, and clocks may be arbitrarily
+wrong – and the algorithm is nevertheless expected to do the right thing. Given what we discussed
+above, these are very reasonable assumptions.</p>
+
+<p>The only purpose for which algorithms may use clocks is to generate timeouts, to avoid waiting
+forever if a node is down. But timeouts do not have to be accurate: just because a request times
+out, that doesn’t mean that the other node is definitely down – it could just as well be that there
+is a large delay in the network, or that your local clock is wrong. When used as a failure detector,
+timeouts are just a guess that something is wrong. (If they could, distributed algorithms would do
+without clocks entirely, but then <a href="http://www.cs.princeton.edu/courses/archive/fall07/cos518/papers/flp.pdf" title="MJ Fischer, N Lynch, and MS Paterson. Impossibility of Distributed Consensus with One Faulty Process. JACM 32(2):374–382, 1985">consensus becomes impossible</a> [10]. Acquiring a lock is
+like a compare-and-set operation, which <a href="https://cs.brown.edu/~mph/Herlihy91/p124-herlihy.pdf" title="Maurice Herlihy. Wait-Free Synchronization. TOPLAS 13(1):124–149, 1991">requires consensus</a> [11].)</p>
+
+<p>Note that Redis <a href="https://github.com/antirez/redis/blob/edd4d555df57dc84265fdfb4ef59a4678832f6da/src/server.c#L390-L404">uses <code>gettimeofday</code></a>, not a <a href="http://linux.die.net/man/2/clock_gettime">monotonic clock</a>, to
+determine the <a href="https://github.com/antirez/redis/blob/f0b168e8944af41c4161249040f01ece227cfc0c/src/db.c#L933-L959">expiry of keys</a>. The man page for <code>gettimeofday</code> <a href="http://linux.die.net/man/2/gettimeofday">explicitly
+says</a> that the time it returns is subject to discontinuous jumps in system time –
+that is, it might suddenly jump forwards by a few minutes, or even jump back in time (e.g. if the
+clock is <a href="https://www.eecis.udel.edu/~mills/ntp/html/clock.html">stepped by NTP</a> because it differs from a NTP server by too much, or if the
+clock is manually adjusted by an administrator). Thus, if the system clock is doing weird things, it
+could easily happen that the expiry of a key in Redis is much faster or much slower than expected.</p>
+
+<p>For algorithms in the asynchronous model this is not a big problem: these algorithms generally
+ensure that their <em>safety</em> properties always hold, <a href="http://www.net.t-labs.tu-berlin.de/~petr/ADC-07/papers/DLS88.pdf" title="C Dwork, N Lynch, and L Stockmeyer. Consensus in the Presence of Partial Synchrony. JACM 35(2):288–323, 1988">without making any timing
+assumptions</a> [12]. Only <em>liveness</em> properties depend on timeouts or some other failure
+detector. In plain English, this means that even if the timings in the system are all over the place
+(processes pausing, networks delaying, clocks jumping forwards and backwards), the performance of an
+algorithm might go to hell, but the algorithm will never make an incorrect decision.</p>
+
+<p>However, Redlock is not like this. Its safety depends on a lot of timing assumptions: it assumes
+that all Redis nodes hold keys for approximately the right length of time before expiring; that the
+network delay is small compared to the expiry duration; and that process pauses are much shorter
+than the expiry duration.</p>
+
+<h2 id="breaking-redlock-with-bad-timings">Breaking Redlock with bad timings</h2>
+
+<p>Let’s look at some examples to demonstrate Redlock’s reliance on timing assumptions. Say the system
+has five Redis nodes (A, B, C, D and E), and two clients (1 and 2). What happens if a clock on one
+of the Redis nodes jumps forward?</p>
+
+<ol>
+  <li>Client 1 acquires lock on nodes A, B, C. Due to a network issue, D and E cannot be reached.</li>
+  <li>The clock on node C jumps forward, causing the lock to expire.</li>
+  <li>Client 2 acquires lock on nodes C, D, E. Due to a network issue, A and B cannot be reached.</li>
+  <li>Clients 1 and 2 now both believe they hold the lock.</li>
+</ol>
+
+<p>A similar issue could happen if C crashes before persisting the lock to disk, and immediately
+restarts. For this reason, the Redlock documentation <a href="http://redis.io/topics/distlock#performance-crash-recovery-and-fsync">recommends delaying restarts</a> of
+crashed nodes for at least the time-to-live of the longest-lived lock. But this restart delay again
+relies on a reasonably accurate measurement of time, and would fail if the clock jumps.</p>
+
+<p>Okay, so maybe you think that a clock jump is unrealistic, because you’re very confident in having
+correctly configured NTP to only ever slew the clock. In that case, let’s look at an example of how
+a process pause may cause the algorithm to fail:</p>
+
+<ol>
+  <li>Client 1 requests lock on nodes A, B, C, D, E.</li>
+  <li>While the responses to client 1 are in flight, client 1 goes into stop-the-world GC.</li>
+  <li>Locks expire on all Redis nodes.</li>
+  <li>Client 2 acquires lock on nodes A, B, C, D, E.</li>
+  <li>Client 1 finishes GC, and receives the responses from Redis nodes indicating that it successfully
+acquired the lock (they were held in client 1’s kernel network buffers while the process was
+paused).</li>
+  <li>Clients 1 and 2 now both believe they hold the lock.</li>
+</ol>
+
+<p>Note that even though Redis is written in C, and thus doesn’t have GC, that doesn’t help us here:
+any system in which the <em>clients</em> may experience a GC pause has this problem. You can only make this
+safe by preventing client 1 from performing any operations under the lock after client 2 has
+acquired the lock, for example using the fencing approach above.</p>
+
+<p>A long network delay can produce the same effect as the process pause. It perhaps depends on your
+TCP user timeout – if you make the timeout significantly shorter than the Redis TTL, perhaps the
+delayed network packets would be ignored, but we’d have to look in detail at the TCP implementation
+to be sure. Also, with the timeout we’re back down to accuracy of time measurement again!</p>
+
+<h2 id="the-synchrony-assumptions-of-redlock">The synchrony assumptions of Redlock</h2>
+
+<p>These examples show that Redlock works correctly only if you assume a <em>synchronous</em> system model –
+that is, a system with the following properties:</p>
+
+<ul>
+  <li>bounded network delay (you can guarantee that packets always arrive within some guaranteed maximum
+delay),</li>
+  <li>bounded process pauses (in other words, hard real-time constraints, which you typically only
+find in car airbag systems and suchlike), and</li>
+  <li>bounded clock error (cross your fingers that you don’t get your time from a <a href="http://xenia.media.mit.edu/~nelson/research/ntp-survey99/">bad NTP
+server</a>).</li>
+</ul>
+
+<p>Note that a synchronous model does not mean exactly synchronised clocks: it means you are assuming
+a <a href="http://www.net.t-labs.tu-berlin.de/~petr/ADC-07/papers/DLS88.pdf" title="C Dwork, N Lynch, and L Stockmeyer. Consensus in the Presence of Partial Synchrony. JACM 35(2):288–323, 1988"><em>known, fixed upper bound</em></a> on network delay, pauses and clock drift [12]. Redlock
+assumes that delays, pauses and drift are all small relative to the time-to-live of a lock; if the
+timing issues become as large as the time-to-live, the algorithm fails.</p>
+
+<p>In a reasonably well-behaved datacenter environment, the timing assumptions will be satisfied <em>most</em>
+of the time – this is known as a <a href="http://www.net.t-labs.tu-berlin.de/~petr/ADC-07/papers/DLS88.pdf" title="C Dwork, N Lynch, and L Stockmeyer. Consensus in the Presence of Partial Synchrony. JACM 35(2):288–323, 1988">partially synchronous system</a> [12]. But is that good
+enough? As soon as those timing assumptions are broken, Redlock may violate its safety properties,
+e.g. granting a lease to one client before another has expired. If you’re depending on your lock for
+correctness, “most of the time” is not enough – you need it to <em>always</em> be correct.</p>
+
+<p>There is plenty of evidence that it is not safe to assume a synchronous system model for most
+practical system environments [7,8]. Keep reminding yourself of the GitHub incident with the
+<a href="https://github.com/blog/1364-downtime-last-saturday" title="Mark Imbriaco. Downtime last Saturday. 2012">90-second packet delay</a>. It is unlikely that Redlock would survive a <a href="https://aphyr.com/tags/jepsen">Jepsen</a> test.</p>
+
+<p>On the other hand, a consensus algorithm designed for a partially synchronous system model (or
+asynchronous model with failure detector) actually has a chance of working. Raft, Viewstamped
+Replication, Zab and Paxos all fall in this category. Such an algorithm must let go of all timing
+assumptions. That’s hard: it’s so tempting to assume networks, processes and clocks are more
+reliable than they really are. But in the messy reality of distributed systems, you have to be very
+careful with your assumptions.</p>
+
+<h2 id="conclusion">Conclusion</h2>
+
+<p>I think the Redlock algorithm is a poor choice because it is “neither fish nor fowl”: it is
+unnecessarily heavyweight and expensive for efficiency-optimization locks, but it is not
+sufficiently safe for situations in which correctness depends on the lock.</p>
+
+<p>In particular, the algorithm makes dangerous assumptions about timing and system clocks (essentially
+assuming a synchronous system with bounded network delay and bounded execution time for operations),
+and it violates safety properties if those assumptions are not met. Moreover, it lacks a facility
+for generating fencing tokens (which protect a system against long delays in the network or in
+paused processes).</p>
+
+<p>If you need locks only on a best-effort basis (as an efficiency optimization, not for correctness),
+I would recommend sticking with the <a href="http://redis.io/commands/set">straightforward single-node locking algorithm</a> for
+Redis (conditional set-if-not-exists to obtain a lock, atomic delete-if-value-matches to release
+a lock), and documenting very clearly in your code that the locks are only approximate and may
+occasionally fail. Don’t bother with setting up a cluster of five Redis nodes.</p>
+
+<p>On the other hand, if you need locks for correctness, please don’t use Redlock. Instead, please use
+a proper consensus system such as <a href="https://zookeeper.apache.org/">ZooKeeper</a>, probably via one of the <a href="http://curator.apache.org/curator-recipes/index.html">Curator recipes</a>
+that implements a lock. (At the very least, use a <a href="http://www.postgresql.org/">database with reasonable transactional
+guarantees</a>.) And please enforce use of fencing tokens on all resource accesses under the
+lock.</p>
+
+<p>As I said at the beginning, Redis is an excellent tool if you use it correctly. None of the above
+diminishes the usefulness of Redis for its intended purposes. <a href="http://antirez.com/">Salvatore</a> has been very
+dedicated to the project for years, and its success is well deserved. But every tool has
+limitations, and it is important to know them and to plan accordingly.</p>
+
+<p>If you want to learn more, I explain this topic in greater detail in <a href="http://dataintensive.net/">chapters 8 and 9 of my
+book</a>, now available in Early Release from O’Reilly. (The diagrams above are taken from my
+book.) For learning how to use ZooKeeper, I recommend <a href="http://shop.oreilly.com/product/0636920028901.do" title="FP Junqueira and B Reed. ZooKeeper: Distributed Process Coordination. O&#39;Reilly, 2013">Junqueira and Reed’s book</a> [3].
+For a good introduction to the theory of distributed systems, I recommend <a href="http://www.distributedprogramming.net/" title="C Cachin, R Guerraoui, and L Rodrigues. Introduction to Reliable and Secure Distributed Programming, 2nd ed. Springer, 2011">Cachin, Guerraoui and
+Rodrigues’ textbook</a> [13].</p>
+
+<p><em>Thank you to <a href="https://aphyr.com">Kyle Kingsbury</a>, <a href="https://twitter.com/skamille">Camille Fournier</a>, <a href="https://twitter.com/fpjunqueira">Flavio Junqueira</a>, and
+<a href="http://antirez.com/">Salvatore Sanfilippo</a> for reviewing a draft of this article. Any errors are mine, of
+course.</em></p>
+
+<p><strong>Update 9 Feb 2016:</strong> <a href="http://antirez.com/">Salvatore</a>, the original author of Redlock, has
+<a href="http://antirez.com/news/101">posted a rebuttal</a> to this article (see also
+<a href="https://news.ycombinator.com/item?id=11065933">HN discussion</a>). He makes some good points, but
+I stand by my conclusions. I may elaborate in a follow-up post if I have time, but please form your
+own opinions – and please consult the references below, many of which have received rigorous
+academic peer review (unlike either of our blog posts).</p>
+
+<h2 id="references">References</h2>
+
+<p>[1] Cary G Gray and David R Cheriton:
+“<a href="https://pdfs.semanticscholar.org/a25e/ee836dbd2a5ae680f835309a484c9f39ae4e.pdf" title="Cary G Gray and David R Cheriton. Leases: An Efficient Fault-Tolerant Mechanism for Distributed File Cache Consistency. SOSP 1989">Leases: An Efficient Fault-Tolerant Mechanism for Distributed File Cache Consistency</a>,”
+at <em>12th ACM Symposium on Operating Systems Principles</em> (SOSP), December 1989.
+<a href="https://dx.doi.org/10.1145/74850.74870">doi:10.1145/74850.74870</a></p>
+
+<p>[2] Mike Burrows:
+“<a href="https://research.google.com/archive/chubby.html" title="Mike Burrows. The Chubby lock service for loosely-coupled distributed systems. OSDI 2006">The Chubby lock service for loosely-coupled distributed systems</a>,”
+at <em>7th USENIX Symposium on Operating System Design and Implementation</em> (OSDI), November 2006.</p>
+
+<p>[3] Flavio P Junqueira and Benjamin Reed:
+<a href="http://shop.oreilly.com/product/0636920028901.do" title="FP Junqueira and B Reed. ZooKeeper: Distributed Process Coordination. O&#39;Reilly, 2013"><em>ZooKeeper: Distributed Process Coordination</em></a>. O’Reilly Media, November 2013.
+ISBN: 978-1-4493-6130-3</p>
+
+<p>[4] Enis Söztutar:
+“<a href="http://www.slideshare.net/enissoz/hbase-and-hdfs-understanding-filesystem-usage" title="Enis Söztutar. HBase and HDFS: Understanding filesystem usage in HBase. HBaseCon 2013">HBase and HDFS: Understanding filesystem usage in HBase</a>,” at <em>HBaseCon</em>, June 2013.</p>
+
+<p>[5] Todd Lipcon:
+“<a href="https://blog.cloudera.com/blog/2011/02/avoiding-full-gcs-in-hbase-with-memstore-local-allocation-buffers-part-1/" title="Todd Lipcon. Avoiding Full GCs in Apache HBase with MemStore-Local Allocation Buffers: Part 1. 2011">Avoiding Full GCs in Apache HBase with MemStore-Local Allocation Buffers: Part 1</a>,”
+blog.cloudera.com, 24 February 2011.</p>
+
+<p>[6] Martin Thompson: “<a href="http://mechanical-sympathy.blogspot.co.uk/2013/07/java-garbage-collection-distilled.html" title="Martin Thompson. Java Garbage Collection Distilled. 2013">Java Garbage Collection Distilled</a>,”
+mechanical-sympathy.blogspot.co.uk, 16 July 2013.</p>
+
+<p>[7] Peter Bailis and Kyle Kingsbury: “<a href="https://queue.acm.org/detail.cfm?id=2655736" title="P Bailis and K Kingsbury. The Network is Reliable. ACM Queue 12(7), 2014.">The Network is Reliable</a>,”
+<em>ACM Queue</em>, volume 12, number 7, July 2014.
+<a href="https://dx.doi.org/10.1145/2639988.2639988">doi:10.1145/2639988.2639988</a></p>
+
+<p>[8] Mark Imbriaco: “<a href="https://github.com/blog/1364-downtime-last-saturday" title="Mark Imbriaco. Downtime last Saturday. 2012">Downtime last Saturday</a>,” github.com, 26 December 2012.</p>
+
+<p>[9] Tushar Deepak Chandra and Sam Toueg:
+“<a href="http://courses.csail.mit.edu/6.852/08/papers/CT96-JACM.pdf" title="TD Chandra and S Toueg. Unreliable Failure Detectors for Reliable Distributed Systems. JACM 43(2):225–267, 1996">Unreliable Failure Detectors for Reliable Distributed Systems</a>,”
+<em>Journal of the ACM</em>, volume 43, number 2, pages 225–267, March 1996.
+<a href="https://dx.doi.org/10.1145/226643.226647">doi:10.1145/226643.226647</a></p>
+
+<p>[10] Michael J Fischer, Nancy Lynch, and Michael S Paterson:
+“<a href="http://www.cs.princeton.edu/courses/archive/fall07/cos518/papers/flp.pdf" title="MJ Fischer, N Lynch, and MS Paterson. Impossibility of Distributed Consensus with One Faulty Process. JACM 32(2):374–382, 1985">Impossibility of Distributed Consensus with One Faulty Process</a>,”
+<em>Journal of the ACM</em>, volume 32, number 2, pages 374–382, April 1985.
+<a href="https://dx.doi.org/10.1145/3149.214121">doi:10.1145/3149.214121</a></p>
+
+<p>[11] Maurice P Herlihy: “<a href="https://cs.brown.edu/~mph/Herlihy91/p124-herlihy.pdf" title="Maurice Herlihy. Wait-Free Synchronization. TOPLAS 13(1):124–149, 1991">Wait-Free Synchronization</a>,”
+<em>ACM Transactions on Programming Languages and Systems</em>, volume 13, number 1, pages 124–149, January 1991.
+<a href="https://dx.doi.org/10.1145/114005.102808">doi:10.1145/114005.102808</a></p>
+
+<p>[12] Cynthia Dwork, Nancy Lynch, and Larry Stockmeyer:
+“<a href="http://www.net.t-labs.tu-berlin.de/~petr/ADC-07/papers/DLS88.pdf" title="C Dwork, N Lynch, and L Stockmeyer. Consensus in the Presence of Partial Synchrony. JACM 35(2):288–323, 1988">Consensus in the Presence of Partial Synchrony</a>,”
+<em>Journal of the ACM</em>, volume 35, number 2, pages 288–323, April 1988.
+<a href="https://dx.doi.org/10.1145/42282.42283">doi:10.1145/42282.42283</a></p>
+
+<p>[13] Christian Cachin, Rachid Guerraoui, and Luís Rodrigues:
+<a href="http://www.distributedprogramming.net/" title="C Cachin, R Guerraoui, and L Rodrigues. Introduction to Reliable and Secure Distributed Programming, 2nd ed. Springer, 2011"><em>Introduction to Reliable and Secure Distributed Programming</em></a>,
+Second Edition. Springer, February 2011. ISBN: 978-3-642-15259-7,
+<a href="https://dx.doi.org/10.1007/978-3-642-15260-3">doi:10.1007/978-3-642-15260-3</a></p>
+
+
+
+                <div>
+                    <p>If you found this post useful, please
+                    <a href="https://www.patreon.com/martinkl">support me on Patreon</a>
+                    so that I can write more like it!</p>
+                    <p>
+                    To get notified when I write something new,
+                    <a href="https://nondeterministic.computer/@martin">follow me on Mastodon</a> or
+                    <a href="https://twitter.com/martinkl">Twitter</a>,
+                    or enter your email address:
+                    </p>
+
+                    
+
+                    <p>
+                    I won&#39;t give your address to anyone else, won&#39;t send you any spam, and you can unsubscribe at any time.
+                    </p>
+                </div>
+
+                
+            </div>
+
+            
+        </div></div>
+  </body>
+</html>
