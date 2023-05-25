@@ -1,0 +1,1722 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://notes.eatonphil.com/2023-05-25-raft.html">Original</a>
+    <h1>Implementing a distributed key-value store on top of implementing Raft in Go</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      <div>
+        <p>As part of bringing myself up-to-speed after joining <a href="https://tigerbeetle.com/">TigerBeetle</a>, I
+wanted some background on how distributed consensus and replicated state
+machines protocols work. TigerBeetle uses <a href="https://pmg.csail.mit.edu/papers/vr-revisited.pdf">Viewstamped
+Replication</a>. But I
+wanted to understand all popular protocols and I decided to start with
+<a href="https://raft.github.io/">Raft</a>.</p>
+<p>We&#39;ll implement two key components of Raft in this post (leader
+election and log replication). Around 1k lines of Go. It took me
+around 7 months of sporadic studying to come to (what I hope is) an
+understanding of the basics.</p>
+<p><strong>Disclaimer</strong>: I&#39;m not an expert. My implementation isn&#39;t yet hooked
+up to <a href="https://github.com/jepsen-io/jepsen">Jepsen</a>. I&#39;ve run it
+through a mix of
+<a href="https://github.com/eatonphil/goraft/tree/main#distributed-key-value-store-api">manual</a> and
+<a href="https://github.com/eatonphil/goraft/tree/main/cmd/stress">automated
+tests</a> and
+it seems generally correct. This is not intended to be used in
+production. It&#39;s just for my education.</p>
+<p>All code for this project is <a href="https://github.com/eatonphil/goraft">available on GitHub</a>.</p>
+<p>Let&#39;s dig in!</p>
+<h3 id="the-algorithm">The algorithm</h3><p><a href="https://raft.github.io/raft.pdf">The Raft paper</a> itself is quite
+readable. Give it a read and you&#39;ll get the basic idea.</p>
+<p>The gist is that nodes in a cluster conduct elections to pick
+a leader. Users of the Raft cluster send messages to the leader. The
+leader passes the message to followers and waits for a majority to
+store the message. Once the message is committed (majority consensus
+has been reached), the message is applied to a state machine the user
+supplies. Followers learn about the latest committed message from the
+leader and apply each new committed message to their local
+user-supplied state machine.</p>
+<p>There&#39;s more to it including reconfiguration and snapshotting, which I
+won&#39;t get into in this post. But you can get the gist of Raft by
+thinking about 1) leader election and 2) replicated logs powering
+replicated state machines.</p>
+<h3 id="modeling-with-state-machines-and-key-value-stores">Modeling with state machines and key-value stores</h3><p>I&#39;ve written before about how you can <a href="https://notes.eatonphil.com/minimal-key-value-store-with-hashicorp-raft.html">build a key-value store on top
+of
+Raft</a>. How
+you can <a href="https://notes.eatonphil.com/zigrocks-sql.html">build a SQL database on top of a key-value
+store</a>. And how you can
+build a <a href="https://notes.eatonphil.com/distributed-postgres.html">distributed SQL database on top of
+Raft</a>.</p>
+<p>This post will start quite similarly to that first post except for
+that we won&#39;t stop at the Raft layer.</p>
+<h3 id="a-distributed-key-value-store">A distributed key-value store</h3><p>To build on top of the Raft library we&#39;ll build, we need to create a
+state machine and commands that are sent to the state machine.</p>
+<p>Our state machine will have two operations: get a value from a key,
+and set a key to a value.</p>
+<p>This will go in <code>cmd/kvapi/main.go</code>.</p>
+<pre><code>package main
+
+import (
+    &#34;bytes&#34;
+    crypto &#34;crypto/rand&#34;
+    &#34;encoding/binary&#34;
+    &#34;fmt&#34;
+    &#34;log&#34;
+    &#34;math/rand&#34;
+    &#34;net/http&#34;
+    &#34;os&#34;
+    &#34;strconv&#34;
+    &#34;strings&#34;
+    &#34;sync&#34;
+
+    &#34;github.com/eatonphil/goraft&#34;
+)
+
+type statemachine struct {
+    db     *sync.Map
+    server int
+}
+
+type commandKind uint8
+
+const (
+    setCommand commandKind = iota
+    getCommand
+)
+
+type command struct {
+    kind  commandKind
+    key   string
+    value string
+}
+
+func (s *statemachine) Apply(cmd []byte) ([]byte, error) {
+    c := decodeCommand(cmd)
+
+    switch c.kind {
+    case setCommand:
+        s.db.Store(c.key, c.value)
+    case getCommand:
+        value, ok := s.db.Load(c.key)
+        if !ok {
+            return nil, fmt.Errorf(&#34;Key not found&#34;)
+        }
+        return []byte(value.(string)), nil
+    default:
+        return nil, fmt.Errorf(&#34;Unknown command: %x&#34;, cmd)
+    }
+
+    return nil, nil
+}
+</code></pre>
+<p>But the Raft library we&#39;ll build needs to deal with various state
+machines. So commands passed from the user into the Raft cluster must
+be serialized to bytes.</p>
+<pre><code>func encodeCommand(c command) []byte {
+    msg := bytes.NewBuffer(nil)
+    err := msg.WriteByte(uint8(c.kind))
+    if err != nil {
+        panic(err)
+    }
+
+    err = binary.Write(msg, binary.LittleEndian, uint64(len(c.key)))
+    if err != nil {
+        panic(err)
+    }
+
+    msg.WriteString(c.key)
+
+    err = binary.Write(msg, binary.LittleEndian, uint64(len(c.value)))
+    if err != nil {
+        panic(err)
+    }
+
+    msg.WriteString(c.value)
+
+    return msg.Bytes()
+}
+</code></pre>
+<p>And the <code>Apply()</code> function from above needs to be able to decode the
+bytes:</p>
+<pre><code>func decodeCommand(msg []byte) command {
+    var c command
+    c.kind = commandKind(msg[0])
+
+    keyLen := binary.LittleEndian.Uint64(msg[1:9])
+    c.key = string(msg[9 : 9+keyLen])
+
+    if c.kind == setCommand {
+        valLen := binary.LittleEndian.Uint64(msg[9+keyLen : 9+keyLen+8])
+        c.value = string(msg[9+keyLen+8 : 9+keyLen+8+valLen])
+    }
+
+    return c
+}
+</code></pre>
+<h4 id="http-api">HTTP API</h4><p>Now that we&#39;ve modeled the key-value store as a state machine. Let&#39;s
+build the HTTP endpoints that allow the user to operate the state
+machine through the Raft cluster.</p>
+<p>First, let&#39;s implement the <code>set</code> operation. We need to grab the key
+and value the user passes in and call <code>Apply()</code> on the Raft
+cluster. Calling <code>Apply()</code> on the Raft cluster will eventually call
+the <code>Apply()</code> function we just wrote, but not until the message sent
+to the Raft cluster is actually replicated.</p>
+<pre><code>type httpServer struct {
+    raft *goraft.Server
+    db   *sync.Map
+}
+
+// Example:
+//
+//  curl http://localhost:2020/set?key=x&amp;value=1
+func (hs httpServer) setHandler(w http.ResponseWriter, r *http.Request) {
+    var c command
+    c.kind = setCommand
+    c.key = r.URL.Query().Get(&#34;key&#34;)
+    c.value = r.URL.Query().Get(&#34;value&#34;)
+
+    _, err := hs.raft.Apply([][]byte{encodeCommand(c)})
+    if err != nil {
+        log.Printf(&#34;Could not write key-value: %s&#34;, err)
+        http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+        return
+    }
+}
+</code></pre>
+<p>To reiterate, we tell the Raft cluster we want this message
+replicated. The message contains the operation type (<code>set</code>) and the
+operation details (<code>key</code> and <code>value</code>). These messages are custom to
+the state machine we wrote. And they will be interpreted by the state
+machine we wrote, on each node in the cluster.</p>
+<p>Next we handle <code>get</code>-ing values from the cluster. There are two ways
+to do this. We already embed a local copy of the distributed key-value
+map. We could just read from that map in the current process. But it
+might not be up-to-date or correct. It would be fast to read
+though. And convenient for debugging.</p>
+<p>But the only <a href="https://github.com/etcd-io/etcd/issues/741"><em>correct</em> way to read from a Raft
+cluster</a> is to pass the
+read through the log replication too.</p>
+<p>So we&#39;ll support both.</p>
+<pre><code>// Example:
+//
+//  curl http://localhost:2020/get?key=x
+//  1
+//  curl http://localhost:2020/get?key=x&amp;relaxed=true # Skips consensus for the read.
+//  1
+func (hs httpServer) getHandler(w http.ResponseWriter, r *http.Request) {
+    var c command
+    c.kind = getCommand
+    c.key = r.URL.Query().Get(&#34;key&#34;)
+
+    var value []byte
+    var err error
+    if r.URL.Query().Get(&#34;relaxed&#34;) == &#34;true&#34; {
+        v, ok := hs.db.Load(c.key)
+        if !ok {
+            err = fmt.Errorf(&#34;Key not found&#34;)
+        } else {
+            value = []byte(v.(string))
+        }
+    } else {
+        var results []goraft.ApplyResult
+        results, err = hs.raft.Apply([][]byte{encodeCommand(c)})
+        if err == nil {
+            if len(results) != 1 {
+                err = fmt.Errorf(&#34;Expected single response from Raft, got: %d.&#34;, len(results))
+            } else if results[0].Error != nil {
+                err = results[0].Error
+            } else {
+                value = results[0].Result
+            }
+
+        }
+    }
+
+    if err != nil {
+        log.Printf(&#34;Could not encode key-value in http response: %s&#34;, err)
+        http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+        return
+    }
+
+    written := 0
+    for written &lt; len(value) {
+        n, err := w.Write(value[written:])
+        if err != nil {
+            log.Printf(&#34;Could not encode key-value in http response: %s&#34;, err)
+            http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+            return
+        }
+
+        written += n
+    }
+}
+</code></pre>
+<h4 id="main">Main</h4><p>Now that we&#39;ve set up our custom state machine and our HTTP API for
+interacting with the Raft cluster, we&#39;ll tie it together with reading
+configuration from the command-line and actually starting the Raft
+node and the HTTP API.</p>
+<pre><code>type config struct {
+    cluster []goraft.ClusterMember
+    index   int
+    id      string
+    address string
+    http    string
+}
+
+func getConfig() config {
+    cfg := config{}
+    var node string
+    for i, arg := range os.Args[1:] {
+        if arg == &#34;--node&#34; {
+            var err error
+            node = os.Args[i+2]
+            cfg.index, err = strconv.Atoi(node)
+            if err != nil {
+                log.Fatal(&#34;Expected $value to be a valid integer in `--node $value`, got: %s&#34;, node)
+            }
+            i++
+            continue
+        }
+
+        if arg == &#34;--http&#34; {
+            cfg.http = os.Args[i+2]
+            i++
+            continue
+        }
+
+        if arg == &#34;--cluster&#34; {
+            cluster := os.Args[i+2]
+            var clusterEntry goraft.ClusterMember
+            for _, part := range strings.Split(cluster, &#34;;&#34;) {
+                idAddress := strings.Split(part, &#34;,&#34;)
+                var err error
+                clusterEntry.Id, err = strconv.ParseUint(idAddress[0], 10, 64)
+                if err != nil {
+                    log.Fatal(&#34;Expected $id to be a valid integer in `--cluster $id,$ip`, got: %s&#34;, idAddress[0])
+                }
+
+                clusterEntry.Address = idAddress[1]
+                cfg.cluster = append(cfg.cluster, clusterEntry)
+            }
+
+            i++
+            continue
+        }
+    }
+
+    if node == &#34;&#34; {
+        log.Fatal(&#34;Missing required parameter: --node $index&#34;)
+    }
+
+    if cfg.http == &#34;&#34; {
+        log.Fatal(&#34;Missing required parameter: --http $address&#34;)
+    }
+
+    if len(cfg.cluster) == 0 {
+        log.Fatal(&#34;Missing required parameter: --cluster $node1Id,$node1Address;...;$nodeNId,$nodeNAddress&#34;)
+    }
+
+    return cfg
+}
+
+func main() {
+    var b [8]byte
+    _, err := crypto.Read(b[:])
+    if err != nil {
+        panic(&#34;cannot seed math/rand package with cryptographically secure random number generator&#34;)
+    }
+    rand.Seed(int64(binary.LittleEndian.Uint64(b[:])))
+
+    cfg := getConfig()
+
+    var db sync.Map
+
+    var sm statemachine
+    sm.db = &amp;db
+    sm.server = cfg.index
+
+    s := goraft.NewServer(cfg.cluster, &amp;sm, &#34;.&#34;, cfg.index)
+    go s.Start()
+
+    hs := httpServer{s, &amp;db}
+
+    http.HandleFunc(&#34;/set&#34;, hs.setHandler)
+    http.HandleFunc(&#34;/get&#34;, hs.getHandler)
+    err = http.ListenAndServe(cfg.http, nil)
+    if err != nil {
+        panic(err)
+    }
+}
+</code></pre>
+<p>And that&#39;s it for the easy part: a distributed key-value store on top
+of a Raft cluster.</p>
+<p>Next we need to implement Raft.</p>
+<h3 id="a-raft-server">A Raft server</h3><p>If we take a look at Figure 2 in the Raft paper, we get an idea for
+all the state we need to model.</p>
+<p><img src="https://notes.eatonphil.com/assets/raft-figure-2.png" alt="Raft Figure 2"/></p>
+<p>We&#39;ll dig into the details as we go. But for now let&#39;s turn that model
+into a few Go types. This goes in <code>raft.go</code> in the base directory,
+not <code>cmd/kvapi</code>.</p>
+<pre><code>package goraft
+
+import (
+    &#34;bufio&#34;
+        &#34;context&#34;
+    &#34;encoding/binary&#34;
+    &#34;errors&#34;
+    &#34;fmt&#34;
+    &#34;io&#34;
+    &#34;math/rand&#34;
+    &#34;net&#34;
+    &#34;net/http&#34;
+    &#34;net/rpc&#34;
+    &#34;os&#34;
+    &#34;path&#34;
+    &#34;sync&#34;
+    &#34;time&#34;
+)
+
+type StateMachine interface {
+    Apply(cmd []byte) ([]byte, error)
+}
+
+type ApplyResult struct {
+    Result []byte
+    Error  error
+}
+
+type Entry struct {
+    Command []byte
+    Term    uint64
+
+    // Set by the primary so it can learn about the result of
+    // applying this command to the state machine
+    result  chan ApplyResult
+}
+
+type ClusterMember struct {
+    Id      uint64
+    Address string
+
+    // Index of the next log entry to send
+    nextIndex uint64
+    // Highest log entry known to be replicated
+    matchIndex uint64
+
+    // Who was voted for in the most recent term
+    votedFor uint64
+
+    // TCP connection
+    rpcClient *rpc.Client
+}
+
+type ServerState string
+
+const (
+    leaderState    ServerState = &#34;leader&#34;
+    followerState              = &#34;follower&#34;
+    candidateState             = &#34;candidate&#34;
+)
+
+type Server struct {
+    // These variables for shutting down.
+    done bool
+        server *http.Server
+
+    Debug bool
+
+    mu sync.Mutex
+    // ----------- PERSISTENT STATE -----------
+
+    // The current term
+    currentTerm uint64
+
+    log []Entry
+
+    // votedFor is stored in `cluster []ClusterMember` below,
+    // mapped by `clusterIndex` below
+
+    // ----------- READONLY STATE -----------
+
+    // Unique identifier for this Server
+    id uint64
+
+    // The TCP address for RPC
+    address string
+
+    // When to start elections after no append entry messages
+    electionTimeout time.Time
+
+    // How often to send empty messages
+    heartbeatMs int
+
+    // When to next send empty message
+    heartbeatTimeout time.Time
+
+    // User-provided state machine
+    statemachine StateMachine
+
+    // Metadata directory
+    metadataDir string
+
+    // Metadata store
+    fd *os.File
+
+    // ----------- VOLATILE STATE -----------
+
+    // Index of highest log entry known to be committed
+    commitIndex uint64
+
+    // Index of highest log entry applied to state machine
+    lastApplied uint64
+
+    // Candidate, follower, or leader
+    state ServerState
+
+    // Servers in the cluster, including this one
+    cluster []ClusterMember
+
+    // Index of this server
+    clusterIndex int
+}
+</code></pre>
+<p>And let&#39;s build a constructor to initialize the state for all servers
+in the cluster, as well as local server state.</p>
+<pre><code>func NewServer(
+    clusterConfig []ClusterMember,
+    statemachine StateMachine,
+    metadataDir string,
+    clusterIndex int,
+) *Server {
+    // Explicitly make a copy of the cluster because we&#39;ll be
+    // modifying it in this server.
+    var cluster []ClusterMember
+    for _, c := range clusterConfig {
+        if c.Id == 0 {
+            panic(&#34;Id must not be 0.&#34;)
+        }
+        cluster = append(cluster, c)
+    }
+
+    return &amp;Server{
+        id:           cluster[clusterIndex].Id,
+        address:      cluster[clusterIndex].Address,
+        cluster:      cluster,
+        statemachine: statemachine,
+        metadataDir:  metadataDir,
+        clusterIndex: clusterIndex,
+        heartbeatMs:  300,
+        mu:           sync.Mutex{},
+    }
+}
+</code></pre>
+<p>And add a few debugging and assertion helpers.</p>
+<pre><code>func (s *Server) debugmsg(msg string) string {
+    return fmt.Sprintf(&#34;%s [Id: %d, Term: %d] %s&#34;, time.Now().Format(time.RFC3339Nano), s.id, s.currentTerm, msg)
+}
+
+func (s *Server) debug(msg string) {
+    if !s.Debug {
+        return
+    }
+    fmt.Println(s.debugmsg(msg))
+}
+
+func (s *Server) debugf(msg string, args ...any) {
+    if !s.Debug {
+        return
+    }
+
+    s.debug(fmt.Sprintf(msg, args...))
+}
+
+func (s *Server) warn(msg string) {
+    fmt.Println(&#34;[WARN] &#34; + s.debugmsg(msg))
+}
+
+func (s *Server) warnf(msg string, args ...any) {
+    fmt.Println(fmt.Sprintf(msg, args...))
+}
+
+func Assert[T comparable](msg string, a, b T) {
+    if a != b {
+        panic(fmt.Sprintf(&#34;%s. Got a = %#v, b = %#v&#34;, msg, a, b))
+    }
+}
+
+func Server_assert[T comparable](s *Server, msg string, a, b T) {
+    Assert(s.debugmsg(msg), a, b)
+}
+</code></pre>
+<h3 id="persistent-state">Persistent state</h3><p>As Figure 2 says, <code>currentTerm</code>, <code>log</code>, and <code>votedFor</code> must be
+persisted to disk as they&#39;re edited.</p>
+<p>I like to initially doing the stupidest thing possible. So in the
+first version of this project I used <code>encoding/gob</code> to write these
+three fields to disk every time <code>s.persist()</code> was called.</p>
+<p>Here is what this first version looked like:</p>
+<pre><code>func (s *Server) persist() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    s.fd.Truncate(0)
+    s.fd.Seek(0, 0)
+    enc := gob.NewEncoder(s.fd)
+    err := enc.Encode(PersistentState{
+        CurrentTerm: s.currentTerm,
+        Log:         s.log,
+        VotedFor:    s.votedFor,
+    })
+    if err != nil {
+        panic(err)
+    }
+    if err = s.fd.Sync(); err != nil {
+        panic(err)
+    }
+    s.debug(fmt.Sprintf(&#34;Persisted. Term: %d. Log Len: %d. Voted For: %s.&#34;, s.currentTerm, len(s.log), s.votedFor))
+}
+</code></pre>
+<p>But doing so means this implementation is a function of the size of
+the log. And that was horrible for throughput.</p>
+<p>I also noticed that <code>encoding/gob</code> is pretty inefficient.</p>
+<p>For a simple struct like:</p>
+<pre><code>type X struct {
+    A uint64
+    B []uint64
+    C bool
+}
+</code></pre>
+<p><code>encoding/gob</code> uses <a href="https://play.golang.com/p/TUe9TDgaZOw">68 bytes to store that data for when B has two
+entries</a>. If we wrote the
+encoder/decoder ourselves we could store that struct in 33 bytes (<code>8
+(sizeof(A)) + 8 (sizeof(len(B))) + 16 (len(B) * sizeof(B)) + 1
+(sizeof(C))</code>).</p>
+<p>It&#39;s not that <code>encoding/gob</code> is bad. It just likely has different
+constraints than we are party to.</p>
+<p>So I decided to swap out <code>encoding/gob</code> for simply binary encoding the
+fields and also, importantly, keeping track of exactly how many
+entries in the log must be written and only writing that many.</p>
+<h4 id="&lt;code&gt;s.persist()&lt;/code&gt;"><code>s.persist()</code></h4><p>Here&#39;s what that looks like.</p>
+<pre><code>const PAGE_SIZE = 4096
+const ENTRY_HEADER = 16
+const ENTRY_SIZE = 128
+
+// Must be called within s.mu.Lock()
+func (s *Server) persist(writeLog bool, nNewEntries int) {
+    t := time.Now()
+
+    if nNewEntries == 0 &amp;&amp; writeLog {
+        nNewEntries = len(s.log)
+    }
+
+    s.fd.Seek(0, 0)
+
+    var page [PAGE_SIZE]byte
+    // Bytes 0  - 8:   Current term
+    // Bytes 8  - 16:  Voted for
+    // Bytes 16 - 24:  Log length
+    // Bytes 4096 - N: Log
+
+    binary.LittleEndian.PutUint64(page[:8], s.currentTerm)
+    binary.LittleEndian.PutUint64(page[8:16], s.getVotedFor())
+    binary.LittleEndian.PutUint64(page[16:24], uint64(len(s.log)))
+    n, err := s.fd.Write(page[:])
+    if err != nil {
+        panic(err)
+    }
+    Server_assert(s, &#34;Wrote full page&#34;, n, PAGE_SIZE)
+
+    if writeLog &amp;&amp; nNewEntries &gt; 0 {
+        newLogOffset := max(len(s.log)-nNewEntries, 0)
+
+        s.fd.Seek(int64(PAGE_SIZE+ENTRY_SIZE*newLogOffset), 0)
+        bw := bufio.NewWriter(s.fd)
+
+        var entryBytes [ENTRY_SIZE]byte
+        for i := newLogOffset; i &lt; len(s.log); i++ {
+            // Bytes 0 - 8:    Entry term
+            // Bytes 8 - 16:   Entry command length
+            // Bytes 16 - ENTRY_SIZE: Entry command
+
+            if len(s.log[i].Command) &gt; ENTRY_SIZE-ENTRY_HEADER {
+                panic(fmt.Sprintf(&#34;Command is too large (%d). Must be at most %d bytes.&#34;, len(s.log[i].Command), ENTRY_SIZE-ENTRY_HEADER))
+            }
+
+            binary.LittleEndian.PutUint64(entryBytes[:8], s.log[i].Term)
+            binary.LittleEndian.PutUint64(entryBytes[8:16], uint64(len(s.log[i].Command)))
+            copy(entryBytes[16:], []byte(s.log[i].Command))
+
+            n, err := bw.Write(entryBytes[:])
+            if err != nil {
+                panic(err)
+            }
+            Server_assert(s, &#34;Wrote full page&#34;, n, ENTRY_SIZE)
+        }
+
+        err = bw.Flush()
+        if err != nil {
+            panic(err)
+        }
+    }
+
+    if err = s.fd.Sync(); err != nil {
+        panic(err)
+    }
+    s.debugf(&#34;Persisted in %s. Term: %d. Log Len: %d (%d new). Voted For: %d.&#34;, time.Now().Sub(t), s.currentTerm, len(s.log), nNewEntries, s.getVotedFor())
+}
+</code></pre>
+<p>Again the important thing is that only the entries that <em>need</em> to be
+written are written. We do that by <code>seek</code>-ing to the offset of the
+first entry that needs to be written.</p>
+<p>And we collect writes of entries in a <code>bufio.Writer</code> so we don&#39;t waste
+write syscalls. Don&#39;t forget to flush the buffered writer!</p>
+<p>And don&#39;t forget to flush all writes to disk with <code>fd.Sync()</code>.</p>
+<p>
+  <code>ENTRY_SIZE</code> is something that I could see being configurable based
+  on the workload. Some workloads truly need only 128 bytes. But a
+  key-value store probably wants much more than that. This
+  implementation doesn&#39;t try to handle the case of completely
+  arbitrary sized keys and values.
+</p><p>Lastly, a few helpers used in there:</p>
+<pre><code>func min[T ~int | ~uint64](a, b T) T {
+    if a &lt; b {
+        return a
+    }
+
+    return b
+}
+
+func max[T ~int | ~uint64](a, b T) T {
+    if a &gt; b {
+        return a
+    }
+
+    return b
+}
+
+// Must be called within s.mu.Lock()
+func (s *Server) getVotedFor() uint64 {
+    for i := range s.cluster {
+        if i == s.clusterIndex {
+            return s.cluster[i].votedFor
+        }
+    }
+
+    Server_assert(s, &#34;Invalid cluster&#34;, true, false)
+    return 0
+}
+</code></pre>
+<h4 id="&lt;code&gt;s.restore()&lt;/code&gt;"><code>s.restore()</code></h4><p>Now let&#39;s do the reverse operation, restoring from disk. This will
+only be called once on startup.</p>
+<pre><code>func (s *Server) restore() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    if s.fd == nil {
+        var err error
+        s.fd, err = os.OpenFile(
+            path.Join(s.metadataDir, fmt.Sprintf(&#34;md_%d.dat&#34;, s.id)),
+            os.O_SYNC|os.O_CREATE|os.O_RDWR,
+            0755)
+        if err != nil {
+            panic(err)
+        }
+    }
+
+    s.fd.Seek(0, 0)
+
+    // Bytes 0  - 8:   Current term
+    // Bytes 8  - 16:  Voted for
+    // Bytes 16 - 24:  Log length
+    // Bytes 4096 - N: Log
+    var page [PAGE_SIZE]byte
+    n, err := s.fd.Read(page[:])
+    if err == io.EOF {
+        s.ensureLog()
+        return
+    } else if err != nil {
+        panic(err)
+    }
+    Server_assert(s, &#34;Read full page&#34;, n, PAGE_SIZE)
+
+    s.currentTerm = binary.LittleEndian.Uint64(page[:8])
+    s.setVotedFor(binary.LittleEndian.Uint64(page[8:16]))
+    lenLog := binary.LittleEndian.Uint64(page[16:24])
+    s.log = nil
+
+    if lenLog &gt; 0 {
+        s.fd.Seek(int64(PAGE_SIZE), 0)
+
+        var e Entry
+        for i := 0; uint64(i) &lt; lenLog; i++ {
+            var entryBytes [ENTRY_SIZE]byte
+            n, err := s.fd.Read(entryBytes[:])
+            if err != nil {
+                panic(err)
+            }
+            Server_assert(s, &#34;Read full entry&#34;, n, ENTRY_SIZE)
+
+            // Bytes 0 - 8:    Entry term
+            // Bytes 8 - 16:   Entry command length
+            // Bytes 16 - ENTRY_SIZE: Entry command
+            e.Term = binary.LittleEndian.Uint64(entryBytes[:8])
+            lenValue := binary.LittleEndian.Uint64(entryBytes[8:16])
+            e.Command = entryBytes[16 : 16+lenValue]
+            s.log = append(s.log, e)
+        }
+    }
+
+    s.ensureLog()
+}
+</code></pre>
+<p>And a few helpers it calls:</p>
+<pre><code>func (s *Server) ensureLog() {
+    if len(s.log) == 0 {
+        // Always has at least one log entry.
+        s.log = append(s.log, Entry{})
+    }
+}
+
+// Must be called within s.mu.Lock()
+func (s *Server) setVotedFor(id uint64) {
+    for i := range s.cluster {
+        if i == s.clusterIndex {
+            s.cluster[i].votedFor = id
+            return
+        }
+    }
+
+    Server_assert(s, &#34;Invalid cluster&#34;, true, false)
+}
+</code></pre>
+<h3 id="the-main-loop">The main loop</h3><p>Now let&#39;s think about the main loop. Before starting the loop we need
+to 1) restore persistent state from disk and 2) kick off an RPC
+server so servers in the cluster can send and receive messages to and
+from eachother.</p>
+<pre><code>// Make sure rand is seeded
+func (s *Server) Start() {
+    s.mu.Lock()
+    s.state = followerState
+    s.done = false
+    s.mu.Unlock()
+
+    s.restore()
+
+    rpcServer := rpc.NewServer()
+    rpcServer.Register(s)
+    l, err := net.Listen(&#34;tcp&#34;, s.address)
+    if err != nil {
+        panic(err)
+    }
+    mux := http.NewServeMux()
+    mux.Handle(rpc.DefaultRPCPath, rpcServer)
+
+    s.server = &amp;http.Server{Handler: mux}
+    go s.server.Serve(l)
+
+    go func() {
+        s.mu.Lock()
+        s.resetElectionTimeout()
+        s.mu.Unlock()
+
+        for {
+            s.mu.Lock()
+            if s.done {
+                s.mu.Unlock()
+                return
+            }
+            state := s.state
+            s.mu.Unlock()
+</code></pre>
+<p>In the main loop we are either in the leader state, follower state or
+candidate state.</p>
+<p>All states will potentially receive RPC messages from other servers in
+the cluster but that won&#39;t be modeled in this main loop.</p>
+<p>The only thing going on in the main loop is that:</p>
+<ul>
+<li>We send heartbeat RPCs (leader state)</li>
+<li>We try to advance the commit index (leader state only) and apply commands to the state machine (leader and follower states)</li>
+<li>We trigger a new election if we haven&#39;t received a message in some time (candidate and follower states)</li>
+<li>Or we become the leader (candidate state)</li>
+</ul>
+<pre><code>            switch state {
+            case leaderState:
+                s.heartbeat()
+                s.advanceCommitIndex()
+            case followerState:
+                s.timeout()
+                s.advanceCommitIndex()
+            case candidateState:
+                s.timeout()
+                s.becomeLeader()
+            }
+        }
+    }()
+}
+</code></pre>
+<p>Let&#39;s deal with leader election first.</p>
+<h3 id="leader-election">Leader election</h3><p>Leader election happens every time nodes haven&#39;t received a message
+from a valid leader in some time.</p>
+<p>I&#39;ll break this up into four major pieces:</p>
+<ol>
+<li>Timing out and becoming a candidate after a random (but bounded)
+period of time of not hearing a message from a valid leader:
+<code>s.timeout()</code>.</li>
+<li>The candidate requests votes from all other servers: <code>s.requestVote()</code>.</li>
+<li>All servers handle vote requests: <code>s.HandleRequestVoteRequest()</code>.</li>
+<li>A candidate with a quorum of vote requests becomes the leader: <code>s.becomeLeader()</code>.</li>
+</ol>
+<p>You increment <code>currentTerm</code>, vote for yourself and send RPC vote
+requests to other nodes in the server.</p>
+<pre><code>func (s *Server) resetElectionTimeout() {
+    interval := time.Duration(rand.Intn(s.heartbeatMs*2) + s.heartbeatMs*2)
+    s.debugf(&#34;New interval: %s.&#34;, interval*time.Millisecond)
+    s.electionTimeout = time.Now().Add(interval * time.Millisecond)
+}
+
+func (s *Server) timeout() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    hasTimedOut := time.Now().After(s.electionTimeout)
+    if hasTimedOut {
+        s.debug(&#34;Timed out, starting new election.&#34;)
+        s.state = candidateState
+        s.currentTerm++
+        for i := range s.cluster {
+            if i == s.clusterIndex {
+                s.cluster[i].votedFor = s.id
+            } else {
+                s.cluster[i].votedFor = 0
+            }
+        }
+
+        s.resetElectionTimeout()
+        s.persist(false, 0)
+        s.requestVote()
+    }
+}
+</code></pre>
+<p>Everything in there is implemented already except for
+<code>s.requestVote()</code>. Let&#39;s dig into that.</p>
+<h4 id="&lt;code&gt;s.requestvote()&lt;/code&gt;"><code>s.requestVote()</code></h4><p>By referring back to Figure 2 from the Raft paper we can see how to
+model the request vote request and response. Let&#39;s turn that into some Go types.</p>
+<pre><code>type RPCMessage struct {
+    Term uint64
+}
+
+type RequestVoteRequest struct {
+    RPCMessage
+
+    // Candidate requesting vote
+    CandidateId uint64
+
+    // Index of candidate&#39;s last log entry
+    LastLogIndex uint64
+
+    // Term of candidate&#39;s last log entry
+    LastLogTerm uint64
+}
+
+type RequestVoteResponse struct {
+    RPCMessage
+
+    // True means candidate received vote
+    VoteGranted bool
+}
+</code></pre>
+<p>Now we just need to fill the <code>RequestVoteRequest</code> struct out and send
+it to each other node in the cluster in parallel. As we iterate
+through nodes in the cluster, we skip ourselves (we always immediately
+vote for ourselves).</p>
+<pre><code>func (s *Server) requestVote() {
+    for i := range s.cluster {
+        if i == s.clusterIndex {
+            continue
+        }
+
+        go func(i int) {
+            s.mu.Lock()
+
+            s.debugf(&#34;Requesting vote from %d.&#34;, s.cluster[i].Id)
+
+            lastLogIndex := uint64(len(s.log) - 1)
+            lastLogTerm := s.log[len(s.log)-1].Term
+
+            req := RequestVoteRequest{
+                RPCMessage: RPCMessage{
+                    Term: s.currentTerm,
+                },
+                CandidateId:  s.id,
+                LastLogIndex: lastLogIndex,
+                LastLogTerm:  lastLogTerm,
+            }
+            s.mu.Unlock()
+
+            var rsp RequestVoteResponse
+            ok := s.rpcCall(i, &#34;Server.HandleRequestVoteRequest&#34;, req, &amp;rsp)
+            if !ok {
+                // Will retry later
+                return
+            }
+</code></pre>
+<p>Now remember from Figure 2 in the Raft paper that we must always check
+that the RPC request and response is still valid. If the term of the
+response is greater than our own term, we must immediately stop
+processing and revert to follower state.</p>
+<p>Otherwise only if the response is still relevant to us at the moment
+(the response term is the same as the request term) <em>and</em> the request
+has succeeded do we count the vote.</p>
+<pre><code>            s.mu.Lock()
+            defer s.mu.Unlock()
+
+            if s.updateTerm(rsp.RPCMessage) {
+                return
+            }
+
+            dropStaleResponse := rsp.Term != req.Term
+            if dropStaleResponse {
+                return
+            }
+
+            if rsp.VoteGranted {
+                s.debugf(&#34;Vote granted by %d.&#34;, s.cluster[i].Id)
+                s.cluster[i].votedFor = s.id
+            }
+        }(i)
+    }
+}
+</code></pre>
+<p>And that&#39;s it for the candidate side of requesting a vote.</p>
+<p>The implementation of <code>s.updateTerm()</code> is simple. It just takes care
+of transitioning to follower state if the term of an RPC message is
+greater than the node&#39;s current term.</p>
+<pre><code>// Must be called within a s.mu.Lock()
+func (s *Server) updateTerm(msg RPCMessage) bool {
+    transitioned := false
+    if msg.Term &gt; s.currentTerm {
+        s.currentTerm = msg.Term
+        s.state = followerState
+        s.setVotedFor(0)
+        transitioned = true
+        s.debug(&#34;Transitioned to follower&#34;)
+        s.resetElectionTimeout()
+        s.persist(false, 0)
+    }
+    return transitioned
+}
+</code></pre>
+<p>And the implementation of <code>s.rpcCall()</code> is a wrapper around <code>net/rpc</code>
+to lazily connect.</p>
+<pre><code>func (s *Server) rpcCall(i int, name string, req, rsp any) bool {
+    s.mu.Lock()
+    c := s.cluster[i]
+    var err error
+    var rpcClient *rpc.Client = c.rpcClient
+    if c.rpcClient == nil {
+        c.rpcClient, err = rpc.DialHTTP(&#34;tcp&#34;, c.Address)
+        rpcClient = c.rpcClient
+    }
+    s.mu.Unlock()
+
+    // TODO: where/how to reconnect if the connection must be reestablished?
+
+    if err == nil {
+        err = rpcClient.Call(name, req, rsp)
+    }
+
+    if err != nil {
+        s.warnf(&#34;Error calling %s on %d: %s.&#34;, name, c.Id, err)
+    }
+
+    return err == nil
+}
+</code></pre>
+<p>Let&#39;s dig into the other side of request vote, what happens when a
+node receives a vote request?</p>
+<h4 id="&lt;code&gt;s.handlevoterequest()&lt;/code&gt;"><code>s.HandleVoteRequest()</code></h4><p>First off, as discussed above, we must always check the RPC term
+versus our own and revert to follower if the term is greater than our
+own. (Remember that since this is an RPC request it could come to a
+server in any state: leader, candidate, or follower.)</p>
+<pre><code>func (s *Server) HandleRequestVoteRequest(req RequestVoteRequest, rsp *RequestVoteResponse) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    s.updateTerm(req.RPCMessage)
+
+    s.debugf(&#34;Received vote request from %d.&#34;, req.CandidateId)
+</code></pre>
+<p>Then we can return immediately if the request term is lower than our
+own (that means it&#39;s an old request).</p>
+<pre><code>    rsp.VoteGranted = false
+    rsp.Term = s.currentTerm
+
+    if req.Term &lt; s.currentTerm {
+        s.debugf(&#34;Not granting vote request from %d.&#34;, req.CandidateId)
+        Server_assert(s, &#34;VoteGranted = false&#34;, rsp.VoteGranted, false)
+        return nil
+    }
+</code></pre>
+<p>And finally, we check to make sure the requester&#39;s log is at least as
+up-to-date as our own and that we haven&#39;t already voted for
+ourselves.</p>
+<p>The first condition (up-to-date log) was not described in
+the Raft paper that I could find. But the author of the paper
+published a Raft TLA+ spec that does <a href="https://github.com/ongardie/raft.tla/blob/master/raft.tla#L284">have it
+defined</a>.</p>
+<p>And the second condition you might think could never happen since we
+already wrote the code that said when we trigger an election we vote
+for ourselves. But since each server has a random election timeout,
+the one who starts the election will differ in timing sufficiently
+enough to catch other servers and allow them to vote for it.</p>
+<pre><code>    lastLogTerm := s.log[len(s.log)-1].Term
+    logLen := uint64(len(s.log) - 1)
+    logOk := req.LastLogTerm &gt; lastLogTerm ||
+        (req.LastLogTerm == lastLogTerm &amp;&amp; req.LastLogIndex &gt;= logLen)
+    grant := req.Term == s.currentTerm &amp;&amp;
+        logOk &amp;&amp;
+        (s.getVotedFor() == 0 || s.getVotedFor() == req.CandidateId)
+    if grant {
+        s.debugf(&#34;Voted for %d.&#34;, req.CandidateId)
+        s.setVotedFor(req.CandidateId)
+        rsp.VoteGranted = true
+        s.resetElectionTimeout()
+        s.persist(false, 0)
+    } else {
+        s.debugf(&#34;Not granting vote request from %d.&#34;, +req.CandidateId)
+    }
+
+    return nil
+}
+</code></pre>
+<p>Lastly, we need to address how the candidate who sent out vote
+requests actually becomes the leader.</p>
+<h4 id="&lt;code&gt;s.becomeleader()&lt;/code&gt;"><code>s.becomeLeader()</code></h4><p>This is a relatively simple method. If we have a quorum of votes, we
+become the leader!</p>
+<pre><code>func (s *Server) becomeLeader() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    quorum := len(s.cluster)/2 + 1
+    for i := range s.cluster {
+        if s.cluster[i].votedFor == s.id &amp;&amp; quorum &gt; 0 {
+            quorum--
+        }
+    }
+</code></pre>
+<p>There is a bit of bookkeeping we need to do like resetting <code>nextIndex</code>
+and <code>matchIndex</code> for each server (noted in Figure 2). And we also need
+to append a blank entry for the new term.</p>
+<p>
+  Despite the section quoted below in code, I still don&#39;t understand
+  why this blank entry is necessary.
+</p><pre><code>    if quorum == 0 {
+        // Reset all cluster state
+        for i := range s.cluster {
+            s.cluster[i].nextIndex = uint64(len(s.log) + 1)
+            // Yes, even matchIndex is reset. Figure 2
+            // from Raft shows both nextIndex and
+            // matchIndex are reset after every election.
+            s.cluster[i].matchIndex = 0
+        }
+
+        s.debug(&#34;New leader.&#34;)
+        s.state = leaderState
+
+        // From Section 8 Client Interaction:
+        // &gt; First, a leader must have the latest information on
+        // &gt; which entries are committed. The Leader
+        // &gt; Completeness Property guarantees that a leader has
+        // &gt; all committed entries, but at the start of its
+        // &gt; term, it may not know which those are. To find out,
+        // &gt; it needs to commit an entry from its term. Raft
+        // &gt; handles this by having each leader commit a blank
+        // &gt; no-op entry into the log at the start of its term.
+        s.log = append(s.log, Entry{Term: s.currentTerm, Command: nil})
+        s.persist(true, 1)
+
+        // Triggers s.appendEntries() in the next tick of the
+        // main state loop.
+        s.heartbeatTimeout = time.Now()
+    }
+}
+</code></pre>
+<p>And we&#39;re done with elections!</p>
+<p>When I was working on this for the first time, I just stopped here and
+made sure I could get to a stable leader quickly. If it takes more
+than 1 term to establish a leader when you run three servers in the
+cluster on localhost, you&#39;ve probably got a bug.</p>
+<p>In an ideal environment (which three processes on one machine most
+likely is), leadership should be established quite quickly and without
+many term changes. As the environment gets more adversarial
+(e.g. processes crash frequently or network latency is high and
+variable), leadership (and log replication) will take longer.</p>
+<p>
+    But just because we have leader election working when there are no
+    logs does not mean we&#39;ll have it working when we introduce log
+    replication since parts of voting depend on log analysis.
+    </p><h3 id="log-replication">Log replication</h3><p>I&#39;ll break up log replication into four major pieces:</p>
+<ol>
+<li>User submits a message to the leader to be replicated: <code>s.Apply()</code>.</li>
+<li>The leader sends uncommitted messages (messages from
+<code>nextIndex</code>) to all followers: <code>s.appendEntries()</code>.</li>
+<li>A follower receives a <code>AppendEntriesRequest</code> and stores new
+messages if appropriate, letting the leader know when it does store
+the messages: <code>s.HandleAppendEntriesRequest()</code>.</li>
+<li>The leader tries to update <code>commitIndex</code> for the last uncommitted
+message by seeing if it&#39;s been replicated on a quorum of servers:
+<code>s.advanceCommitIndex()</code>.</li>
+</ol>
+<p>Let&#39;s dig in in that order.</p>
+<h4 id="&lt;code&gt;s.apply()&lt;/code&gt;"><code>s.Apply()</code></h4><p>This is the entry point for a user of the cluster to attempt to get
+messages replicated into the cluster.</p>
+<p>It must be called on the current leader of the cluster. In the future
+the failure response might include the current leader. Or the user
+could submit messages in parallel to all nodes in the cluster and
+ignore <code>ErrApplyToLeader</code>. In the meantime we just assume the user can
+figure out which server in the cluster is the leader.</p>
+<pre><code>var ErrApplyToLeader = errors.New(&#34;Cannot apply message to follower, apply to leader.&#34;)
+
+func (s *Server) Apply(commands [][]byte) ([]ApplyResult, error) {
+    s.mu.Lock()
+    if s.state != leaderState {
+        s.mu.Unlock()
+        return nil, ErrApplyToLeader
+    }
+    s.debugf(&#34;Processing %d new entry!&#34;, len(commands))
+</code></pre>
+<p>Next we&#39;ll store the message in the leader&#39;s log along with a
+Go channel that we must block on for the result of applying
+the message in the state machine after the message has been committed
+to the cluster.</p>
+<pre><code>    resultChans := make([]chan ApplyResult, len(commands))
+    for i, command := range commands {
+        resultChans[i] = make(chan ApplyResult)
+        s.log = append(s.log, Entry{
+            Term:    s.currentTerm,
+            Command: command,
+            result:  resultChans[i],
+        })
+    }
+
+    s.persist(true, len(commands))
+</code></pre>
+<p>Then we kick off the replication process (this will not block).</p>
+<pre><code>    s.debug(&#34;Waiting to be applied!&#34;)
+    s.mu.Unlock()
+
+    s.appendEntries()
+</code></pre>
+<p>And then we block until we receive results from each of the channels we created.</p>
+<pre><code>    // TODO: What happens if this takes too long?
+    results := make([]ApplyResult, len(commands))
+    var wg sync.WaitGroup
+    wg.Add(len(commands))
+    for i, ch := range resultChans {
+        go func(i int, c chan ApplyResult) {
+            results[i] = &lt;-c
+            wg.Done()
+        }(i, ch)
+    }
+
+    wg.Wait()
+
+    return results, nil
+}
+</code></pre>
+<p>The interesting thing here is that appending entries is detached from
+the messages we just received. <code>s.appendEntries()</code> will probably
+include at least the messages we just appended to our log, but it
+might include more too if some servers are not very up-to-date. It may
+even include less than the messages we append to our log since we&#39;ll
+restrict the number of entries to send at one time so we keep latency
+down.</p>
+<h4 id="&lt;code&gt;s.appendentries()&lt;/code&gt;"><code>s.appendEntries()</code></h4><p>This is the meat of log replication on the leader side. We send
+unreplicated messages to each other server in the cluster.</p>
+<p>By again referring back to Figure 2 from the Raft paper we can see how
+to model the request vote request and response. Let&#39;s turn that into
+some Go types too.</p>
+<pre><code>type AppendEntriesRequest struct {
+    RPCMessage
+
+    // So follower can redirect clients
+    LeaderId uint64
+
+    // Index of log entry immediately preceding new ones
+    PrevLogIndex uint64
+
+    // Term of prevLogIndex entry
+    PrevLogTerm uint64
+
+    // Log entries to store. Empty for heartbeat.
+    Entries []Entry
+
+    // Leader&#39;s commitIndex
+    LeaderCommit uint64
+}
+
+type AppendEntriesResponse struct {
+    RPCMessage
+
+    // true if follower contained entry matching prevLogIndex and
+    // prevLogTerm
+    Success bool
+}
+</code></pre>
+<p>For the method itself, we start optimistically sending no entries and
+decrement <code>nextIndex</code> for each server as the server fails to replicate
+messages. This means that we might eventually end up sending the
+entire log to one or all servers.</p>
+<p>We&#39;ll set a max number of entries to send per request so we avoid
+unbounded latency as followers store entries to disk. But we still
+want to send a large batch so that we amortize the cost of <code>fsync</code>.</p>
+<pre><code>const MAX_APPEND_ENTRIES_BATCH = 8_000
+
+func (s *Server) appendEntries() {
+    for i := range s.cluster {
+        // Don&#39;t need to send message to self
+        if i == s.clusterIndex {
+            continue
+        }
+
+        go func(i int) {
+            s.mu.Lock()
+
+            next := s.cluster[i].nextIndex
+            prevLogIndex := next - 1
+            prevLogTerm := s.log[prevLogIndex].Term
+
+            var entries []Entry
+            if uint64(len(s.log)-1) &gt;= s.cluster[i].nextIndex {
+                s.debugf(&#34;len: %d, next: %d, server: %d&#34;, len(s.log), next, s.cluster[i].Id)
+                entries = s.log[next:]
+            }
+
+            // Keep latency down by only applying N at a time.
+            if len(entries) &gt; MAX_APPEND_ENTRIES_BATCH {
+                entries = entries[:MAX_APPEND_ENTRIES_BATCH]
+            }
+
+            lenEntries := uint64(len(entries))
+            req := AppendEntriesRequest{
+                RPCMessage: RPCMessage{
+                    Term: s.currentTerm,
+                },
+                LeaderId:     s.cluster[s.clusterIndex].Id,
+                PrevLogIndex: prevLogIndex,
+                PrevLogTerm:  prevLogTerm,
+                Entries:      entries,
+                LeaderCommit: s.commitIndex,
+            }
+
+            s.mu.Unlock()
+
+            var rsp AppendEntriesResponse
+            s.debugf(&#34;Sending %d entries to %d for term %d.&#34;, len(entries), s.cluster[i].Id, req.Term)
+            ok := s.rpcCall(i, &#34;Server.HandleAppendEntriesRequest&#34;, req, &amp;rsp)
+            if !ok {
+                // Will retry next tick
+                return
+            }
+</code></pre>
+<p>Now, as with every RPC request and response, we must check terms and
+potentially drop the message if it&#39;s outdated.</p>
+<pre><code>            s.mu.Lock()
+            defer s.mu.Unlock()
+            if s.updateTerm(rsp.RPCMessage) {
+                return
+            }
+
+            dropStaleResponse := rsp.Term != req.Term &amp;&amp; s.state == leaderState
+            if dropStaleResponse {
+                return
+            }
+</code></pre>
+<p>Otherwise, if the message was successful, we&#39;ll update <code>matchIndex</code>
+(the last confirmed message stored on the follower) and <code>nextIndex</code>
+(the next likely message to send to the follower).</p>
+<p>If the message was not successful, we decrement <code>nextIndex</code>. Next time
+<code>s.appendEntries()</code> is called it will include one more previous
+message for this replica.</p>
+<pre><code>            if rsp.Success {
+                prev := s.cluster[i].nextIndex
+                s.cluster[i].nextIndex = max(req.PrevLogIndex+lenEntries+1, 1)
+                s.cluster[i].matchIndex = s.cluster[i].nextIndex - 1
+                s.debugf(&#34;Message accepted for %d. Prev Index: %d, Next Index: %d, Match Index: %d.&#34;, s.cluster[i].Id, prev, s.cluster[i].nextIndex, s.cluster[i].matchIndex)
+            } else {
+                s.cluster[i].nextIndex = max(s.cluster[i].nextIndex-1, 1)
+                s.debugf(&#34;Forced to go back to %d for: %d.&#34;, s.cluster[i].nextIndex, s.cluster[i].Id)
+            }
+        }(i)
+    }
+}
+</code></pre>
+<p>And we&#39;re done the leader side of append entries!</p>
+<h4 id="&lt;code&gt;s.handleappendentriesrequest()&lt;/code&gt;"><code>s.HandleAppendEntriesRequest()</code></h4><p>Now for the follower side of log replication. This is, again, an RPC
+handler that could be called at any moment. So we need to potentially
+update the <code>term</code> (and transition to follower).</p>
+<pre><code>func (s *Server) HandleAppendEntriesRequest(req AppendEntriesRequest, rsp *AppendEntriesResponse) error {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    s.updateTerm(req.RPCMessage)
+</code></pre>
+<p>&#34;Hidden&#34; in the &#34;Candidates (§5.2):&#34; section of Figure 2 is an additional rule about:</p>
+<blockquote><p>If AppendEntries RPC received from new leader: convert to follower</p>
+</blockquote>
+<p>So we also need to handle that here. And if we&#39;re still not a
+follower, we&#39;ll return immediately.</p>
+<pre><code>    // From Candidates (§5.2) in Figure 2
+    // If AppendEntries RPC received from new leader: convert to follower
+    if req.Term == s.currentTerm &amp;&amp; s.state == candidateState {
+        s.state = followerState
+    }
+
+    rsp.Term = s.currentTerm
+    rsp.Success = false
+
+    if s.state != followerState {
+        s.debugf(&#34;Non-follower cannot append entries.&#34;)
+        return nil
+    }
+</code></pre>
+<p>Next, we also return early if the request term is less than our
+own. This would represent an old request.</p>
+<pre><code>    if req.Term &lt; s.currentTerm {
+        s.debugf(&#34;Dropping request from old leader %d: term %d.&#34;, req.LeaderId, req.Term)
+        // Not a valid leader.
+        return nil
+    }
+</code></pre>
+<p>Now, finally, we know we&#39;re receiving a request from a valid
+leader. So we need to immediately bump the election timeout.</p>
+<pre><code>    // Valid leader so reset election.
+    s.resetElectionTimeout()
+</code></pre>
+<p>Then we do the log comparison to see if we can add the entries sent
+from this request. Specifically, we make sure that our log at
+<code>req.PrevLogIndex</code> exists and has the same term as <code>req.PrevLogTerm</code>.</p>
+<pre><code>    logLen := uint64(len(s.log))
+    validPreviousLog := req.PrevLogIndex == 0 /* This is the induction step */ ||
+        (req.PrevLogIndex &lt; logLen &amp;&amp;
+            s.log[req.PrevLogIndex].Term == req.PrevLogTerm)
+    if !validPreviousLog {
+        s.debug(&#34;Not a valid log.&#34;)
+        return nil
+    }
+</code></pre>
+<p>Next, we&#39;ve got valid entries that we need to add to our log. This
+implementation is a little more complex because we&#39;ll make use of Go
+slice capacity so that <code>append()</code> never allocates.</p>
+<p>Importantly, we must truncate the log if a new entry ever conflicts
+with an existing one:</p>
+<blockquote><p>If an existing entry conflicts with a new one (same index
+but different terms), delete the existing entry and all that
+follow it (§5.3)</p>
+</blockquote>
+<pre><code>    next := req.PrevLogIndex + 1
+    nNewEntries := 0
+
+    for i := next; i &lt; next+uint64(len(req.Entries)); i++ {
+        e := req.Entries[i-next]
+        if i &gt;= uint64(cap(s.log)) {
+            newTotal := next + uint64(len(req.Entries))
+            // Second argument must actually be `i`
+            // not `0` otherwise the copy after this
+            // doesn&#39;t work.
+            // Only copy until `i`, not `newTotal` since
+            // we&#39;ll continue appending after this.
+            newLog := make([]Entry, i, newTotal*2)
+            copy(newLog, s.log)
+            s.log = newLog
+        }
+
+        if i &lt; uint64(len(s.log)) &amp;&amp; s.log[i].Term != e.Term {
+            prevCap := cap(s.log)
+            // If an existing entry conflicts with a new
+            // one (same index but different terms),
+            // delete the existing entry and all that
+            // follow it (§5.3)
+            s.log = s.log[:i]
+            Server_assert(s, &#34;Capacity remains the same while we truncated.&#34;, cap(s.log), prevCap)
+        }
+
+        s.debugf(&#34;Appending entry: %s. At index: %d.&#34;, string(e.Command), len(s.log))
+
+        if i &lt; uint64(len(s.log)) {
+            Server_assert(s, &#34;Existing log is the same as new log&#34;, s.log[i].Term, e.Term)
+        } else {
+            s.log = append(s.log, e)
+            Server_assert(s, &#34;Length is directly related to the index.&#34;, uint64(len(s.log)), i+1)
+            nNewEntries++
+        }
+    }
+</code></pre>
+<p>Finally, we update the server&#39;s local <code>commitIndex</code> to the min of
+<code>req.LeaderCommit</code> and our own log length.</p>
+<p>And finally we persist all these changes and mark the response as
+successful.</p>
+<pre><code>    if req.LeaderCommit &gt; s.commitIndex {
+        s.commitIndex = min(req.LeaderCommit, uint64(len(s.log)-1))
+    }
+
+    s.persist(nNewEntries != 0, nNewEntries)
+
+    rsp.Success = true
+    return nil
+}
+</code></pre>
+<p>So the combined behavior of the leader and follower when replicating
+is that a follower not in sync with the leader may eventually go down
+to the beginning of the log so the leader and follower have some first
+N messages of the log that match.</p>
+<h4 id="&lt;code&gt;s.advancecommitindex()&lt;/code&gt;"><code>s.advanceCommitIndex()</code></h4><p>Now when not just one follower but a quorum of followers all have a
+matching first N messages, the leader can advance the cluster&#39;s
+<code>commitIndex</code>.</p>
+<pre><code>func (s *Server) advanceCommitIndex() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    // Leader can update commitIndex on quorum.
+    if s.state == leaderState {
+        lastLogIndex := uint64(len(s.log) - 1)
+
+        for i := lastLogIndex; i &gt; s.commitIndex; i-- {
+            quorum := len(s.cluster) / 2 + 1
+
+            for j := range s.cluster {
+                if quorum == 0 {
+                    break
+                }
+
+                isLeader := j == s.clusterIndex
+                if s.cluster[j].matchIndex &gt;= i || isLeader {
+                    quorum--
+                }
+            }
+
+            if quorum == 0 {
+                s.commitIndex = i
+                s.debugf(&#34;New commit index: %d.&#34;, i)
+                break
+            }
+        }
+    }
+</code></pre>
+<p>And for every state a server might be in, if there are messages
+committed but not applied, we&#39;ll apply one here. And importantly,
+we&#39;ll pass the result back to the message&#39;s result channel if it
+exists, so that <code>s.Apply()</code> can learn about the result.</p>
+<pre><code>    if s.lastApplied &lt;= s.commitIndex {
+        log := s.log[s.lastApplied]
+
+        // len(log.Command) == 0 is a noop committed by the leader.
+        if len(log.Command) != 0 {
+            s.debugf(&#34;Entry applied: %d.&#34;, s.lastApplied)
+            // TODO: what if Apply() takes too long?
+            res, err := s.statemachine.Apply(log.Command)
+
+            // Will be nil for follower entries and for no-op entries.
+            // Not nil for all user submitted messages.
+            if log.result != nil {
+                log.result &lt;- ApplyResult{
+                    Result: res,
+                    Error:  err,
+                }
+            }
+        }
+
+        s.lastApplied++
+    }
+}
+</code></pre>
+<h3 id="heartbeats">Heartbeats</h3><p>Heartbeats combine log replication and leader election. Heartbeats
+stave off leader election (follower timeouts). And heartbeats also
+bring followers up-to-date if they are behind.</p>
+<p>And it&#39;s a simple method. If it&#39;s time to heartbeat, we call
+<code>s.appendEntries()</code>. That&#39;s it.</p>
+<pre><code>func (s *Server) heartbeat() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    timeForHeartbeat := time.Now().After(s.heartbeatTimeout)
+    if timeForHeartbeat {
+        s.heartbeatTimeout = time.Now().Add(time.Duration(s.heartbeatMs) * time.Millisecond)
+        s.debug(&#34;Sending heartbeat&#34;)
+        s.appendEntries()
+    }
+}
+</code></pre>
+<p>The reason this staves off leader election is because any number of
+entries (0 or N) will come from a valid leader and will thus cause the
+followers to reset their election timeout.</p>
+<p>And that&#39;s the entirety of (the basics of) Raft.</p>
+<p>There are probably bugs.</p>
+<h3 id="running-kvapi">Running kvapi</h3><p>Now let&#39;s run the key-value API.</p>
+<pre><code>$ cd cmd/kvapi &amp;&amp; go build
+$ rm *.dat
+</code></pre>
+<h4 id="terminal-1">Terminal 1</h4><pre><code>$ ./kvapi --node 0 --http :2020 --cluster &#34;0,:3030;1,:3031;2,:3032&#34;
+</code></pre>
+<h4 id="terminal-2">Terminal 2</h4><pre><code>$ ./kvapi --node 1 --http :2021 --cluster &#34;0,:3030;1,:3031;2,:3032&#34;
+</code></pre>
+<h4 id="terminal-3">Terminal 3</h4><pre><code>$ ./kvapi --node 2 --http :2022 --cluster &#34;0,:3030;1,:3031;2,:3032&#34;
+</code></pre>
+<h4 id="terminal-4">Terminal 4</h4><p>Remember that requests will go through the leader (except for if we
+turn that off in the <code>/get</code> request). So you&#39;ll have to try sending a
+message to each server until you find the leader.</p>
+<p>To set a key:</p>
+<pre><code>$ curl http://localhost:2020/set?key=y&amp;value=hello
+</code></pre>
+<p>To get a key:</p>
+<pre><code>$ curl http://localhost:2020/get\?key\=y
+</code></pre>
+<p>And that&#39;s that! Try killing a server and restarting it. A new leader
+will be elected so you&#39;ll need to find the right one to send requests
+to again. But all existing entries should still be there.</p>
+<h3 id="a-test-rig">A test rig</h3><p>I won&#39;t cover the <a href="https://github.com/eatonphil/goraft/blob/main/cmd/sim/main.go">implementation of my test
+rig</a> in
+this post but I will describe it.</p>
+<p>It&#39;s nowhere near Jepsen but it does have a specific focus:</p>
+<ol>
+<li>Can the cluster elect a leader?</li>
+<li>Can the cluster store logs correctly?</li>
+<li>Can the cluster of three nodes tolerate one node down?</li>
+<li>How fast can it store N messages?</li>
+<li>Are messages recovered correctly when the nodes shut down and start back up?</li>
+<li>If a node&#39;s logs are deleted, is the log for that node recovered after it is restarted?</li>
+</ol>
+<p>This implementation passes these tests and handles around 20k-40k entries/second.</p>
+<h3 id="considerations">Considerations</h3><p>This was quite a challenging project. Normally when I hack on stuff
+like this I have TV (The Simpsons) on in the background. It&#39;s sort of
+dumb but this was the first project where I absolutely could not focus
+with that background noise.</p>
+<p>There are a tedious number of conditions and I am not sure I got them
+all (right). Numerous ways for subtle bugs.</p>
+<h4 id="race-conditions-and-deadlocks">Race conditions and deadlocks</h4><p>It&#39;s very easy to program in race conditions. Thankfully Go has the
+<code>-race</code> flag that detects this. This makes sure that you are locking
+read and write access to shared variables when necessary.</p>
+<p>On the other side of race conditions, Go does not help you out with:
+deadlocks. Once you&#39;ve got locks in place for shared variables, you
+need to make sure you&#39;re releasing the locks appropriately too.</p>
+<p>Thankfully someone wrote a swap-in replacement for the Go <code>sync</code>
+package called
+<a href="https://github.com/sasha-s/go-deadlock">go-deadlock</a>. When you import
+this file instead of the default <code>sync</code> package, it will panic and
+give you a stacktrace when it thinks you hit a deadlock.</p>
+<p>Sometimes it thinks you hit a deadlock because a method that needs a
+lock takes too long. Sometimes that time it takes is legitimate (or
+something you haven&#39;t optimized yet). But actually it&#39;s default of
+<code>30s</code> is not really aggressive at all.</p>
+<p>So I normally set the deadlock timeout to <code>2s</code> and eventually would
+like to make that more like <code>100ms</code>:</p>
+<pre><code>sync.Opts.DeadlockTimeout = 2000 * time.Millisecond
+</code></pre>
+<p>It&#39;s mostly the <code>persist()</code> function that causes <code>go-deadlock</code> to
+think there&#39;s a deadlock because it tries to synchronously write a
+bunch of data to disk.</p>
+<h5 id="&lt;code&gt;go-deadlock&lt;/code&gt;-is-slow"><code>go-deadlock</code> is slow</h5><p>The <code>go-deadlock</code> package is incredibly useful. But don&#39;t forget to
+turn it off for benchmarks. With it on I get around 4-8k
+entries/second. With it off I get around 20k-40k entries/second.</p>
+<h4 id="unbounded-memory">Unbounded memory</h4><p>Another issue in this implementation is that the log keeps growing
+indefinitely <em>and</em> the entire log is duplicated in memory.</p>
+<p>There are two ways to deal with that:</p>
+<ol>
+<li>Implement Raft snapshotting so the log can be truncated safely.</li>
+<li>Keep only some number of entries in memory (say, 1 million) and
+read from disk as needed when logs need to be verified. In ideal
+operation this would never happen since ideally all servers are
+always on, never miss entries, and just keep appending. But &#34;ideal&#34;
+won&#39;t always happen.</li>
+</ol>
+<p>Similarly, there is unbounded and unreused channel creation for
+notifying <code>s.Apply()</code> when the user-submitted message(s) finish.</p>
+<h4 id="net/rpc-and-encoding/gob">net/rpc and encoding/gob</h4><p>In the <code>persist()</code> section above I already mentioned how I prototyped
+this using Go&#39;s builtin gob encoding. And I mentioned how inefficient
+it was. It&#39;s also pretty slow and I learned that because <code>net/rpc</code>
+uses it and after everything I did <code>net/rpc</code> started to be the
+bottleneck in my benchmarks. This isn&#39;t incredibly surprising.</p>
+<p>So a future version of this code might implement its own protocol and
+own encoding (like we did for disk) on top of TCP rather than use
+<code>net/rpc</code>.</p>
+<h4 id="jepsen">Jepsen</h4><p>Everyone wants to know how a distributed algorithm does against
+<a href="https://github.com/jepsen-io/jepsen">Jepsen</a>, which tests
+linearizability of distributed systems in the face of network and
+process faults.</p>
+<p>But the setup is not trivial so I haven&#39;t hooked it up to this project
+yet. This would be a good area for future work.</p>
+<h4 id="election-timeout-and-the-environment">Election timeout and the environment</h4><p>One thing I noticed as I was trying out alternatives to <code>net/rpc</code>
+(alternatives that injected latency to simulate a bad environment) is
+that election timeouts should probably be tuned with latency of the
+cluster in mind.</p>
+<p>If the election timeout is every <code>300ms</code> but the latency of the
+cluster is near <code>1s</code>, you&#39;re going to have non-stop leader election.</p>
+<p>When I adjusted the election timeout to be every <code>2s</code> when the latency
+of the cluster is near <code>1s</code>, everything was fine. Maybe this means
+there&#39;s a bug in my code but I don&#39;t think so.</p>
+<h4 id="client-request-serial-identifier">Client request serial identifier</h4><p>One major part of the Raft protocol I did not cover is that the client
+is supposed to send a serial identifier for each message sent to the
+cluster. This is to ensure that messages are not accidentally
+duplicated at any level of the entire software stack.</p>
+<p><a href="https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf">Diego Ongaro&#39;s
+thesis</a>
+goes into more detail about this than the Raft paper. Search in that
+PDF for &#34;session&#34;.</p>
+<p>Again I just completely ignored the possibility of duplicate messages
+in this implementation so far.</p>
+<h3 id="references">References</h3><p>Finally, I could not have done this without a bunch of internet
+help. This project took me about 7 months in total. The first 5 months
+I was trying to figure it out mostly on my own, just looking at the
+Raft paper.</p>
+<p>The biggest breakthrough came from discovering the author of Raft&#39;s
+TLA+ spec for Raft. Formal methods sound scary but it was truly not
+too bad! This was the first &#34;implementation&#34; of Raft that was in a
+single file of code. And under 500 lines.</p>
+<p>Jack Vanlightly&#39;s guide to reading TLA+ helped a bunch.</p>
+<p>Finally, I had to peer at other implementations, especially to figure
+out locking and avoiding deadlocks.</p>
+<p>Here&#39;s everything that helped me out.</p>
+<ul>
+<li><a href="https://raft.github.io/raft.pdf">In Search of an Understandable Consensus Algorithm</a>: The Raft paper.</li>
+<li><a href="https://github.com/ongardie/raft.tla/blob/master/raft.tla">raft.tla</a>: Diego Ongaro&#39;s TLA+ spec for Raft.</li>
+<li>Jon Gjengset&#39;s <a href="https://thesquareplanet.com/blog/students-guide-to-raft/">Students&#39; Guide to Raft</a></li>
+<li>Jack Vanlightly&#39;s <a href="https://medium.com/splunk-maas/detecting-bugs-in-data-infrastructure-using-formal-methods-704fde527c58">Detecting Bugs in Data Infrastructure using Formal Methods (TLA+ Series Part 1)</a>: An intro to TLA+.</li>
+</ul>
+<p>And useful implementations I looked at for inspiration and clarity.</p>
+<ul>
+<li>Hashicorp&#39;s <a href="https://github.com/hashicorp/raft">Raft implementation</a> in Go: Although it&#39;s often quite complicated to learn from since it actually is intended for production.</li>
+<li>Eli Bendersky&#39;s <a href="https://github.com/eliben/raft">Raft implementation</a> in Go: Although it gets confusing because it uses negative numbers for terms whereas the paper does not.</li>
+<li>Jing Yang&#39;s <a href="https://github.com/ditsing/ruaft">Raft implementation</a> in Rust.</li>
+</ul>
+<p>And I haven&#39;t tried these but they look cool:</p>
+<ul>
+<li><a href="https://jepsen.io/services#training">Raft course taught by Jepsen</a></li>
+<li><a href="https://www.dabeaz.com/raft.html">Raft course taught by David Beazley</a></li>
+</ul>
+<p>Cheers!</p>
+<blockquote><p lang="en" dir="ltr">I wrote about implementing Raft in Go. By far the most challenging project I&#39;ve worked on in spare time. About 7 months sporadically.</p>— Phil Eaton (@eatonphil) <a href="https://twitter.com/eatonphil/status/1661720451616210944?ref_src=twsrc%5Etfw">May 25, 2023</a></blockquote> 
+
+	<div>
+	  <h4>Feedback</h4>
+	  <p><small>As always,
+	      please <a href="mailto:phil@eatonphil.com">email</a>
+	      or <a href="https://twitter.com/eatonphil">tweet me</a>
+	      with questions, corrections, or ideas!</small></p>
+
+	</div>
+      </div>
+    </div></div>
+  </body>
+</html>
