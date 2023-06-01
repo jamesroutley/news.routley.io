@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://sneller.io/blog/decompressing-at-over-10-gigabytes-per-second/">Original</a>
+    <h1>Iguana: fast SIMD-optimized decompression</h1>
+    
+    <div id="readability-page-1" class="page"><div id="post-content">
+                          <p>Extreme performance takes no prisoners, often to the point of reinventing the wheel. As many wheels have already been invented, one might wonder what makes ours unique. Let’s spare a thousand-word answer for later and start with a single picture.</p>
+<p><img src="https://sneller.io/blog/decompressing-at-over-10-gigabytes-per-second/bench.svg" alt="Benchmark"/></p>
+<p>Yup, there’s no mistake. Thanks to a format specifically designed to take full advantage of the modern SIMD extensions, the decompression performance <strong>is 13 gigabytes per second</strong> on a single AVX-512-capable core (<em>11th Gen Intel(R) Core(TM) i9-11950H @ 2.60GHz</em>). Or six GiB/s, with optional entropy compression. That is almost <strong>two times</strong> the performance of <em>LZ4</em>, still at the compression ratio close to 4:1. And that is <strong>244%</strong> faster than <em>zstd</em> when using entropy compression with only slightly less favourable compression ratios. Without entropy compression, Iguana is <strong>6 times</strong> faster than <em>zstd</em>.</p>
+<p>While Sneller primarily employs Iguana to compress logging data sets, the algorithm performs well on the widely accepted <a href="https://sun.aei.polsl.pl//~sdeor/index.php?page=silesia">Silesia corpus</a> benchmark too:</p>
+<p><img src="https://sneller.io/blog/decompressing-at-over-10-gigabytes-per-second/silesia.svg" alt="Silesia corpus"/></p>
+<p>This huge performance boost is possible thanks to a novel encoding of the input streams and a careful implementation.</p>
+<h3 id="background">Background</h3>
+<p>Our objective at <a href="https://github.com/SnellerInc/sneller">Sneller</a> is to query large quantities of data incredibly fast. Alas, as no data item can be processed before it is ingested, efficient data delivery is of paramount importance. Two factors can be identified as the ultimate bottlenecks:</p>
+<ol>
+<li>The bandwidth of the physical networking hardware.</li>
+<li>The pace at which the application can consume the delivered input.</li>
+</ol>
+<p>The cloud-native nature of Sneller makes the physical bandwidth largely a constraint we cannot address. We are restricted to using whatever the prevalent Cloud infrastructure providers can offer us within our budget constraints. Even though many instances come equipped with impressive single or double 100 gigabit links – a bandwidth that belonged to the realm of science fiction not long ago – it is still <em>merely</em> 25 gigabytes per second. This value is already below the current Sneller’s engine saturation point, and we plan to continue raising the bar even higher.</p>
+<h3 id="compression-to-the-rescue">Compression to the rescue</h3>
+<p>Since increasing the physical bandwidth is not viable, the next best thing to consider is raising the <em>effective</em> throughput. Simply put: compress data. The format Sneller uses under the hood is derived from <a href="https://amazon-ion.github.io/ion-docs/docs/binary.html">Amazon Ion</a> which is a binary form of JSON. It is convenient to the point of making us able to process it at the AVX-512 assembly level <strong>directly</strong>. It is much more compact than the textual JSON as well. The compactness is, however, restricted to the clever representation of individual items: no form of extracting the redundancy typically present <em>across</em> data items is exploited. Feeding <em>ION</em> input into a universal compression pipeline could make the dog hunt again. And it is indeed the case – our survey of compression algorithms confirms that <em>ION</em> files <strong>do</strong> compress well.</p>
+<p>Compression is a mixed blessing, though. While the effective bandwidth increases as intended, the computational cost of compression and decompression also does so. Replacing the rock with a hard place only helps a little overall: the network is no longer a problem, but decompression leaves little computing power for the actual data processing. The overhead varies from one algorithm to another, but it is clearly visible in all cases. The unquestionable king of the hill nowadays is <em>zstd</em>, but even with this sophisticated and cleverly optimized algorithm, the decompression overhead is in the ballpark of 48%, as <em>perf</em> traces can witness.</p>
+<p>One option would be to optimize the best <em>zstd</em> implementation available, and Sneller followed this route. Substantial speedup has been observed, but the algorithm’s complexity makes the optimization effort challenging to progress beyond a certain point. While the algorithm can achieve excellent compression ratios, this feature remains inaccessible to us by an impenetrable wall of decompression cost.</p>
+<h3 id="lizard">Lizard</h3>
+<p>Designing a competitive compression algorithm from scratch is not trivial, so surveying promising candidates looked like a good thing. The most promising option was <a href="https://github.com/inikep/lizard"><em>lizard - efficient compression with very fast decompression</em></a>. Its performance figures were impressive but not close to what we wanted at Sneller. On the bright side, its implementation was more straightforward than that of <em>zstd</em>, and some helpful documentation of its internals was also available. The high-level structure is as follows:</p>
+<ol>
+<li>The top-level part is an <em>LZ77</em> derivative with a neatly designed constellation of tokens.</li>
+<li>At the bottom, there is an optional entropy encoder based on the <a href="https://fastcompression.blogspot.com/2013/12/finite-state-entropy-new-breed-of.html">Finite State Entropy</a> algorithm.</li>
+</ol>
+<p>Vectorization stopped as suddenly as promptly it started. No matter how clever the algorithm was, the number of dependencies it inherited from its predecessors made it inherently scalar. Modern processors can execute instructions out-of-order and – in lucky cases – in parallel, but the sustainable speedup is still pretty low. Matching the capabilities of the ever-hungry downstream data-crunching pipeline cried for a radically different approach. If anything at all, only the AVX-512 SIMD extension could help us.</p>
+<h3 id="scalar-and-simd-do-not-mate">Scalar and SIMD do not mate</h3>
+<p>However scalar dependencies and SIMD processing don’t mate. Specifically, four types of problems make vectorization of <em>Lizard</em> next to impossible:</p>
+<ol>
+<li>A straightforward implementation results in many unpredictable branches, incurring a significant branch misprediction penalty.</li>
+<li>Literals are mixed with variable-length uints, making it impossible to infer the semantics of an arbitrary bitstream portion without interpreting all the preceding tokens. Only the current state of the <em>Lizard</em> state machine can resolve the ambiguities. Not an issue for a scalar implementation of the decoder, but it suffices to make a vectorized one fighting a losing battle.</li>
+<li>A similar flaw haunts the variable-length unsigned integer encoding. Should a byte be interpreted as a part of a longer run of payload bytes or as a marker of the value that follows? Again, only the state machine can provide a decisive answer.</li>
+<li>The <em>FSE</em> algorithm is a member of the <em>tANS</em> <a href="https://arxiv.org/abs/1311.2540">arithmetic coding</a> family. The <em>t</em>, standing for <em>tabled</em>, indicates one cause of performance problems. Not only does the algorithm need to traverse large state tables, but the stream consumption also occurs at the granularity of individual bits instead of bytes the processor can work with so much more efficiently. The scenario is about as bad as possible for a modern SIMD-vectorized processor like the AVX-512-capable x64 chips.</li>
+</ol>
+<h3 id="introducing-iguana-vectorized-decompression">Introducing Iguana: vectorized decompression</h3>
+<p>The hardware-assisted masked execution of the AVX-512 instructions alleviates the first problem. While not ideal, a mostly branchless execution is possible with meticulous implementation. Only the loop-like branches remain, but these can be accurately predicted most of the time and hence incur little to no execution time penalty.</p>
+<p>The second problem is unfixable without altering the <em>Lizard</em> stream format. But since interoperability was not a design requirement, the <em>Iguana</em> compression was born. With this constraint removed, the fix becomes trivial: we barely need to split <code>Literals_Stream</code> into two separate streams. One contains the actual literals and the other solely the varuints, so the semantic dependence on the decoder state is removed.</p>
+<p>The third problem survives the splitting, however. The encoding used by <em>Lizard</em> and many other <em>LZ77</em> derivatives is remarkably dense under typical input data statistics:</p>
+<ul>
+<li>Values not exceeding 253 are encoded as a single byte carrying that value.</li>
+<li>Values exceeding 253 and not exceeding 65535 are encoded as a byte 254 followed by two little-endian bytes carrying the value.</li>
+<li>Values exceeding 65536 are encoded as a byte 255, followed by three little-endian bytes carrying the value.</li>
+</ul>
+<p>Alas, it is not <a href="https://en.wikipedia.org/wiki/Self-synchronizing_code">self-synchronizing</a>: it is trivially decodable by scalar code, but no vectorized parser of reasonable complexity can extract multiple values in one go. There is no way but to change the encoding, constituting another incompatibility with <em>Lizard</em>.</p>
+<h4 id="from-base256-to-base254">From base256 to base254</h4>
+<p>Many candidates for a self-synchronizing varuint encoding exist, but to keep the density of the original encoding, the prefix scheme is retained. The decoding ambiguity is caused by the presence of the <code>254</code> and <code>255</code> bytes in the payload, so these are prohibited from occurring there. This step effectively transforms the original encoding from <em>base256</em> into <em>base254</em>. The encodable range drops from 16777216 to 16387064, but since these values encode run lengths, the entire 24-bit range is not strictly required. We need just as much capacity as necessary for compact encoding of typically occurring run lengths, and almost 16-megabyte-long runs are hardly seen in practice. If the capacity were insufficient, <em>Iguana</em> (and <em>Lizard</em>, just slightly later) would emit two or more tokens to cover the excessively long run. The bitstream remains valid, so it is not a big deal.</p>
+<h4 id="from-tables-to-ranges-or-tans-to-rans">From tables to ranges (or: tANS to rANS)</h4>
+<p>Concerning the fourth problem, saturating the memory bus with massive amounts of gather/scatter requests and competing for cache capacity with the actual data being processed is precisely what should be avoided at all costs in a high-performance scenario. Luckily, <em>tANS</em> has an older sibling, the <em>rANS</em> or <em>range ANS</em> in full form. It is conceptually exquisite and enjoys a compact implementation. However, its author does not praise it enough due to its heavy demand for efficient integer multiplication hardware. But not only do the AVX-512-capable processors have efficient vectorized multipliers, these multipliers operate independently from the load/store units.</p>
+<h3 id="final-words-and-future-plans">Final words and Future plans</h3>
+<!-- raw HTML omitted -->
+<p><em>Iguana</em> is a part of the open-source <a href="https://github.com/SnellerInc/sneller"><em>Sneller</em></a> so you can <a href="https://github.com/SnellerInc/sneller/tree/master/ion/zion/iguana"><em>check it out</em></a> if you are interested in the details. In addition to the optimized AVX-512 assembly implementation, it also contains a reference implementation written fully in Go.</p>
+<p>We are using the Iguana compression already in <a href="https://sneller.io/register/">Sneller Cloud</a> for very fast and efficient log analysis. We are planning on releasing it as a standalone compression library for Golang in the near future.</p>
+<h3 id="appendix-a-benchmarking">Appendix A: Benchmarking</h3>
+<p>Two forms of benchmarking are relevant for comparative performance analysis. One is to rely on a standardized input, and currently, the Silesia corpus is the weapon of choice. The <em>zstd</em> and <em>lz4</em> command line tools have a built-in option ‘-b’. Since <em>Iguana</em> still lacks a stand-alone compression utility, Phil Hofer created the <a href="https://github.com/SnellerInc/compbench">compbench</a> program to allow performance comparison. Using the tool is as simple as:</p>
+<pre tabindex="0"><code>$ go install github.com/SnellerInc/compbench@latest
+$ compbench
+</code></pre><p>Note that currently, <em>Iguana</em> depends on the <em>AVX-512</em> instruction set with the <em>VBMI2</em> extension. In the absence thereof, a scalar, non-optimized reference implementation in Go is activated, and the results — while still correct — would be somewhat far from the depicted values in terms of performance. A variant not relying on the <em>VBMI2</em> extension is now subject to code review, so running the decompressor on any AVX-512-capable machine will soon be possible, including <em>Skylake-X</em>. The early benchmarking figures are encouraging, suggesting that no less than 90% of the <em>VBMI2</em> performance is to be recovered. However, we plan to stop there, as the AVX-512 support is required by the Sneller product anyway.</p>
+<p>While <em>Iguana</em> performs (surprisingly) well in the universal compression case, the other benchmarking form takes the <em>ION</em> context into account.
+<em>Sneller</em> can use both <em>zstd</em> and <em>Iguana</em> to compress the data sets, so a comparative benchmark is available in the <a href="https://github.com/SnellerInc/sneller/tree/master/ion/zion">zion</a> directory:
+<code>go test -bench .</code> The <em>zion</em> data format usually gives <em>Iguana</em> roughly 50% higher decompression performance and compression ratio than in the <em>Silesia</em> case.</p>
+
+                        </div></div>
+  </body>
+</html>
