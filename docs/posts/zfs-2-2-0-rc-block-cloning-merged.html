@@ -17,57 +17,87 @@
     <a href="https://github.com/openzfs/zfs/pull/13392">Original</a>
     <h1>ZFS 2.2.0 (RC): Block Cloning merged</h1>
     
-    <div id="readability-page-1" class="page"><article id="post-3667">
-
-	
-	<header>
-		
-					<span><a href="https://thewitchofendor.com/category/art/" rel="category tag">art</a></span>
-		
-			</header><!-- .entry-header -->
-
-					<div>
-			
-<p>In this story a man saves animals from children by paying the children money. Out of money he steals from the king, is caught, and locked in a box with holes, water and loaf of bread and tossed into a river. The animals he saved try to break him free but cannot with out the help of a magic stone. The man gets the magic stone and wishes for a castle. After a while merchants come to the castle and the man foolishly trades his stone for some clothing. His castle disappears and he is back in the locked box in the river, the animals connive to steal the stone from the merchant – but then when they are swimming to release the man the bear forces the monkey to make idle chit-chat and drops the stone. They then scare the frogs into collecting all the stones from the river. One old fat frog finds the stone – because it has a red ribbon – the man once again wishes for his castle and lives happily ever after with his animals.</p>
+    <div id="readability-page-1" class="page"><div>
+        <div>
+  
+  <task-lists disabled="" sortable="">
+    <div>
+      
 
 
+<h3 dir="auto">Motivation and Context</h3>
+<p dir="auto">Block Cloning allows to clone a file (or a subset of its blocks) into another (or the same) file by just creating additional references to the data blocks without copying the data itself. Block Cloning can be described as a fast, manual deduplication.</p>
+<h3 dir="auto">Description</h3>
+<p dir="auto">In many ways Block Cloning is similar to the existing deduplication, but there are some important differences:</p>
+<ul dir="auto">
+<li>Deduplication is automatic and Block Cloning is not - one has to use a dedicated system call(s) to clone the given file/blocks.</li>
+<li>Deduplication keeps all data blocks in its table, even those referenced just ones. Block Cloning creates an entry in its tables only when there are at least two references to the given data block. If the block was never explicitly cloned or the second to last reference was dropped, there will be neither space nor performance overhead.</li>
+<li>Deduplication needs data to work - one needs to pass real data to the write(2) syscall, so hash can be calculated. Block Cloning doesn&#39;t require data, just block pointers to the data, so it is extremely fast, as we pay neither the cost of reading the data, nor the cost of writing the data - we operate exclusively on metadata.</li>
+<li>If the D (dedup) bit is not set in the block pointer, it means that the block is not in the dedup table (DDT) and we won&#39;t consult the DDT when we need to free the block. Block Cloning must be consulted on every free, because we cannot modify the source BP (eg. by setting something similar to the D bit), thus we have no hint if the block is in the Block Reference Table (BRT), so we need to look into the BRT. There is an optimization in place that allows to eliminate majority of BRT lookups that is described below in the &#34;Minimizing free penalty&#34; section.</li>
+<li>The BRT entry is much smaller than the DDT entry - for BRT we only store 64bit offset and 64bit reference counter.</li>
+<li>Dedup keys are cryptographic hashes, so two blocks that are close to each other on disk are most likely in totally different parts of the DDT.  The BRT entry keys are offsets into a single top-level VDEV, so data blocks from one file should have BRT entries close to each other.</li>
+<li>Scrub will only do a single pass over a block that is referenced multiple times in the DDT. Unfortunately it is not currently (if at all) possible with Block Cloning and block referenced multiple times will be scrubbed multiple times.</li>
+<li>Deduplication requires cryptographically strong hash as a checksum or additional data verification. Block Cloning works with any checksum algorithm or even with checksumming disabled.</li>
+</ul>
+<p dir="auto">As mentioned above, the BRT entries are much smaller than the DDT entries.  To uniquely identify a block we just need its vdevid and offset. We also need to maintain a reference counter. The vdevid will often repeat, as there is a small number of top-level VDEVs and a large number of blocks stored in each VDEV. We take advantage of that to reduce the BRT entry size further by maintaining one BRT for each top-level VDEV, so we can then have only offset and counter as the BRT entry.</p>
+<p dir="auto">Minimizing free penalty.</p>
+<p dir="auto">Block Cloning allows to clone any existing block. When we free a block there is no hint in the block pointer whether the block was cloned or not, so on each free we have to check if there is a corresponding entry in the BRT or not. If there is, we need to decrease the reference counter. Doing BRT lookup on every free can potentially be expensive by requiring additional I/Os if the BRT doesn&#39;t fit into memory. This is the main problem with deduplication, so we&#39;ve learn our lesson and try not to repeat the same mistake here. How do we do that? We divide each top-level VDEV into 64MB regions. For each region we maintain a reference counter that is a sum of all reference counters of the cloned blocks that have offsets within the region. This creates the regions array of 64bit numbers for each top-level VDEV. The regions array is always kept in memory and updated on disk in the same transaction group as the BRT updates to keep everything in-sync. We can keep the array in memory, because it is very small. With 64MB regions and 1TB VDEV the array requires only 128kB of memory (we may decide to decrease the region size in the future). Now, when we want to free a block, we first consult the array. If the counter for the whole region is zero, there is no need to look for the BRT entry, as there isn&#39;t one for sure. If the counter for the region is greater than zero, only then we will do a BRT lookup and if an entry is found we will decrease the reference counters in the entry and in the regions array.</p>
+<p dir="auto">The regions array is small, but can potentially be larger for very large VDEVs or smaller regions. In this case we don&#39;t want to rewrite entire array on every change. We then divide the regions array into 128kB chunks and keep a bitmap of dirty chunks within a transaction group. When we sync the transaction group we can only update the parts of the regions array that were modified. Note: Keeping track of the dirty parts of the regions array is implemented, but updating only parts of the regions array on disk is not yet implemented - for now we will update entire regions array if there was any change.</p>
+<p dir="auto">The implementation tries to be economic: if BRT is not used, or no longer used, there will be no entries in the MOS and no additional memory used (eg.  the regions array is only allocated if needed).</p>
+<p dir="auto">Interaction between Deduplication and Block Cloning.</p>
+<p dir="auto">If both functionalities are in use, we could end up with a block that is referenced multiple times in both DDT and BRT. When we free one of the references we couldn&#39;t tell where it belongs, so we would have to decide what table takes the precedence: do we first clear DDT references or BRT references? To avoid this dilemma BRT cooperates with DDT - if a given block is being cloned using BRT and the BP has the D (dedup) bit set, BRT will lookup DDT entry and increase the counter there. No BRT entry will be created for a block that resides on a dataset with deduplication turned on.  BRT may be more efficient for manual deduplication, but if the block is already in the DDT, then creating additional BRT entry would be less efficient. This clever idea was proposed by Allan Jude.</p>
+<p dir="auto">Block Cloning across datasets.</p>
+<p dir="auto">Block Cloning is not limited to cloning blocks within the same dataset.  It is possible (and very useful) to clone blocks between different datasets.</p>
+<p dir="auto">Block Cloning flow through ZFS layers.</p>
+<p dir="auto">Note: Block Cloning can be used both for cloning file system blocks and ZVOL blocks. As of this writing no interface is implemented that allows for ZVOL blocks cloning.</p>
+<div data-snippet-clipboard-copy-content=" ssize_t fclonefile(int srcfd, int dstfd);
+ ssize_t fclonerange(int srcfd, off_t srcoffset, size_t length, int dstfd, off_t dstoffset);"><pre><code> ssize_t fclonefile(int srcfd, int dstfd);
+ ssize_t fclonerange(int srcfd, off_t srcoffset, size_t length, int dstfd, off_t dstoffset);
+</code></pre></div>
+<p dir="auto">Even though fclonerange() takes byte offsets and length, they have to be block-aligned.</p>
+<p dir="auto">We use this pending list to keep track of all BPs that got new references within this transaction group.</p>
+<p dir="auto">Some special cases to consider and how we address them:</p>
+<ul dir="auto">
+<li>The block we want to clone may have been created within the same transaction group as we are trying to clone. Such block has no BP allocated yet, so it is too early to clone it. In this case the dmu_read_l0_bps() function will return EAGAIN and in the zfs_clone_range() function we will wait for the transaction group to be synced to disks and retry.</li>
+<li>The block we want to clone may have been modified within the same transaction group. We could potentially clone the previous version of the data, but that doesn&#39;t seem right. We handle it as the previous case.</li>
+<li>A block may be cloned multiple times during one transaction group (that&#39;s why pending list is actually a tree and not an append-only list - this way we can figure out faster if this block is cloned for the first time in this txg or consecutive time).</li>
+<li>A block may be cloned and freed within the same transaction group (see dbuf_undirty()).</li>
+<li>A block may be cloned and within the same transaction group the clone can be cloned again (see dmu_read_l0_bps()).</li>
+<li>A file might have been deleted, but the caller still has a file descriptor open to this file and clones it.</li>
+</ul>
+<p dir="auto">When we free a block we have additional step in the ZIO pipeline where we call the zio_brt_free() function. We then call the brt_entry_decref() that loads the corresponding BRT entry (if one exists) and decreases reference counter. If this is not the last reference we will stop ZIO pipeline here. If this is the last reference or the block is not in the BRT, we continue the pipeline and free the block as usual.</p>
+<p dir="auto">At the beginning of spa_sync() where there can be no more block cloning, but before issuing frees we call brt_pending_apply(). This function applies all the new clones to the BRT table - we load BRT entries and update reference counters. To sync new BRT entries to disk, we use brt_sync() function. This function will sync all dirty top-level-vdev BRTs, regions arrays, etc.</p>
+<p dir="auto">Block Cloning and ZIL.</p>
+<p dir="auto">Every clone operation is divided into chunks (similar to write) and each chunk is cloned in a separate transaction. To keep ZIL entries small, each chunk clones at most 254 blocks, which makes ZIL entry to be 32kB.  Replaying clone operation is different from the regular clone operation, as when we log clone operation we cannot use the source object - it may reside on a different dataset, so we log BPs we want to clone.</p>
+<h3 dir="auto">How Has This Been Tested?</h3>
+<p dir="auto">I have a test program that can make use of this functionality that I have been using for manual testing.</p>
+<h3 dir="auto">Types of changes</h3>
 
-<p>What the hell is this! Well it is not a story where love conquers all. Again it is a story about transaction, money, value, identifiers. I am so fucking tired. Colors: red. Elements: stone, water. Symbols: Boxes, Bread.</p>
+<ul>
+<li> Bug fix (non-breaking change which fixes an issue)</li>
+<li> New feature (non-breaking change which adds functionality)</li>
+<li> Performance enhancement (non-breaking change which improves efficiency)</li>
+<li> Code cleanup (non-breaking change which makes code smaller or more readable)</li>
+<li> Breaking change (fix or feature that would cause existing functionality to change)</li>
+<li> Library ABI change (libzfs, libzfs_core, libnvpair, libuutil and libzfsbootenv)</li>
+<li> Documentation (a change to man pages or other documentation)</li>
+</ul>
+<h3 dir="auto">Checklist:</h3>
 
 
+<ul>
+<li> My code follows the OpenZFS <a href="https://github.com/openzfs/zfs/blob/master/.github/CONTRIBUTING.md#coding-conventions">code style requirements</a>.</li>
+<li> I have updated the documentation accordingly.</li>
+<li> I have read the <a href="https://github.com/openzfs/zfs/blob/master/.github/CONTRIBUTING.md"><strong>contributing</strong> document</a>.</li>
+<li> I have added <a href="https://github.com/openzfs/zfs/tree/master/tests">tests</a> to cover my changes.</li>
+<li> I have run the ZFS Test Suite with this change applied.</li>
+<li> All commit messages are properly formatted and contain <a href="https://github.com/openzfs/zfs/blob/master/.github/CONTRIBUTING.md#signed-off-by"><code>Signed-off-by</code></a>.</li>
+</ul>
+    </div>
+  </task-lists>
+  
+</div>
 
-<p>Who are the animals – our elemental nature. I have been reading about huddhism and the 6 realms: gods, jealous gods, humans, animals, hungry ghosts, and hell.  In each realm there is a path towards liberation – freedom – liberation from the 6 realms all together. The 6 realms are on a wheel.  Do we  experience all the realms in one life, one realm per life. On my vision quest I saw wheels.  When I see a wheel in my minds eye I see a decoder wheel. </p>
-
-
-
-<figure><img data-attachment-id="3669" data-permalink="https://thewitchofendor.com/2023/06/30/ma-book-club-grimms-fairy-tales-the-faithful-animals/image-7/" data-orig-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?fit=1170%2C1170&amp;ssl=1" data-orig-size="1170,1170" data-comments-opened="1" data-image-meta="{&#34;aperture&#34;:&#34;0&#34;,&#34;credit&#34;:&#34;&#34;,&#34;camera&#34;:&#34;&#34;,&#34;caption&#34;:&#34;&#34;,&#34;created_timestamp&#34;:&#34;0&#34;,&#34;copyright&#34;:&#34;&#34;,&#34;focal_length&#34;:&#34;0&#34;,&#34;iso&#34;:&#34;0&#34;,&#34;shutter_speed&#34;:&#34;0&#34;,&#34;title&#34;:&#34;&#34;,&#34;orientation&#34;:&#34;0&#34;}" data-image-title="image" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?fit=300%2C300&amp;ssl=1" data-large-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?fit=840%2C840&amp;ssl=1" decoding="async" width="840" height="840" src="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=840%2C840&amp;ssl=1" alt="" data-recalc-dims="1" data-lazy-srcset="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=1024%2C1024&amp;ssl=1 1024w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=300%2C300&amp;ssl=1 300w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=150%2C150&amp;ssl=1 150w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=768%2C768&amp;ssl=1 768w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=800%2C800&amp;ssl=1 800w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=400%2C400&amp;ssl=1 400w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=200%2C200&amp;ssl=1 200w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=180%2C180&amp;ssl=1 180w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=50%2C50&amp;ssl=1 50w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?w=1170&amp;ssl=1 1170w" data-lazy-sizes="(max-width: 840px) 100vw, 840px" data-lazy-src="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image.png?resize=840%2C840&amp;is-pending-load=1#038;ssl=1" srcset="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"/></figure>
-
-
-
-<figure><img data-attachment-id="3670" data-permalink="https://thewitchofendor.com/2023/06/30/ma-book-club-grimms-fairy-tales-the-faithful-animals/image-1-4/" data-orig-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?fit=800%2C810&amp;ssl=1" data-orig-size="800,810" data-comments-opened="1" data-image-meta="{&#34;aperture&#34;:&#34;0&#34;,&#34;credit&#34;:&#34;&#34;,&#34;camera&#34;:&#34;&#34;,&#34;caption&#34;:&#34;&#34;,&#34;created_timestamp&#34;:&#34;0&#34;,&#34;copyright&#34;:&#34;&#34;,&#34;focal_length&#34;:&#34;0&#34;,&#34;iso&#34;:&#34;0&#34;,&#34;shutter_speed&#34;:&#34;0&#34;,&#34;title&#34;:&#34;&#34;,&#34;orientation&#34;:&#34;0&#34;}" data-image-title="image-1" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?fit=296%2C300&amp;ssl=1" data-large-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?fit=800%2C810&amp;ssl=1" decoding="async" width="800" height="810" src="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?resize=800%2C810&amp;ssl=1" alt="" data-recalc-dims="1" data-lazy-srcset="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?w=800&amp;ssl=1 800w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?resize=296%2C300&amp;ssl=1 296w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?resize=768%2C778&amp;ssl=1 768w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?resize=178%2C180&amp;ssl=1 178w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?resize=50%2C50&amp;ssl=1 50w" data-lazy-sizes="(max-width: 800px) 100vw, 800px" data-lazy-src="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-1.png?resize=800%2C810&amp;is-pending-load=1#038;ssl=1" srcset="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"/></figure>
-
-
-
-<figure><img data-attachment-id="3672" data-permalink="https://thewitchofendor.com/2023/06/30/ma-book-club-grimms-fairy-tales-the-faithful-animals/image-2-3/" data-orig-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?fit=2500%2C3747&amp;ssl=1" data-orig-size="2500,3747" data-comments-opened="1" data-image-meta="{&#34;aperture&#34;:&#34;0&#34;,&#34;credit&#34;:&#34;&#34;,&#34;camera&#34;:&#34;&#34;,&#34;caption&#34;:&#34;&#34;,&#34;created_timestamp&#34;:&#34;0&#34;,&#34;copyright&#34;:&#34;&#34;,&#34;focal_length&#34;:&#34;0&#34;,&#34;iso&#34;:&#34;0&#34;,&#34;shutter_speed&#34;:&#34;0&#34;,&#34;title&#34;:&#34;&#34;,&#34;orientation&#34;:&#34;0&#34;}" data-image-title="image-2" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?fit=200%2C300&amp;ssl=1" data-large-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?fit=683%2C1024&amp;ssl=1" decoding="async" width="683" height="1024" src="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=683%2C1024&amp;ssl=1" alt="" data-recalc-dims="1" data-lazy-srcset="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=683%2C1024&amp;ssl=1 683w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=200%2C300&amp;ssl=1 200w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=768%2C1151&amp;ssl=1 768w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=1025%2C1536&amp;ssl=1 1025w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=1366%2C2048&amp;ssl=1 1366w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=1200%2C1799&amp;ssl=1 1200w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=800%2C1199&amp;ssl=1 800w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=120%2C180&amp;ssl=1 120w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?w=1680&amp;ssl=1 1680w" data-lazy-sizes="(max-width: 683px) 100vw, 683px" data-lazy-src="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-2.png?resize=683%2C1024&amp;is-pending-load=1#038;ssl=1" srcset="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"/></figure>
-
-
-
-<figure><img data-attachment-id="3673" data-permalink="https://thewitchofendor.com/2023/06/30/ma-book-club-grimms-fairy-tales-the-faithful-animals/image-3-2/" data-orig-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?fit=1200%2C1177&amp;ssl=1" data-orig-size="1200,1177" data-comments-opened="1" data-image-meta="{&#34;aperture&#34;:&#34;0&#34;,&#34;credit&#34;:&#34;&#34;,&#34;camera&#34;:&#34;&#34;,&#34;caption&#34;:&#34;&#34;,&#34;created_timestamp&#34;:&#34;0&#34;,&#34;copyright&#34;:&#34;&#34;,&#34;focal_length&#34;:&#34;0&#34;,&#34;iso&#34;:&#34;0&#34;,&#34;shutter_speed&#34;:&#34;0&#34;,&#34;title&#34;:&#34;&#34;,&#34;orientation&#34;:&#34;0&#34;}" data-image-title="image-3" data-image-description="" data-image-caption="" data-medium-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?fit=300%2C294&amp;ssl=1" data-large-file="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?fit=840%2C824&amp;ssl=1" decoding="async" width="840" height="824" src="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?resize=840%2C824&amp;ssl=1" alt="" data-recalc-dims="1" data-lazy-srcset="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?resize=1024%2C1004&amp;ssl=1 1024w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?resize=300%2C294&amp;ssl=1 300w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?resize=768%2C753&amp;ssl=1 768w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?resize=800%2C785&amp;ssl=1 800w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?resize=184%2C180&amp;ssl=1 184w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?resize=50%2C50&amp;ssl=1 50w, https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?w=1200&amp;ssl=1 1200w" data-lazy-sizes="(max-width: 840px) 100vw, 840px" data-lazy-src="https://i0.wp.com/thewitchofendor.com/wp-content/uploads/2023/06/image-3.png?resize=840%2C824&amp;is-pending-load=1#038;ssl=1" srcset="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"/></figure>
-
-
-
-<p>The story reminds me of the origin of the chinese zodiac story where a bunch of animals try and cross a river.  </p>
-
-
-
-<p>How do we remember to find our magic – our transcendence our freedom – remember the red string.</p>
-
-<p id="jp-relatedposts">
-	<h3><em>Related</em></h3>
-</p>					</div><!-- .entry-content -->
-			
-	
-			<!-- .entry-meta -->
-	</article></div>
+      </div></div>
   </body>
 </html>
