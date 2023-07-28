@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://gvisor.dev/blog/2023/06/27/directfs/">Original</a>
+    <h1>Faster filesystem access with Directfs</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+  <p>Directfs is now the default in runsc. This feature gives gVisor’s application
+kernel (the Sentry) secure direct access to the container filesystem, avoiding
+expensive round trips to the filesystem gofer. Learn more about this feature in
+the following blog that was
+<a href="https://opensource.googleblog.com/2023/06/optimizing-gvisor-filesystems-with-directfs.html">originally posted</a>
+on <a href="https://opensource.googleblog.com/">Google Open Source Blog</a>.</p>
+
+<hr/>
+
+<h2 id="origins-of-the-gofer">Origins of the Gofer</h2>
+
+<p>gVisor is used internally at Google to run a variety of services and workloads.
+One of the challenges we faced while building gVisor was providing remote
+filesystem access securely to the sandbox. gVisor’s strict
+<a href="https://gvisor.dev/docs/architecture_guide/security/">security model</a> and
+defense in depth approach assumes that the sandbox may get compromised because
+it shares the same execution context as the untrusted application. Hence the
+sandbox cannot be given sensitive keys and credentials to access Google-internal
+remote filesystems.</p>
+
+<p>To address this challenge, we added a trusted filesystem proxy called a “gofer”.
+The gofer runs outside the sandbox, and provides a secure interface for
+untrusted containers to access such remote filesystems. For architectural
+simplicity, gofers were also used to serve local filesystems as well as remote.</p>
+
+<p><img src="https://gvisor.dev/assets/images/2023-06-27-gofer-proxy.svg" alt="Figure 1" title="Filesystem gofer proxy" width="100%"/></p>
+
+<h2 id="isolating-the-container-filesystem-in-runsc">Isolating the Container Filesystem in runsc</h2>
+
+<p>When gVisor was <a href="https://github.com/google/gvisor">open sourced</a> as
+<a href="https://gvisor.dev/docs/">runsc</a>, the same gofer model was copied over to
+maintain the same security guarantees. runsc was configured to start one gofer
+process per container which serves the container filesystem to the sandbox over
+a predetermined protocol (now
+<a href="https://github.com/google/gvisor/blob/master/pkg/lisafs">LISAFS</a>). However, a gofer
+adds a layer of indirection with significant overhead.</p>
+
+<p>This gofer model (built for remote filesystems) brings very few advantages for
+the runsc use-case, where all the filesystems served by the gofer (like rootfs
+and <a href="https://docs.docker.com/storage/bind-mounts/">bind mounts</a>) are mounted
+locally on the host. The gofer directly accesses them using filesystem syscalls.</p>
+
+<p>Linux provides some security primitives to effectively isolate local
+filesystems. These include,
+<a href="https://man7.org/linux/man-pages/man7/mount_namespaces.7.html">mount namespaces</a>,
+<a href="https://man7.org/linux/man-pages/man2/pivot_root.2.html"><code>pivot_root</code></a> and
+detached bind mounts<sup id="fnref:1" role="doc-noteref"><a href="#fn:1">1</a></sup>. <strong>Directfs</strong> is a new filesystem access mode that uses
+these primitives to expose the container filesystem to the sandbox in a secure
+manner. The sandbox’s view of the filesystem tree is limited to just the
+container filesystem. The sandbox process is not given access to anything
+mounted on the broader host filesystem. Even if the sandbox gets compromised,
+these mechanisms provide additional barriers to prevent broader system
+compromise.</p>
+
+<h2 id="directfs">Directfs</h2>
+
+<p>In directfs mode, the gofer still exists as a cooperative process outside the
+sandbox. As usual, the gofer enters a new mount namespace, sets up appropriate
+bind mounts to create the container filesystem in a new directory and then
+<a href="https://man7.org/linux/man-pages/man2/pivot_root.2.html"><code>pivot_root(2)</code></a>s into
+that directory. Similarly, the sandbox process enters new user and mount
+namespaces and then
+<a href="https://man7.org/linux/man-pages/man2/pivot_root.2.html"><code>pivot_root(2)</code></a>s into
+an empty directory to ensure it cannot access anything via path traversal. But
+instead of making RPCs to the gofer to access the container filesystem, the
+sandbox requests the gofer to provide file descriptors to all the mount points
+via <a href="https://man7.org/linux/man-pages/man7/unix.7.html"><code>SCM_RIGHTS</code> messages</a>.
+The sandbox then directly makes file-descriptor-relative syscalls (e.g.
+<a href="https://linux.die.net/man/2/fstatat"><code>fstatat(2)</code></a>,
+<a href="https://linux.die.net/man/2/openat"><code>openat(2)</code></a>,
+<a href="https://linux.die.net/man/2/mkdirat"><code>mkdirat(2)</code></a>, etc) to perform filesystem
+operations.</p>
+
+<p><img src="https://gvisor.dev/assets/images/2023-06-27-directfs.svg" alt="Figure 2" title="Directfs configuration" width="100%"/></p>
+
+<p>Earlier when the gofer performed all filesystem operations, we could deny all
+these syscalls in the sandbox process using seccomp. But with directfs enabled,
+the sandbox process’s seccomp filters need to allow the usage of these syscalls.
+Most notably, the sandbox can now make
+<a href="https://linux.die.net/man/2/openat"><code>openat(2)</code></a> syscalls (which allow path
+traversal), but with certain restrictions:
+<a href="https://github.com/google/gvisor/commit/114a033bd038519fa6e867c230dc4ad4e057e675"><code>O_NOFOLLOW</code> is required</a>,
+<a href="https://github.com/google/gvisor/commit/fcbc289a7ac14b8d84d0c0b23c4b2a14fc626e79">no access to procfs</a>
+and
+<a href="https://github.com/google/gvisor/commit/aa8abdfa9256cf057202ec8f4a81ba9f5d6a203f">no directory FDs from the host</a>.
+We also had to give the sandbox the same privileges as the gofer (for example
+<code>CAP_DAC_OVERRIDE</code> and <code>CAP_DAC_READ_SEARCH</code>), so it can perform the same
+filesystem operations.</p>
+
+<p>It is noteworthy that only the trusted gofer provides FDs (of the container
+filesystem) to the sandbox. The sandbox cannot walk backwards (using ‘..’) or
+follow a malicious symlink to escape out of the container filesystem. In effect,
+we’ve decreased our dependence on the syscall filters to catch bad behavior, but
+correspondingly increased our dependence on Linux’s filesystem isolation
+protections.</p>
+
+<h2 id="performance">Performance</h2>
+
+<p>Making RPCs to the gofer for every filesystem operation adds a lot of overhead
+to runsc. Hence, avoiding gofer round trips significantly improves performance.
+Let’s find out what this means for some of our benchmarks. We will run the
+benchmarks using our newly released
+<a href="https://gvisor.dev/blog/2023/04/28/systrap-release/">systrap platform</a> on bind
+mounts (as opposed to rootfs). This would simulate more realistic use cases
+because bind mounts are extensively used while configuring filesystems in
+containers. Bind mounts also do not have an overlay
+(<a href="https://opensource.googleblog.com/2023/04/gvisor-improves-performance-with-root-filesystem-overlay.html">like the rootfs mount</a>),
+so all operations go through goferfs / directfs mount.</p>
+
+<p>Let’s first look at our
+<a href="https://github.com/google/gvisor/blob/master/test/perf/linux/stat_benchmark.cc">stat micro-benchmark</a>,
+which repeatedly calls
+<a href="https://man7.org/linux/man-pages/man2/lstat.2.html"><code>stat(2)</code></a> on a file.</p>
+
+<p><img src="https://gvisor.dev/assets/images/2023-06-27-stat-benchmark.svg" alt="Figure 3" title="Stat micro benchmark" width="100%"/></p>
+
+<p>The <code>stat(2)</code> syscall is more than 2x faster! However, since this is not
+representative of real-world applications, we should not extrapolate these
+results. So let’s look at some
+<a href="https://github.com/google/gvisor/blob/master/test/benchmarks/fs">real-world benchmarks</a>.</p>
+
+<p><img src="https://gvisor.dev/assets/images/2023-06-27-real-world-benchmarks.svg" alt="Figure 4" title="Real world benchmarks" width="100%"/></p>
+
+<p>We see a 12% reduction in the absolute time to run these workloads and 17%
+reduction in Ruby load time!</p>
+
+<h2 id="conclusion">Conclusion</h2>
+
+<p>The gofer model in runsc was overly restrictive for accessing host files. We
+were able to leverage existing filesystem isolation mechanisms in Linux to
+bypass the gofer without compromising security. Directfs significantly improves
+performance for certain workloads. This is part of our ongoing efforts to
+improve gVisor performance. You can learn more about gVisor at
+<a href="http://www.gvisor.dev/">gvisor.dev</a>. You can also use gVisor in
+<a href="https://cloud.google.com/kubernetes-engine">GKE</a> with
+<a href="https://cloud.google.com/kubernetes-engine/docs/concepts/sandbox-pods">GKE Sandbox</a>.
+Happy sandboxing!</p>
+
+<hr/>
+
+
+
+</div></div>
+  </body>
+</html>
