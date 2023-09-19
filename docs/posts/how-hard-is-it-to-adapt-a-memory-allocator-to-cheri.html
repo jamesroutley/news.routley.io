@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://tratt.net/laurie/blog/2023/how_hard_is_it_to_adapt_a_memory_allocator_to_cheri.html">Original</a>
+    <h1>How hard is it to adapt a memory allocator to CHERI?</h1>
+    
+    <div id="readability-page-1" class="page"><div id="article-body"><p>
+
+
+
+CHERI is a set of things (adapted CPUs, adapted operating systems, adapted
+libraries) that, collectively, aim to stop software bugs becoming security
+flaws. If you&#39;d like to know more, I gave some of my thinking on CHERI in <a href="https://tratt.net/laurie/blog/2023/two_stories_for_what_is_cheri.html">Two Stories for
+&#34;What is CHERI?&#34;</a>.
+
+</p><p>In this post I&#39;m going to flesh out an observation I
+made in that post, which is that some software needs thoughtful adaption to CHERI if we want
+to get the security advantages we hope for. Exactly what that thoughtful adaption might
+look like will vary, probably substantially, between different pieces of software.
+What, for instance, might it look like for critical, widely used, components? In
+this post I&#39;m going to look at how
+memory allocators (henceforth &#34;allocators&#34;), one of software&#39;s most
+fundamental building blocks, can be adapted to CHERI. If
+you find this interesting, but want greater depth than I&#39;ll go into here, you
+might be interested in the paper
+<a href="https://soft-dev.org/pubs/html/bramley_jacob_lascu_singer_tratt__picking_a_cheri_allocator_security_and_performance_considerations/index.html">Picking
+a CHERI Allocator: Security and Performance Considerations</a> that this post
+is based upon.
+
+
+</p><h2>A Simple Allocator</h2><p>
+
+It is a truism that virtually every program needs to dynamically allocate
+memory. Our collective folklore tells us that allocators like <a href="http://gee.cs.oswego.edu/pub/misc/malloc.c">dlmalloc</a> or <a href="https://github.com/jemalloc/jemalloc">jemalloc</a> are impressive pieces
+of software that improve on their predecessors, but very few of us can really
+explain why. We call <code>malloc</code>, <code>realloc</code>, and
+<code>free</code> and magically chunks of memory are allocated, resized,
+or freed on our behalf.
+
+</p><p>As is often the case, one can get a useful insight into allocators by
+stripping away as much of the cleverness as possible. It turns out that we can
+write an allocator sufficient to run some real programs
+<a href="https://github.com/ltratt/cheri_malloc_blog/blob/master/malloc1.c">in just 25 lines of C</a>:
+
+</p><pre><span></span>#include &lt;stddef.h&gt;
+<span></span>#include &lt;stdlib.h&gt;
+<span></span>#include &lt;string.h&gt;
+<span></span>#include &lt;sys/mman.h&gt;
+<span></span>
+<span></span>static char *heap_start;
+<span></span>static char *heap;
+<span></span>static size_t HEAP_SIZE = 1024 * 1024 * 1024;
+<span></span>
+<span></span>void *malloc(size_t sz) {
+<span></span>  if (!heap) heap = heap_start = mmap(NULL, HEAP_SIZE,
+<span></span>    PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON,-1,0);
+<span></span>  sz = __builtin_align_up(sz, _Alignof(max_align_t));
+<span></span>  if (heap + sz &gt; heap_start + HEAP_SIZE) return NULL;
+<span></span>  heap += sz;
+<span></span>  return heap - sz;
+<span></span>}
+<span></span>
+<span></span>void free(void *ptr) { }
+<span></span>
+<span></span>void *realloc(void *ptr, size_t sz) {
+<span></span>  void *new_ptr = malloc(sz);
+<span></span>  if (ptr &amp;&amp; new_ptr) memmove(new_ptr, ptr, sz);
+<span></span>  return new_ptr;
+<span></span>}
+</pre><p>
+
+What we&#39;ve implemented is a &#34;bump allocator&#34;: every time we want to allocate
+or reallocate a block of memory, we &#34;bump&#34; (i.e. increment) the pointer stored
+in the variable <code>heap</code>.
+
+</p><p>The first time that we call <code>malloc</code>, no heap has been allocated, so
+we use the operating system primitive <code>mmap</code> to reserve 1GiB of RAM
+for our process (lines 8, 11, and 12). Because many systems become unhappy if we
+return unaligned memory (e.g. memory which starts on addresses ending in an odd
+number), we round the size requested up (on my machine to the next multiple of
+16) to avoid such unhappiness (line 13). We then check if there is enough space
+left in the heap for the allocation, returning <code>NULL</code> if there is
+not (line 14). If there is enough space in the heap we then return a pointer to
+the beginning of the block (line 16) and &#34;bump&#34; the heap pointer (line 15).
+
+</p><p>Unsurprisingly, I have cut a few corners to keep things simple (e.g.
+let&#39;s hope that <code>mmap</code> doesn&#39;t fail!). Most obviously,
+<code>free</code> doesn&#39;t &#34;return&#34; memory to the heap: this is semantically
+correct, though it will cause programs to run out of
+memory rather quickly! You may also find the definition of <code>realloc</code>
+surprising, because it copies however many bytes are now requested from the old
+to the new block. This works because our heap is contiguous so, if there&#39;s
+enough space for the new block, by definition we can copy at least that many
+bytes from the old block.
+
+</p><p>So, does this <em>really</em> work? Let&#39;s start with the classic <a href="https://benchmarksgame-team.pages.debian.net/benchmarksgame/program/binarytrees-gcc-5.html">binary
+trees</a> benchmark which does a lot of memory allocation. What we want to do
+is to compare a normal allocator against our bump allocator. There are various
+ways we could do this, but the simplest is to put our allocator in a shared
+object and use the &#34;<code>LD_PRELOAD</code> trick&#34; .
+Setting the <code>LD_PRELOAD</code> environment variable to point at our
+shared object allows us to override the system allocator on a per-execution basis.
+
+</p><p>In the following video you can see me (in order): run the benchmark on my
+normal desktop computer with OpenBSD&#39;s default system allocator; compile the
+bump allocator; and then use <code>LD_PRELOAD</code> to override the system
+allocator when I run the benchmark for a second time.
+
+<video controls="">
+<source src="/laurie/blog/extra/2023/how_hard_is_it_to_adapt_a_memory_allocator_to_cheri/malloc1.mp4" type="video/mp4"/>
+</video>
+
+Not only does it run, but it&#39;s three times faster than when run with the system allocator!
+Before you get too excited, let&#39;s remember that the bump allocator is,
+to put it mildly, less general than the system allocator — this is not, in
+general, a sensible performance comparison .
+Still, it does give us a good degree of confidence
+that we&#39;re really running the bump allocator in the second run of the
+benchmark.
+
+</p><p>As that suggests, it&#39;s notoriously easy to fool yourself into thinking
+you&#39;re testing your new allocator (&#34;wow, I write software without bugs!&#34;) when
+you&#39;re actually running the system allocator. We won&#39;t always be able to tell
+easily from <code>time</code> which allocator we&#39;re running so, to give us some assurance
+for later examples in this post – and also because it&#39;s fun – let&#39;s add
+<a href="https://github.com/ltratt/cheri_malloc_blog/blob/master/malloc2.c">this little chunk of code to our allocator</a>:
+
+</p><pre><span></span>__attribute__((destructor))
+<span></span>static void malloc_exit() {
+<span></span>  fprintf(stderr, &#34;heap used %lu\n&#34;, heap-heap_start);
+<span></span>}
+</pre><p>
+
+Now, when a program uses our bump allocator, it will print out how many bytes
+of heap were used during execution just before the program exits. Have you
+ever wanted to know how many bytes <code>grep</code> or <code>vi</code>
+allocate during execution? Now&#39;s your chance to find out:
+
+</p><video controls="">
+<source src="/laurie/blog/extra/2023/how_hard_is_it_to_adapt_a_memory_allocator_to_cheri/malloc2.mp4" type="video/mp4"/>
+</video><p>
+
+I had to be a little careful in the choice of programs I run above, because
+Unix has, over time, slowly added more functions to the allocator API (most
+of which are rarely used). Fortunately, we can handle most of those (again
+with minor corner cutting) <a href="https://github.com/ltratt/cheri_malloc_blog/blob/master/malloc3.c">fairly easily</a>.
+It&#39;s quite good fun to see which software runs with this extended allocator
+— assuming you&#39;ve got enough RAM!
+
+
+</p><h2>The Bump Allocator and CHERI purecap</h2><p>
+
+What does it mean to run an allocator under CHERI? Let&#39;s start by assuming
+we&#39;re using &#34;pure capability&#34; (henceforth &#34;purecap&#34;) CHERI. For our purposes,
+that means that 64-bit &#34;pointers&#34; become 128-bit <em>capabilities</em>, where the
+additional 64-bits contain various <em>permissions</em>. The main permissions
+we&#39;re interested in are <em>bounds</em>, which record the range
+of memory that a capability – and, vitally, those capabilities derived
+from it – are allowed to read/write from. When we compile a C program
+for CHERI we&#39;re actually compiling a &#34;CHERI C&#34; program. For our purposes, the
+semantics of CHERI C can be thought of as mostly the same as normal C&#39;s semantics,
+though &#34;pointer types&#34; are now &#34;capability types&#34; (and hence double the width
+they are in normal C).
+
+</p><p>Perhaps surprisingly, our bump allocator not only compiles out of the box on purecap
+CHERI, but both binary trees and vi run successfully. That sounds good —
+until we start digging a bit. In order for CHERI to do something useful,
+capabilities need to have &#34;non global&#34; permissions. What bounds does the capability
+returned by our bump allocator&#39;s <code>malloc</code> have? The easiest
+way to see this is to allocate some memory and then use the CHERI API
+to print out the capability&#39;s lower bound, and the length of the bounds.
+Let&#39;s allocate two blocks of memory and see what the result is:
+
+</p><pre><span></span>#include &lt;cheriintrin.h&gt;
+<span></span>#include &lt;stdio.h&gt;
+<span></span>#include &lt;stdlib.h&gt;
+<span></span>
+<span></span>int main() {
+<span></span>  void *c1 = malloc(4);
+<span></span>  void *c2 = malloc(4);
+<span></span>  printf(&#34;c1 address 0x%lx lower 0x%lx length 0x%lx\n&#34;,
+<span></span>    cheri_address_get(c1), cheri_base_get(c1),
+<span></span>    cheri_length_get(c1));
+<span></span>  printf(&#34;c2 address 0x%lx lower 0x%lx length 0x%lx\n&#34;,
+<span></span>    cheri_address_get(c2), cheri_base_get(c2),
+<span></span>    cheri_length_get(c2));
+<span></span>}
+</pre><p>
+
+For each of the two capabilities returned by <code>malloc</code> this will
+print: the capability&#39;s address (equivalent to the address a &#34;pointer&#34; normally
+stores); the lower bound of memory the capability can address; and the length
+of memory (relative to the lower bound) that the capability can read/write from.
+I can derive other (valid!) capabilities from these that have different
+addresses, provided that those addresses stay within the bounds.
+
+</p><p>So that you can play along at home, I&#39;m going to run an emulator of Arm&#39;s
+Morello, built with <a href="https://github.com/CTSRD-CHERI/cheribuild">cheribuild</a>:
+you can build your own with <code>./cheribuild.py run-morello-purecap -d</code>. I&#39;ll
+warn you now that the emulator isn&#39;t fast, but it is more than usable for our purposes.
+If I run the code snippet above with, first, the default allocator and, second,
+our bump allocator I see the following:
+
+<video controls="">
+<source src="/laurie/blog/extra/2023/how_hard_is_it_to_adapt_a_memory_allocator_to_cheri/bounds1.mp4" type="video/mp4"/>
+</video>
+
+To make things a bit easier to follow, here&#39;s the critical part of
+the video as text:
+
+</p><pre>root@cheribsd-morello-purecap:~/cheri_malloc_blog # ./print_bounds
+c1 address 0x40c0e010 lower 0x40c0e010 length 0x4
+c2 address 0x40c0e018 lower 0x40c0e018 length 0x4
+root@cheribsd-morello-purecap:~/cheri_malloc_blog # LD_PRELOAD=$(pwd)/malloc2.so ./print_bounds
+c1 address 0x41400000 lower 0x41400000 length 0x40000000
+c2 address 0x41400010 lower 0x41400000 length 0x40000000
+heap used 4128
+</pre>
+<p>Both allocators return sensible looking addresses, but the bounds are very
+different: the default allocator returns capabilities whose bounds are restricted
+to the 4 bytes requested; but our bump allocator returns
+capabilities that can read/write from 1GiB of memory!
+
+</p><p>More formally, with the default allocator, neither <code>c1</code> or
+<code>c2</code> can be derived from the other, but with the bump allocator
+either capability can be derived from the other. While this isn&#39;t exactly
+wrong, it means that we haven&#39;t gained much from CHERI: code with access to one of those two
+capabilities can read/write from the same memory as the other capability.
+Indeed, it turns out that <em>every</em> block of memory our bump allocator
+returns will share the same bounds!
+
+</p><p>The clue to where those bounds comes from is that they span 1GiB of memory
+— exactly the same quantity of memory our bump allocator requested from
+<code>mmap</code>. As that suggests, <code>mmap</code> in CheriBSD returns a capability
+whose bounds are at least as big as the quantity of memory that you requested,
+and our bump allocator has simply copied those bounds over unchanged to the
+caller of <code>malloc</code>.
+
+
+</p><h2>What Should an Allocator do on CHERI purecap?</h2><p>
+
+Our bump allocator works without changes on CHERI purecap, but gives little
+meaningful
+security improvement relative to a non-CHERI system. We thus need to pause
+for a brief philosophical interlude: what <em>should</em> an allocator do on
+CHERI purecap?
+
+</p><p>Naively we might
+think we want &#34;maximum security&#34; but, even if we could define what that means,
+we probably couldn&#39;t achieve it. Like most things in life, software nearly
+always requires trade-offs: if we want more of one thing (e.g. security) we&#39;ll
+have to accept less of another (e.g. performance or ease of use). Although
+I&#39;m not going to dwell on it in this post, there is unlikely to be a &#34;one true secure
+allocator&#34; that works well in all cases.
+
+</p><p>Let&#39;s start with what security folk call &#34;threat models&#34;.
+In our case, let&#39;s assume that our threat model is that external attackers
+might be able to take over one part of our program and then &#34;upgrade&#34; the
+attack to read all the program&#39;s heap data. Given this threat model, we can then
+think about techniques and technologies that might help mitigate the threat.
+
+</p><p>In our case, we have a promising
+technology (CHERI purecap) and we may then decide that having the program store
+capabilities with the most restrictive bounds possible is the right way to
+mitigate the &#34;upgrade&#34; attack. That
+implies that allocators should return capabilities
+with bounds restricted to just the memory allocated. Doing so will clearly
+make an attacker&#39;s life harder, even though it might not make it impossible
+.
+
+
+</p><h2>Adjusting the Bump Allocator</h2><p>
+
+Let&#39;s adapt the bump allocator&#39;s <code>malloc</code> so that it returns
+capabilities whose bounds only allow access to the requested range of memory:
+
+</p><pre><span></span>#include &#34;cheriintrin.h&#34;
+<span></span>
+<span></span>void *malloc(size_t sz) {
+<span></span>  if (!heap) heap = heap_start = mmap(NULL, HEAP_SIZE,
+<span></span>    PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON,-1,0);
+<span></span>
+<span></span>  char *new_ptr = __builtin_align_up(
+<span></span>    heap, -cheri_representable_alignment_mask(sz));
+<span></span>  size_t bounds = cheri_representable_length(sz);
+<span></span>  sz = __builtin_align_up(sz, _Alignof(max_align_t));
+<span></span>
+<span></span>  if (new_ptr + sz &gt; heap_start + HEAP_SIZE)
+<span></span>    return NULL;
+<span></span>  heap = new_ptr + sz;
+<span></span>  return cheri_bounds_set_exact(new_ptr, bounds);
+<span></span>}
+</pre><p>
+
+The main changes we&#39;ve made are lines 7-10 and 15 where we perform an
+odd-looking dance with CHERI&#39;s APIs to create a pointer with the appropriate
+bounds. In essence, because CHERI permissions
+<a href="https://www.cl.cam.ac.uk/research/security/ctsrd/pdfs/2019tc-cheri-concentrate.pdf">don&#39;t have enough spare bits to
+represent all possible lower bounds</a>, we might have to align the heap pointer to
+an arbitrary amount (lines 7-8), and we may also align the requested length
+upwards for similar reasons (line 9). We then make sure we always align
+future pointers to <code>max_align_t</code> as in the normal
+<code>malloc</code> (line 10). Finally we return a capability with the heap
+pointer we want, with the bounds set to those we&#39;ve calculated (line 15).
+
+</p><p>If I compile
+<a href="https://github.com/ltratt/cheri_malloc_blog/blob/master/malloc4.c">our CHERI-fied <code>malloc</code></a>
+and run our little bounds printing program again, I can see that I really am
+getting capabilities whose bounds mean that they cannot be derived from each
+other:
+
+</p><pre>$ LD_PRELOAD=$(pwd)/malloc4.so ./print_bounds
+c1 address 0x41400000 lower 0x41400000 length 0x4
+c2 address 0x41400010 lower 0x41400010 length 0x4
+heap used 4128
+</pre><p>
+
+That all looks good! But if I write this
+<a href="https://github.com/ltratt/cheri_malloc_blog/blob/master/realloc.c">this little program</a>:
+
+</p><pre><span></span>#include &lt;cheriintrin.h&gt;
+<span></span>#include &lt;stdlib.h&gt;
+<span></span>
+<span></span>int main() {
+<span></span>  void *c1 = malloc(4);
+<span></span>  c1 = realloc(c1, 8);
+<span></span>  return 0;
+<span></span>}
+</pre><p>
+
+and run it, the program is terminated with a <code>SIGPROT</code> (the CHERI
+equivalent of a <code>SEGFAULT</code>):
+
+</p><pre>$ LD_PRELOAD=$(pwd)/malloc4.so ./print_bounds
+In-address space security exception (core dumped)
+</pre><p>
+
+How can such a simple program cause a problem? The problem is in our original
+<code>realloc</code>. Earlier I wrote:
+
+</p><blockquote>
+You may also find the definition of <code>realloc</code>
+surprising, because it copies however many bytes are now requested from the old
+to the new block. This works because our heap is contiguous so, if there&#39;s
+enough space for the new block, by definition we can copy at least that many
+bytes from the old block.
+</blockquote><p>
+
+My corner cutting has come back to bite us! The problem is that when we pass to
+<code>realloc</code> a capability whose bounds allow access to 4 bytes and then
+we try and copy 8 bytes from it, CHERI – quite rightly! – considers
+this a violation of its rules and stops the program.
+
+</p><p>The fix for this is obvious: we have to know how big the block of memory we
+want to reallocate currently is. However, our simple bump allocator doesn&#39;t
+store that length. Adjusting it to do so wouldn&#39;t be rocket science, but it would be
+annoying . Fortunately, since the
+input capability records the length of its bounds, we can use that information to
+<a href="https://github.com/ltratt/cheri_malloc_blog/blob/master/malloc5.c">make sure
+that we don&#39;t copy more from the input capability than we should</a>:
+
+</p><pre><span></span>void *realloc(void *ptr, size_t sz) {
+<span></span>  void *new_ptr = malloc(sz);
+<span></span>  if (ptr &amp;&amp; new_ptr) memmove(new_ptr, ptr,
+<span></span>    cheri_length_get(ptr) &lt; sz
+<span></span>    ? cheri_length_get(ptr) : sz);
+<span></span>  return new_ptr;
+<span></span>}
+</pre><p>
+
+Note that we only copy the minimum of the input capability&#39;s length or the
+requested size (lines 4 and 5). With this modification, our allocator now works
+as expected:
+
+</p><pre>$ LD_PRELOAD=$(pwd)/malloc4.so ./print_bounds
+heap used 32
+</pre>
+<h2>What Have We Actually Done?</h2><p>
+
+Amongst all the detail, it&#39;s easy to miss that our manual adaptions of the bump
+allocator to CHERI have meaningfully improved its security. If an attacker gets
+access to one capability returned by <code>malloc</code>, they have no way
+of turning it into any other capability returned by <code>malloc</code>. In
+other words, we have given the user a new tool for &#34;compartmentalising&#34; their
+heap allocated memory. Consider this simple program:
+
+</p><pre><span></span>#include &lt;cheriintrin.h&gt;
+<span></span>#include &lt;stdio.h&gt;
+<span></span>#include &lt;stdlib.h&gt;
+<span></span>
+<span></span>int main() {
+<span></span>  void *c1 = malloc(4);
+<span></span>  void *c2 = malloc(4);
+<span></span>  printf(&#34;c1 address 0x%lx lower 0x%lx length 0x%lx\n&#34;,
+<span></span>    cheri_address_get(c1), cheri_base_get(c1),
+<span></span>    cheri_length_get(c1));
+<span></span>  printf(&#34;c2 address 0x%lx lower 0x%lx length 0x%lx\n&#34;,
+<span></span>    cheri_address_get(c2), cheri_base_get(c2),
+<span></span>    cheri_length_get(c2));
+<span></span>  c1[0] = &#39;a&#39;;
+<span></span>  printf(&#34;c1[0] %c\n&#34;, c1[0]);
+<span></span>  printf(&#34;(c2 - 0x10)[0] %c\n&#34;, (c2 - 0x10)[0]);
+<span></span>}
+</pre><p>
+
+Because we – as might a cunning attacker – know that the bump
+allocator places consecutively allocated blocks at predictable locations, we
+can try rederiving <code>c1</code> from <code>c2</code> (line 16).
+<a href="https://github.com/ltratt/cheri_malloc_blog/blob/master/realloc.c">This code</a>
+executes successfully (i.e. insecurely!) with our original bump allocator on
+CHERI purecap, but is terminated with a <code>SIGPROT</code> with our adapted bump
+allocator.
+
+</p><video controls="">
+<source src="/laurie/blog/extra/2023/how_hard_is_it_to_adapt_a_memory_allocator_to_cheri/exceed_bounds.mp4" type="video/mp4"/>
+</video>
+<p>This is not to say that our adjusted allocator magically makes programs
+impervious to attackers. Most obviously, the user still has to think
+carefully about which parts of the system should have access to which capabilities
+returned by the allocator: handing out capabilities without sufficient thought
+tends to undermine the
+security properties the user was hoping for. Less obviously, even our adjusted
+allocator can be tricked into doing things we might not expect. For example, I
+can take a capability returned by the allocator, narrow its bounds or downgrade its permissions,
+and hand it off to a less trusted part of my system. An attacker can then use
+<code>realloc</code> to obtain a more powerful capability than they started
+with.
+
+</p><p>This isn&#39;t merely a theoretical concern. In
+<a href="https://soft-dev.org/pubs/html/bramley_jacob_lascu_singer_tratt__picking_a_cheri_allocator_security_and_performance_considerations/index.html">Picking
+a CHERI Allocator</a> we introduced 5 simple &#34;attacks&#34; which, in essence,
+model situations where an attacker has gained initial access to a system
+and is trying to widen the scope of the attack. We then tried these attacks on a number
+of different allocators that have been ported to CHERI purecap. Only one allocator was invulnerable
+to these simple attacks — and the default CheriBSD allocator, a jemalloc fork,
+was vulnerable to 3 of them! We didn&#39;t even try <em>that</em> hard to find
+such attacks — it seems likely to me that more attacks on CHERI purecap
+allocators could be found if someone has the time to investigate further.
+
+
+</p><h2>Summary</h2>
+<p>If nothing else, I hope this post has made allocators seem a little less
+magical to you. On top of that, I hope that you believe that while CHERI
+(purecap or hybrid) can help you improve a program&#39;s security, it isn&#39;t magic:
+just because something runs correctly on CHERI doesn&#39;t necessarily mean it&#39;s
+any more secure than running it on a traditional system.
+
+</p><p>The adjustments we made to the bump allocator to take advantage of what
+CHERI has to offer are not huge, but they aren&#39;t merely mechanical either. As
+that suggests, to take full advantage of CHERI you have to think not just about
+the code itself, but how that code is expected to be used.
+
+</p><p><b>Acknowledgements</b>: my co-authors on
+<a href="https://soft-dev.org/pubs/html/bramley_jacob_lascu_singer_tratt__picking_a_cheri_allocator_security_and_performance_considerations/index.html">Picking a CHERI Allocator</a>
+(Jacob Bramley,
+<a href="https://www.dcs.gla.ac.uk/~jacobd/">Dejice Jacob</a>,
+<a href="https://andreil.eu/">Andrei Lascu</a>,
+and
+<a href="https://www.dcs.gla.ac.uk/~jsinger/">Jeremy Singer</a>)
+did all the hard work and generously offered comments
+on this post. In focussing on one aspect
+of that paper for this post, I&#39;ve probably introduced various mistakes,
+for which I am solely responsible!
+
+</p>
+
+
+
+<h3>Footnotes</h3>
+<p><a name="57753376"><span>[1]</span><code>LD_PRELOAD</code> isn&#39;t a trick but using it is trickier than people
+often realise. First, you <em>must</em> give it an absolute path to a shared
+object. Second, it&#39;s astonishingly easy to create an input shared object that
+doesn&#39;t contain all of the functions you need, or expected, to override.</a></p></div></div>
+  </body>
+</html>
