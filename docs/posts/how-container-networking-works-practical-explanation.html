@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://iximiuz.com/en/posts/container-networking-is-simple/">Original</a>
+    <h1>How Container Networking Works: Practical Explanation</h1>
+    
+    <div id="readability-page-1" class="page"><div><p><a name="cut"></a>
+<i><b>Just kidding, it&#39;s not... But fear not and read on!</b></i></p>
+<p><i>You can find a Russian translation of this article <a href="https://habr.com/ru/companies/timeweb/articles/558612/">here</a></i>.</p>
+<p>Working with containers always feels like magic. In a good way for those who understand the internals and in a terrifying - for those who don&#39;t. Luckily, we&#39;ve been looking under the hood of the containerization technology for quite some time already and even managed to uncover that <a href="https://iximiuz.com/en/posts/not-every-container-has-an-operating-system-inside/#container-is-just-a-processes">containers are just isolated and restricted Linux processes</a>, that <a href="https://iximiuz.com/en/posts/you-dont-need-an-image-to-run-a-container/">images aren&#39;t really needed to run containers</a>, and on the contrary - <a href="https://iximiuz.com/en/posts/you-need-containers-to-build-an-image/">to build an image we need to run some containers</a>.</p>
+<p>Now comes a time to tackle the container networking problem. Or, more precisely, a single-host container networking problem. In this article, we are going to answer the following questions:</p>
+<ul>
+<li>How to virtualize network resources to make containers think each of them has a dedicated network stack?</li>
+<li>How to turn containers into friendly neighbors, prevent them from interfering, and teach to communicate well?</li>
+<li>How to reach the outside world (e.g. the Internet) from inside the container?</li>
+<li>How to reach containers running on a machine from the outside world (<em>aka</em> port publishing)?</li>
+</ul>
+<p>While answering these questions, we&#39;ll setup a container networking from scratch using standard Linux tools. As a result, it&#39;ll become apparent that the single-host container networking is nothing more than a simple combination of the well-known Linux facilities:</p>
+<ul>
+<li>network namespaces;</li>
+<li>virtual Ethernet devices (veth);</li>
+<li>virtual network switches (bridge);</li>
+<li>IP routing and network address translation (NAT).</li>
+</ul>
+<p>And for better or worse, no code is required to make the networking magic happen...
+<a name="eofcut"></a></p>
+<h2 id="prerequisites">Prerequisites</h2>
+<p>All examples in the article were prepared on a <em>vagrant</em> CentOS 8 virtual machine, but any more or less fresh Linux distribution would likely do. I strongly suggest using an isolated test environment, though - <strong>applying the below commands on the main system may be harmful</strong>.</p>
+
+
+<p>For the sake of simplicity of the examples, in this article, we are not going to rely on any fully-fledged containerization solution (e.g. <em>docker</em> or <em>podman</em>). Instead, we&#39;ll focus on the basic concepts and use the bare minimum tooling to achieve our learning goals.</p>
+<h2 id="isolating-containers-with-network-namespaces"><a name="netns"></a>Isolating containers with network namespaces</h2>
+<p>What constitutes a Linux network stack? Well, obviously, the set of network devices. What else? Probably, the set of routing rules. And not to forget, the set of netfilter hooks, including defined by iptables rules.</p>
+<p>We can quickly forge a non-comprehensive <code>inspect-net-stack.sh</code> script:</p>
+<pre><code>#!/usr/bin/env bash
+
+echo &#34;&gt; Network devices&#34;
+ip link
+
+echo -e &#34;\n&gt; Route table&#34;
+ip route
+
+echo -e &#34;\n&gt; Iptables rules&#34;
+iptables --list-rules
+</code></pre>
+<p>Before running it, let&#39;s taint the iptables rules a bit to make them recognizable:</p>
+<pre><code>$ sudo iptables -N ROOT_NS
+</code></pre>
+<p>After that, execution of the inspect script on my machine produces the following output:</p>
+<pre><code>$ sudo ./inspect-net-stack.sh
+&gt; Network devices
+1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: eth0: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+    link/ether 52:54:00:e3:27:77 brd ff:ff:ff:ff:ff:ff
+
+&gt; Route table
+default via 10.0.2.2 dev eth0 proto dhcp metric 100
+10.0.2.0/24 dev eth0 proto kernel scope link src 10.0.2.15 metric 100
+
+&gt; Iptables rules
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+-N ROOT_NS
+</code></pre>
+<p>We are interested in that output because we want to make sure that each of the containers we are going to create soon will get a separate network stack.</p>
+<p>Well, you might have heard already, that one of the Linux namespaces used for containers isolation is called <em>network namespace</em>. From <a href="https://man7.org/linux/man-pages/man8/ip-netns.8.html"><code>man ip-netns</code></a>, <em>&#34;network namespace is logically another copy of the network stack, with its own routes, firewall rules, and network devices.&#34;</em> For the sake of simplicity, this is the only namespace we&#39;re going to use in this article. Instead of creating fully-isolated containers, we&#39;d rather restrict the scope to only the network stack.</p>
+<p>One of the ways to create a network namespace is the <code>ip</code> tool - part of the de facto standard <a href="https://en.wikipedia.org/wiki/Iproute2">iproute2</a> collection:</p>
+<pre><code>$ sudo ip netns add netns0
+$ ip netns
+netns0
+</code></pre>
+<p>How to start using the just created namespace? There is a lovely Linux command called <code>nsenter</code>. It enters one or more of the specified namespaces and then executes the given program:</p>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns0 bash
+# The newly created bash process lives in netns0
+
+$ sudo ./inspect-net-stack.sh
+&gt; Network devices
+1: lo: &lt;LOOPBACK&gt; mtu 65536 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+
+&gt; Route table
+
+&gt; Iptables rules
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+</code></pre>
+<p>From the output above it&#39;s clear that the <em>bash</em> process running inside <code>netns0</code> namespace sees a totally different network stack. There is no routing rules at all, no custom iptables chain, and only one loopback network device. So far, so good...</p>
+<div>
+    <p><img src="https://iximiuz.com/container-networking-is-simple/network-namespace-4000-opt.png" alt="Linux network namespace visualized"/></p><p><i>Network namespace visualized.</i></p>
+</div>
+
+<p><i><strong>Beware:</strong> The <code>nsenter</code> command from above started a nested <code>bash</code> session in the <code>netns0</code> network namespace. Don&#39;t forget to <code>exit</code> from it, or use a fresh terminal to continue.</i></p>
+<h2 id="connecting-containers-to-host-with-virtual-ethernet-devices-veth"><a name="veth"></a>Connecting containers to host with virtual Ethernet devices (veth)</h2>
+<p>A dedicated network stack would be not so useful if we could not communicate with it. Luckily, Linux provides a suitable facility for that - a virtual Ethernet device! From <a href="https://man7.org/linux/man-pages/man4/veth.4.html"><code>man veth</code></a>, <em>&#34;veth devices are virtual Ethernet devices. They can act as tunnels between network namespaces to create a bridge to a physical network device in another namespace, but can also be used as standalone network devices.&#34;</em></p>
+<p>Virtual Ethernet devices always go in pairs. No worries, it&#39;ll be clear when we take a look at the creation command:</p>
+<pre><code>$ sudo ip link add veth0 type veth peer name ceth0
+</code></pre>
+<p>With this single command, we just created a pair of <em>interconnected</em> virtual Ethernet devices. The names <code>veth0</code> and <code>ceth0</code> have been chosen arbitrarily:</p>
+<pre><code>$ ip link
+1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: eth0: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+    link/ether 52:54:00:e3:27:77 brd ff:ff:ff:ff:ff:ff
+5: ceth0@veth0: &lt;BROADCAST,MULTICAST,M-DOWN&gt; mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether 66:2d:24:e3:49:3f brd ff:ff:ff:ff:ff:ff
+6: veth0@ceth0: &lt;BROADCAST,MULTICAST,M-DOWN&gt; mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether 96:e8:de:1d:22:e0 brd ff:ff:ff:ff:ff:ff
+</code></pre>
+<p>Both <code>veth0</code> and <code>ceth0</code> after creation resides on the host&#39;s network stack (also called root network namespace). To connect the root namespace with the <code>netns0</code> namespace, we need to keep one of the devices in the root namespace and move another one into the <code>netns0</code>:</p>
+<pre><code>$ sudo ip link set ceth0 netns netns0
+
+# List all the devices to make sure one of them disappeared from the root stack
+$ ip link
+1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: eth0: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000
+    link/ether 52:54:00:e3:27:77 brd ff:ff:ff:ff:ff:ff
+6: veth0@if5: &lt;BROADCAST,MULTICAST&gt; mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether 96:e8:de:1d:22:e0 brd ff:ff:ff:ff:ff:ff link-netns netns0
+</code></pre>
+<p>Once we turn the devices on and assign proper IP addresses, any packet occurring on one of the devices will immediately pop up on its peer device connecting two namespaces. Let&#39;s start from the root namespace:</p>
+<pre><code>$ sudo ip link set veth0 up
+$ sudo ip addr add 172.18.0.11/16 dev veth0
+</code></pre>
+<p>And continue with the <code>netns0</code>:</p>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns0
+$ ip link set lo up  # whoops
+$ ip link set ceth0 up
+$ ip addr add 172.18.0.10/16 dev ceth0
+$ ip link
+1: lo: &lt;LOOPBACK,UP,LOWER_UP&gt; mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+5: ceth0@if6: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc noqueue state UP mode DEFAULT group default qlen 1000
+    link/ether 66:2d:24:e3:49:3f brd ff:ff:ff:ff:ff:ff link-netnsid 0
+</code></pre>
+<div>
+    <p><img src="https://iximiuz.com/container-networking-is-simple/veth-4000-opt.png" alt="Connecting network namespaces via veth device"/></p><p><i>Connecting network namespaces via veth device.</i></p>
+</div>
+
+<p>We are ready to check the connectivity:</p>
+<pre><code># From `netns0`, ping root&#39;s veth0
+$ ping -c 2 172.18.0.11
+PING 172.18.0.11 (172.18.0.11) 56(84) bytes of data.
+64 bytes from 172.18.0.11: icmp_seq=1 ttl=64 time=0.038 ms
+64 bytes from 172.18.0.11: icmp_seq=2 ttl=64 time=0.040 ms
+
+--- 172.18.0.11 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 58ms
+rtt min/avg/max/mdev = 0.038/0.039/0.040/0.001 ms
+
+# Leave `netns0`
+$ exit
+
+# From root namespace, ping ceth0
+$ ping -c 2 172.18.0.10
+PING 172.18.0.10 (172.18.0.10) 56(84) bytes of data.
+64 bytes from 172.18.0.10: icmp_seq=1 ttl=64 time=0.073 ms
+64 bytes from 172.18.0.10: icmp_seq=2 ttl=64 time=0.046 ms
+
+--- 172.18.0.10 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 3ms
+rtt min/avg/max/mdev = 0.046/0.059/0.073/0.015 ms
+</code></pre>
+<p>At the same time, if we try to reach any other addresses from the <code>netns0</code> namespace, we are not going to succeed:</p>
+<pre><code># Inside root namespace
+$ ip addr show dev eth0
+2: eth0: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 qdisc fq_codel state UP group default qlen 1000
+    link/ether 52:54:00:e3:27:77 brd ff:ff:ff:ff:ff:ff
+    inet 10.0.2.15/24 brd 10.0.2.255 scope global dynamic noprefixroute eth0
+       valid_lft 84057sec preferred_lft 84057sec
+    inet6 fe80::5054:ff:fee3:2777/64 scope link
+       valid_lft forever preferred_lft forever
+
+# Remember this 10.0.2.15
+
+$ sudo nsenter --net=/var/run/netns/netns0
+
+# Try host&#39;s eth0
+$ ping 10.0.2.15
+connect: Network is unreachable
+
+# Try something from the Internet
+$ ping 8.8.8.8
+connect: Network is unreachable
+</code></pre>
+<p>That&#39;s easy to explain, though. There is simply no route in the <code>netns0</code> routing table for such packets. The only entry there shows how to reach <code>172.18.0.0/16</code> network:</p>
+<pre><code># From `netns0` namespace:
+$ ip route
+172.18.0.0/16 dev ceth0 proto kernel scope link src 172.18.0.10
+</code></pre>
+<p>Linux has a bunch of ways to populate the routing table. One of them is to extract routes from the directly attached network interfaces. Remember, the routing table in <code>netns0</code> was empty right after the namespace creation. But then we added the <code>ceth0</code> device there and assigned it an IP address <code>172.18.0.10/16</code>. Since we were using not a simple IP address, but a combination of the address and the netmask, the network stack managed to extract the routing information from it. Every packet destined to <code>172.18.0.0/16</code> network will be sent through <code>ceth0</code> device. But any other packets will be discarded. Similarly, there is a new route in the root namespace:</p>
+<pre><code># From `root` namespace:
+$ ip route
+# ... omitted lines ...
+172.18.0.0/16 dev veth0 proto kernel scope link src 172.18.0.11
+</code></pre>
+<p>At this point, we are ready to mark our very first question answered. <strong>We know now how to isolate, virtualize, and connect Linux network stacks.</strong></p>
+<h2 id="interconnecting-containers-with-virtual-network-switch-bridge"><a name="bridge"></a>Interconnecting containers with virtual network switch (bridge)</h2>
+<p>The whole idea of containerization boils down to efficient resource sharing. I.e. it&#39;s uncommon to have a single container per machine. Instead, the goal is to run as many isolated processes in the shared environment as possible. So, what&#39;d happen if we were to place multiple containers on the same host following the <code>veth</code> approach from above? Let&#39;s add the second <em>container</em>:</p>
+<pre><code># From root namespace
+$ sudo ip netns add netns1
+$ sudo ip link add veth1 type veth peer name ceth1
+$ sudo ip link set ceth1 netns netns1
+$ sudo ip link set veth1 up
+$ sudo ip addr add 172.18.0.21/16 dev veth1
+
+$ sudo nsenter --net=/var/run/netns/netns1
+$ ip link set lo up
+$ ip link set ceth1 up
+$ ip addr add 172.18.0.20/16 dev ceth1
+</code></pre>
+<p>My favourite part, checking the connectivity:</p>
+<pre><code># From `netns1` we cannot reach the root namespace!
+$ ping -c 2 172.18.0.21
+PING 172.18.0.21 (172.18.0.21) 56(84) bytes of data.
+From 172.18.0.20 icmp_seq=1 Destination Host Unreachable
+From 172.18.0.20 icmp_seq=2 Destination Host Unreachable
+
+--- 172.18.0.21 ping statistics ---
+2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 55ms
+pipe 2
+
+# But there is a route!
+$ ip route
+172.18.0.0/16 dev ceth1 proto kernel scope link src 172.18.0.20
+
+# Leaving `netns1`
+$ exit
+
+# From root namespace we cannot reach the `netns1`
+$ ping -c 2 172.18.0.20
+PING 172.18.0.20 (172.18.0.20) 56(84) bytes of data.
+From 172.18.0.11 icmp_seq=1 Destination Host Unreachable
+From 172.18.0.11 icmp_seq=2 Destination Host Unreachable
+
+--- 172.18.0.20 ping statistics ---
+2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 23ms
+pipe 2
+
+# From `netns0` we CAN reach `veth1`
+$ sudo nsenter --net=/var/run/netns/netns0
+$ ping -c 2 172.18.0.21
+PING 172.18.0.21 (172.18.0.21) 56(84) bytes of data.
+64 bytes from 172.18.0.21: icmp_seq=1 ttl=64 time=0.037 ms
+64 bytes from 172.18.0.21: icmp_seq=2 ttl=64 time=0.046 ms
+
+--- 172.18.0.21 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 33ms
+rtt min/avg/max/mdev = 0.037/0.041/0.046/0.007 ms
+
+# But we still cannot reach `netns1`
+$ ping -c 2 172.18.0.20
+PING 172.18.0.20 (172.18.0.20) 56(84) bytes of data.
+From 172.18.0.10 icmp_seq=1 Destination Host Unreachable
+From 172.18.0.10 icmp_seq=2 Destination Host Unreachable
+
+--- 172.18.0.20 ping statistics ---
+2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 63ms
+pipe 2
+</code></pre>
+<p>Whoops! Something is wrong... <code>netns1</code> is stuck in limbo. For some reason, it cannot talk to the root and from the root namespace we cannot reach it out too. However, since both containers reside in the same IP network <code>172.18.0.0/16</code>, we now can talk to the host&#39;s <code>veth1</code> from the <code>netns0</code> container. Interesting...</p>
+<p>Well, it took me some time to figure it out, but apparently we are facing the clash of routes. Let&#39;s inspect the routing table in the root namespace:</p>
+<pre><code>$ ip route
+# ... omitted lines ...
+172.18.0.0/16 dev veth0 proto kernel scope link src 172.18.0.11
+172.18.0.0/16 dev veth1 proto kernel scope link src 172.18.0.21
+</code></pre>
+<p>Even though after adding the second <code>veth</code> pair, root&#39;s network stack learned the new route <code>172.18.0.0/16 dev veth1 proto kernel scope link src 172.18.0.21</code>, there already was an existing route for exactly the same network. When the second container tries to ping <code>veth1</code> device, the first route is being selected breaking the connectivity. If we were to delete the first route <code>sudo ip route delete 172.18.0.0/16 dev veth0 proto kernel scope link src 172.18.0.11</code> and recheck the connectivity, the situation would turn into a mirrored case. I.e. the connectivity of the <code>netns1</code> would be restored, but <code>netns0</code> would be in limbo.</p>
+<p><img src="https://iximiuz.com/container-networking-is-simple/route-clash-4000-opt.png" alt="Connecting multiple network namespaces with a bridge"/>
+</p>
+
+<p>Well, I believe if we selected another IP network for <code>netns1</code>, everything would work. However, multiple containers sitting in one IP network is a legitimate use case. Thus, we need to adjust the <code>veth</code> approach somehow...</p>
+<p>Behold the Linux bridge - yet another virtualized network facility! <a href="https://iximiuz.com/en/posts/bridge-vs-switch/">The Linux bridge behaves like a network switch.</a> It forwards packets between interfaces that are connected to it. And since it&#39;s a switch, it does it on the L2 (i.e. Ethernet) level.</p>
+<p>Let&#39;s try to play with our new toy. But first, we need to clean up the existing setup because some of the configurational changes we&#39;ve made so far aren&#39;t really needed anymore. Removing network namespaces would suffice:</p>
+<pre><code>$ sudo ip netns delete netns0
+$ sudo ip netns delete netns1
+
+# But if you still have some leftovers...
+$ sudo ip link delete veth0
+$ sudo ip link delete ceth0
+$ sudo ip link delete veth1
+$ sudo ip link delete ceth1
+</code></pre>
+<p>Quickly re-create two containers. Notice, we don&#39;t assign any IP address to the new <code>veth0</code> and <code>veth1</code> devices:</p>
+<pre><code>$ sudo ip netns add netns0
+$ sudo ip link add veth0 type veth peer name ceth0
+$ sudo ip link set veth0 up
+$ sudo ip link set ceth0 netns netns0
+
+$ sudo nsenter --net=/var/run/netns/netns0
+$ ip link set lo up
+$ ip link set ceth0 up
+$ ip addr add 172.18.0.10/16 dev ceth0
+$ exit
+
+$ sudo ip netns add netns1
+$ sudo ip link add veth1 type veth peer name ceth1
+$ sudo ip link set veth1 up
+$ sudo ip link set ceth1 netns netns1
+
+$ sudo nsenter --net=/var/run/netns/netns1
+$ ip link set lo up
+$ ip link set ceth1 up
+$ ip addr add 172.18.0.20/16 dev ceth1
+$ exit
+</code></pre>
+<p>Make sure there is no new routes on the host:</p>
+<pre><code>$ ip route
+default via 10.0.2.2 dev eth0 proto dhcp metric 100
+10.0.2.0/24 dev eth0 proto kernel scope link src 10.0.2.15 metric 100
+</code></pre>
+<p>And finally, create the bridge interface:</p>
+<pre><code>$ sudo ip link add br0 type bridge
+$ sudo ip link set br0 up
+</code></pre>
+<p>Now, attach <code>veth0</code> and <code>veth1</code> ends to the bridge:</p>
+<pre><code>$ sudo ip link set veth0 master br0
+$ sudo ip link set veth1 master br0
+</code></pre>
+<p><img src="https://iximiuz.com/container-networking-is-simple/bridge-4000-opt.png" alt="Setting up routing between multiple network namespaces"/>
+</p>
+
+<p>...and check the connectivity between containers:</p>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns0
+$ ping -c 2 172.18.0.20
+PING 172.18.0.20 (172.18.0.20) 56(84) bytes of data.
+64 bytes from 172.18.0.20: icmp_seq=1 ttl=64 time=0.259 ms
+64 bytes from 172.18.0.20: icmp_seq=2 ttl=64 time=0.051 ms
+
+--- 172.18.0.20 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 2ms
+rtt min/avg/max/mdev = 0.051/0.155/0.259/0.104 ms
+</code></pre>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns1
+$ ping -c 2 172.18.0.10
+PING 172.18.0.10 (172.18.0.10) 56(84) bytes of data.
+64 bytes from 172.18.0.10: icmp_seq=1 ttl=64 time=0.037 ms
+64 bytes from 172.18.0.10: icmp_seq=2 ttl=64 time=0.089 ms
+
+--- 172.18.0.10 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 36ms
+rtt min/avg/max/mdev = 0.037/0.063/0.089/0.026 ms
+</code></pre>
+<p>Lovely! Everything works great. With this new approach, we haven&#39;t been configuring <code>veth0</code> and <code>veth1</code> at all. The only two IP addresses we assigned were on the <code>ceth0</code> and <code>ceth1</code> ends. But since both of them are on the same Ethernet segment (remember, we connected them to the virtual switch), there is connectivity on the L2 level:</p>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns0
+$ ip neigh
+172.18.0.20 dev ceth0 lladdr 6e:9c:ae:02:60:de STALE
+$ exit
+
+$ sudo nsenter --net=/var/run/netns/netns1
+$ ip neigh
+172.18.0.10 dev ceth1 lladdr 66:f3:8c:75:09:29 STALE
+$ exit
+</code></pre>
+<p>Congratulations, we learned how to <strong>turn containers into friendly neighbors, prevent them from interfering, but keep the connectivity.</strong></p>
+<h2 id="reaching-out-to-the-outside-world-ip-routing-and-masquerading"><a name="masquerading"></a>Reaching out to the outside world (IP routing and masquerading)</h2>
+<p>Our containers can talk to each other. But can they talk to the host, i.e. the root namespace?</p>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns0
+$ ping 10.0.2.15  # eth0 address
+connect: Network is unreachable
+</code></pre>
+<p>That&#39;s kind of obvious, there is simply no route for that in <code>netns0</code>:</p>
+<pre><code>$ ip route
+172.18.0.0/16 dev ceth0 proto kernel scope link src 172.18.0.10
+</code></pre>
+<p>The root namespace cannot talk to containers either:</p>
+<pre><code># Use exit to leave `netns0` first:
+$ ping -c 2 172.18.0.10
+PING 172.18.0.10 (172.18.0.10) 56(84) bytes of data.
+From 213.51.1.123 icmp_seq=1 Destination Net Unreachable
+From 213.51.1.123 icmp_seq=2 Destination Net Unreachable
+
+--- 172.18.0.10 ping statistics ---
+2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 3ms
+
+$ ping -c 2 172.18.0.20
+PING 172.18.0.20 (172.18.0.20) 56(84) bytes of data.
+From 213.51.1.123 icmp_seq=1 Destination Net Unreachable
+From 213.51.1.123 icmp_seq=2 Destination Net Unreachable
+
+--- 172.18.0.20 ping statistics ---
+2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 3ms
+</code></pre>
+<p>To establish the connectivity between the root and container namespaces, we need to assign the IP address to the bridge network interface:</p>
+<pre><code>$ sudo ip addr add 172.18.0.1/16 dev br0
+</code></pre>
+<p>Once we assigned the IP address to the bridge interface, we got a route on the host routing table:</p>
+<pre><code>$ ip route
+# ... omitted lines ...
+172.18.0.0/16 dev br0 proto kernel scope link src 172.18.0.1
+
+$ ping -c 2 172.18.0.10
+PING 172.18.0.10 (172.18.0.10) 56(84) bytes of data.
+64 bytes from 172.18.0.10: icmp_seq=1 ttl=64 time=0.036 ms
+64 bytes from 172.18.0.10: icmp_seq=2 ttl=64 time=0.049 ms
+
+--- 172.18.0.10 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 11ms
+rtt min/avg/max/mdev = 0.036/0.042/0.049/0.009 ms
+
+$ ping -c 2 172.18.0.20
+PING 172.18.0.20 (172.18.0.20) 56(84) bytes of data.
+64 bytes from 172.18.0.20: icmp_seq=1 ttl=64 time=0.059 ms
+64 bytes from 172.18.0.20: icmp_seq=2 ttl=64 time=0.056 ms
+
+--- 172.18.0.20 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 4ms
+rtt min/avg/max/mdev = 0.056/0.057/0.059/0.007 ms
+</code></pre>
+<p>The container probably also got an ability to ping the bridge interface, but they still cannot reach out to host&#39;s <code>eth0</code>. We need to add the default route for containers:</p>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns0
+$ ip route add default via 172.18.0.1
+$ ping -c 2 10.0.2.15
+PING 10.0.2.15 (10.0.2.15) 56(84) bytes of data.
+64 bytes from 10.0.2.15: icmp_seq=1 ttl=64 time=0.036 ms
+64 bytes from 10.0.2.15: icmp_seq=2 ttl=64 time=0.053 ms
+
+--- 10.0.2.15 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 14ms
+rtt min/avg/max/mdev = 0.036/0.044/0.053/0.010 ms
+
+# And repeat the change for `netns1`
+</code></pre>
+<p>This change basically turned the host machine into a router and the bridge interface became the default gateway for the containers.</p>
+<p><img src="https://iximiuz.com/container-networking-is-simple/router-4000-opt.png" alt="Using bridge as a gateway"/>
+</p>
+
+<p>Perfect, we connected containers with the root namespace. Now, let&#39;s try to connect them to the outside world. By default, the packet forwarding (i.e. the router functionality) is disabled in Linux. We need to turn it on:</p>
+<pre><code># In the root namespace
+sudo bash -c &#39;echo 1 &gt; /proc/sys/net/ipv4/ip_forward&#39;
+</code></pre>
+<p>Again, my favourite part - checking the connectivity:</p>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns0
+$ ping 8.8.8.8
+# hangs indefinitely long for me...
+</code></pre>
+<p>Well, still doesn&#39;t work. What have we missed? If the container were to sends packets to the outside world, the destination server would not be able to send packets back to the container because the container&#39;s IP address is private. I.e. the routing rules for that particular IP are known only to the local network. And lots of the containers in the world share exactly the same private IP address <code>172.18.0.10</code>. The solution to this problem is called the <a href="https://en.wikipedia.org/wiki/Network_address_translation">Network address translation (NAT)</a>. Before going to the external network, packets originated by the containers will get their source IP addresses replaced with the host&#39;s external interface address. The host also will track all the existing mappings and on arrival, it&#39;ll be restoring the IP addresses before forwarding packets back to the containers. Sounds complicated, but I have good news for you! Thanks to <a href="https://iximiuz.com/en/posts/laymans-iptables-101/">iptables</a> module, we need only a single command to make it happen:</p>
+<pre><code>$ sudo iptables -t nat -A POSTROUTING -s 172.18.0.0/16 ! -o br0 -j MASQUERADE
+</code></pre>
+<p>The command is fairly simple. We are adding a new rule to the <code>nat</code> table of the <code>POSTROUTING</code> chain asking to masquerade all the packets originated in <code>172.18.0.0/16</code> network, but not by the bridge interface.</p>
+<p>Check the connectivity:</p>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns0
+$ ping -c 2 8.8.8.8
+PING 8.8.8.8 (8.8.8.8) 56(84) bytes of data.
+64 bytes from 8.8.8.8: icmp_seq=1 ttl=61 time=43.2 ms
+64 bytes from 8.8.8.8: icmp_seq=2 ttl=61 time=36.8 ms
+
+--- 8.8.8.8 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 2ms
+rtt min/avg/max/mdev = 36.815/40.008/43.202/3.199 ms
+</code></pre>
+<p>Beware that we&#39;re following <em>by default - allow</em> strategy which might be quite dangerous in a real-world setup. The host&#39;s default iptables policy is <code>ACCEPT</code> for every chain:</p>
+<pre><code>sudo iptables -S
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+</code></pre>
+<p>As a good example, Docker, instead, restricts everything by default and then enables routing for only known paths.</p>
+<div>
+
+<details><summary>Click here to see Docker iptables rules.</summary>
+
+<p>The following are the dumped rules generated by the Docker daemon on a <i>CentOS 8</i> machine with single container exposed on port 5005:</p>
+<pre><code>$ sudo iptables -t filter --list-rules
+-P INPUT ACCEPT
+-P FORWARD DROP
+-P OUTPUT ACCEPT
+-N DOCKER
+-N DOCKER-ISOLATION-STAGE-1
+-N DOCKER-ISOLATION-STAGE-2
+-N DOCKER-USER
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-ISOLATION-STAGE-1
+-A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -o docker0 -j DOCKER
+-A FORWARD -i docker0 ! -o docker0 -j ACCEPT
+-A FORWARD -i docker0 -o docker0 -j ACCEPT
+-A DOCKER -d 172.17.0.2/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 5000 -j ACCEPT
+-A DOCKER-ISOLATION-STAGE-1 -i docker0 ! -o docker0 -j DOCKER-ISOLATION-STAGE-2
+-A DOCKER-ISOLATION-STAGE-1 -j RETURN
+-A DOCKER-ISOLATION-STAGE-2 -o docker0 -j DROP
+-A DOCKER-ISOLATION-STAGE-2 -j RETURN
+-A DOCKER-USER -j RETURN
+
+$ sudo iptables -t nat --list-rules
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P POSTROUTING ACCEPT
+-P OUTPUT ACCEPT
+-N DOCKER
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+-A POSTROUTING -s 172.17.0.2/32 -d 172.17.0.2/32 -p tcp -m tcp --dport 5000 -j MASQUERADE
+-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+-A DOCKER -i docker0 -j RETURN
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 5005 -j DNAT --to-destination 172.17.0.2:5000
+
+$ sudo iptables -t mangle --list-rules
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+-P POSTROUTING ACCEPT
+
+$ sudo iptables -t raw --list-rules
+-P PREROUTING ACCEPT
+-P OUTPUT ACCEPT
+</code></pre>
+</details>
+
+</div>
+
+
+<h2 id="letting-the-outside-world-reach-out-to-containers-port-publishing"><a name="port-publishing"></a>Letting the outside world reach out to containers (port publishing)</h2>
+<p>It&#39;s a known practice to <em>publish</em> container ports to some (or all) of the host&#39;s interfaces. But what does <em>port publishing</em> really mean?</p>
+<p>Imagine we have a server running inside a container:</p>
+<pre><code>$ sudo nsenter --net=/var/run/netns/netns0
+$ python3 -m http.server --bind 172.18.0.10 5000
+</code></pre>
+<p>If we try to send an HTTP request to this server process from the host, everything will work (well, there is a connectivity between root namespace and all the container interfaces, why wouldn&#39;t it?):</p>
+<pre><code># From root namespace
+$ curl 172.18.0.10:5000
+&lt;!DOCTYPE HTML PUBLIC &#34;-//W3C//DTD HTML 4.01//EN&#34; &#34;http://www.w3.org/TR/html4/strict.dtd&#34;&gt;
+# ... omitted lines ...
+</code></pre>
+<p>However, if we were to access this server from the outside world, what IP address would we use? The only IP address we might know is the host&#39;s external interface address <code>eth0</code>:</p>
+<pre><code>$ curl 10.0.2.15:5000
+curl: (7) Failed to connect to 10.0.2.15 port 5000: Connection refused
+</code></pre>
+<p>Thus, we need to find a way to forward any packets arriving at port 5000 on the host&#39;s <code>eth0</code> interface to <code>172.18.0.10:5000</code> destination. Or, in other words, we need to <em>publish</em> the container&#39;s port 5000 on the host&#39;s <code>eth0</code> interface. iptables to the rescue!</p>
+<pre><code># External traffic
+sudo iptables -t nat -A PREROUTING -d 10.0.2.15 -p tcp -m tcp --dport 5000 -j DNAT --to-destination 172.18.0.10:5000
+
+# Local traffic (since it doesn&#39;t pass the PREROUTING chain)
+sudo iptables -t nat -A OUTPUT -d 10.0.2.15 -p tcp -m tcp --dport 5000 -j DNAT --to-destination 172.18.0.10:5000
+</code></pre>
+<p>Additionally, we need to enable <a href="https://github.com/omribahumi/libvirt_metadata_api/pull/4/files">iptables intercepting traffic over bridged networks</a>:</p>
+<pre><code>sudo modprobe br_netfilter
+</code></pre>
+<p>Testing time!</p>
+<pre><code>curl 10.0.2.15:5000
+&lt;!DOCTYPE HTML PUBLIC &#34;-//W3C//DTD HTML 4.01//EN&#34; &#34;http://www.w3.org/TR/html4/strict.dtd&#34;&gt;
+# ... omitted lines ...
+</code></pre>
+<h2 id="understanding-docker-network-drivers"><a name="docker-network-drivers"></a>Understanding Docker network drivers</h2>
+<p>Ok, sir, what can we do with all this <del>useless</del> knowledge? For instance, we could try to understand some of the <a href="https://docs.docker.com/network/#network-drivers">Docker network modes</a>!</p>
+<p>Let&#39;s start from the <code>--network host</code> mode. Try to compare the output of the following commands <code>ip link</code> and <code>sudo docker run -it --rm --network host alpine ip link</code>. Surprise, surprise, they are exactly the same! I.e. in the <code>host</code> mode, Docker simply doesn&#39;t use the network namespace isolation and containers work in the root network namespace and share the network stack with the host machine.</p>
+<p>The next mode to inspect is <code>--network none</code>. The output of the <code>sudo docker run -it --rm --network none alpine ip link</code> command shows only a single loopback network interface. It&#39;s very similar to our observations of the freshly created network namespace. I.e. before the point where we were adding any <code>veth</code> devices.</p>
+<p>Last but not least, the <code>--network bridge</code> (the default) mode. Well, it&#39;s exactly what we&#39;ve been trying to reproduce in this whole article. I encourage you to play with <code>ip</code> and <code>iptables</code> commands and inspect the network stack from the host and containers point of view.</p>
+<h2 id="bonus-rootless-containers-and-networking"><a name="rootless-networking"></a>Bonus: rootless containers and networking</h2>
+<p>One of the nice features of <code>podman</code> container manager is its focus on rootless containers. However, as you probably noticed, we used a lot of <code>sudo</code> escalations in this article. I.e. it&#39;s impossible to configure the network without root privileges. <a href="https://www.redhat.com/sysadmin/container-networking-podman">Podman&#39;s approach</a> to rootful networking is very close to docker. But when it comes to rootless containers, podman relies on <a href="https://github.com/rootless-containers/slirp4netns">slirp4netns</a> project:</p>
+<blockquote>
+<p>Starting with Linux 3.8, unprivileged users can create network_namespaces(7) along with user_namespaces(7). However, unprivileged network namespaces had not been very useful, because creating veth(4) pairs across the host and network namespaces still requires the root privileges. (i.e. No internet connection)</p>
+</blockquote>
+<blockquote>
+<p>slirp4netns allows connecting a network namespace to the Internet in a completely unprivileged way, by connecting a TAP device in a network namespace to the usermode TCP/IP stack (&#34;slirp&#34;).</p>
+</blockquote>
+<p>The rootless networking <a href="https://www.redhat.com/sysadmin/container-networking-podman">is quite limited</a>: &#34;technically, the container itself does not have an IP address, because without root privileges, network device association cannot be achieved. Moreover, pinging from a rootless container does not work because it lacks the CAP_NET_RAW security capability that the ping command requires.&#34; But it&#39;s still better than no connectivity at all.</p>
+<h2 id="conclusion"><a name="conclusion"></a>Conclusion</h2>
+<p>The considered in this article approach to organizing container networking is only one of the possible ways (well, probably the most widely used one). There are many more other ways, implemented as official or 3rd party plugins, but all of them heavily rely on <a href="https://developers.redhat.com/blog/2018/10/22/introduction-to-linux-interfaces-for-virtual-networking">Linux network virtualization facilities</a>. Thus, containerization can fairly be regarded as virtualization technology.</p>
+<p>Make code, not war!</p>
+<h3 id="references"><a name="references"></a>References:</h3>
+<ul>
+<li><a href="https://developers.redhat.com/blog/2018/10/22/introduction-to-linux-interfaces-for-virtual-networking">Introduction to Linux interfaces for virtual networking</a></li>
+<li><a href="https://man7.org/linux/man-pages/man8/ip.8.html">ip(8) — Linux manual page</a></li>
+<li>⭐ <a href="https://hechao.li/2017/12/13/linux-bridge-part1/">Linux Bridge - Part 1</a> by <a href="https://hechao.li/aboutme/">Hechao Li</a> (and more techical <a href="https://hechao.li/2018/01/31/linux-bridge-part2/">Part 2</a>)</li>
+<li><a href="https://wiki.aalto.fi/download/attachments/70789083/linux_bridging_final.pdf">Anatomy of a Linux bridge</a></li>
+<li><a href="https://jvns.ca/blog/2016/12/22/container-networking/">A container networking overview</a></li>
+<li><a href="https://blog.mbrt.dev/posts/container-network/">Demystifying container networking</a></li>
+<li><a href="https://blog.scottlowe.org/2013/09/04/introducing-linux-network-namespaces/">Introducing Linux Network Namespaces</a></li>
+<li>🎥 <a href="https://www.youtube.com/watch?v=6v_BDHIgOY8&amp;list=WL&amp;index=2&amp;t=0s">Container Networking From Scratch</a></li>
+<li><a href="https://learnk8s.io/kubernetes-network-packets">Tracing the path of network traffic in Kubernetes</a> - how Kubernetes builds its networking atop containers.</li>
+</ul>
+<h3 id="more-networking-articles">More <a href="https://iximiuz.com/en/categories/?category=Networking">Networking</a> articles</h3>
+<ul>
+<li><a href="https://iximiuz.com/en/posts/computer-networking-101/">Computer Networking Introduction: Ethernet and IP (Heavily Illustrated)</a></li>
+<li><a href="https://iximiuz.com/en/posts/bridge-vs-switch/">Bridge vs Switch: What I Learned From a Data Center Tour</a></li>
+<li><a href="https://iximiuz.com/en/posts/laymans-iptables-101/">Illustrated introduction to Linux iptables</a></li>
+</ul>
+<h3 id="other-containers-articles">Other <a href="https://iximiuz.com/en/categories/?category=Containers">Containers</a> articles</h3>
+<ul>
+<li><a href="https://iximiuz.com/en/posts/container-learning-path/">Learning Containers From The Bottom Up</a></li>
+<li><a href="https://iximiuz.com/en/posts/not-every-container-has-an-operating-system-inside/">Not every container has an operating system inside</a></li>
+<li><a href="https://iximiuz.com/en/posts/you-dont-need-an-image-to-run-a-container/">You don&#39;t need an image to run a container</a></li>
+<li><a href="https://iximiuz.com/en/posts/you-need-containers-to-build-an-image/">You need containers to build images</a></li>
+</ul>
+</div></div>
+  </body>
+</html>
