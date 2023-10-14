@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://quuxplusone.github.io/blog/2021/03/07/copy-elision-borks-escape-analysis/">Original</a>
+    <h1>Escape analysis hates copy elision (2021)</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    <p>Yesterday Lauri Vasama showed me <a href="https://godbolt.org/z/jG7x5h">this awesome Godbolt</a>:</p>
+
+<div><div><pre><code>struct S {
+    static std::unique_ptr&lt;S&gt; make() noexcept;
+    ~S();
+
+    static std::unique_ptr&lt;S&gt; factory() {
+        std::unique_ptr&lt;S&gt; s = S::make();
+        return M(s);
+    }
+};
+
+void take_ownership(S*) noexcept;
+
+void test() {
+    std::unique_ptr&lt;S&gt; p = S::factory();
+    take_ownership(p.release());
+}
+</code></pre></div></div>
+
+<p>When <code>M(s)</code> is defined as <code>std::move(s)</code>, Clang gives pretty much optimal codegen
+for <code>test</code>:</p>
+
+<div><div><pre><code>  pushq %rax
+  movq %rsp, %rdi
+  callq S::make()
+  movq (%rsp), %rdi
+  callq take_ownership(S*)
+  popq %rax
+  retq
+</code></pre></div></div>
+
+<p>But by defining <code>M(s)</code> as <code>std::move(s)</code>, we’re actually creating a return statement
+of the form <code>return std::move(s)</code>, which is widely known as an antipattern in C++.
+Returning “by <code>move</code>” disables <a href="https://quuxplusone.github.io/blog/2019/08/02/the-tough-guide-to-cpp-acronyms/#rvo-nrvo-urvo">RVO</a>,
+and even when RVO doesn’t happen, <code>return std::move(x)</code> is (in 99% of cases)
+no more efficient than <code>return x</code>, because <code>return x</code> triggers a special case in the
+standard known as “implicit move,” which means that the copy into the return slot uses
+the <em>move</em> constructor, not the <em>copy</em> constructor, even though the returned expression
+<code>x</code> is totally an lvalue.</p>
+
+<blockquote>
+  <p>I have a proposal before EWG right now —
+<a href="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2021/p2266r0.html">P2266</a> —
+which in C++23 will make that <code>x</code> into an rvalue, literally. This radically simplifies
+the wording and compiler implementation around “implicit move.”</p>
+</blockquote>
+
+<p>Okay, so, let’s get rid of that “return by <code>move</code>.” Let’s define <code>M(s)</code> to just <code>(s)</code>,
+and see what happens. (Here’s the <a href="https://godbolt.org/z/jG7x5h">Godbolt</a> again.)</p>
+
+<div><div><pre><code>  pushq %rbx
+  subq $16, %rsp
+  leaq 8(%rsp), %rdi
+  callq S::make()
+  movq 8(%rsp), %rdi
+  movq $0, 8(%rsp)
+  callq take_ownership(S*)
+  movq 8(%rsp), %rbx
+  testq %rbx, %rbx
+  je .LBB0_2
+  movq %rbx, %rdi
+  callq S::~S() [complete object destructor]
+  movq %rbx, %rdi
+  callq operator delete(void*)
+.LBB0_2:
+  addq $16, %rsp
+  popq %rbx
+  retq
+</code></pre></div></div>
+
+<p>Whoa! The code got way longer! What happened?</p>
+
+<hr/>
+
+<p>What happened was <em>copy elision.</em> When the body of <code>factory</code> was this:</p>
+
+<div><div><pre><code>static std::unique_ptr&lt;S&gt; factory() {
+    std::unique_ptr&lt;S&gt; s = S::make();
+    return std::move(s);
+}
+</code></pre></div></div>
+
+<p>the meaning was “Create an object named <code>s</code>, whose initial value comes from
+being used as the return slot of <code>S::make()</code>. Then, construct the object
+in my own return slot by calling <code>S</code>’s move constructor on xvalue <code>s</code>.”</p>
+
+<p>When the body of <code>factory</code> changed to this:</p>
+
+<div><div><pre><code>static std::unique_ptr&lt;S&gt; factory() {
+    std::unique_ptr&lt;S&gt; s = S::make();
+    return s;
+}
+</code></pre></div></div>
+
+<p>the meaning changed as well, to “<em>Either</em> do the same thing as above; <em>or</em>,
+let <code>s</code> be another name for my return slot, and give it its initial value by
+using it as the return slot of <code>S::make()</code>.” In the latter case we’ve gone
+from having “<code>s</code>” and “my return slot” be two separate objects, to having
+them be one single object. This is normally a big performance win; we like it.</p>
+
+<p>But in this case, this optimization interfered with Clang’s <em>escape analysis</em>.
+Escape analysis is the thing that tells us, in</p>
+
+<div><div><pre><code>void f(int);
+int test() {
+    int x = 42;
+    f(x);
+    return x + 1;  // i.e., return 43
+}
+</code></pre></div></div>
+
+<p>that <code>x</code> must still be 42 after the call to <code>f</code>, because
+(even though we don’t know what that function does in general) we know it
+can’t modify <code>x</code>, because it doesn’t know <code>x</code>’s address on our stack.
+Escape analysis tracks everything we do with <code>x</code>’s address, and can prove
+in this case that that address has never <em>escaped</em> into the wider world.</p>
+
+<p>However, if you change <code>f</code> to take its parameter as <code>const int&amp;</code>,
+then <code>x</code>’s stack address <em>does</em> escape, and so the compiler can’t assume
+the value of <code>x</code> remains unchanged after the call to <code>other_function</code>:
+it must reload <code>x</code> from memory and actually compute that addition.
+(<a href="https://godbolt.org/z/751Yc3">Godbolt.</a>) Because <code>f</code> might do</p>
+
+<div><div><pre><code>void f(const int&amp; x) {
+    *const_cast&lt;int*&gt;(&amp;x) = 918;
+}
+</code></pre></div></div>
+
+<p>Even worse, consider this caller:</p>
+
+<div><div><pre><code>void g(const int&amp;);
+void h();
+int test() {
+    int x = 0;
+    g(x);
+    x = 42;
+    h();
+    return x + 1;
+}
+</code></pre></div></div>
+
+<p>In this case, <code>h</code> doesn’t even receive <code>x</code>’s address… yet <code>h</code> can still
+modify <code>x</code>, because by this point <code>x</code>’s address has already escaped! <code>g</code> and <code>h</code>
+might collude together:</p>
+
+<div><div><pre><code>int *global;
+void g(const int&amp; x) {
+    global = const_cast&lt;int*&gt;(&amp;x);
+}
+void h() {
+    *global = 918;
+}
+</code></pre></div></div>
+
+<p>The compiler’s escape analysis cannot rule out this possibility, and so,
+<em>for all the compiler knows,</em> it might be the truth! After the call to <code>h</code>,
+the compiler cannot assume that <code>x</code>’s value remains 42.</p>
+
+<hr/>
+
+<p>Back to our <code>unique_ptr</code> example.</p>
+
+<div><div><pre><code>struct S {
+    static std::unique_ptr&lt;S&gt; make() noexcept;
+    ~S();
+
+    static std::unique_ptr&lt;S&gt; factory() {
+        std::unique_ptr&lt;S&gt; s = S::make();
+        return M(s);
+    }
+};
+
+void take_ownership(S*) noexcept;
+
+void test() {
+    std::unique_ptr&lt;S&gt; p = S::factory();
+    take_ownership(p.release());
+}
+</code></pre></div></div>
+
+<p>Escape analysis reasons as follows:</p>
+
+<ul>
+  <li>
+    <p>The address of <code>factory</code>’s stack variable <code>s</code> escapes into <code>S::make</code>,
+  as part of the calling convention for how <code>S::make</code> returns its prvalue
+  result. We don’t know what <code>S::make</code> does with that address.</p>
+  </li>
+  <li>
+    <p>Later, we null out <code>test</code>’s stack variable <code>p</code>.</p>
+  </li>
+  <li>
+    <p>Then, we call <code>take_ownership</code>. We don’t know what it does.</p>
+  </li>
+  <li>
+    <p>Finally, we destroy <code>p</code>, which is a no-op if and only if <code>p</code> is still null.</p>
+  </li>
+</ul>
+
+<p>Could <code>take_ownership</code> affect <code>p</code>’s value, the way <code>h</code> affected <code>x</code>’s value in our
+simpler example? Or can we assume that <code>p</code>’s value is definitely still null?
+In short: does <code>p</code>’s address <em>escape?</em></p>
+
+<p>Well, <code>p</code> is just another name for the return slot of <code>S::factory</code>.
+When <code>S::factory</code> returns “by <code>move</code>,” it is constructing that object <em>right there</em>,
+using the move-constructor of <code>unique_ptr</code>, which is fine for escape analysis
+because that move-constructor is <code>inline</code> — we know what it does, and it <em>doesn’t</em>
+stash any addresses in global variables. So <code>p</code>’s address doesn’t escape, which
+means that <code>take_ownership</code> can’t possibly have access to <code>p</code>, which means that
+<code>p</code> is still null when <code>take_ownership</code> returns, which means that we don’t need
+to reload its value nor generate any code to call <code>delete</code> on it if it’s non-null.</p>
+
+<p>But, when <code>S::factory</code> returns “by name,” copy elision kicks in. Now the returned
+variable <code>s</code> becomes an alias for the object in <code>factory</code>’s return slot (which
+you’ll recall is already an alias for <code>p</code>). And <code>s</code>’s address <em>does</em> escape —
+it escapes into <code>S::make</code>!</p>
+
+<p>Suppose <code>S::make</code> and <code>take_ownership</code> were secretly colluding, like this:</p>
+
+<div><div><pre><code>std::unique_ptr&lt;S&gt; *global;
+
+std::unique_ptr&lt;S&gt; S::make() {
+    std::unique_ptr&lt;S&gt; origp = std::make_unique&lt;S&gt;();
+    global = &amp;origp;
+    return origp;
+}
+
+void take_ownership(S *rawp) {
+    delete rawp;
+    *global = std::make_unique&lt;S&gt;();
+}
+</code></pre></div></div>
+
+<p>The compiler cannot rule out this possibility, and so it must assume that calling
+<code>take_ownership</code> might repopulate the stack variable <code>p</code> with a new value.
+So it generates all that extra code in <code>test</code> to reload, check, and possibly <code>delete</code>
+the value of <code>p</code>.</p>
+
+<hr/>
+
+<p>Clang and ICC behave pretty uniformly as described in this blog post.
+GCC “succeeds” in generating good code for both variations of the Godbolt above (with
+or without <code>std::move</code>), but this appears to be <a href="https://stackoverflow.com/questions/48749440/c-nrvo-copy-elision-with-return-statement-in-parentheses">due to a GCC bug</a> —
+it thinks <code>return (s)</code> with parentheses is a request to disable copy elision!
+A slight tweak to my <code>M</code> macro, to remove the redundant parentheses,
+and GCC joins the pack: <a href="https://godbolt.org/z/361sfY">Godbolt</a>.</p>
+
+<hr/>
+
+<p>It would be interesting to see a compiler patch that instrumented escape analysis somehow,
+so that it could give an optimization-time note such as “Object <code>x</code>’s address escapes only
+because copy elision in <code>f</code> gave <code>x</code> the same address as object <code>y</code>.” I think that would happen
+a lot, and certainly isn’t something you’d want to see in your daily builds; but it might be
+very interesting to trawl through the output.</p>
+
+<hr/>
+
+<p>Anton Zhilin’s <a href="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2020/p2025r1.html">P2025R1 “Guaranteed copy elision for return variables”</a>
+(June 2020) talks a bit about escape analysis in section 6.5, “What about the invalidation of optimizations?”
+The more we expand the scope of copy-elision, the easier it will be for copy-elision to bump up against
+escape analysis. The example dissected in today’s blog post is interesting precisely <em>because</em> it is
+obscure and happens so rarely.</p>
+
+<p>Please do not use this post as evidence that copy elision is bad! Copy elision is awesome!
+Mainly this post is an interesting piece of trivia. But, secondarily, if any change to C++ <em>is</em> needed
+in this area, it would be <em>tightening up the object model</em> so that escape analysis could
+become more aggressive. I hope we all agree that the kind of “collusion” shown in this post is
+terribly contrived, and nothing of value would be lost if C++ disallowed it. Escape analysis should
+not allow for the possibility that a function has “remembered” the address of its own prvalue return
+slot.</p>
+
+<hr/>
+
+<p>Previously on this blog:</p>
+
+<ul>
+  <li><a href="https://quuxplusone.github.io/blog/2018/04/17/downsides-of-omitting-trivial-destructor-calls">“Downsides of omitting trivial destructor calls”</a> (2018-04-17)</li>
+</ul>
+
+  </div></div>
+  </body>
+</html>
