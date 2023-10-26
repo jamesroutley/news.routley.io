@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://probablymarcus.com/blocks/2023/10/19/vectorizing-wide-pytorch-expressions.html">Original</a>
+    <h1>What happens when you vectorize wide PyTorch expressions?</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    <div>
+      <div>
+              
+
+      <article>
+        
+
+<p>In scientific computing, code is often naturally expressed as wide, tree-like expressions. Often different branches of that tree contain similar chunks of logic, so there is potential to run many different branches together in parallel vectorized operations. What happens when you take your nice tree-like code and mangle it into hard-to-read vectorized code? How would a person do that?</p>
+
+<p>I created <a href="https://vexpr.org">Vexpr</a> and used it to take <a href="https://probablymarcus.com/blocks/2022/11/30/hands-on-bayesian-optimization.html">real experiment</a> code and convert its <a href="https://github.com/outergroup/outer-loop-cookbook/blob/585b3b09fc7ac7f254a0cda8ef962670fb4f45fb/mnist_project/src/gp/vexpr_handson_gp.py#L55-L204">readable expressions</a> into <a href="https://probablymarcus.com/stuff/2023-10-19-vexpr-compiled-code.txt">vectorized expressions</a> at runtime. In this post, I present the results. Topics include:</p>
+
+<ul>
+  <li>What is the immediate impact?</li>
+  <li>How does this relate to <code>torch.compile</code>?</li>
+  <li>What is the more detailed breakdown of the impact on the GPU and CPU?</li>
+</ul>
+
+<h2 id="introduction-wide-expressions">Introduction: Wide expressions</h2>
+
+<p>Mathematical expressions naturally form trees. Here’s a toy example.</p>
+
+\[\sqrt{a^2 + b^2} + \sqrt{c^2 + d^2}\]
+
+<p>Here’s Python code implementing this expression and highlighting its wide tree-like structure:</p>
+
+<figure><pre><code data-lang="python"><span>sum</span><span>([</span><span>math</span><span>.</span><span>sqrt</span><span>(</span><span>sum</span><span>([</span><span>a</span> <span>**</span> <span>2</span><span>,</span>
+                    <span>b</span> <span>**</span> <span>2</span><span>])),</span>
+     <span>math</span><span>.</span><span>sqrt</span><span>(</span><span>sum</span><span>([</span><span>c</span> <span>**</span> <span>2</span><span>,</span>
+                    <span>d</span> <span>**</span> <span>2</span><span>]))])</span></code></pre></figure>
+
+<p>For this simple function, we can write vectorized PyTorch code by hand:</p>
+
+<figure><pre><code data-lang="python"><span>torch</span><span>.</span><span>tensor</span><span>([</span><span>a</span><span>,</span> <span>b</span><span>,</span> <span>c</span><span>,</span> <span>d</span><span>]).</span><span>pow</span><span>(</span><span>2</span><span>).</span><span>view</span><span>((</span><span>2</span><span>,</span> <span>2</span><span>)).</span><span>sum</span><span>(</span><span>dim</span><span>=</span><span>0</span><span>).</span><span>sqrt</span><span>().</span><span>sum</span><span>()</span></code></pre></figure>
+
+<p>The former code calls <code>pow</code> 4 times, calls <code>sum</code> twice, calls <code>sqrt</code> twice, then calls <code>sum</code> one last time. The latter code flattens the tree into a single pipeline so that one operation occurs for each <em>level</em> of the tree. Previously we ran one Python function call per <em>node</em> of the tree, and afterward we run one call per <em>level</em> of the tree – a number that is exponentially smaller.</p>
+
+<p>PyTorch is often used in a pipelined way as shown above, but that’s usually because the expression is inherently <em>deep</em>; neural networks are the obvious example. Here we are concerned with expressions that are <em>wide</em>.</p>
+
+<p>Imagine scaling up this toy example: use actual, larger expressions; let each variable represent a <em>list of vectors</em>, not just a number; within the expression, call functions like SciPy’s <code>cdist</code> which compute pairwise distances and return large matrices; do all of this on <em>batches</em> of inputs. With these changes, we now have a wide expression that is worth running on a GPU.</p>
+
+<p>This scenario comes up often in scientific computing. For example, the kernel of a Gaussian Process (GP) takes in two lists of vectors and returns pairwise similarities. We <a href="https://probablymarcus.com/blocks/2022/11/30/hands-on-bayesian-optimization.html">can encode some of our intuition into these kernels</a> by composing them via weighted sums and products. This leads to giant tree-like expressions, and because those expressions have many similar operations in each parallel branch, there is a lot of potential for vectorization.</p>
+
+<p>Writing vectorized code for giant expressions is hard, so I created <a href="https://vexpr.org">Vexpr</a> to make it easy. Vexpr takes readable-but-slow PyTorch, NumPy, and JAX expressions and compiles them into fast, <a href="https://probablymarcus.com/stuff/2023-10-19-vexpr-compiled-code.txt">delightfully ugly</a> vectorized expressions.</p>
+
+<h2 id="how-to-vectorize-one-level-of-an-expression-tree">How to vectorize one level of an expression tree</h2>
+
+<p>Wide expressions naturally form a tree. When we vectorize that tree, we create a new narrower expression that invokes a series of Python functions, one for each level of the original tree.</p>
+
+<p><img src="https://probablymarcus.com/images/2023-10-19-tree.svg" alt="Trees collapsing"/>
+</p>
+
+<p>We can see some operations already support such a change.</p>
+<ul>
+  <li>Elementwise operations like <code>pow</code> and <code>sqrt</code> can run on multiple inputs as-is.</li>
+  <li>Parallel sums can be implemented as <code>.view(...).sum(dim=0)</code></li>
+</ul>
+
+<p>What about more difficult cases? For example, what if the parallel sums are of different lengths? On GPUs, fast parallel reductions only work when inputs all have the same length. Would providing a single-input single-output interface still have a benefit? The answer is yes, even if the operation internally just loops over the sums. Collapsing one level of the tree allows subsequent levels to be collapsed, and low-hanging fruit tends to appear in the deeper levels. Moreover, we can do better than looping over the sums, even when the lengths are different. Vexpr’s vectorizer groups the inputs by length and performs a reduced number of operations—one for each unique length. For example, this decreases the number of <code>torch.cdist</code> operations in my <a href="https://probablymarcus.com/blocks/2022/11/30/hands-on-bayesian-optimization.html">hands-on kernel</a> from 49 to 5. These 5 calls happen invisibly inside of a <code>cdist_multi</code> function that the code calls once.</p>
+
+<p>These collapsed operations often introduce some overhead. Batch operations often require permuting tensors (e.g. for batched pairwise distances) or reordering values (e.g. putting equal-length sums next to each other). For operations that are grouped by size, we must split input tensors then re-concatenate the output tensors. Thus, while vectorizing has many benefits, it also introduces extra work for the GPU that is not necessary when using a non-vectorized expression. Is this overhead worth it? Let’s turn to experiments to find out.</p>
+
+<h2 id="vectorizing-leads-to-4x-7x-speed-up-on-one-set-of-benchmarks">Vectorizing leads to 4x-7x speed-up on one set of benchmarks</h2>
+
+<p>Here I run a pair of benchmarks on an NVIDIA V100 GPU. I describe the benchmarks within the context of real Gaussian Process use cases, but you don’t need to understand Gaussian Processes to understand these results; I am simply running <a href="https://probablymarcus.com/stuff/2023-10-19-vexpr-compiled-code.txt">this big vectorized expression</a> on inputs of different shapes.</p>
+
+<p>When you use Gaussian Processes for Bayesian Optimization, you first fit a GP’s parameters to the training data, then you optimize a set of candidate points to maximize expected improvement. Both of these steps include backpropagating gradients through the GP kernel.</p>
+
+<p><strong>Benchmark 1:</strong> Fit the kernel’s parameters. I run the forward and backward pass of the kernel, using <code>x1.shape == x2.shape == (379, 26)</code>, i.e. a training set of 379 26-dimensional vectors. I repeat 100 times, then wait for a final CUDA synchronize. I test with and without <code>torch.compile</code>.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th> </th>
+      <th>Don’t compile</th>
+      <th>Compile</th>
+      <th> </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Baseline</strong></td>
+      <td>6.43s</td>
+      <td>3.0s</td>
+      <td>     <em>Compile speed-up: 2.1x</em></td>
+    </tr>
+    <tr>
+      <td><strong>Vectorized</strong></td>
+      <td>0.99s</td>
+      <td>0.76s</td>
+      <td>     <em>Compile speed-up: 1.3x</em></td>
+    </tr>
+    <tr>
+      <td> </td>
+      <td>   <em>Vectorize speed-up: 6.5x</em></td>
+      <td>   <em>Vectorize speed-up: 3.9x</em></td>
+      <td>     <em>Combined speed-up: 8.5x</em></td>
+    </tr>
+  </tbody>
+</table>
+
+
+
+<table>
+  <thead>
+    <tr>
+      <th> </th>
+      <th>Don’t compile</th>
+      <th>Compile</th>
+      <th> </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Baseline</strong></td>
+      <td>6.03s</td>
+      <td>2.57s</td>
+      <td>     <em>Compile speed-up: 2.3x</em></td>
+    </tr>
+    <tr>
+      <td><strong>Vectorized</strong></td>
+      <td>0.83s</td>
+      <td>0.63s</td>
+      <td>     <em>Compile speed-up: 1.3x</em></td>
+    </tr>
+    <tr>
+      <td> </td>
+      <td>   <em>Vectorize speed-up: 7.2x</em></td>
+      <td>   <em>Vectorize speed-up: 4.1x</em></td>
+      <td>     <em>Combined speed-up: 9.6x</em></td>
+    </tr>
+  </tbody>
+</table>
+
+
+
+<h2 id="but-this-speed-up-doesnt-happen-in-all-benchmarks">…but this speed-up doesn’t happen in all benchmarks</h2>
+
+<p>Now I test the kernel’s performance in another scenario: hold-one-out cross-validation. During cross-validation, we fit \(N\) models on \(N\) slightly different datasets. We can test this by just rerunning Benchmark 1 on \(N\) models in parallel. To demonstrate a surprising phenomenon, I set \(N=20\).</p>
+
+<p><strong>Benchmark 3:</strong> Cross-validation. Repeat Benchmark 1, but train 20 models in parallel rather than 1. So we have <code>x1.shape == x2.shape == (20, 379, 26)</code>, and the shapes of every parameter, e.g. <code>lengthscale</code>,  have <code>(20,)</code> prepended to them.</p>
+
+<table>
+  <thead>
+    <tr>
+      <th> </th>
+      <th>Don’t compile</th>
+      <th>Compile</th>
+      <th> </th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Baseline</strong></td>
+      <td>15.6s</td>
+      <td>7.50s</td>
+      <td>   <em>Compile speed-up: 2.1x</em></td>
+    </tr>
+    <tr>
+      <td><strong>Vectorized</strong></td>
+      <td>17.7s</td>
+      <td>6.15s</td>
+      <td>   <em>Compile speed-up: 2.9x</em></td>
+    </tr>
+    <tr>
+      <td> </td>
+      <td>   <em>Vectorize <strong>slow-down</strong>: 1.1x</em></td>
+      <td>   <em>Vectorize speed-up: 1.2x</em></td>
+      <td>   <em>Combined speed-up: 2.5x</em></td>
+    </tr>
+  </tbody>
+</table>
+
+
+
+<p>To understand where the change occurs, I rerun this benchmark for different \(N\). Note that \(N=1\) and \(N=20\) correspond to the original Benchmark 1 and Benchmark 3 results, respectively. I used the same hardware, but I enabled some additional profiling, hence the slower times compared to above.</p>
+
+<p><img src="https://probablymarcus.com/images/2023-10-19-benchmark_fit_VexprHandsOnGP_benchmarkonly.svg" alt="Benchmark showing diminishing improvement from vectorization"/></p>
+
+<p>The vectorized kernel initially has a huge advantage over the baseline, but this advantage diminishes as we give it more parallel work, and without <code>torch.compile</code> the vectorized kernel is eventually <em>slower</em> when viewed in isolation. Why does this happen?</p>
+
+<h2 id="the-cpu-is-a-bottleneck-vectorizing-removes-that-bottleneck">The CPU is a bottleneck. Vectorizing removes that bottleneck.</h2>
+
+<p>To really understand the performance impact of vectorization, we need to understand the CPU and GPU usage before and after. First, note that CUDA / PyTorch are built on an asynchronous relationship between the CPU and GPU, where the CPU ideally should always run ahead, always queueing the GPU’s future work, while the GPU is always working through its queue. However, there are two events that cause the CPU to wait for the GPU:</p>
+
+<ol>
+  <li>When the CPU chooses to read a value from the GPU. This is a decision made by your code.</li>
+  <li>When the CPU gets too far ahead of the GPU. This is a decision made by CUDA.</li>
+</ol>
+
+<p>I <a href="https://github.com/outergroup/outer-loop-cookbook/blob/585b3b09fc7ac7f254a0cda8ef962670fb4f45fb/mnist_project/profile_performance_test.sh#L86">profiled the kernel using NVIDIA’s <code>nsys</code></a>, and I used that trace to obtain GPU and CPU active time. My so-called CPU “active” time is actually an inferred value; CUDA spins the CPU 100% constantly, even when the CPU is just waiting for the GPU, so I use <a href="https://github.com/outergroup/outer-loop-cookbook/blob/585b3b09fc7ac7f254a0cda8ef962670fb4f45fb/mnist_project/print_nsys_stats.py#L94">heuristics</a> to detect these waits and subtract it them from the actual active time.</p>
+
+<p>Here is the same plot from above, but with the CPU and GPU time overlaid.</p>
+
+<p><img src="https://probablymarcus.com/images/2023-10-19-benchmark_fit_VexprHandsOnGP.svg" alt="Benchmark with CPU and GPU time included. The baseline is CPU-bound until we reach larger input sizes."/></p>
+
+<p>First, to understand the result of Benchmark 1 above, look at the left side of both plots. Both the baseline and vectorized models have low total active GPU time. But the baseline model puts a much larger workload on the CPU, which is responsible for orchestrating the set of operations that are sent to the GPU. Thus, the GPU spends the vast majority of the time idle, waiting for the CPU to give it more work. For the vectorized model the amount of CPU work is almost always less than the amount of GPU work, so the GPU is almost never idle; the benchmark time is roughly equal to the GPU active time.</p>
+
+<p>Now we focus on the surprising result from Benchmark 3, where the baseline model did slightly <em>better</em> than the vectorized model. As we scale up the number of models, we see an interesting phenomenon. When training many models simultaneously, even the baseline model is able to keep the GPU busy. Once the GPU active time exceeds CPU active time. one of the key selling points of vectorized code is eliminated, because the nonvectorized code becomes good enough. This was a fun, surprising fact; even unvectorized code can outrun the GPU if you pass in large enough tensors. I expect this phenomenon to occur in other large-batch scenarios like training on very large datasets or doing Bayesian Optimizations with very large sets of candidate points. Of course, the vectorized code is still superior when using <code>torch.compile</code>, and in all cases its CPU usage is far superior.</p>
+
+<p>Finally, let’s look at the GPU workload. Independent of the effect on CPU, what is the impact of vectorization on the total amount of work that the GPU has to do? Looking at slopes of the “GPU time” lines, we see that for some models, e.g. my non-compiled model, vectorization increases the total workload, and for other models it decreases the workload. I studied the CUDA traces closely and found that vectorization does indeed reduce many aspects of the GPU workload, greatly reducing the number of operations and decreasing the total amount of time spent on the fundamental computations of the algorithm. However it also introduces overhead (mentioned above) by interspersing operations that permute and reorder the tensors, or splitting them into groups then concatenating results. Sometimes the reduced “fundamental” time outweighs the additional overhead, while other times the overhead outweighs the reduction in fundamental time.</p>
+
+<p>So we see that vectorization has three effects:</p>
+<ol>
+  <li>It lets us keep the GPU busy even when inputs are small.</li>
+  <li>It frees up the CPU to do other work.</li>
+  <li>It can slightly change the total amount of GPU work, sometimes for the worse.</li>
+</ol>
+
+<p>The speed-up from vectorization can be great, but it can be underwhelming in scenarios where none of the benefits are needed.</p>
+
+<h2 id="the-benefits-of-vectorization-increase-as-gpu-speed-increases">The benefits of vectorization increase as GPU speed increases</h2>
+
+<p>Here is a point that follows naturally from everything above, but it might not be immediately obvious. It is quite striking when you experience it.</p>
+
+<p>As I built Vexpr, I tested on an NVIDIA T4. Then for this experiment, I upgraded to a much-faster NVIDIA V100, and the benefits of vectorization greatly improved.</p>
+
+<p>You always want your CPU to stay ahead of the GPU so that the GPU is never idle. Code that is good enough to stay ahead of this year’s GPU might not be good enough for next year’s GPU. With each upgrade, you need the dotted CPU line from these charts to be lower and lower.</p>
+
+<p>This means that vectorizing your code is good strategy for future-proofing it.</p>
+
+<h2 id="gpytorchs-structure-kernels-show-similar-results">GPyTorch’s “structure” kernels show similar results</h2>
+
+<p>I also tested GPyTorch’s limited support for vectorization. GPyTorch lets you take sets of identically-shaped kernels and run them as a single vectorized kernel. This capability is easy to use when summing single-feature kernels, so I created a partially vectorized kernel by <a href="https://github.com/outergroup/outer-loop-cookbook/blob/585b3b09fc7ac7f254a0cda8ef962670fb4f45fb/mnist_project/src/gp/botorch_partial_handson_gp.py#L43">replacing sums of single-feature Matern kernels with single Additive Structure</a> kernels.</p>
+
+<p><img src="https://probablymarcus.com/images/2023-10-19-benchmark_fit_BotorchPartialHandsOnGP.svg" alt="Benchmark showing vectorized version is faster than baseline, but this advantage goes away at higher input sizes"/></p>
+
+<p><em>(Don’t focus too much on comparing absolute speed of the Vexpr and the GPyTorch kernels. There are many small differences between the two that have nothing to do with vectorization. For example, unlike my Vexpr kernel, GPyTorch has a nice optimization of putting <a href="https://github.com/cornellius-gp/gpytorch/blob/43383c2411569bfd3e4417a3918cf53f2c9dbe40/gpytorch/kernels/kernel.py#L492">this line</a> before <a href="https://github.com/cornellius-gp/gpytorch/blob/43383c2411569bfd3e4417a3918cf53f2c9dbe40/gpytorch/kernels/kernel.py#L506">this line</a>.)</em></p>
+
+<p>Vexpr has been optimized much more for this use case than GPyTorch, but we see that the same fundamental phenomena occur. Vectorization leads to wins at small batch sizes, but the advantage diminishes at large batch sizes. In this experiment, vectorization increased the total GPU workload, so with large batch sizes the only advantage of vectorization is a freed up CPU.</p>
+
+<p>Interestingly, neither GPyTorch kernel ever reaches a point where GPU time is equal to the benchmark time. The GPU always spends at least 1-2 seconds idle. This happens because GPyTorch’s kernels do a <a href="https://github.com/cornellius-gp/gpytorch/blob/43383c2411569bfd3e4417a3918cf53f2c9dbe40/gpytorch/kernels/kernel.py#L345">synchronous equality check</a> on every call, forcing a GPU synchronize, which causes the CPU to fall behind the GPU immediately afterward. So when you use GPyTorch kernels on GPUs, you don’t get the ideal fully asynchronous execution that you’re supposed to get with CUDA / PyTorch. (There is good news: PyTorch has recently introduced <a href="https://pytorch.org/docs/stable/generated/torch.cuda.set_sync_debug_mode.html"><code>torch.cuda.set_debug_mode(2)</code></a> which detects these unwanted synchronize events. Like <a href="https://x.com/ID_AA_Carmack/status/1616525615041216513?s=20">others</a>, I think every PyTorch library developer should become friends with this API.)</p>
+
+<h2 id="closing-thoughts-on-compilation">Closing thoughts on compilation</h2>
+
+<p>Everybody agrees that vectorization is good. Is it worth doing even in cases where it requires extra work, like with wide expressions? The results above suggest: most of the time, yes, but with interesting nuances. Vectorization is especially great for making the most of a GPU when your task is running many iterations on smaller batches of input data. For larger-batch scenarios, maybe you’ll only benefit from vectorization after you add JIT compilation, or after you upgrade your GPU, or after you’ve found some use for all the newfound idle CPU time. But, to a first approximation, vectorization is good.</p>
+
+<p>The real open question for the field remains: for “wide” computation graphs, what is a practical strategy for getting vectorized code?</p>
+
+<p>My experiments above show that this is not solved by JIT tools like <code>torch.compile</code>, nor do I expect it to be. I think a compiler would need to become a huge slow unreliable hairball to solve this type of auto-vectorization problem. Vexpr’s vectorizer is a compiler that solves this, but <strong>it does so by making the programmer meet the compiler in the middle</strong>. The programmer gives Vexpr a tree-like expression and tells Vexpr, “You should try vectorizing this.” Both of those pieces of information are valuable: the programmer structures the logic in a certain way, and the programmer indicates that there is opportunity for vectorization there. The programmer doesn’t need to do anything too difficult, and neither does the compiler.</p>
+
+<p>I think this “meet-in-the-middle” approach between programmer and compiler is a good design principle that leads to good systems. And I think this will become even more true in the age of Large Language Models; rather than cramming too much magic into our compilers, let’s rely on humans-with-LLMs to meet the compiler in the middle.</p>
+
+<p><em>(This project is supported by a GCP cloud compute grant from <a href="https://mlcollective.org/wiki/ask-mlc-compute-assistance/">ML Collective</a>, which has been super helpful. Thanks, also, to Rosanne Liu for useful feedback on drafts of this post.)</em></p>
+
+
+
+
+      </article>
+
+      </div>
+    </div>
+  </div></div>
+  </body>
+</html>
