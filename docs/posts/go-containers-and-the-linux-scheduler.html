@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.riverphillips.dev/blog/go-cfs/">Original</a>
+    <h1>Go, Containers, and the Linux Scheduler</h1>
+    
+    <div id="readability-page-1" class="page"><div data-astro-cid-bvzihdzo=""><p>Like many Go developers my applications are usually deployed in containers.
+When running in container orchestrators it’s important to set CPU limits to ensure that the container doesn’t consume all the CPU on the host.
+However, the Go runtime is not aware of the CPU limits set on the container and will happily use all the CPU available.
+This has bitten me in the past, leading to high latency, in this blog I’ll explain what is going on and how to fix it.</p>
+<h2 id="how-the-go-garbage-collector-works">How the Go Garbage Collector works</h2>
+<p>This is going to be a pretty high level overview of the Go Garbage Collector (GC).
+For a more in depth overview I recommend reading <a href="https://tip.golang.org/doc/gc-guide">the go docs</a>
+and this <a href="https://www.ardanlabs.com/blog/2018/12/garbage-collection-in-go-part1-semantics.html">excellent series of blogs</a>
+by Will Kennedy.</p>
+<p>The vast majority of the time the Go runtime performs garbage collection concurrently with the execution of your program.
+This means that the GC is running at the same time as your program. However, there are two points in the GC process where the Go runtime needs to stop every Goroutine.
+This is required to ensure data integrity. Before the Mark Phase of the GC the runtime stops every Goroutine to apply the write barrier, this ensures no objects created after this point are garbage collected. This phase is known as Sweep Termination.
+After the mark phase has finished there is another stop the world phase, this is known as Mark Termination and the same process happens to remove the write barrier. These usually takes in the order of tens of microseconds.</p>
+<p>I created a simple web application that allocates a lot of memory and ran it in a container with a limit of 4 CPU cores with the following command.The Source code for this is available <a href="https://github.com/RiverPhillips/go-cfs-blog">here.</a></p>
+<pre tabindex="0" lang="bash"><code><span><span>docker</span><span> run</span><span> --cpus=4</span><span> -p</span><span> 8080</span><span>:8080</span><span> $(</span><span>ko</span><span> build </span><span>-L</span><span> main.go)</span></span>
+<span></span></code></pre>
+<p>You can collect a trace using the <a href="https://golang.org/pkg/runtime/trace/">runtime/trace</a> package then analyze it with <code>go tool trace</code>. The following trace shows a GC cycle captured on my machine. You can see the Sweep Termination and the Mark Termination stop the world phase on <code>Proc 5</code> (They’re labelled STW for stop the world).</p>
+<p><a href="https://www.riverphillips.dev/gc_trace.jpg"><img src="https://www.riverphillips.dev/gc_trace.jpg" alt="GC Trace"/></a></p>
+<p>This GC cycle took just under 2.5ms, but we spent almost 10% of that in a stop the world phase. This is a pretty significant amount of time, especially if you are running a latency sensitive application.</p>
+<h2 id="the-linux-scheduler">The Linux Scheduler</h2>
+<p>The <a href="https://docs.kernel.org/scheduler/sched-design-CFS.html">Completely Fair Scheduler (CFS)</a> was introduced in Linux 2.6.23 and was the default Scheduler until Linux 6.6 which was released last week. It’s likely you’re using the CFS.</p>
+<p>The CFS is a <a href="https://en.wikipedia.org/wiki/Proportional_share_scheduling">proportional share scheduler</a>, this means that the weight of a process is proportional to the number of CPU cores it is allowed to use. For example, if a process is allowed to use 4 CPU cores it will have a weight of 4. If a process is allowed to use 2 CPU cores it will have a weight of 2.</p>
+<p>The CFS does this by allocating a fraction of CPU time. A 4 core system has 4 seconds of CPU time to allocate every second. When you allocate a container a number of CPU cores you’re essentially asking the Linux Scheduler to give it <code>n</code> CPUs worth of time.</p>
+<p>In the above <code>docker run</code> command I’m asking for 4 CPUs worth of time. This means that the container will get 4 seconds of CPU time every second.</p>
+<h2 id="the-problem">The Problem</h2>
+<p>When the Go runtime starts it creates an OS thread for each CPU core. This means if you have a 16 core machine the Go runtime will create 16 OS threads - regardless of any CGroup CPU Limits. The Go runtime then uses these OS threads to schedule goroutines.</p>
+<p>The problem is that the Go runtime is not aware of the CGroup CPU limits and will happily schedule goroutines on all 16 OS threads. This means that the Go runtime will expect to be able to use 16 seconds of CPU time every second.</p>
+<p>Long stop the world durations arise from the Go runtime needing to stop Goroutine on threads that it’s waiting for the Linux Scheduler to schedule. These threads will not be scheduled once the container has used it’s CPU quota.</p>
+<h2 id="the-solution">The Solution</h2>
+<p>Go allows you to limit the number of CPU threads that the runtime will create using the <code>GOMAXPROCS</code> environment variable.
+This time I used the following command to start the container</p>
+<pre tabindex="0" lang="bash"><code><span><span>docker</span><span> run</span><span> --cpus=4</span><span> -e</span><span> GOMAXPROCS=</span><span>4</span><span> -p</span><span> 8080</span><span>:8080</span><span> $(</span><span>ko</span><span> build </span><span>-L</span><span> main.go)</span></span></code></pre>
+<p>Below is a trace captured from the same application as above, now with the <code>GOMAXPROCS</code> environment variable matching the CPU quota.</p>
+<p><a href="https://www.riverphillips.dev/gc_trace_4.jpg"><img src="https://www.riverphillips.dev/gc_trace_4.jpg" alt="GC Trace"/></a></p>
+<p>In this trace, the garbage collection is much shorter, despite having the exact same load. The GC Cycle took under 1ms and the stop the world phase was 26μs, approximately 1/10 of the time when there was no limit.</p>
+<p><code>GOMAXPROCS</code> should be set to the number of CPU cores that the container is allowed to use, if you’re allocating fractional CPU round down, unless you’re allocating less than 1 CPU core in which case round up. <code>GOMAXPROCS=max(1, floor(CPUs))</code> can be used to calculate the value.
+If you find it easier Uber has open sourced a library <a href="https://github.com/uber-go/automaxprocs">automaxprocs</a> to calculate this value for you from your container’s cgroups automatically.</p>
+<p>There’s an outstanding <a href="https://github.com/golang/go/issues/33803">Github Issue</a> with the Go runtime to support this out the box so hopefully it will be added eventually!</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>When running Go in a containerised application it’s important to set CPU limits. It’s also important to ensure that the Go runtime is aware of these limits by setting a sensible <code>GOMAXPROCS</code> value or using a library like <a href="https://github.com/uber-go/automaxprocs">automaxprocs</a>.</p></div></div>
+  </body>
+</html>
