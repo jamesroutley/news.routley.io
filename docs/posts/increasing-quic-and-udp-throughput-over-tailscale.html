@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://tailscale.com/blog/quic-udp-throughput/">Original</a>
+    <h1>Increasing QUIC and UDP Throughput over Tailscale</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      <p>Hi, we’re back to talk about performance. You might remember us from our previous work (<a href="https://tailscale.com/blog/throughput-improvements/">post #1</a> &amp; <a href="https://tailscale.com/blog/more-throughput/">post #2</a>), which increased TCP throughput over <a href="https://git.zx2c4.com/wireguard-go/about/">wireguard-go</a>, the userspace <a href="https://www.wireguard.com/">WireGuard</a>® implementation that Tailscale uses. We’re releasing a set of changes that builds on this foundation, significantly improving UDP throughput on Linux. As with the previous work, we <a href="https://github.com/WireGuard/wireguard-go/pull/97">intend to upstream</a> these changes to WireGuard.</p>
+<p>The <a href="https://en.wikipedia.org/wiki/User_Datagram_Protocol">User Datagram Protocol (UDP)</a> is a connectionless transport protocol, and unlike the <a href="https://en.wikipedia.org/wiki/Transmission_Control_Protocol">Transmission Control Protocol (TCP)</a> provides no delivery or ordering guarantees on its own. These properties make UDP appropriate for real-time applications, e.g. gaming and video conferencing, where dropping a packet is preferred over a delayed retransmission. In recent years, the usage of UDP has dramatically increased with the emergence of <a href="https://en.wikipedia.org/wiki/HTTP/3">HTTP/3</a> and the <a href="https://en.wikipedia.org/wiki/QUIC">QUIC protocol</a>.</p>
+<p><strong>Our changes improve throughput for HTTP/3, QUIC, and other UDP-based applications through the use of <strong><a href="https://www.kernel.org/doc/html/latest/networking/segmentation-offloads.html"><strong>segmentation offloads</strong></a></strong>. UDP throughput over Tailscale increases 4x on bare metal Linux, and pushes past (for now) the in-kernel WireGuard implementation on that hardware.</strong> You can experience these improvements in Tailscale v1.54. Continue reading to learn more, or jump down to the <a href="#results">Results</a> section if you just want numbers.</p>
+<h2 id="background">Background</h2>
+<p>wireguard-go is the foundation of the dataplane in Tailscale. It receives packets from the operating system via a <a href="https://en.wikipedia.org/wiki/TUN/TAP">TUN</a> interface, encrypts them, and sends them to a remote peer via a UDP socket. Packets flowing in the opposite direction are read from the UDP socket, decrypted, and written back to the kernel’s TUN interface driver.</p>
+
+    
+    
+
+<figure>
+        <img src="https://tailscale.com/blog/quic-udp-throughput/improved-throughput.svg"/>
+    
+</figure>
+
+<p>The changes we made in Tailscale v1.36 and v1.40 updated this packet pipeline to <a href="https://tailscale.com/blog/more-throughput/#results">greatly increase TCP throughput over wireguard-go</a>. In both cases we focused on increasing the number of packets shuffled end-to-end per I/O operation. On the TUN driver side this involved TCP segmentation offload (TSO) and generic receive offload (GRO). On the UDP socket side we leveraged UDP generic segmentation offload (UDP GSO) and UDP generic receive offload (UDP GRO). Both segmentation and receive offloads enable multiple packets to pass through the stack as a single element. Segmentation offloads involve segmenting the single “monster” packet closest to the transmit boundary where natural-sized packets are to be written. Receive offloads involve coalescing multiple packets together to form a “monster” packet closest to the receive boundary where natural-sized packets are expected to be read.</p>
+
+    
+    
+
+<figure>
+        <img src="https://tailscale.com/blog/quic-udp-throughput/transmit-tuntso-udpsendmmsg-udpgso.svg"/>
+    
+</figure>
+
+
+    
+    
+
+<figure>
+        <img src="https://tailscale.com/blog/quic-udp-throughput/receive-udprecvmmsg-udpgro-tungro.svg"/>
+    
+</figure>
+
+<p>Where these offloads were leveraged for UDP, UDP was acting as the underlay protocol. The offloads we implemented on the TUN side were specific to TCP, and did not apply for UDP overlay traffic. This resulted in little benefit for UDP flows <strong>over wireguard-go</strong>. TCP has long been the transport protocol of choice for high throughput applications, so initially focusing on TCP throughput made sense. However, with the emergence of HTTP/3 and QUIC, this is starting to shift.</p>
+<h2 id="http3-and-quic">HTTP/3 and QUIC</h2>
+<p>HTTP/3 is the successor to HTTP/2, and it uses QUIC, a relatively new multiplexed transport protocol built on UDP.</p>
+
+    
+    
+
+<figure>
+        <img src="https://tailscale.com/blog/quic-udp-throughput/http2-vs-http3.svg"/>
+    
+</figure>
+
+<p>QUIC has a number of benefits over TCP, including but not limited to:</p>
+<ul>
+<li>Tight integration with TLS, making it less susceptible to middleboxes messing with or depending upon transport layer metadata</li>
+<li>A faster connection handshake (assuming HTTP/2 over TCP isn’t required to bootstrap)</li>
+<li>Being less susceptible to head-of-line blocking; stream-awareness stretches from transport protocol to HTTP/3</li>
+<li>Enablement of rapid congestion control evolution, as it exists in user space</li>
+</ul>
+<p>Depending on who you ask, <a href="https://pulse.internetsociety.org/blog/why-http-3-is-eating-the-world">HTTP/3 is already supported by ~27% of web servers and networks worldwide.</a> So, HTTP/3 and QUIC adoption is on the rise, and it’s time we extended our performance work to benefit it.</p>
+<h2 id="baseline">Baseline</h2>
+<p><strong>Disclaimer about benchmarks</strong>: This post contains benchmarks! These benchmarks are reproducible at the time of writing, and we provide details about the environments we ran them in. But benchmark results tend to vary across environments, and they also tend to go stale as time progresses. Your mileage may vary.</p>
+<p>We need to set a UDP throughput baseline for later comparison. In our previous posts we conducted TCP benchmarks with <a href="https://github.com/esnet/iperf">iperf3</a>, but at the time of writing iperf3 does not support UDP GSO/GRO. Without this support it won’t reflect real-world performance in comparison to widely-used QUIC implementations. So, we will be using <a href="https://github.com/microsoft/msquic/tree/main/src/perf#secured-network-performance-testing">secnetperf</a>, a utility of <a href="https://github.com/microsoft/msquic">msquic</a>, instead. To quote the msquic README:</p>
+<blockquote>
+<p>MsQuic is a Microsoft implementation of the <a href="https://datatracker.ietf.org/wg/quic/about/">IETF QUIC</a> protocol. It is cross-platform, written in C and designed to be a general purpose QUIC library. MsQuic also has C++ API wrapper classes and exposes interop layers for both Rust and C#.</p>
+</blockquote>
+<p>One of msquic’s maintainers, Nick Banks, has worked inside the IETF and proposed a <a href="https://datatracker.ietf.org/doc/html/draft-banks-quic-performance-00">QUIC performance protocol</a> for testing the performance characteristics of a QUIC implementation. secnetperf implements this protocol. </p>
+<p>Using secnetperf we baselined QUIC throughput for <a href="https://git.zx2c4.com/wireguard-go/commit/?id=2e0774f246fb4fc1bd5cb44584d033038c89174e">wireguard-go@2e0774f</a> and in-kernel WireGuard between two pairs of hosts, both running Ubuntu 22.04 with the <a href="https://ubuntu.com/kernel/lifecycle">LTS Hardware Enablement kernel</a> available at time of writing:</p>
+<ul>
+<li>2 x AWS c6i.8xlarge instance types</li>
+<li>2 x “bare metal” servers powered by <a href="https://ark.intel.com/content/www/us/en/ark/products/134586/intel-core-i512400-processor-18m-cache-up-to-4-40-ghz.html">i5-12400</a> CPUs &amp; Mellanox MCX512A-ACAT NICs</li>
+</ul>
+<p>The AWS instances are in the same region and availability zone:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>ubuntu@c6i-8xlarge-1:~$ ec2metadata <span>|</span> grep -E <span>&#39;instance-type:|availability-zone:&#39;</span>
+</span></span><span><span>availability-zone: us-east-2b
+</span></span><span><span>instance-type: c6i.8xlarge
+</span></span><span><span>ubuntu@c6i-8xlarge-1:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ cat /sys/module/intel_idle/parameters/max_cstate
+</span></span><span><span><span>1</span>
+</span></span><span><span>
+</span></span><span><span>ubuntu@c6i-8xlarge-2:~$ ec2metadata <span>|</span> grep -E <span>&#39;instance-type:|availability-zone:&#39;</span>
+</span></span><span><span>availability-zone: us-east-2b
+</span></span><span><span>instance-type: c6i.8xlarge
+</span></span><span><span>ubuntu@c6i-8xlarge-2:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ cat /sys/module/intel_idle/parameters/max_cstate
+</span></span><span><span><span>1</span>
+</span></span><span><span>
+</span></span><span><span>ubuntu@c6i-8xlarge-1:~$ ping 172.31.23.111 -c <span>5</span> -q
+</span></span><span><span>PING 172.31.23.111 <span>(</span>172.31.23.111<span>)</span> 56<span>(</span>84<span>)</span> bytes of data.
+</span></span><span><span>
+</span></span><span><span>--- 172.31.23.111 ping statistics ---
+</span></span><span><span><span>5</span> packets transmitted, <span>5</span> received, 0% packet loss, <span>time</span> 4094ms
+</span></span><span><span>rtt min/avg/max/mdev <span>=</span> 0.109/0.126/0.168/0.022 ms
+</span></span></code></pre></div><p>The i5-12400 CPU is a modern (released Q1 2022) desktop-class chip, available for $150 USD at the time of writing. The Mellanox NICs are connected at 25Gb/s via a direct attach copper (DAC) cable:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>jwhited@i5-12400-1:~$ lscpu <span>|</span> grep Model.name <span>&amp;&amp;</span> cpupower frequency-info -d <span>&amp;&amp;</span> cpupower frequency-info -p
+</span></span><span><span>Model name:                     	12th Gen Intel<span>(</span>R<span>)</span> Core<span>(</span>TM<span>)</span> i5-12400
+</span></span><span><span>analyzing CPU 5:
+</span></span><span><span>  driver: intel_pstate
+</span></span><span><span>analyzing CPU 11:
+</span></span><span><span>  current policy: frequency should be within <span>800</span> MHz and 4.40 GHz.
+</span></span><span><span>                The governor <span>&#34;performance&#34;</span> may decide which speed to use
+</span></span><span><span>                within this range.
+</span></span><span><span>jwhited@i5-12400-1:~$ sudo ethtool enp1s0f0np0 <span>|</span> grep Speed <span>&amp;&amp;</span> sudo ethtool -i enp1s0f0np0 <span>|</span> egrep <span>&#39;driver|^version&#39;</span>
+</span></span><span><span>    Speed: 25000Mb/s
+</span></span><span><span>driver: mlx5_core
+</span></span><span><span>version: 6.2.0-35-generic
+</span></span><span><span>jwhited@i5-12400-1:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ cat /sys/module/intel_idle/parameters/max_cstate
+</span></span><span><span><span>1</span>
+</span></span><span><span>
+</span></span><span><span>jwhited@i5-12400-2:~$ lscpu <span>|</span> grep Model.name <span>&amp;&amp;</span> cpupower frequency-info -d <span>&amp;&amp;</span> cpupower frequency-info -p
+</span></span><span><span>Model name:                     	12th Gen Intel<span>(</span>R<span>)</span> Core<span>(</span>TM<span>)</span> i5-12400
+</span></span><span><span>analyzing CPU 1:
+</span></span><span><span>  driver: intel_pstate
+</span></span><span><span>analyzing CPU 10:
+</span></span><span><span>  current policy: frequency should be within <span>800</span> MHz and 4.40 GHz.
+</span></span><span><span>                The governor <span>&#34;performance&#34;</span> may decide which speed to use
+</span></span><span><span>                within this range.
+</span></span><span><span>jwhited@i5-12400-2:~$ sudo ethtool enp1s0f0np0 <span>|</span> grep Speed <span>&amp;&amp;</span> sudo ethtool -i enp1s0f0np0 <span>|</span> egrep <span>&#39;driver|^version&#39;</span>
+</span></span><span><span>    Speed: 25000Mb/s
+</span></span><span><span>driver: mlx5_core
+</span></span><span><span>version: 6.2.0-35-generic
+</span></span><span><span>jwhited@i5-12400-2:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ cat /sys/module/intel_idle/parameters/max_cstate
+</span></span><span><span><span>1</span>
+</span></span><span><span>
+</span></span><span><span>jwhited@i5-12400-1:~$ ping 10.0.0.20 -c <span>5</span> -q
+</span></span><span><span>PING 10.0.0.20 <span>(</span>10.0.0.20<span>)</span> 56<span>(</span>84<span>)</span> bytes of data.
+</span></span><span><span>
+</span></span><span><span>--- 10.0.0.20 ping statistics ---
+</span></span><span><span><span>5</span> packets transmitted, <span>5</span> received, 0% packet loss, <span>time</span> 4100ms
+</span></span><span><span>rtt min/avg/max/mdev <span>=</span> 0.211/0.229/0.299/0.034 ms
+</span></span></code></pre></div><p>c6i.8xlarge over in-kernel WireGuard:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>ubuntu@c6i-8xlarge-1:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ ./secnetperf -stats:1 -test:tput -exec:maxtput -target:c6i-8xlarge-2-wg -download:10000 -timed:1 -encrypt:0
+</span></span><span><span>Started!
+</span></span><span><span>
+</span></span><span><span><span>[</span>conn<span>][</span>0x55da01e608b0<span>]</span> STATS: <span>EcnCapable</span><span>=</span><span>0</span> <span>RTT</span><span>=</span><span>2978</span> us <span>SendTotalPackets</span><span>=</span><span>40942</span> <span>SendSuspectedLostPackets</span><span>=</span><span>3</span> <span>SendSpuriousLostPackets</span><span>=</span><span>0</span> <span>SendCongestionCount</span><span>=</span><span>0</span> <span>SendEcnCongestionCount</span><span>=</span><span>0</span> <span>RecvTotalPackets</span><span>=</span><span>2603832</span> <span>RecvReorderedPackets</span><span>=</span><span>0</span> <span>RecvDroppedPackets</span><span>=</span><span>0</span> <span>RecvDuplicatePackets</span><span>=</span><span>0</span> <span>RecvDecryptionFailures</span><span>=</span><span>0</span>
+</span></span><span><span>Result: <span>3425635581</span> bytes @ <span>2739682</span> kbps <span>(</span>10003.016 ms<span>)</span>.
+</span></span><span><span>App Main returning status <span>0</span>
+</span></span></code></pre></div><p>c6i.8xlarge over <a href="https://git.zx2c4.com/wireguard-go/commit/?id=2e0774f246fb4fc1bd5cb44584d033038c89174e">wireguard-go@2e0774f</a>:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>ubuntu@c6i-8xlarge-1:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ ./secnetperf -stats:1 -test:tput -exec:maxtput -target:c6i-8xlarge-2-wg -download:10000 -timed:1 -encrypt:0
+</span></span><span><span>Started!
+</span></span><span><span>
+</span></span><span><span><span>[</span>conn<span>][</span>0x55b6b6d718b0<span>]</span> STATS: <span>EcnCapable</span><span>=</span><span>0</span> <span>RTT</span><span>=</span><span>2439</span> us <span>SendTotalPackets</span><span>=</span><span>41663</span> <span>SendSuspectedLostPackets</span><span>=</span><span>43</span> <span>SendSpuriousLostPackets</span><span>=</span><span>40</span> <span>SendCongestionCount</span><span>=</span><span>8</span> <span>SendEcnCongestionCount</span><span>=</span><span>0</span> <span>RecvTotalPackets</span><span>=</span><span>2095421</span> <span>RecvReorderedPackets</span><span>=</span><span>0</span> <span>RecvDroppedPackets</span><span>=</span><span>0</span> <span>RecvDuplicatePackets</span><span>=</span><span>0</span> <span>RecvDecryptionFailures</span><span>=</span><span>0</span>
+</span></span><span><span>Result: <span>2756939372</span> bytes @ <span>2204985</span> kbps <span>(</span>10002.565 ms<span>)</span>.
+</span></span><span><span>App Main returning status <span>0</span>
+</span></span></code></pre></div><p>i5-12400 over in-kernel WireGuard:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>jwhited@i5-12400-1:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ ./secnetperf -stats:1 -exec:maxtput -test:tput -target:i5-12400-2-wg -download:10000 -timed:1 -encrypt:0
+</span></span><span><span>Started!
+</span></span><span><span>
+</span></span><span><span><span>[</span>conn<span>][</span>0x562e0ffe4990<span>]</span> STATS: <span>EcnCapable</span><span>=</span><span>0</span> <span>RTT</span><span>=</span><span>254</span> us <span>SendTotalPackets</span><span>=</span><span>89475</span> <span>SendSuspectedLostPackets</span><span>=</span><span>268</span> <span>SendSpuriousLostPackets</span><span>=</span><span>201</span> <span>SendCongestionCount</span><span>=</span><span>259</span> <span>SendEcnCongestionCount</span><span>=</span><span>0</span> <span>RecvTotalPackets</span><span>=</span><span>5152896</span> <span>RecvReorderedPackets</span><span>=</span><span>0</span> <span>RecvDroppedPackets</span><span>=</span><span>0</span> <span>RecvDuplicatePackets</span><span>=</span><span>0</span> <span>RecvDecryptionFailures</span><span>=</span><span>0</span>
+</span></span><span><span>Result: <span>6777820234</span> bytes @ <span>5422105</span> kbps <span>(</span>10000.278 ms<span>)</span>.
+</span></span><span><span>App Main returning status <span>0</span>
+</span></span></code></pre></div><p>i5-12400 over <a href="https://git.zx2c4.com/wireguard-go/commit/?id=2e0774f246fb4fc1bd5cb44584d033038c89174e">wireguard-go@2e0774f</a>:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>jwhited@i5-12400-1:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ ./secnetperf -stats:1 -exec:maxtput -test:tput -target:i5-12400-2-wg -download:10000 -timed:1 -encrypt:0
+</span></span><span><span>Started!
+</span></span><span><span>
+</span></span><span><span><span>[</span>conn<span>][</span>0x5653ff74f980<span>]</span> STATS: <span>EcnCapable</span><span>=</span><span>0</span> <span>RTT</span><span>=</span><span>4407</span> us <span>SendTotalPackets</span><span>=</span><span>54768</span> <span>SendSuspectedLostPackets</span><span>=</span><span>74</span> <span>SendSpuriousLostPackets</span><span>=</span><span>69</span> <span>SendCongestionCount</span><span>=</span><span>26</span> <span>SendEcnCongestionCount</span><span>=</span><span>0</span> <span>RecvTotalPackets</span><span>=</span><span>2792345</span> <span>RecvReorderedPackets</span><span>=</span><span>0</span> <span>RecvDroppedPackets</span><span>=</span><span>0</span> <span>RecvDuplicatePackets</span><span>=</span><span>0</span> <span>RecvDecryptionFailures</span><span>=</span><span>0</span>
+</span></span><span><span>Result: <span>3672645654</span> bytes @ <span>2936870</span> kbps <span>(</span>10004.241 ms<span>)</span>.
+</span></span><span><span>App Main returning status <span>0</span>
+</span></span></code></pre></div><p>In our previous posts we analyzed flame graphs (<a href="https://tailscale.com/blog/throughput-improvements/#linux-perf-and-flame-graphs">post #1</a> &amp; <a href="https://tailscale.com/blog/more-throughput/#linux-perf-and-flame-graphs">post #2</a>) which highlighted where CPU cycle/byte efficiency could improve through the kernel networking stack and wireguard-go. The results of this analysis lead us to implement transport layer offloads at both ends of wireguard-go, which improved throughput for TCP traffic on the overlay. Now, we need to build on this work to benefit UDP traffic over wireguard-go just the same. Enter tx-udp-segmentation.</p>
+<h2 id="tx-udp-segmentation">tx-udp-segmentation</h2>
+<p>tx-udp-segmentation is the ethtool short name for UDP segmentation offload as a network device feature:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>ubuntu@c6i-8xlarge-1:~$ ethtool --show-features wg0 <span>|</span> grep tx-udp-segme
+</span></span><span><span>tx-udp-segmentation: on
+</span></span></code></pre></div><p>NETIF_F_GSO_UDP_L4 is the Linux kernel symbol used to define it in code. To quote <a href="https://github.com/torvalds/linux/blob/v6.2/Documentation/networking/netdev-features.rst?plain=1#L119">kernel documentation</a>:</p>
+<blockquote>
+<p>NETIF_F_GSO_UDP_L4 accepts a single UDP header with a payload that exceeds gso_size. On segmentation, it segments the payload on gso_size boundaries and replicates the network and UDP headers (fixing up the last one if less than gso_size).</p>
+</blockquote>
+<p>This netdev feature was <a href="https://github.com/torvalds/linux/commit/83aa025f535f76733e334e3d2a4d8577c8441a7e">added in Linux v4.18</a>, and more recently <a href="https://github.com/torvalds/linux/commit/399e0827642f6a8bcae24277fe08e80e7e4bb891">added as a feature that can be toggled in the TUN driver in Linux v6.2</a>. The TUN driver support in v6.2 was the missing piece needed to improve UDP throughput <strong>over wireguard-go</strong>. With it toggled on, wireguard-go can receive “monster” UDP datagrams from the kernel:</p>
+
+    
+    
+
+<figure>
+        <img src="https://tailscale.com/blog/quic-udp-throughput/transmit-with-app-UDPGSO-TUNUDPGSO-UDPsndmmsg-UDPGSO.svg"/>
+    
+</figure>
+
+<p>The opposite direction works similarly. It does not require an explicit netdev feature to support UDP GRO, and simply piggybacks on the <a href="https://github.com/torvalds/linux/blob/v6.2/include/uapi/linux/virtio_net.h#L136">same virtio network infrastructure</a> for coalescing support.</p>
+
+    
+    
+
+<figure>
+        <img src="https://tailscale.com/blog/quic-udp-throughput/recieve-with-UDPrecvmmsg-UDPGRO-TUNUDPGRO-appUDPGRO.svg"/>
+    
+</figure>
+
+<p>Now, on to the overall results.</p>
+<h2 id="results">Results</h2>
+<p>Applying TUN UDP GSO/GRO resulted in significant throughput improvements for wireguard-go, and so also in the Tailscale client.</p>
+<p>wireguard-go (c6i.8xlarge) with TUN UDP GSO/GRO:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>ubuntu@c6i-8xlarge-1:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ ./secnetperf -stats:1 -test:tput -exec:maxtput -target:c6i-8xlarge-2-wg -download:10000 -timed:1 -encrypt:0
+</span></span><span><span>Started!
+</span></span><span><span>
+</span></span><span><span><span>[</span>conn<span>][</span>0x556b755e68b0<span>]</span> STATS: <span>EcnCapable</span><span>=</span><span>0</span> <span>RTT</span><span>=</span><span>3654</span> us <span>SendTotalPackets</span><span>=</span><span>91459</span> <span>SendSuspectedLostPackets</span><span>=</span><span>3</span> <span>SendSpuriousLostPackets</span><span>=</span><span>0</span> <span>SendCongestionCount</span><span>=</span><span>0</span> <span>SendEcnCongestionCount</span><span>=</span><span>0</span> <span>RecvTotalPackets</span><span>=</span><span>6856927</span> <span>RecvReorderedPackets</span><span>=</span><span>0</span> <span>RecvDroppedPackets</span><span>=</span><span>0</span> <span>RecvDuplicatePackets</span><span>=</span><span>0</span> <span>RecvDecryptionFailures</span><span>=</span><span>0</span>
+</span></span><span><span>Result: <span>9015481229</span> bytes @ <span>7209669</span> kbps <span>(</span>10003.767 ms<span>)</span>.
+</span></span><span><span>App Main returning status <span>0</span>
+</span></span></code></pre></div><p>wireguard-go (i5-12400) with TUN UDP GSO/GRO:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>jwhited@i5-12400-1:~/msquic/artifacts/bin/linux/x64_Release_openssl3$ ./secnetperf -stats:1 -exec:maxtput -test:tput -target:i5-12400-2-wg -download:10000 -timed:1 -encrypt:0
+</span></span><span><span>Started!
+</span></span><span><span>
+</span></span><span><span><span>[</span>conn<span>][</span>0x56493dfd09a0<span>]</span> STATS: <span>EcnCapable</span><span>=</span><span>0</span> <span>RTT</span><span>=</span><span>1216</span> us <span>SendTotalPackets</span><span>=</span><span>165033</span> <span>SendSuspectedLostPackets</span><span>=</span><span>64</span> <span>SendSpuriousLostPackets</span><span>=</span><span>61</span> <span>SendCongestionCount</span><span>=</span><span>53</span> <span>SendEcnCongestionCount</span><span>=</span><span>0</span> <span>RecvTotalPackets</span><span>=</span><span>11845268</span> <span>RecvReorderedPackets</span><span>=</span><span>25267</span> <span>RecvDroppedPackets</span><span>=</span><span>0</span> <span>RecvDuplicatePackets</span><span>=</span><span>0</span> <span>RecvDecryptionFailures</span><span>=</span><span>0</span>
+</span></span><span><span>Result: <span>15574671184</span> bytes @ <span>12458214</span> kbps <span>(</span>10001.222 ms<span>)</span>.
+</span></span><span><span>App Main returning status <span>0</span>
+</span></span></code></pre></div>
+    
+    
+
+<figure>
+        <img src="https://tailscale.com/blog/quic-udp-throughput/results-QUIC.svg"/>
+    
+</figure>
+
+<p><strong>With this new set of changes, UDP throughput over Tailscale increases 4x on bare metal Linux, and pushes past (for now) the in-kernel WireGuard implementation on that hardware.</strong> The AWS c6i.8xlarge instances hit a wall at ~7Gb/s that appears to be an artificial limit of the underlay network.</p>
+<h2 id="rx-udp-gro-forwarding-and-rx-gro-list">rx-udp-gro-forwarding and rx-gro-list</h2>
+<p>It’s important to cover two network device features in the Linux kernel that relate to UDP throughput in forwarding topologies, i.e. a packet comes in one interface and leaves another.</p>
+<p>The first is rx-udp-gro-forwarding, which to quote its <a href="https://github.com/torvalds/linux/blob/v6.2/include/linux/netdev_features.h#L87">comment from the Linux kernel</a>:</p>
+<blockquote>
+<p>/* Allow UDP GRO for forwarding */</p>
+</blockquote>
+<p>Without rx-udp-gro-forwarding enabled on the receiving interface, UDP packets that are forwarded, i.e. not destined to a local socket, will not be candidates for coalescing. This limits the effects of GRO through the rest of the stack, reducing throughput. Initially UDP GRO for forwarded packets was enabled by default, prior to this feature’s existence. This was unintentional as mentioned by the <a href="https://github.com/torvalds/linux/commit/36707061d6bafc254b3dfc23a8bb95451812b233">kernel commit introducing the feature</a>:</p>
+<blockquote>
+<p>Commit <a href="https://github.com/torvalds/linux/commit/9fd1ff5d2ac7181844735806b0a703c942365291">9fd1ff5</a> (“udp: Support UDP fraglist GRO/GSO.”) actually not only added a support for fraglisted UDP GRO, but also tweaked some logics the way that non-fraglisted UDP GRO started to work for forwarding too.</p>
+</blockquote>
+<p>It worked as expected, but the intent was to leave the previous default behavior as-is:</p>
+<blockquote>
+<p>Tests showed that currently forwarding and NATing of plain UDP GRO packets are performed fully correctly, regardless if the target netdevice has a support for hardware/driver GSO UDP L4 or not.</p>
+</blockquote>
+<p>We recommend <a href="https://tailscale.com/s/ethtool-config-udp-gro">enabling rx-udp-gro-forwarding on your default route interface</a> if you are running Tailscale version 1.54 or later as a subnet router or exit node with a Linux 6.2 or later kernel. Initially this will be a soft recommendation via the CLI, and we are considering alternatives to make this easier to surface and enable in the future.</p>
+<p>This same commit also makes mention of rx-gro-list / NETIF_F_GRO_FRAGLIST:</p>
+<blockquote>
+<p>If both NETIF_F_GRO_FRAGLIST and NETIF_F_GRO_UDP_FWD are set, fraglisted GRO takes precedence. This keeps the current behaviour and is generally more optimal for now, as the number of NICs with hardware USO offload is relatively small.</p>
+</blockquote>
+<p>We just implemented “hardware USO” (tx-udp-segmentation), so “generally more optimal” does not apply. We recommend leaving rx-gro-list disabled. With rx-gro-list taking precedence over rx-udp-gro-forwarding, the effects of UDP GRO will be limited, reducing UDP throughput. rx-gro-list is a compelling, performance-enhancing feature, but the Linux kernel does not currently support a method to carry its benefits through the TUN driver. Instead, packets are segmented <strong>before</strong> being transmitted out a TUN device.</p>
+
+    
+    
+
+<figure>
+        <img src="https://tailscale.com/blog/quic-udp-throughput/coalescing-benefits-not-realized.svg"/>
+    
+</figure>
+
+
+    
+    
+
+<figure>
+        <img src="https://tailscale.com/blog/quic-udp-throughput/coalescing-benefits-realized.svg"/>
+    
+</figure>
+
+<h2 id="c-states">C-States</h2>
+<p>Looking back at the Baseline section you may have noticed we recorded the output of <code>cat /sys/module/intel_idle/parameters/max_cstate</code>. Why? What is a C-State? Why do we want to limit it?</p>
+<p>C-States represent CPU core sleep level. The states are numbered and start at 0. A core in C-State 0 (C0) is awake and ready to accept instructions. As the C-State gets deeper you save more power (C1, C2, …), but you also incur an increasingly larger latency penalty when transitioning back to an awake state (Cn =&gt; C0). This latency penalty can reduce network throughput.</p>
+<p>When testing a forwarding topology with the bare metal machines, we observed cores on the forwarding node entering a deeper sleep with TUN UDP GSO/GRO, than without. This correlated with lower throughput with TUN UDP GSO/GRO, than without.</p>
+<p>To measure and observe what was happening we used <a href="https://manpages.ubuntu.com/manpages/jammy/man8/turbostat.8.html">turbostat</a>, which reports processor topology, frequency, and idle power-state statistics (C-States), among other things. We’ll compare turbostat output from 2 secnetperf runs. The first is <a href="https://git.zx2c4.com/wireguard-go/commit/?id=2e0774f246fb4fc1bd5cb44584d033038c89174e">wireguard-go@2e0774f</a>, max_cstate = 9.</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>Result: <span>3825021302</span> bytes @ <span>3059741</span> kbps <span>(</span>10000.900 ms<span>)</span>.
+</span></span><span><span>
+</span></span><span><span>jwhited@i5-12400-2:~$ sudo turbostat --show Core,CPU,Avg_MHZ,Busy%,Bzy_MHz,POLL%,C1E%,C6%,C8%,C10% --quiet sleep <span>5</span>
+</span></span><span><span>5.001241 sec
+</span></span><span><span>Core    CPU    Busy%    Bzy_MHz    POLL%    C1E%    C6%    C8%    C10%
+</span></span><span><span>-       -      12.76    <span>3905</span>       0.39    28.25    2.08   6.67   50.58
+</span></span><span><span><span>0</span>       <span>0</span>      15.48    <span>3850</span>       0.03    25.31    1.79   5.82   51.90
+</span></span><span><span><span>0</span>       <span>1</span>      7.75     <span>3876</span>       0.02    10.50    1.37   4.18   76.35
+</span></span><span><span><span>1</span>       <span>2</span>      12.15    <span>3864</span>       1.23    54.73    2.36   8.07   23.08
+</span></span><span><span><span>1</span>       <span>3</span>      6.95     <span>3789</span>       0.78    28.31    1.44   4.11   59.52
+</span></span><span><span><span>2</span>       <span>4</span>      17.08    <span>3993</span>       0.21    30.32    2.66   7.64   42.77
+</span></span><span><span><span>2</span>       <span>5</span>      18.68    <span>4037</span>       0.40    35.10    3.28   9.42   33.82
+</span></span><span><span><span>3</span>       <span>6</span>      14.48    <span>3819</span>       0.73    47.79    1.98   7.06   29.09
+</span></span><span><span><span>3</span>       <span>7</span>      3.88     <span>3711</span>       0.29    10.44    0.91   1.82   83.14
+</span></span><span><span><span>4</span>       <span>8</span>      18.91    <span>3946</span>       0.41    28.76    3.07   10.74  39.07
+</span></span><span><span><span>4</span>       <span>9</span>      16.77    <span>4009</span>       0.35    34.73    2.12   8.68   38.04
+</span></span><span><span><span>5</span>       <span>10</span>     12.72    <span>3849</span>       0.16    21.80    2.30   7.30   56.22
+</span></span><span><span><span>5</span>       <span>11</span>     8.22     <span>3743</span>       0.09    11.24    1.66   5.19   73.92
+</span></span></code></pre></div><p>The second is wireguard-go with TUN UDP GSO/GRO, max_cstate = 9.</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>Result: <span>1729858286</span> bytes @ <span>1383646</span> kbps <span>(</span>10001.732 ms<span>)</span>.
+</span></span><span><span>
+</span></span><span><span>jwhited@i5-12400-2:~$ sudo turbostat --show Core,CPU,Avg_MHZ,Busy%,Bzy_MHz,POLL%,C1E%,C6%,C8%,C10% --quiet sleep <span>5</span>
+</span></span><span><span>5.001498 sec
+</span></span><span><span>Core    CPU    Busy%    Bzy_MHz    POLL%    C1E%    C6%    C8%    C10%
+</span></span><span><span>-       -      6.68     <span>3269</span>       0.04    13.62    0.99   4.96   74.00
+</span></span><span><span><span>0</span>       <span>0</span>      6.53     <span>3498</span>       0.02    10.12    0.78   3.79   78.94
+</span></span><span><span><span>0</span>       <span>1</span>      0.72     <span>3727</span>       0.00    1.67     0.10   0.49   97.05
+</span></span><span><span><span>1</span>       <span>2</span>      5.99     <span>3406</span>       0.04    11.60    1.34   5.87   75.42
+</span></span><span><span><span>1</span>       <span>3</span>      7.70     <span>3159</span>       0.01    5.75     1.39   7.52   77.90
+</span></span><span><span><span>2</span>       <span>4</span>      11.79    <span>2788</span>       0.04    12.89    1.68   3.11   70.92
+</span></span><span><span><span>2</span>       <span>5</span>      6.79     <span>3442</span>       0.08    10.00    0.94   3.72   78.83
+</span></span><span><span><span>3</span>       <span>6</span>      7.41     <span>3534</span>       0.07    14.21    1.37   9.46   67.75
+</span></span><span><span><span>3</span>       <span>7</span>      4.24     <span>3007</span>       0.07    46.16    0.12   0.72   49.03
+</span></span><span><span><span>4</span>       <span>8</span>      9.07     <span>3150</span>       0.05    26.89    1.45   7.92   54.99
+</span></span><span><span><span>4</span>       <span>9</span>      3.42     <span>3506</span>       0.02    3.97     0.39   2.76   89.60
+</span></span><span><span><span>5</span>       <span>10</span>     8.39     <span>3435</span>       0.05    9.85     1.08   7.23   73.74
+</span></span><span><span><span>5</span>       <span>11</span>     8.04     <span>3357</span>       0.04    10.27    1.28   6.87   73.80
+</span></span></code></pre></div><p>The TUN UDP GSO/GRO run is significantly lower throughput (1.3Gb/s vs 3Gb/s). The CPU cores are not in C0 as often (Busy% - 6.68% vs 12.76%), and the kernel requests they enter the deepest C-State a higher percentage of the time (74.00% vs 50.58%), where the transition to C0 latency penalty is at its highest. The increased CPU cycle/byte efficiency combined with a largely inactive forwarding node load-wise resulted in the CPU idle governor driving C-States in a nonideal fashion.</p>
+<p>Performing the same forwarding test again, but with max_cstate = 1, we get very different results.</p>
+<p><a href="https://git.zx2c4.com/wireguard-go/commit/?id=2e0774f246fb4fc1bd5cb44584d033038c89174e">wireguard-go@2e0774f</a>, max_cstate = 1:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>Result: <span>3571056796</span> bytes @ <span>2856624</span> kbps <span>(</span>10000.775 ms<span>)</span>.
+</span></span><span><span>
+</span></span><span><span>jwhited@i5-12400-2:~$ sudo turbostat --show Core,CPU,Avg_MHZ,Busy%,Bzy_MHz,POLL%,C1E%,C6%,C8%,C10% --quiet sleep <span>5</span>
+</span></span><span><span>5.000964 sec
+</span></span><span><span>Core    CPU    Busy%    Bzy_MHz    POLL%
+</span></span><span><span>-       -      99.77    <span>3997</span>       91.13
+</span></span><span><span><span>0</span>       <span>0</span>      99.77    <span>3999</span>       91.61
+</span></span><span><span><span>0</span>       <span>1</span>      99.77    <span>3999</span>       92.94
+</span></span><span><span><span>1</span>       <span>2</span>      99.77    <span>3992</span>       82.17
+</span></span><span><span><span>1</span>       <span>3</span>      99.77    <span>3992</span>       83.64
+</span></span><span><span><span>2</span>       <span>4</span>      99.77    <span>3995</span>       95.74
+</span></span><span><span><span>2</span>       <span>5</span>      99.77    <span>3995</span>       93.49
+</span></span><span><span><span>3</span>       <span>6</span>      99.77    <span>3998</span>       84.26
+</span></span><span><span><span>3</span>       <span>7</span>      99.77    <span>3998</span>       97.31
+</span></span><span><span><span>4</span>       <span>8</span>      99.77    <span>3999</span>       87.36
+</span></span><span><span><span>4</span>       <span>9</span>      99.77    <span>3999</span>       99.04
+</span></span><span><span><span>5</span>       <span>10</span>     99.77    <span>3996</span>       93.47
+</span></span><span><span><span>5</span>       <span>11</span>     99.77    <span>3996</span>       92.45
+</span></span></code></pre></div><p>wireguard-go with TUN UDP GSO/GRO, max_cstate = 1:</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span>Result: <span>13430811102</span> bytes @ <span>10740198</span> kbps <span>(</span>10004.144 ms<span>)</span>.
+</span></span><span><span>
+</span></span><span><span>jwhited@i5-12400-2:~$ sudo turbostat --show Core,CPU,Avg_MHZ,Busy%,Bzy_MHz,POLL%,C1E%,C6%,C8%,C10% --quiet sleep <span>5</span>
+</span></span><span><span>5.001024 sec
+</span></span><span><span>Core    CPU    Busy%    Bzy_MHz    POLL%
+</span></span><span><span>-       -      99.77    <span>3994</span>       80.79
+</span></span><span><span><span>0</span>       <span>0</span>      99.77    <span>3995</span>       77.53
+</span></span><span><span><span>0</span>       <span>1</span>      99.77    <span>3995</span>       82.51
+</span></span><span><span><span>1</span>       <span>2</span>      99.77    <span>3996</span>       81.34
+</span></span><span><span><span>1</span>       <span>3</span>      99.77    <span>3996</span>       78.01
+</span></span><span><span><span>2</span>       <span>4</span>      99.77    <span>3996</span>       73.59
+</span></span><span><span><span>2</span>       <span>5</span>      99.77    <span>3996</span>       89.27
+</span></span><span><span><span>3</span>       <span>6</span>      99.77    <span>3990</span>       69.13
+</span></span><span><span><span>3</span>       <span>7</span>      99.77    <span>3990</span>       96.57
+</span></span><span><span><span>4</span>       <span>8</span>      99.77    <span>3995</span>       76.34
+</span></span><span><span><span>4</span>       <span>9</span>      99.77    <span>3995</span>       84.18
+</span></span><span><span><span>5</span>       <span>10</span>     99.77    <span>3994</span>       75.50
+</span></span><span><span><span>5</span>       <span>11</span>     99.77    <span>3994</span>       85.47
+</span></span></code></pre></div><p><a href="https://git.zx2c4.com/wireguard-go/commit/?id=2e0774f246fb4fc1bd5cb44584d033038c89174e">wireguard-go@2e0774f</a> throughput is roughly the same, but the run with TUN UDP GSO/GRO is dramatically different with throughput jumping from 1.3Gb/s to 10.7Gb/s. There’s no longer a whole lot to compare across turbostat outputs, and the cores are almost always in C0 (Busy% 99.77).</p>
+<p>Of note, forwarding throughput increased dramatically with UDP GSO/GRO &amp; max_cstate = 9 when increasing load on the forwarding node, e.g. introducing a second secnetperf flow or running tcpdump. This was the hint we needed to look closer at CPU idle power management.</p>
+<p>Practically speaking it’s unlikely for a forwarding node to only be servicing a single flow with almost nothing else going on load-wise. Additionally, the c6i.8xlarge instance types were immune in this context, as the deepest they go is C1, before any max_cstate limit. Limiting C-State to a shallow level will always come with trade-offs in power savings and thermal headroom, which will vary by workload, and should be evaluated as such.</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>With the emergence of HTTP/3 and QUIC, UDP is now expected to perform similarly, if not better than TCP in networked applications. We have built upon our previous work to support UDP generic segmentation offload and UDP generic receive offload at the TUN layer, multiplying UDP throughput over Tailscale by a factor of 4.</p>
+<p>Thanks to <a href="https://www.zx2c4.com/">Jason A. Donenfeld</a> for his ongoing review of our patches, and to our designer <a href="https://dannypagano.com/">Danny Pagano</a> for the illustrations.</p>
+    </div></div>
+  </body>
+</html>
