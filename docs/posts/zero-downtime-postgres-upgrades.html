@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://knock.app/blog/zero-downtime-postgres-upgrades">Original</a>
+    <h1>Zero downtime Postgres upgrades</h1>
+    
+    <div id="readability-page-1" class="page"><div><p><strong>👋 We’re Knock. We provide a set of simple APIs developers use to introduce
+notifications into their products, without needing to build and
+maintain a notification system in-house.</strong></p>
+<div><div><p><strong>Tl;dr:</strong> We recently upgraded from Postgres 11.9 to 15.3 with
+zero downtime by using logical replication, a suite of support scripts,
+and tools in Elixir &amp; Erlang’s BEAM virtual machine.</p><p>This post will go into far too much detail explaining how we did it,
+and considerations you might need to make along the way if you try to do the same.</p><p>It is more of a manual than anything, and includes things we learned along the
+way that we wish we’d known up front.</p></div></div>
+<p>Knock relies on Postgres to power our notification workflow engine. From storing
+workflow configurations and message templates, to <a href="https://knock.app/blog/how-we-use-postgres-ltrees">ingesting millions of logs</a>
+and <a href="https://getoban.pro/">enqueuing background jobs</a>, Postgres sits at the heart of everything our systems do.
+Our Postgres databases running on AWS RDS Aurora have been consistently reliable,
+performant, and extensible. This foundation to Knock’s service lets us support
+with confidence every customer that joins our platform.</p>
+<p>Unlike SaaS software that can be constantly upgraded in the background with little notice,
+upgrading relational databases like Postgres generally requires at least a reboot of the database.
+In the case of major version upgrades, the database often needs to shut down completely for several minutes
+in order to upgrade how data is stored and indexed on disk.</p>
+<p><strong>The more data you have, the longer the upgrade will take.</strong></p>
+<p>In Knock’s case, we have been running Postgres 11.9 since we started the company.
+Although it has reliably served us at every step along the way,
+<a href="https://docs.aws.amazon.com/AmazonRDS/latest/PostgreSQLReleaseNotes/postgresql-release-calendar.html#Release.Calendar">Postgres 11.9 is being retired by Amazon’s RDS service on February 29, 2024</a>.
+Without taking action (i.e. arranging a long-term support contract with RDS),
+teams that use Postgres 11.9 on AWS RDS will be forcibly upgraded at that point,
+likely resulting in forced downtime.</p>
+<p>No amount of downtime - scheduled or otherwise - is acceptable for a service like Knock.
+Our customers rely on us to be online 24/7. Although no service can guarantee
+perfect uptime, responsible developer teams work to proactively address service
+issues before they happen.</p>
+<p>We added this upgrade to our roadmap in June of this year, with the following constraints:</p>
+<ol>
+<li>Upgrade as many versions ahead as possible, skipping to the latest available version (at the time, Postgres 15.3 for Aurora).</li>
+<li>Any downtime beyond 60 seconds was completely unacceptable, and ideally we would have zero system downtime.</li>
+<li>The upgrade must happen well in advance of Amazon’s February deadline.</li>
+<li>Minimize customer impact (e.g. zero API error responses).</li>
+<li>Operationalize the process so that next time we need to upgrade the database, it is a well-established runbook.</li>
+</ol>
+<p>Each of our Postgres databases would need to run through this process, and going
+from 11.9 to 15.3 would comprise <strong>four</strong> major version upgrades. If doing an
+in-place upgrade for each major version would trigger downtime, doing <strong>four</strong>
+in a row was out of the question.</p>
+<p>In order to meet our requirements, we knew we’d have to get creative.</p>
+<h2 id="preparing-for-any-postgres-upgrade"><a href="#preparing-for-any-postgres-upgrade" aria-hidden="true" tabindex="-1"><span></span></a>Preparing for any Postgres upgrade</h2>
+<p>More than anything, teams seeking to upgrade Postgres in any way should focus on
+<strong>de-risking</strong> the upgrade process as much as possible:</p>
+<ol>
+<li>
+<p>Make a list of the risks involved in making the migration. For example:</p>
+<ul>
+<li>Unacceptably long downtime</li>
+<li>Data loss</li>
+<li>Changes in database performance for your application’s workload</li>
+<li>Changes in vacuum frequency or behavior</li>
+<li>Are there any replication slots that need to be migrated (this can be tricky - <a href="#a-note-about-moving-replication-slots">see below</a>)</li>
+</ul>
+</li>
+<li>
+<p>Figure out which risks are the most critical to the project, and which ones
+might be the easiest to explore/rule out/fix in advance.</p>
+<p>Sort the list so the risks with the biggest impact yet easiest to address are at the top.</p>
+</li>
+<li>
+<p>As you develop solutions, consider your list of risks:</p>
+<ul>
+<li>Are there solutions that rule out risks completely?</li>
+<li>Which solutions spread out the risk over time? (So we can more gradually
+address each step of the migration without taking on too much risk at once.)</li>
+</ul>
+</li>
+<li>
+<p>As you work through the project, always revisit your list of risks,
+and keep it up to date as you learn new things - including discovering new risks!</p>
+<div><p><strong>Incrementally and continually de-risk projects like this until you are
+confident in being able to deliver on your project goals.</strong></p></div>
+</li>
+</ol>
+<p>To plan out our upgrade, we started with <a href="https://www.postgresql.org/docs/release/">Postgres’ release notes</a>
+to get a sense of what was going to change between database versions.
+This helped us identify more risks (e.g. changes in how Postgres’ vacuum works,
+requirement to reindex the database when performing certain upgrades) while ruling out others.</p>
+<p>As we moved through our planning process, we maintained this list of risks,
+adding new concerns and updating old ones as we collected more information.
+While working through the upgrade, we systematically addressed each concern
+until we were confident we could deliver on our project goals without
+risking our reliability.</p>
+<h3 id="a-word-about-monitoring--metrics"><a href="#a-word-about-monitoring--metrics" aria-hidden="true" tabindex="-1"><span></span></a>A word about monitoring &amp; metrics</h3>
+<p>Having thorough instrumentation (thanks DataDog!) to monitor the health of your
+system and database makes it possible to monitor each step of the migration.</p>
+<p>A few key metrics to watch:</p>
+<ul>
+<li>Max TXN ID to avoid <a href="https://www.crunchydata.com/blog/managing-transaction-id-wraparound-in-postgresql">transaction wraparound</a> - if this gets too high, your database can shut down and go into emergency maintenance mode</li>
+<li>DB CPU Utilization</li>
+<li>Waiting sessions on your writer instance</li>
+<li>Query latency</li>
+<li>API response latencies for your application</li>
+</ul>
+<p>At Knock, we monitor all of these metrics as well as some that are unique to our application,
+like the time it takes to turn an API request into a notification.</p>
+<p><strong>Without timely metrics, you’re flying blind.</strong></p>
+<h2 id="options-for-upgrading-postgres"><a href="#options-for-upgrading-postgres" aria-hidden="true" tabindex="-1"><span></span></a>Options for upgrading Postgres</h2>
+<p>Part of our research process included looking for <a href="https://retool.com/blog/how-we-upgraded-postgresql-database">prior examples</a>
+of database migrations and <a href="https://www.postgresql.org/docs/current/pgupgrade.html">how the Postgres docs</a>
+recommend performing an update. Here are a few strategies:</p>
+<h3 id="in-place-upgrades-a-non-starter-for-zero-downtime-upgrades"><a href="#in-place-upgrades-a-non-starter-for-zero-downtime-upgrades" aria-hidden="true" tabindex="-1"><span></span></a>In-place upgrades (a non-starter for zero-downtime upgrades)</h3>
+<p>The most basic upgrade option for Postgres is an in-place upgrade.
+On AWS RDS, this upgrade is executed from the AWS console. When performing an
+in-place upgrade, AWS will shut down the database, run upgrade scripts, and then
+bring the system back online. Doing this often requires some preparation,
+including dropping Postgres replication slots,
+like those used to synchronize with a data warehouse or other systems.</p>
+<p>This in-place upgrade process can take anywhere from a few minutes to potentially
+hours or more - it entirely depends on how much data needs to be updated
+between Postgres versions.</p>
+<p>Often, the system is still not in a fully usable state when it comes online, and
+administrators must run maintenance tasks like Postgres’ <code>VACUUM</code> command,
+or <code>REINDEX</code> to update indexes to support the new version’s format.</p>
+<p><strong>Because an in-place upgrade would require far more downtime than we wanted to
+tolerate, it was out of the question for us.</strong></p>
+<p>A similar approach to an in-place upgrade is to use <code>pg_dump</code> and <code>pg_restore</code>
+to transfer the contents of a database once it has shut down.
+This <a href="https://www.postgresql.org/docs/current/app-pgdump.html">dump &amp; restore</a>
+approach would also not work for us due to the required downtime involved,
+mostly because you need to disconnect all applications from the old database in
+order to get a reliable database backup. Even then, for large databases, it can
+take prohibitively long to dump and restore the database.</p>
+<h3 id="replication-based-upgrades"><a href="#replication-based-upgrades" aria-hidden="true" tabindex="-1"><span></span></a>Replication-based upgrades</h3>
+<p>This approach relies on Postgres’ excellent replication primitives:
+the <code>PUBLICATION</code> and the <code>SUBSCRIPTION</code>.</p>
+<p>It works something like this:</p>
+<ol>
+<li>Spin up a new database on your target Postgres version</li>
+<li>Copy over settings, extensions, table configurations, users, etc.</li>
+<li>Set up a publication on the old database and a subscription to that publication on the new database</li>
+<li>Add your tables to the publication (there is a lot of nuance here - <a href="#choosing-tables-to-replicate">more below</a>)</li>
+<li>Once it&#39;s fully replicated, run tests to satisfy any remaining risks</li>
+<li>Once you are confident in the new database&#39;s configuration, point your application at the new database</li>
+<li>Tear down the old database</li>
+</ol>
+<p><strong>In the end, this is the option that we chose at Knock for a few reasons:</strong></p>
+<ol>
+<li>It gave us gradual steps we could take towards a migration instead of one big upgrade</li>
+<li>We could test the new database with real workloads and real data to avoid any regressions</li>
+<li>It gave us the most control over when and how to perform the upgrade:
+once the new database was fully ready, cutting over to the new database took just a few seconds</li>
+</ol>
+<p>Although that may sound straightforward, there are several points to consider in
+this solution that will depend on your application &amp; circumstances.</p>
+<p><strong>Configuring your source and destination databases</strong></p>
+<p>Publications and subscriptions depend on a few configuration parameters for
+setting up replication slots (how the database keeps track of what needs to be
+copied from the primary to the follower database).
+<a href="https://www.postgresql.org/docs/16/logical-replication-config.html">The Postgres docs</a>
+have plenty of detail on these parameters. These parameters will need to be
+tuned for your particular application. For simple applications, the only change
+necessary is that <code>wal_level</code> should be set to <code>logical</code>.</p>
+<p>If you already use replication slots (e.g. to manage a read replica,
+database failover, or to keep a data warehouse in sync), then consider setting
+<code>max_replication_slots</code> and the other parameters according to the guidance in the docs.</p>
+<p><strong>Setting up basic replication</strong></p>
+<ol>
+<li>
+<p>Start a new Postgres server on your target version of Postgres (in our case v15.3).</p>
+</li>
+<li>
+<p>Set up your desired databases, schemas, tables, partitions, users &amp; passwords, and everything else.</p>
+<p><strong>The target database’s tables must have an identical structure to the
+source database, but these tables must be empty.</strong></p>
+<p>To get a snapshot of the database schema, run <a href="https://www.postgresql.org/docs/current/app-pg-dumpall.html"><code>pg_dumpall</code></a>
+on the old DB (pass the <code>--schema-only</code> and <code>--no-role-passwords</code> options to
+keep it focused), and then adapt that command for the new DB. You can then
+compare the generated SQL files to identify and fix discrepancies between the
+old and the new DB.</p>
+<p>It may be worth periodically comparing both databases to detect any drift,
+especially if you have schema migrations happening in the source database.
+Consider running migrations against both databases to keep them in sync.</p>
+</li>
+<li>
+<p>On the primary instance of the <strong>old</strong> database, run <code>CREATE PUBLICATION pg_upgrade_pub;</code>.</p>
+<div><div><p>Although you can tack on <code>FOR ALL TABLES</code> and that will set up the publication
+for every table, we found that for large databases, this can lead to performance problems.</p><p>Instead, we found it worked much better to incrementally add one table
+at a time to the publication via <code>ALTER PUBLICATION pg_upgrade_pub ADD TABLE table_name</code>.
+More on this <a href="#choosing-tables-to-replicate">below</a>.</p></div></div>
+</li>
+<li>
+<p>On the primary instance of the <strong>new</strong> database, set up the new subscription pointing to that publication:</p>
+
+<p>At this point, you now have a replication pipeline
+from the old database to the new one.</p>
+<p>To enable the subscription:</p>
+
+</li>
+</ol>
+<h3 id="choosing-tables-to-replicate"><a href="#choosing-tables-to-replicate" aria-hidden="true" tabindex="-1"><span></span></a>Choosing tables to replicate</h3>
+<p>The next step in the process is to build a list of tables you’d like to replicate.
+You will want to add tables one at a time, watching each table until all of them
+are fully replicated. Later in this post we will show you <a href="#checking-a-tables-replication-status">how to monitor replication
+for all the tables</a>.</p>
+<p>Generally, the tables will fall into three based on their disk size and the
+number of tuples stored in the database.</p>
+<ol>
+<li>Small enough to synchronize in a few minutes: These can be replicated by just
+adding them to the publication and refreshing the subscription</li>
+<li>Large, append-only tables: These can be synchronize by first replicating only
+future changes, and then separately backfilling old data from a backup or snapshot</li>
+<li>Large, frequently updated tables: These are the hardest to synchronize, and
+will require some extra care</li>
+</ol>
+<p>For us, &#34;small&#34; was any table using less than 50 GB of storage and 10 million tuples.</p>
+<p>Anything over those thresholds we considered &#34;large&#34;.</p>
+<div><div><p><strong>What is a tuple?</strong></p><p>Each insert or update to a Postgres table is stored as a &#34;tuple&#34;. If a table has
+3 inserts followed by 2 updates, the table would have 5 tuples. Tuples are used
+by Postgres’ concurrency mechanism (<a href="https://www.postgresql.org/docs/16/mvcc-intro.html">more in the docs</a>).
+Postgres’ <code>VACUUM</code> procedure cleans up old tuples that are no longer needed.</p><p>When we replicate a table, we replicate all of the tuples that make up the
+tables contents - inserts and updates. A table with a few rows but many tuples
+that haven’t been cleaned up will take longer to replicate than a similar table
+with fewer tuples.</p></div></div>
+<p>The following query can help determine the size of a database table in terms of
+disk space and tuple counts:</p>
+
+<p>One way to prepare your source database for replication is to <code>VACUUM</code> your tables,
+which should help the source database reduce the number of tuples it needs to copy
+to the target database. This can help reduce the amount of time it takes to replicate a table.</p>
+<p>Before using <code>VACUUM</code>, consult the <a href="https://www.postgresql.org/docs/current/sql-vacuum.html">Postgres docs</a>.</p>
+<div><div><p><strong>Why does table size matter?</strong></p><p>The time it takes to synchronize a table is directly correlated to its size on disk
+and the number of tuples it contains. The larger the table, the longer it takes to replicate.
+This is because Postgres needs to copy the entire table over to the new database,
+and then apply any changes that happen after the initial copy.</p><p>The problem with long synchronization time is that it can prevent your primary
+Postgres instance from performing <code>VACUUM</code> operations, which can lead to degraded
+performance over time. Left unchecked, it can even lead to transaction wraparound
+and a forced shutdown of the database.</p><p>For these reasons, we added tables one at a time to replication, used different
+strategies based on the size &amp; write patterns of each table, and closely monitored
+the system’s performance to ensure we didn’t degrade our service.</p><p>If migrating a table becomes problematic, you can remove a table from replication
+at any time, and then re-add it later (although you will need to truncate the
+target table and start from scratch).</p></div></div>
+<h3 id="how-to-replicate-small-tables"><a href="#how-to-replicate-small-tables" aria-hidden="true" tabindex="-1"><span></span></a>How to replicate &#34;small&#34; tables</h3>
+<p>To migrate small tables, you just add it to the publication and then refresh the subscription:</p>
+
+<p>Postgres will handle copying the table over, getting it synchronized, and
+applying any further operations to the table. For very small tables,
+synchronization can happen in less than a second.</p>
+<h3 id="large-append-only-tables"><a href="#large-append-only-tables" aria-hidden="true" tabindex="-1"><span></span></a>Large, append-only tables</h3>
+<p>Tables that are too large but generally append-only, with no updates (or, if
+updates are <em>always</em> on rows that are recent, like within the past week),
+then you can set up a separate <code>PUBLICATION</code> and <code>SUBSCRIPTION</code> following the
+same steps as above, but setting the <code>copy_data</code> option on the subscription to
+false. Suffix the name of the new publication and new subscription with <code>_nocopy</code>
+to make it distinct.</p>
+<p>When you are ready to migrate these large, append-only tables, you can add them
+to this <code>nocopy</code> publication, and refresh the subscription on the target using
+the <code>copy_data = false</code> option:</p>
+
+<p>We found this approach worked really well for our partitioned tables that stored
+various types of logs for our customers.
+We did not need to migrate the root of a partitioned table, we only migrated the
+underlying tables, and that seemed to work pretty well.</p>
+<p>Once the subscription is running, you should start seeing logs appear on the
+target databases table:</p>
+
+<p>From here, you can backfill any records older than those now visible in the
+database using whatever means you like (e.g. <code>pg_dump</code>).</p>
+<p>Here is how we did it on AWS RDS Aurora:</p>
+<ol>
+<li>
+<p>Take a snapshot of your production database in the AWS Console</p>
+</li>
+<li>
+<p>Restore that snapshot into a new database instance (the snapshot DB)</p>
+</li>
+<li>
+<p>Rename the table(s) on the snapshot DB that you want to replicate by adding
+a suffix like <code>_snapshot</code>. This prevents us having two replication pipelines
+feeding into the same table on the target database.</p>
+</li>
+<li>
+<p>Create the same table(s) on the target database with the same schema as the
+snapshot database. Use the same suffix as above.</p>
+</li>
+<li>
+<p>Create a publication on the snapshot database and a subscription on the target
+database to replicate these snapshot table(s) from the snapshot database to the
+target database</p>
+</li>
+<li>
+<p>Enable the subscription and monitor its progress</p>
+</li>
+<li>
+<p>Once the subscription is caught up, you can merge the tables together using
+<code>INSERT...ON CONFLICT</code>:</p>
+
+</li>
+</ol>
+<p><span><span></span><img alt="Diagram showing how to backfill data from a snapshot" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" decoding="async" data-nimg="responsive"/></span></p>
+<p>For very large tables, this can still take several days, but because it’s all
+in the background it shouldn’t affect your production environment.</p>
+<p>Once the tables are fully merged, compare them to ensure a consistent row count
+(more on that later). Once you are confident the tables are identical,
+drop the snapshot table on the target DB, drop the subscription to the snapshot DB,
+and terminate the snapshot database instance.</p>
+<h3 id="large-tables-with-many-updates-over-most-of-the-rows"><a href="#large-tables-with-many-updates-over-most-of-the-rows" aria-hidden="true" tabindex="-1"><span></span></a>Large tables with many updates over most of the rows</h3>
+<p>These are the hard tables. Because they have so much data in them, they can
+take a long time to replicate, which can affect system performance on the
+source database if it prevents <code>AUTOVUACUUM</code> from running. Because they have
+so many updates, we can’t treat it as an append-only table.</p>
+<p>A few points to consider:</p>
+<ol>
+<li>Is there any housekeeping you can do to reduce the table’s size?</li>
+<li>Have you vacuumed the table recently?</li>
+<li>Can you partition the table into smaller pieces?</li>
+<li>Do rows stop receiving updates after a reliable time frame (e.g. 1 week?) -
+this could be used to treat the table as an append-only table, and then after
+that time frame has elapsed you can backfill old rows from a snapshot.</li>
+</ol>
+<p>If your source database is not on PG 15 or greater, your options are limited.
+Follow the steps in the &#34;small tables&#34; section. Rely on the monitoring you have
+in place (you do have monitoring, right?) to ensure replication doesn’t degrade
+your service. If needed, you can rollback by removing the table from the
+publication, and refreshing the subscription (<a href="#aborting-the-replication-of-one-table">See below</a>).</p>
+<p>If the table is still too big, try to start replication during low traffic times to
+reduce load and write activity. This will hopefully minimize the impact on your
+system.</p>
+<h3 id="large-tables-coming-from-pg-15-or-greater"><a href="#large-tables-coming-from-pg-15-or-greater" aria-hidden="true" tabindex="-1"><span></span></a>Large tables coming from PG 15 or greater</h3>
+<p>If your source database is on PG 15 or greater, you may be able to split up replication
+across multiple publications (similar to partitioning or sharding). You can then
+migrate the table in smaller chunks, at the expense of using more replication
+slots. <a href="https://www.postgresql.org/docs/16/logical-replication-config.html">The Postgres docs</a>
+have more information on setting these parameters.</p>
+<div><p>Because we migrated from 11.9 to 15.3, we did not have this option available
+to us. As such, we have not tested this approach. Even so, as we considered
+our options we noticed that this approach might be possible. If you try it
+out, let us know, we’d love to hear how it goes!</p></div>
+<p>The goal is to have enough publications to split your largest table into manageable
+pieces (for us, this was about 100 GB of non-index data stored). We’ll assume we
+are splitting across three partitions in this example. The trick is adding a <code>WHERE</code>
+clause that splits up the rows handled by each subscription:</p>
+
+<p>On the destination database, create a subscription for each partition.</p>
+<p>You only want to migrate one slice of each table at a time. Generally, you will
+follow the same instructions as adding a &#34;small&#34; table, but with the extra <code>WHERE</code>
+clause added when setting up the table for each publication.</p>
+<p>In this way, you can slice up large tables into smaller, more workable pieces.</p>
+<p>Consider only using this approach if having too many replication slots is a
+problem: you can still add &#34;small&#34; tables using this approach,
+just add the table to the <code>_0</code> publication without a <code>WHERE</code> clause.
+This can help reduce the number of replication slots required when migrating.</p>
+<h3 id="checking-a-tables-replication-status"><a href="#checking-a-tables-replication-status" aria-hidden="true" tabindex="-1"><span></span></a>Checking a table’s replication status</h3>
+<p>When a table is added to a subscription, it moves through five distinct states
+(visible on the target database under the system table <code>pg_subscription_rel</code>
+in the <code>srsubstate</code> column):</p>
+<ol>
+<li>Initializing the table’s subscription (State code <code>i</code> )</li>
+<li>Copying the table’s contents in one efficient operation (State code <code>d</code>)</li>
+</ol>
+<div><div><p>This step requires keeping old Postgres transaction IDs around, which
+prevents vacuum from running effectively and can lead to system performance
+issues and (if left running long enough) even Postgres transaction ID
+wraparound which can halt the system.</p><p>This is the step that requires replicating only one table at a time.</p></div></div>
+<ol start="3">
+<li>Copy finished, waiting for final sync (State code <code>f</code>)</li>
+<li>Finalizing initial sync (State code <code>s</code>)</li>
+<li>Ready and running under normal replication (State code <code>r</code>)</li>
+</ol>
+<p>In order to prevent the issues found in step 2 above, we found it was necessary
+to add one table at a time to replication, and to closely watch the system’s
+performance. The worst-case scenario (transaction wraparound) must be avoided.</p>
+<p><strong>If you get anywhere close to wraparound, it is better to <a href="#aborting-the-replication-of-one-table">abort the migration</a>
+and break it up into smaller pieces.</strong></p>
+<p>If we had created our publication using the <code>FOR ALL TABLES</code> option, Postgres
+would have started to sync our very large source database all at once,
+preventing automatic <code>VACUUM</code> operations from completing necessary maintenance.
+We found this to gradually degrade database performance over time,
+leading to increased risk to system stability.</p>
+<p>Adding one table at a time has the added advantage of allowing teams to
+incrementally migrate each table. Replication does come with CPU and other costs
+for the source and destination databases. By adding one table at a time,
+administrators can control how replication affects the running system.</p>
+<h3 id="aborting-the-replication-of-one-table"><a href="#aborting-the-replication-of-one-table" aria-hidden="true" tabindex="-1"><span></span></a>Aborting the replication of one table</h3>
+<p>If you need to halt the replication of a table, you reverse the instructions for
+adding the table in the first place:</p>
+
+<p>In an emergency, you can also drop the publications and subscriptions entirely,
+and start the process over. Postgres will clean up any replication slots that
+were created as part of the publication and subscription, which should relieve
+any pressure on the source database.</p>
+<div><div><p>Be advised that if you just disable the subscription without removing the table
+from the publication and refreshing the subscription, the source database
+will continue to hold onto old transaction IDs, which can lead to transaction
+wraparound and a forced shutdown of the database.</p><p>Just disabling the subscription will not resolve any replication-related
+performance problems.</p></div></div>
+<h3 id="a-note-about-moving-replication-slots"><a href="#a-note-about-moving-replication-slots" aria-hidden="true" tabindex="-1"><span></span></a>A note about moving replication slots</h3>
+<p>Replication slots in Postgres store a log of database activity that can be
+consumed on another database or in another application. Postgres tracks slot
+progress using a Log Sequence Number (LSN). LSNs are unique to the primary
+Postgres database. This means that if you have a replication slot on your
+database (e.g. to copy changes to a data warehouse or as part of your own
+application), you will not be able to copy the replication slot&#39;s LSN over from
+the old database to the new database.</p>
+<p>You will need to consult the documentation of the application consuming the
+replication slot to decide how to best migrate (e.g. for data warehousing tools,
+they may have a way to merge duplicated information between both databases).
+If you’re using replication slots as part of your own application, you already
+know that you’re on your own to roll your own solution. Having some idempotence
+mechanism to deduplicate transactions from the old and the new database will
+definitely be helpful.</p>
+<h2 id="finalizing-the-migration"><a href="#finalizing-the-migration" aria-hidden="true" tabindex="-1"><span></span></a>Finalizing the migration</h2>
+<p>Once you have added all of your tables to publications, and the subscriptions
+have caught up on everything, you need to now verify that the tables match.</p>
+<p>Unfortunately, eventual consistency (the lag between a write being applied to
+the old database and it showing up on the new database) will prevent both
+databases from being perfect matches at the same time, you can still count table
+rows to make sure you’re close enough to know it’s working.</p>
+<p>At Knock, we wrote a script that iterated through each table and asked both
+databases to count the total number of rows in each table on the old and new
+database, and compared the results. For tables with an <code>inserted_at</code> column, we
+filtered to rows older than 10 seconds. This interval is more than enough to
+prove that the tables match, with the assumption that the remaining 10 seconds
+will replicate across in short order.</p>
+<p>You may need to come up with a strategy that fits your application’s needs. We
+felt that as long as row counts were accurate within a few seconds, we could
+otherwise assume that Postgres replication was reliable.</p>
+<p>In a few instances, we also spot-checked the contents of a few tables to ensure
+they matched to confirm this assumption. Collecting a random sample of rows from
+tables and comparing them between the old and the new database can help verify
+that the tables are identical.</p>
+<h3 id="application-level-changes"><a href="#application-level-changes" aria-hidden="true" tabindex="-1"><span></span></a>Application-level changes</h3>
+<p>Parallel to all of this database work, you may need to change your application
+to connect to both databases. When you are finally ready to cut over,
+you need a strategy to shift traffic to your new database.</p>
+<p>When the final cutover happens, you could change your application’s configuration
+to point to the new database, and then reboot your app. This is simple,
+straightforward, and is precisely how we migrated one of our
+lower-traffic databases.</p>
+<p>For applications with lots of concurrent activity, you may need to get creative.
+We wanted to avoid a situation with conflicting writes between the old and new
+database. Such conflicts could have caused a service outage for us, requiring
+manually reconciling database state.</p>
+<p>At Knock, we configured our application to connect to both databases.
+When we were ready to execute the cutover, we ran a script that did the following:</p>
+<ol>
+<li>
+<p>Tell all instances of our application to send new queries to the new database</p>
+</li>
+<li>
+<p>All currently running database queries had 500 ms to complete before being forcefully cancelled</p>
+</li>
+<li>
+<p>For the first second after flipping the flag, our application artificially paused
+any new database requests for one second. This allowed pending transactions
+to replicate to the new database so that new queries wouldn’t have stale reads</p>
+<p>500 ms is far higher than most of our db queries, and we saw zero errors due to forced disconnections</p>
+</li>
+<li>
+<p>After that first second, database activity returned to normal behavior, but pointing at the new database.</p>
+</li>
+<li>
+<p>In the middle of the cutover, we had some specialized database workloads that
+the script shut down and restarted in order to reconnect to the new database.</p>
+</li>
+</ol>
+<h3 id="one-more-thing-sequences"><a href="#one-more-thing-sequences" aria-hidden="true" tabindex="-1"><span></span></a>One more thing: sequences</h3>
+<p>One thing that replication doesn’t synchronize is any Postgres sequence.
+Sequences are monotonically increasing integers that are guaranteed to never
+duplicate. Unfortunately, they are not incremented on the new database as
+sequence values are used up on the old database.</p>
+<p>Fortunately, this is pretty easy to control for. Part of our cutover procedure
+was to run a script right before flipping our feature flag that did the following:</p>
+<ol>
+<li>
+<p>Connect to both databases</p>
+</li>
+<li>
+<p>Get the next value of all of the sequences in the database using <code>SELECT nextval(&#39;sequence_name&#39;)</code></p>
+</li>
+<li>
+<p>Set that value in the new database using <code>SELECT setval(&#39;sequence_name&#39;, value::int4 + 100000)</code>
+to advance the sequence and offer a little bit of buffer (in this case, 100k
+rows can be added between setting this value on the new database and cutting over).
+This will introduce a gap in the sequence, but that’s generally not a problem.
+For us, our sequences are bigints. 100k values skipped in the sequence is a
+rounding error off of 0% used up sequence values in that case.</p>
+<p>You will want to tune how big of a gap you introduce so you don’t use too
+much of your sequence’s usable space. If you only expect the sequence to
+use a few hundred values during your cutover window,
+then maybe advance it only by 5000.</p>
+</li>
+</ol>
+<h2 id="final-checklist-before-cutting-over"><a href="#final-checklist-before-cutting-over" aria-hidden="true" tabindex="-1"><span></span></a>Final checklist before cutting over</h2>
+<p>Here are some of the things we considered before executing our final cutover:</p>
+<ol>
+<li>Do the rows on all the tables match as expected?</li>
+<li>Are all the subscriptions enabled and running without error?</li>
+<li>Do the schemas match? Can you freeze any new schema migrations from being
+released to reduce the risk of something changing while you’re migrating?</li>
+<li>Is your new database properly sized for your workloads?</li>
+<li>Do you have to add any read replicas so the database cluster topology is the
+same between the old and the new database?</li>
+<li>Have you reindexed and performed basic VACUUM maintenance on the new database
+to ensure it’s fresh and ready for production traffic?</li>
+<li>Have you double checked Postgres’ release notes for anything that might cause
+a regression in your app?</li>
+<li>Have you run automated and manual tests against a staging database on the new
+version to verify system performance?</li>
+<li>Have you run load tests of your most demanding queries using <code>pg_bench</code>
+against your new version to verify performance?</li>
+<li>If there’s one thing that you can de-risk still, what is it?</li>
+<li>Do practice runs in a staging or test environment until you have fully
+exercised the cutover process multiple times. Dry runs like this will help
+reveal gaps in your plan before you go to production.</li>
+<li>Right before cutover, take a database backup - just in case.</li>
+</ol>
+<h2 id="cutting-over"><a href="#cutting-over" aria-hidden="true" tabindex="-1"><span></span></a>Cutting over</h2>
+<p>At Knock, we took a few weeks replicating tables one at a time. We generally did
+this after business hours and during our lowest traffic time frames. We practiced
+cutover in our staging environment multiple times, ironing out the process until
+it just worked without much operator involvement.</p>
+<p>Once we had a replica running PG 15 and had the application code in place to
+cut over from the old to the new database, we ran one final set of checks and
+flipped the flag.</p>
+<p>After months of preparation, the actual cutover was uneventful: our
+application cut over within a few seconds, we had a brief blip of (intentional)
+latency as queries waited to allow for replication, and our application
+continued running without skipping a beat. Reading this paragraph took longer
+than the cutover itself.</p>
+<p>From there, we rolled back the application changes we introduced, permanently
+pointed everything at the new database, removed the subscriptions on the new
+database, and tore down the old database. We had successfully jumped from
+Postgres 11.9 to 15.3 with zero downtime!</p>
+<h2 id="conclusion"><a href="#conclusion" aria-hidden="true" tabindex="-1"><span></span></a>Conclusion</h2>
+<p>Although jumping four major versions of Postgres in one leap is a painstaking
+process, it can be done, and in many ways it’s safer than scheduled downtime:
+it can be practiced, tested, and reworked multiple times before performing the
+actual cutover. At any point in the process, we could have dropped the
+publications from the old database and started over without degrading our service.</p>
+<p>Modern customers expect 100% availability. While that is not technically possible,
+zero downtime migrations make it easier to keep systems running smoothly without
+major service interruptions.</p></div></div>
+  </body>
+</html>
