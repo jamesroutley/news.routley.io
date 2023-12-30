@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://patrick.engineering/posts/postgres-internals/">Original</a>
+    <h1>PostgreSQL internals: Things to know about update statements</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      <p>I recently finished reading <a href="https://postgrespro.com/community/books/internals">PostgreSQL 14 Internals</a> by Egor Rogov.
+It is one of the great books that teach applied computer science without watering down the difficult parts.</p>
+<p>One particularly interesting topic is PostgreSQL’s execution of <code>UPDATE</code> statements.
+Updates in relational databases are inherently complex.
+They can be affected by conflicts, anomalies, and deadlocks.
+However, some behavior is specific to PostgreSQL. This can lead to surprises.</p>
+<h2 id="1-write-amplification">1. Write Amplification</h2>
+<p>PostgreSQL generally does not update rows in-place.
+This is a design decision in PostgreSQL’s implementation of multi-version concurrency control (<a href="https://www.postgresql.org/docs/7.1/mvcc.html">MVCC</a>).
+The design can lead to <em>write amplification</em>: a small update can lead to a larger amount of data being written to disk.</p>
+<p>Consider a table that stores user profiles in a social networking service:</p>
+<div><pre tabindex="0"><code data-lang="sql"><span>CREATE</span> <span>TABLE</span> <span>IF</span> <span>NOT</span> <span>EXISTS</span> user_profile (
+    id UUID,
+    last_active TIMESTAMPTZ,
+    description TEXT
+);
+</code></pre></div><p>Each column has a different size:</p>
+<ul>
+<li><code>id</code> takes 16 bytes</li>
+<li><code>last_active</code> takes 8 bytes</li>
+<li><code>description</code> has a variable length, which could be hundreds of bytes <sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup>.</li>
+</ul>
+<p>If the <code>description</code> column takes 200 bytes on average, the write amplification factor when updating <code>last_active</code> is approximately 28.
+For each logical byte that needs to be updated, 28 bytes are written to disk <sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup>.
+This is because PostgreSQL writes the whole updated row to a different location on disk.
+Considering row metadata, the real write amplification factor is even higher.</p>
+<p>Write amplification can lead to increased disk I/O and wasted storage space.
+There are more sources of write amplification:</p>
+<ul>
+<li>Indexes may have to be updated. This can be the case even if the updated column is not indexed <sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup>.</li>
+<li>PostgreSQL writes all changes to a write-ahead log (WAL) to ensure durability <sup id="fnref:4"><a href="#fn:4" role="doc-noteref">4</a></sup>.</li>
+</ul>
+<p>If disk I/O is approaching limits, it may be worth investigating row sizes, update statements, and unused indexes <sup id="fnref:5"><a href="#fn:5" role="doc-noteref">5</a></sup>.</p>
+<h2 id="2-lost-updates">2. Lost Updates</h2>
+<p>The SQL standard mandates that lost updates be prevented at any isolation level <sup id="fnref:6"><a href="#fn:6" role="doc-noteref">6</a></sup>.
+Nonetheless, it is trivial to simulate a lost update in PostgreSQL.
+Consider an additional <code>followers_count</code> column and two transactions (Read Committed) that perform the following steps:</p>
+<ol>
+<li><code>BEGIN</code></li>
+<li>Read the row (e.g., <code>SELECT followers_count AS curr FROM user_profile WHERE id = &#39;...&#39;</code>).</li>
+<li>Compute a new value <em>in application logic</em> (e.g., <code>curr + 1</code>).</li>
+<li>Write the new value to the database (e.g., <code>UPDATE user_profile SET followers_count = &lt;new value&gt; WHERE id = &#39;...&#39;</code>).</li>
+<li><code>COMMIT</code></li>
+</ol>
+<p>In step 2, two concurrent transactions may read the original <code>followers_count</code> value.
+This causes a lost update because the count is effectively only incremented once.</p>
+<p>This behavior may well be interpreted as a violation of the SQL standard.
+However, the application logic which calculates the new value is not considered part of the transaction.
+The database merely stores the new value as requested.
+Still, the behavior is clearly an anomaly: it cannot occur if the transactions run sequentially <sup id="fnref:7"><a href="#fn:7" role="doc-noteref">7</a></sup>.</p>
+<p>When using a higher isolation level, PostgreSQL fully prevents lost updates.
+Consider two concurrent transactions executing the following statements using the Repeatable Read isolation level:</p>
+<div><pre tabindex="0"><code data-lang="sql"><span>BEGIN</span>;
+<span>SELECT</span> followers_count <span>FROM</span> user_profile <span>WHERE</span> id <span>=</span> <span>&#39;...&#39;</span>;
+<span>-- Returns 300. Compute new value in application: 300 + 1 = 301
+</span><span></span><span>UPDATE</span> user_profile <span>SET</span> followers_count <span>=</span> <span>301</span> <span>WHERE</span> id <span>=</span> <span>&#39;...&#39;</span>;
+</code></pre></div><p>Now, only one of the transactions can commit.</p>
+<div><pre tabindex="0"><code data-lang="sql"><span>-- Session 1
+</span><span></span><span>COMMIT</span>;
+<span>-- =&gt; COMMIT
+</span><span></span>
+<span>-- Session 2
+</span><span>-- =&gt; ERROR:  could not serialize access due to concurrent update
+</span></code></pre></div><p>The application can handle this error by retrying the transaction.
+A simpler solution using the weaker Read Committed level is to let the database compute the new value:</p>
+<div><pre tabindex="0"><code data-lang="sql"><span>UPDATE</span> user_profile
+<span>SET</span> followers_count <span>=</span> followers_count <span>+</span> <span>1</span>
+<span>WHERE</span> id <span>=</span> <span>&#39;...&#39;</span>;
+</code></pre></div><p>This statement prevents lost updates at the Read Committed isolation level <sup id="fnref:8"><a href="#fn:8" role="doc-noteref">8</a></sup>.
+The second transaction waits for the first transaction to abort or commit, and then proceeds with execution.
+Therefore, no error is raised, and the overhead of retrying transactions can be avoided <sup id="fnref:9"><a href="#fn:9" role="doc-noteref">9</a></sup>.</p>
+<h2 id="3-deadlocks">3. Deadlocks</h2>
+<p>Deadlocks are another source of confusion in PostgreSQL.
+In theory, deadlocks are often explained using the <a href="https://en.wikipedia.org/wiki/Deadlock">four required conditions</a>: mutual exclusion, hold and wait, no preemption, and circular wait.
+This would be the case if</p>
+<ul>
+<li>Transaction A updates Row 1, then wants to update Row 2.</li>
+<li>Transaction B updates Row 2, then wants to update Row 1.</li>
+</ul>
+<p>Until one of the transactions aborts, there is a circular dependency and hence a deadlock.
+The textbook scenario requires two update statements in each transaction, but in reverse order.
+Surprisingly, deadlocks can also occur with two transactions that each contain only a single update statement.
+The reason is that row locks are acquired in a non-deterministic order.</p>
+<p>Consider the following transactions:</p>
+<div><pre tabindex="0"><code data-lang="sql"><span>-- Session 1
+</span><span></span><span>UPDATE</span> user_profile
+<span>SET</span> followers_count <span>=</span> <span>0</span>
+<span>WHERE</span> followers_count <span>IS</span> <span>NULL</span>;
+
+<span>-- Session 2
+</span><span></span><span>UPDATE</span> user_profile
+<span>SET</span> last_active <span>=</span> NOW()
+<span>WHERE</span> id <span>=</span> <span>ANY</span> (<span>/* list of ids */</span>);
+</code></pre></div><p>The first transaction runs a sequential scan and updates all rows that match the <code>WHERE</code> clause.
+Affected rows are locked in the order of the sequential scan.
+The second transaction can use the index on <code>id</code> to find the rows to update.
+An index scan might access affected rows in a different order.
+Hence, it is possible that a circular dependency between locks arises.</p>
+<p>This particular scenario is most likely to occur when updating a large number of rows in a single transaction.
+Updating rows in smaller batches can help to avoid deadlocks.
+Batching can also fix performance issues caused by holding locks for an unnecessarily long time.
+If performance is not an issue, it may be enough to retry transactions that have been aborted because of a deadlock.</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>Many engineers have a good theoretical understanding of isolation levels, anomalies, and deadlocks.
+However, PostgreSQL—like any other database—is a specific implementation with its own quirks.</p>
+<p><em>PostgreSQL 14 Internals</em> offers many more insights beyond the execution of update statements.
+The book is a valuable resource for anyone working with PostgreSQL.
+It covers data storage, query execution, caching, and indexing in great detail.
+I recommend it to anyone who uses PostgreSQL in production.</p>
+<hr/>
+<p>→ <em>Discuss this post on <a href="https://news.ycombinator.com/item?id=38781442">Hacker News</a>.</em></p>
+
+<ul>
+  
+</ul>
+
+
+
+
+
+  <div id="sharing">
+    <p><i>Liked this post? Get in touch! </i></p><a href="https://twitter.com/ppati000" aria-label="share on Twitter">
+      <svg height="32px" style="enable-background:new 0 0 67 67;" version="1.1" viewBox="0 0 67 67" width="32px" xml:space="preserve" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><path d="M37.167,22.283c-2.619,0.953-4.274,3.411-4.086,6.101  l0.063,1.038l-1.048-0.127c-3.813-0.487-7.145-2.139-9.974-4.915l-1.383-1.377l-0.356,1.017c-0.754,2.267-0.272,4.661,1.299,6.271  c0.838,0.89,0.649,1.017-0.796,0.487c-0.503-0.169-0.943-0.296-0.985-0.233c-0.146,0.149,0.356,2.076,0.754,2.839  c0.545,1.06,1.655,2.097,2.871,2.712l1.027,0.487l-1.215,0.021c-1.173,0-1.215,0.021-1.089,0.467  c0.419,1.377,2.074,2.839,3.918,3.475l1.299,0.444l-1.131,0.678c-1.676,0.976-3.646,1.526-5.616,1.568  C19.775,43.256,19,43.341,19,43.405c0,0.211,2.557,1.397,4.044,1.864c4.463,1.377,9.765,0.783,13.746-1.568  c2.829-1.673,5.657-5,6.978-8.221c0.713-1.716,1.425-4.851,1.425-6.354c0-0.975,0.063-1.102,1.236-2.267  c0.692-0.678,1.341-1.419,1.467-1.631c0.21-0.403,0.188-0.403-0.88-0.043c-1.781,0.636-2.033,0.551-1.152-0.402  c0.649-0.678,1.425-1.907,1.425-2.267c0-0.063-0.314,0.042-0.671,0.233c-0.377,0.212-1.215,0.53-1.844,0.72l-1.131,0.361l-1.027-0.7  c-0.566-0.381-1.361-0.805-1.781-0.932C39.766,21.902,38.131,21.944,37.167,22.283z M33,64C16.432,64,3,50.569,3,34S16.432,4,33,4  s30,13.431,30,30S49.568,64,33,64z" style="fill-rule:evenodd;clip-rule:evenodd;fill:;"></path></svg>
+
+    </a>
+
+    
+    <a href="https://www.linkedin.com/in/patrick-petrovic" aria-label="share on LinkedIn">
+      <svg height="32px" style="enable-background:new 0 0 65 65;" version="1.1" viewBox="0 0 65 65" width="32px" xml:space="preserve" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <path d="M50.837,48.137V36.425c0-6.275-3.35-9.195-7.816-9.195  c-3.604,0-5.219,1.983-6.119,3.374V27.71h-6.79c0.09,1.917,0,20.427,0,20.427h6.79V36.729c0-0.609,0.044-1.219,0.224-1.655  c0.49-1.22,1.607-2.483,3.482-2.483c2.458,0,3.44,1.873,3.44,4.618v10.929H50.837z M22.959,24.922c2.367,0,3.842-1.57,3.842-3.531  c-0.044-2.003-1.475-3.528-3.797-3.528s-3.841,1.524-3.841,3.528c0,1.961,1.474,3.531,3.753,3.531H22.959z M34,64  C17.432,64,4,50.568,4,34C4,17.431,17.432,4,34,4s30,13.431,30,30C64,50.568,50.568,64,34,64z M26.354,48.137V27.71h-6.789v20.427  H26.354z" style="fill-rule:evenodd;clip-rule:evenodd;fill:;"></path>
+</svg>
+
+    </a>
+
+    
+    <a href="https://github.com/ppati000" aria-label="share on LinkedIn">
+      <svg height="32px" style="enable-background:new 0 0 512 512;" version="1.1" viewBox="0 0 512 512" width="32px" xml:space="preserve" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <path d="M256,32C132.3,32,32,134.8,32,261.7c0,101.5,64.2,187.5,153.2,217.9c11.2,2.1,15.3-5,15.3-11.1   c0-5.5-0.2-19.9-0.3-39.1c-62.3,13.9-75.5-30.8-75.5-30.8c-10.2-26.5-24.9-33.6-24.9-33.6c-20.3-14.3,1.5-14,1.5-14   c22.5,1.6,34.3,23.7,34.3,23.7c20,35.1,52.4,25,65.2,19.1c2-14.8,7.8-25,14.2-30.7c-49.7-5.8-102-25.5-102-113.5   c0-25.1,8.7-45.6,23-61.6c-2.3-5.8-10-29.2,2.2-60.8c0,0,18.8-6.2,61.6,23.5c17.9-5.1,37-7.6,56.1-7.7c19,0.1,38.2,2.6,56.1,7.7   c42.8-29.7,61.5-23.5,61.5-23.5c12.2,31.6,4.5,55,2.2,60.8c14.3,16.1,23,36.6,23,61.6c0,88.2-52.4,107.6-102.3,113.3   c8,7.1,15.2,21.1,15.2,42.5c0,30.7-0.3,55.5-0.3,63c0,6.1,4,13.3,15.4,11C415.9,449.1,480,363.1,480,261.7   C480,134.8,379.7,32,256,32z"></path>
+</svg>
+
+    </a>
+  </div>
+
+
+
+      </div></div>
+  </body>
+</html>
