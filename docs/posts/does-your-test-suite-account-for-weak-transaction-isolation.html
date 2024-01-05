@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://concerningquality.com/txn-isolation-testing/">Original</a>
+    <h1>Does your test suite account for weak transaction isolation?</h1>
+    
+    <div id="readability-page-1" class="page"><article>
+  <header>
+  <time datetime="2023-12-31T00:00:00+00:00">December 31, 2023</time>
+</header>
+
+  <p>Transaction isolation is the kind of thing that you learn about and it fills you with fear. Specifically, there are <em>weak</em> transaction isolation levels which allow some fairly unexpected behavior. Tools like Jepsen are used to test the general isolation guarantees of databases, but it’s pretty uncommon to check the application layer for issues related to isolation anomalies. These anomalies can impact actual domain logic, so it’s important to understand them as well as how we can test them.</p>
+
+
+
+<p>Transaction isolation means that concurrent transactions against a database will be independent of one another. It’s the “I” in ACID. Unfortunately, “independence” in this context is a spectrum, and there are actually different isolation levels that are supported, each with subtly different behavior.</p>
+
+<p>Here’s a quick example script which makes concurrent queries against a database (Postgres):</p>
+
+<pre><code>create table txn_iso (ival int);
+insert into txn_iso (ival) values(1);
+</code></pre>
+
+<pre><code>import { Pool, Transaction } from &#39;https://deno.land/x/postgres/mod.ts&#39;;
+
+const pool = new Pool({
+  user: &#39;postgres&#39;,
+  hostname: &#39;localhost&#39;,
+  database: &#39;postgres&#39;,
+  port: 5433,
+  password: &#39;test1234&#39;,
+}, 10);
+
+async function runQuery(
+  txn: Transaction,
+  query: string,
+  args: (string | number)[],
+  beforeMsg: string,
+  afterMsg: (result: any) =&gt; string
+) {
+  console.log(beforeMsg);
+  const result = await txn.queryObject(query, args);
+  console.log(afterMsg(result));
+}
+
+async function readTransaction() {
+  const query = &#39;select ival from txn_iso&#39;;
+  const printResult = (result: any) =&gt; `Read result: ${result.rows[0].ival}`;
+
+  const client = await pool.connect();
+  const txn = client.createTransaction();
+
+  await txn.begin();
+
+  await runQuery(txn, query, [], &#39;Executing first read...&#39;,  printResult);
+
+  // Wait for concurrent write to occur
+  await new Promise(resolve =&gt; setTimeout(resolve, 2000));
+
+  await runQuery(txn, query, [], &#39;Executing second read...&#39;, printResult);
+
+  await txn.commit();
+
+  await client.release();
+}
+
+async function writeTransaction() {
+  await new Promise(resolve =&gt; setTimeout(resolve, 1000));
+  const client = await pool.connect();
+  const txn = client.createTransaction();
+
+  await txn.begin();
+
+  const updateVal = Math.floor(Math.random() * 1000);
+  const updateMsgBefore = `Updating ival to ${updateVal}...`;
+  const query = &#39;update txn_iso set ival = $1&#39;;
+  await runQuery(txn, query, [updateVal], updateMsgBefore, () =&gt; &#39;ival updated&#39;);
+
+  await txn.commit();
+
+  await client.release();
+}
+
+await Promise.allSettled([readTransaction(), writeTransaction()]);
+</code></pre>
+
+<p>This script executes two transactions concurrently: one that reads the <code>txn_iso.ival</code> column two different times, and another which modifies the value of that column. There’s some sleeps sprinkled in so that the second read occurs after the write. The question is: do both reads return the same value?</p>
+
+<p>In Postgres, with the default transaction isolation level set, the answer is surprisingly no. This is an example output of running the script:</p>
+
+<pre><code>Executing first read...
+Read result: 839
+Updating ival to 79...
+ival updated
+Executing second read...
+Read result: 79
+</code></pre>
+
+<p>The first read will return the value of the column at the time that the read transaction begins, but the second read will return the value that was updated by the concurrent write transaction. That’s because the default level is Read Committed, which allows non-repeatable reads. A non-repeatable read means that in the span of the same transaction, queries to the same column may return different results! This isn’t unique to Postgres either - Read Committed is the default isolation level in Oracle and SQL Server as well<sup id="fnref:fn1" role="doc-noteref"><a href="#fn:fn1" rel="footnote">1</a></sup>.</p>
+
+<p>This is surprising to a lot of people, and rightfully so, since it seems to go against the very definition of what a transaction is. But that’s because Read Committed is a <em>weak</em> transaction isolation level. Weak isolation means that transactions aren’t truly independent from one another, and the effects of one concurrent transaction can be seen in another. There’s 4 isolation levels defined by the ANSI SQL standard<sup id="fnref:fn2" role="doc-noteref"><a href="#fn:fn2" rel="footnote">2</a></sup>. All but Serializable, which is the strictest, are weak and allow some kind of interference between transactions.</p>
+
+<p>Hopefully it’s clear why this is an issue. If you have an important column value, say a user’s account balance, you might query multiple different values in the same transaction which will surely result in a domain logic bug. Will our test suites catch such bugs? That depends how we set up the tests.</p>
+
+
+
+<p>The difficulty with coming up with tests that expose transaction isolation anomalies is that the test has to simulate multiple concurrent connections. Test cases almost always have the implicit assumption that they’re being executed by a single user, and isolation anomalies don’t show up in that scenario.</p>
+
+<p>As an example, here’s some oversimplified code for making outbound transfers from an account with overdraft protection:</p>
+
+<pre><code>interface BalanceRepository {
+  getBalance(txn: Transaction): Promise&lt;number&gt;;
+  updateBalance(txn: Transaction, amount: number): Promise&lt;void&gt;;
+}
+
+async function checkOverdraftProtection(txn: Transaction, balanceRepo: BalanceRepository, amount: number) {
+  const balance =  await balanceRepo.getBalance(txn);
+  if (balance &gt;= amount) {
+    return;
+  }
+
+  balanceRepo.updateBalance(txn, balance + 100);
+}
+
+async function applyFundTransfer(txn: Transaction, balanceRepo: BalanceRepository, amount: number) {
+  const balance = await balanceRepo.getBalance(txn);
+  if (balance &lt; amount) {
+    console.error(&#34;Insufficient funds&#34;);
+    return;
+  }
+
+  await balanceRepo.updateBalance(txn, balance - amount);
+}
+
+async function transferFunds(balanceRepo: BalanceRepository, amount: number) {
+  const client = await pool.connect();
+  const txn = client.createTransaction();
+
+  await txn.begin();
+
+  await checkOverdraftProtection(txn, balanceRepo, amount);
+  await applyFundTransfer(txn, balanceRepo, amount);
+  
+  await txn.commit();
+
+  await client.release();
+}
+
+const protectedBalanceRepo = {
+  balance: 90,
+  async getBalance(txn: Transaction) {
+    return this.balance;
+  },
+  async updateBalance(txn: Transaction, amount: number) {
+    this.balance = amount;
+  }
+}
+
+await transferFunds(protectedBalanceRepo, 100);
+console.assert(protectedBalanceRepo.balance === 90);
+</code></pre>
+
+<p>The main logic that we want to test is that overdraft protection adds additional funds when there’s not enough to cover a transfer, and that the final balance is correct. To test this, we’re placing all queries behind a <code>BalanceRepository</code> interface and creating a <code>protectedBalanceRepo</code> which starts out with insufficient funds but updates the balance based on overdraft protection.</p>
+
+<p>This is the operation from the perspective of a single user and thus a single DB connection, so the insufficient funds error won’t get hit. As we saw with the Read Committed example though, another concurrent transaction can affect a value that’s read multiple times. So one way to simulate a concurrent transaction is to simply ignore the overdraft protection and specify a different balance result directly.</p>
+
+<pre><code>const concurrentWriteRepo = {
+  currBalance: 0,
+  balances: [100, 90],
+  async getBalance(txn: Transaction) {
+    return this.balances[this.currBalance++];
+  },
+  async updateBalance(txn: Transaction, amount: number) {
+  }
+}
+
+...
+
+await transferFunds(concurrentWriteRepo, 100);
+</code></pre>
+
+<p>This test double sets up two different balance results: it’ll first return 100, which will bypass overdraft protection, but the next balance check will return 90 which will result in an insufficient funds error. One way this would be possible in real life is if multiple people have access to the same account and initiate a transfer in close proximity to one another.</p>
+
+<p>There’s a simple fix for this failure: just don’t read the balance multiple times, and instead pass in the sampled balance to any function that needs it:</p>
+
+<pre><code>async function transferFunds(balanceRepo: BalanceRepository, amount: number) {
+  const client = await pool.connect();
+  const txn = client.createTransaction();
+
+  await txn.begin();
+
+  const balance = await balanceRepo.getBalance(txn);
+  const protectedBalance = await checkOverdraftProtection(txn, balance, balanceRepo, amount);
+  await applyFundTransfer(txn, protectedBalance, balanceRepo, amount);
+  
+  await txn.commit();
+
+  await client.release();
+}
+</code></pre>
+
+<p>Now the logic of <code>checkOverdraftProtection</code> and <code>applyFundTransfer</code> can get changed to use a balance value instead of querying it. This also means that <code>checkOverdraftProtection</code> has to return the balance after protection is applied since <code>applyFundTransfer</code> used to get this value with the second balance query, and using the pre-protection balance will result in an insufficient funds error.</p>
+
+<p>This solves the repeatable read anomaly by avoiding multiple reads, but there’s still a major issue: there’s a race condition between multiple concurrent transactions that can result in an incorrect balance.</p>
+
+
+
+<p>To show the error we can execute two fund transfers concurrently against the actual DB, and we can introduce a write delay so that we can control which one writes last (we’d see errors even without this, but this reduces the non-determinism):</p>
+
+<pre><code>create table accounts (balance int);
+insert into accounts (balance) values (100);
+</code></pre>
+
+<pre><code>async function transferFunds(balanceRepo: BalanceRepository, amount: number, writeDelay?: number) {
+  const client = await pool.connect();
+  const txn = client.createTransaction();
+
+  await txn.begin();
+
+  const balance = await balanceRepo.getBalance(txn);
+
+  if (writeDelay) {
+    await new Promise(resolve =&gt; setTimeout(resolve, writeDelay));
+  }
+
+  const protectedBalance = await checkOverdraftProtection(txn, balance, balanceRepo, amount);
+  await applyFundTransfer(txn, protectedBalance, balanceRepo, amount);
+  
+  await txn.commit();
+
+  await client.release();
+}
+
+const postgresBalanceRepo = {
+  async getBalance(txn: Transaction): Promise&lt;number&gt; {
+    const result = await txn.queryObject(&#39;select balance from accounts&#39;);
+    return result.rows[0].balance;
+  },
+  async updateBalance(txn: Transaction, amount: number) {
+    await txn.queryObject(&#39;update accounts set balance = $1&#39;, [amount]);
+  }
+}
+
+async function runInTransaction&lt;T&gt;(f: (txn: Transaction) =&gt; Promise&lt;T&gt;) {
+  const conn = await pool.connect()
+  const txn = conn.createTransaction()
+  await txn.begin();
+
+  const result = await f(txn);
+
+  await txn.commit();
+  await conn.release();
+
+  return result
+}
+
+// Setup
+await runInTransaction((txn) =&gt; {
+  return postgresBalanceRepo.updateBalance(txn, 100);
+});
+
+// Run two concurrent fund transfers
+await Promise.allSettled([transferFunds(postgresBalanceRepo, 80, 2000), transferFunds(postgresBalanceRepo, 60)]);
+
+const balance = await runInTransaction((txn) =&gt; {
+  return postgresBalanceRepo.getBalance(txn)
+});
+
+console.assert(balance === 60);
+</code></pre>
+
+<p>When this is run, the transfers will see the same initial balance (100), but the one with the write delay will overwrite the balance set in the other one. This also means that neither transfer will trigger overdraft protection, there will be no insufficient funds error, and the resulting balance will be an incorrect value of 20.</p>
+
+<p>This is a <em>serialization anomaly</em>. The Postgres docs define this as:</p>
+
+<blockquote>
+  <p>The result of successfully committing a group of transactions is inconsistent with all possible orderings of running those transactions one at a time.</p>
+</blockquote>
+
+<p>There are only two possible orderings of the two fund transfers here:</p>
+
+<ol>
+  <li>Transfer 80, then transfer 60</li>
+  <li>Transfer 60, then transfer 80</li>
+</ol>
+
+<p>Since the starting balance is 100, both of these cases should trigger overdraft protection on the second transfer, and the resulting balance in both cases should be 60 (100 + 100 - 80 - 60). Race conditions can exist when transactions don’t adhere to serializability, and that’s what’s going on here - two fund transfers are initiated, but only one is accounted for because of a concurrent race. This is known as the “lost update” problem.</p>
+
+<p>There’s a few different ways to fix this, but the simplest is to lock the row for the duration of the transaction with <code>FOR UPDATE</code>:</p>
+
+<pre><code>const postgresBalanceRepo = {
+  async getBalance(txn: Transaction): Promise&lt;number&gt; {
+    const result = await txn.queryObject(&#39;select balance from accounts FOR UPDATE&#39;);
+    return result.rows[0].balance;
+  },
+  ...
+}
+</code></pre>
+
+<p>Again from the Postgres docs:</p>
+
+<blockquote>
+  <p>FOR UPDATE causes the rows retrieved by the SELECT statement to be locked as though for update. This prevents them from being locked, modified or deleted by other transactions until the current transaction ends.</p>
+</blockquote>
+
+<p>This means that each transaction will grab a lock on the <code>accounts</code> row and that will block all other transactions from modifying that row until it’s complete, i.e. the transactions will execute in a serializable fashion. It’s worth noting that this is now slower. Without the lock the transactions could truly operate concurrently, but now they have to wait in contention over balance updates to the same account. This is necessary for correct behavior, but it’s worth understanding the tradeoff.</p>
+
+<p>Also of note, test doubles alone won’t help with this bug because the fix is in the real Postgres repository implementation. Test doubles are useful for testing application code independent of the database in many cases, but transaction isolation is a case where the different levels are so subtly different that it’s simpler to test against the real thing.</p>
+
+<hr/>
+
+<p>Transaction isolation has a major impact on an application, both in terms of performance as well as its influence on domain logic. It’s important to integration test against the real database to make sure that a weak transaction isolation level isn’t the cause of concurrency bugs. To expose such bugs, we have to execute at least two concurrent transactions in a test case. Unfortunately this can require some amount of time-based coordination which is never ideal, but is often necessary when tools like databases have opaque non-deterministic behavior that’s out of our control.</p>
+
+<p>Still, it is something we can and should test for at the application level.</p>
+
+<hr/>
+
+
+
+  
+</article></div>
+  </body>
+</html>
