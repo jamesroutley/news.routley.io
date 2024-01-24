@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://sourcegraph.com/blog/slow-to-simd">Original</a>
+    <h1>From slow to SIMD: A Go optimization story</h1>
+    
+    <div id="readability-page-1" class="page"><div><div><p>So, there&#39;s this function. It&#39;s called a lot. More importantly, all those calls are on the critical path of a key user
+interaction. Let&#39;s talk about making it fast.</p>
+<p>Spoiler: it&#39;s a dot product.</p>
+<h2 id="some-background-or-skip-to-the-juicy-stuff"><a aria-hidden="true" tabindex="-1" href="#some-background-or-skip-to-the-juicy-stuff"><span></span></a>Some background (or <a href="#the-target">skip to the juicy stuff</a>)</h2>
+<p>At Sourcegraph, we&#39;re working on a Code AI tool named <a href="https://sourcegraph.com/cody">Cody</a>. In order for Cody to answer
+questions well, we need to give them enough <a href="https://about.sourcegraph.com/blog/cheating-is-all-you-need">context</a> to
+work with. One of the <a href="https://about.sourcegraph.com/whitepaper/cody-context-architecture.pdf">ways we do this</a> is by
+leveraging <a href="https://platform.openai.com/docs/guides/embeddings">embeddings</a>.</p>
+<p>For our purposes, an <a href="https://developers.google.com/machine-learning/crash-course/embeddings/video-lecture">embedding</a>
+is a vector representation of a chunk of text. They are constructed in such a way that semantically similar pieces of
+text have more similar vectors. When Cody needs more information to answer a query, we run a similarity search over the
+embeddings to fetch a set of related chunks of code and feed those results to Cody to improve the relevance of results.</p>
+<p>The piece relevant to this blog post is that similarity metric, which is the function that determines how similar two
+vectors are. For similarity search, a common metric is <a href="https://en.wikipedia.org/wiki/Cosine_similarity">cosine
+similarity</a>. However, for normalized vectors (vectors with unit
+magnitude), the <a href="https://en.wikipedia.org/wiki/Dot_product">dot product</a> yields a ranking that&#39;s <a href="https://developers.google.com/machine-learning/clustering/similarity/measuring-similarity">equivalent to cosine
+similarity</a>. To run a search,
+we calculate the dot product for every embedding in our data set and keep the top results. And since we cannot
+start execution of the LLM until we get the necessary context, optimizing this step is crucial.</p>
+<p>You might be thinking: why not just use an indexed vector DB? Outside of adding yet another piece of infra that we need
+to manage, the construction of an index adds latency and increases resource requirements. Additionally, standard
+nearest-neighbor indexes only provide approximate retrieval, which adds another layer of fuzziness compared to a more
+easily explainable exhaustive search. Given that, we decided to invest a little in our hand-rolled solution to see how
+far we could push it.</p>
+<h2 id="the-target"><a aria-hidden="true" tabindex="-1" href="#the-target"><span></span></a>The target</h2>
+<p>This is a simple Go implementation of a function that calculates the dot product of two vectors. My goal is to outline
+the journey I took to optimize this function, and to share some tools I picked up along the way.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="go" data-theme="github-light"><code data-language="go" data-theme="github-light"><span data-line=""><span>func</span><span> DotNaive</span><span>(a, b []</span><span>float32</span><span>) </span><span>float32</span><span> {</span></span>
+<span data-line=""><span>	sum </span><span>:=</span><span> float32</span><span>(</span><span>0</span><span>)</span></span>
+<span data-line=""><span>	for</span><span> i </span><span>:=</span><span> 0</span><span>; i </span><span>&lt;</span><span> len</span><span>(a) </span><span>&amp;&amp;</span><span> i </span><span>&lt;</span><span> len</span><span>(b); i</span><span>++</span><span> {</span></span>
+<span data-line=""><span>		sum </span><span>+=</span><span> a[i] </span><span>*</span><span> b[i]</span></span>
+<span data-line=""><span>	}</span></span>
+<span data-line=""><span>	return</span><span> sum</span></span>
+<span data-line=""><span>}</span></span></code></pre></figure>
+<p>Unless otherwise stated, all benchmarks are run on an Intel Xeon Platinum 8481C 2.70GHz CPU. This is a <code>c3-highcpu-44</code>
+GCE VM. The code in this blog post can all be found in runnable form <a href="https://github.com/camdencheek/simd_blog">here</a>.</p>
+<h2 id="loop-unrolling"><a aria-hidden="true" tabindex="-1" href="#loop-unrolling"><span></span></a>Loop unrolling</h2>
+<p>Modern CPUs do this thing called <a href="https://chadaustin.me/2009/02/latency-vs-throughput/"><em>instruction pipelining</em></a> where
+it can run multiple instructions simultaneously if it finds no data dependencies between them. A data dependency just
+means that the input of one instruction depends on the output of another.</p>
+<p>In our simple implementation, we have data dependencies between our loop iterations. A couple, in fact. Both <code>i</code> and
+<code>sum</code> have a read/write pair each iteration, meaning an iteration cannot start executing until the previous is finished.</p>
+<p>A common method of squeezing more out of our CPUs in situations like this is known as <a href="https://en.wikipedia.org/wiki/Loop_unrolling"><em>loop
+unrolling</em></a>. The basic idea is to rewrite our loop so more of our
+relatively-high-latency multiply instructions can execute simultaneously. Additionally, it amortizes the fixed loop
+costs (increment and compare) across multiple operations.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="go" data-theme="github-light"><code data-language="go" data-theme="github-light"><span data-line=""><span>func</span><span> DotUnroll4</span><span>(a, b []</span><span>float32</span><span>) </span><span>float32</span><span> {</span></span>
+<span data-line=""><span>	sum </span><span>:=</span><span> float32</span><span>(</span><span>0</span><span>)</span></span>
+<span data-line=""><span>	for</span><span> i </span><span>:=</span><span> 0</span><span>; i </span><span>&lt;</span><span> len</span><span>(a); i </span><span>+=</span><span> 4</span><span> {</span></span>
+<span data-line=""><span>		s0 </span><span>:=</span><span> a[i] </span><span>*</span><span> b[i]</span></span>
+<span data-line=""><span>		s1 </span><span>:=</span><span> a[i</span><span>+</span><span>1</span><span>] </span><span>*</span><span> b[i</span><span>+</span><span>1</span><span>]</span></span>
+<span data-line=""><span>		s2 </span><span>:=</span><span> a[i</span><span>+</span><span>2</span><span>] </span><span>*</span><span> b[i</span><span>+</span><span>2</span><span>]</span></span>
+<span data-line=""><span>		s3 </span><span>:=</span><span> a[i</span><span>+</span><span>3</span><span>] </span><span>*</span><span> b[i</span><span>+</span><span>3</span><span>]</span></span>
+<span data-line=""><span>		sum </span><span>+=</span><span> s0 </span><span>+</span><span> s1 </span><span>+</span><span> s2 </span><span>+</span><span> s3</span></span>
+<span data-line=""><span>	}</span></span>
+<span data-line=""><span>	return</span><span> sum</span></span>
+<span data-line=""><span>}</span></span></code></pre></figure>
+<p>In our unrolled code, the dependencies between multiply instructions are removed, enabling the CPU to take more
+advantage of pipelining. This increases our throughput by 37% compared to our naive implementation.</p>
+<div><p><code>DotNaive</code></p><p><span>0.94<!-- -->M vec/s</span></p><p><code>DotUnroll4</code></p><p><span>1.3<!-- -->M vec/s</span></p></div>
+<p>Note that we can actually improve this slightly more by twiddling with the number of iterations we unroll. On the
+benchmark machine, 8 seemed to be optimal, but on my laptop, 4 performs best. However, the improvement is quite platform
+dependent and fairly minimal, so for the rest of the post, I&#39;ll stick with an unroll depth of 4 for readability.</p>
+<h2 id="bounds-checking-elimination"><a aria-hidden="true" tabindex="-1" href="#bounds-checking-elimination"><span></span></a>Bounds-checking elimination</h2>
+<p>In order to keep out-of-bounds slice accesses from being a security vulnerability (like the famous
+<a href="https://en.wikipedia.org/wiki/Heartbleed">Heartbleed</a> exploit), the go compiler inserts checks before each read. You
+can check it out in the <a href="https://go.godbolt.org/z/qT3M7nPGf">generated assembly</a> (look for <code>runtime.panic</code>).</p>
+<p>The compiled code makes it look like we wrote something like this:</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="go" data-theme="github-light"><code data-language="go" data-theme="github-light"><span data-line=""><span>func</span><span> DotUnroll4</span><span>(a, b []</span><span>float32</span><span>) </span><span>float32</span><span> {</span></span>
+<span data-line=""><span>	sum </span><span>:=</span><span> float32</span><span>(</span><span>0</span><span>)</span></span>
+<span data-line=""><span>	for</span><span> i </span><span>:=</span><span> 0</span><span>; i </span><span>&lt;</span><span> len</span><span>(a); i </span><span>+=</span><span> 4</span><span> {</span></span>
+<span data-line=""><span>        if</span><span> i </span><span>&gt;=</span><span> cap</span><span>(b) {</span></span>
+<span data-line=""><span>            panic</span><span>(</span><span>&#34;out of bounds&#34;</span><span>)</span></span>
+<span data-line=""><span>        }</span></span>
+<span data-line=""><span>		s0 </span><span>:=</span><span> a[i] </span><span>*</span><span> b[i]</span></span>
+<span data-line=""><span>        if</span><span> i</span><span>+</span><span>1</span><span> &gt;=</span><span> cap</span><span>(a) </span><span>||</span><span> i</span><span>+</span><span>1</span><span> &gt;=</span><span> cap</span><span>(b) {</span></span>
+<span data-line=""><span>            panic</span><span>(</span><span>&#34;out of bounds&#34;</span><span>)</span></span>
+<span data-line=""><span>        }</span></span>
+<span data-line=""><span>		s1 </span><span>:=</span><span> a[i</span><span>+</span><span>1</span><span>] </span><span>*</span><span> b[i</span><span>+</span><span>1</span><span>]</span></span>
+<span data-line=""><span>        if</span><span> i</span><span>+</span><span>2</span><span> &gt;=</span><span> cap</span><span>(a) </span><span>||</span><span> i</span><span>+</span><span>2</span><span> &gt;=</span><span> cap</span><span>(b) {</span></span>
+<span data-line=""><span>            panic</span><span>(</span><span>&#34;out of bounds&#34;</span><span>)</span></span>
+<span data-line=""><span>        }</span></span>
+<span data-line=""><span>		s2 </span><span>:=</span><span> a[i</span><span>+</span><span>2</span><span>] </span><span>*</span><span> b[i</span><span>+</span><span>2</span><span>]</span></span>
+<span data-line=""><span>        if</span><span> i</span><span>+</span><span>3</span><span> &gt;=</span><span> cap</span><span>(a) </span><span>||</span><span> i</span><span>+</span><span>3</span><span> &gt;=</span><span> cap</span><span>(b) {</span></span>
+<span data-line=""><span>            panic</span><span>(</span><span>&#34;out of bounds&#34;</span><span>)</span></span>
+<span data-line=""><span>        }</span></span>
+<span data-line=""><span>		s3 </span><span>:=</span><span> a[i</span><span>+</span><span>3</span><span>] </span><span>*</span><span> b[i</span><span>+</span><span>3</span><span>]</span></span>
+<span data-line=""><span>		sum </span><span>+=</span><span> s0 </span><span>+</span><span> s1 </span><span>+</span><span> s2 </span><span>+</span><span> s3</span></span>
+<span data-line=""><span>	}</span></span>
+<span data-line=""><span>	return</span><span> sum</span></span>
+<span data-line=""><span>}</span></span></code></pre></figure>
+<p>In a hot loop like this, even with modern branch prediction, the additional branches per iteration can add up to a
+pretty significant performance penalty. This is especially true in our case because the inserted jumps limit how much we
+can take advantage of pipelining.</p>
+<p>If we can convince the compiler that these reads can never be out of bounds, it won&#39;t insert these runtime checks. This
+technique is known as &#34;bounds-checking elimination&#34;, and the same patterns can apply to <a href="https://github.com/Shnatsel/bounds-check-cookbook/">languages other than
+Go</a>.</p>
+<p>In theory, we should be able to do all checks once, outside the loop, and the compiler would be able to determine that
+all the slice indexing is safe. However, I couldn&#39;t find the right combination of checks to convince the compiler that
+what I&#39;m doing is safe. I landed on a combination of asserting the lengths are equal and moving all the bounds checking
+to the top of the loop. This was enough to hit nearly the speed of the bounds-check-free version.</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="go" data-theme="github-light"><code data-language="go" data-theme="github-light"><span data-line=""><span>func</span><span> DotBCE</span><span>(a, b []</span><span>float32</span><span>) </span><span>float32</span><span> {</span></span>
+<span data-line=""><span>	if</span><span> len</span><span>(a) </span><span>!=</span><span> len</span><span>(b) {</span></span>
+<span data-line=""><span>		panic</span><span>(</span><span>&#34;slices must have equal lengths&#34;</span><span>)</span></span>
+<span data-line=""><span>	}</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>    if</span><span> len</span><span>(a)</span><span>%</span><span>4</span><span> !=</span><span> 0</span><span> {</span></span>
+<span data-line=""><span>		panic</span><span>(</span><span>&#34;slice length must be multiple of 4&#34;</span><span>)</span></span>
+<span data-line=""><span>	}</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>	sum </span><span>:=</span><span> float32</span><span>(</span><span>0</span><span>)</span></span>
+<span data-line=""><span>	for</span><span> i </span><span>:=</span><span> 0</span><span>; i </span><span>&lt;</span><span> len</span><span>(a); i </span><span>+=</span><span> 4</span><span> {</span></span>
+<span data-line=""><span>		aTmp </span><span>:=</span><span> a[i : i</span><span>+</span><span>4</span><span> : i</span><span>+</span><span>4</span><span>]</span></span>
+<span data-line=""><span>		bTmp </span><span>:=</span><span> b[i : i</span><span>+</span><span>4</span><span> : i</span><span>+</span><span>4</span><span>]</span></span>
+<span data-line=""><span>		s0 </span><span>:=</span><span> aTmp[</span><span>0</span><span>] </span><span>*</span><span> bTmp[</span><span>0</span><span>]</span></span>
+<span data-line=""><span>		s1 </span><span>:=</span><span> aTmp[</span><span>1</span><span>] </span><span>*</span><span> bTmp[</span><span>1</span><span>]</span></span>
+<span data-line=""><span>		s2 </span><span>:=</span><span> aTmp[</span><span>2</span><span>] </span><span>*</span><span> bTmp[</span><span>2</span><span>]</span></span>
+<span data-line=""><span>		s3 </span><span>:=</span><span> aTmp[</span><span>3</span><span>] </span><span>*</span><span> bTmp[</span><span>3</span><span>]</span></span>
+<span data-line=""><span>		sum </span><span>+=</span><span> s0 </span><span>+</span><span> s1 </span><span>+</span><span> s2 </span><span>+</span><span> s3</span></span>
+<span data-line=""><span>	}</span></span>
+<span data-line=""><span>	return</span><span> sum</span></span>
+<span data-line=""><span>}</span></span></code></pre></figure>
+<p>The minimizing of bounds checking nets a 9% improvement. Consistently non-zero, but nothing to write home about.</p>
+<div><p><code>DotNaive</code></p><p><span>0.94<!-- -->M vec/s</span></p><p><code>DotUnroll4</code></p><p><span>1.3<!-- -->M vec/s</span></p><p><code>DotBCE</code></p><p><span>1.4<!-- -->M vec/s</span></p></div>
+<p>This technique translates well to many memory-safe compiled languages like
+<a href="https://nnethercote.github.io/perf-book/bounds-checks.html">Rust</a>.</p>
+<p>Exercise for the reader: why is it significant that we slice like <code>a[i:i+4:i+4]</code> rather than just <code>a[i:i+4]</code>?</p>
+<h2 id="quantization"><a aria-hidden="true" tabindex="-1" href="#quantization"><span></span></a>Quantization</h2>
+<p>We&#39;ve improved single-core search throughput by ~50% at this point, but now we&#39;ve hit a new bottleneck: memory usage.
+Our vectors are 1536 dimensions. With 4-byte elements, this comes out to 6KiB per vector, and we generate roughly a million
+vectors per GiB of code. That adds up quickly. We had a few customers come to us with some massive monorepos, and we
+wanted to reduce our memory usage so we can support those cases more cheaply.</p>
+<p>One possible mitigation would be to move the vectors to disk, but loading them from disk at search time can add
+<a href="https://colin-scott.github.io/personal_website/research/interactive_latency.html">significant latency</a>, especially on
+slow disks. Instead, we chose to compress our vectors with <code>int8</code> quantization.</p>
+<p>There are <a href="https://en.wikipedia.org/wiki/Dimensionality_reduction">plenty of ways</a> to compress vectors, but we&#39;ll be
+talking about <a href="https://huggingface.co/docs/optimum/concept_guides/quantization"><em>integer quantization</em></a>, which is
+relatively simple, but effective. The idea is to reduce the precision of the 4-byte <code>float32</code> vector elements by
+converting them to 1-byte <code>int8</code>s.</p>
+<p>I won&#39;t get into exactly <em>how</em> we decide to do the translation between <code>float32</code> and <code>int8</code>, since that&#39;s a pretty <a href="https://huggingface.co/docs/optimum/concept_guides/quantization">deep
+topic</a>, but suffice it to say our function now looks
+like the following:</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="go" data-theme="github-light"><code data-language="go" data-theme="github-light"><span data-line=""><span>func</span><span> DotInt8BCE</span><span>(a, b []</span><span>int8</span><span>) </span><span>int32</span><span> {</span></span>
+<span data-line=""><span>	if</span><span> len</span><span>(a) </span><span>!=</span><span> len</span><span>(b) {</span></span>
+<span data-line=""><span>		panic</span><span>(</span><span>&#34;slices must have equal lengths&#34;</span><span>)</span></span>
+<span data-line=""><span>	}</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>	sum </span><span>:=</span><span> int32</span><span>(</span><span>0</span><span>)</span></span>
+<span data-line=""><span>	for</span><span> i </span><span>:=</span><span> 0</span><span>; i </span><span>&lt;</span><span> len</span><span>(a); i </span><span>+=</span><span> 4</span><span> {</span></span>
+<span data-line=""><span>		aTmp </span><span>:=</span><span> a[i : i</span><span>+</span><span>4</span><span> : i</span><span>+</span><span>4</span><span>]</span></span>
+<span data-line=""><span>		bTmp </span><span>:=</span><span> b[i : i</span><span>+</span><span>4</span><span> : i</span><span>+</span><span>4</span><span>]</span></span>
+<span data-line=""><span>		s0 </span><span>:=</span><span> int32</span><span>(aTmp[</span><span>0</span><span>]) </span><span>*</span><span> int32</span><span>(bTmp[</span><span>0</span><span>])</span></span>
+<span data-line=""><span>		s1 </span><span>:=</span><span> int32</span><span>(aTmp[</span><span>1</span><span>]) </span><span>*</span><span> int32</span><span>(bTmp[</span><span>1</span><span>])</span></span>
+<span data-line=""><span>		s2 </span><span>:=</span><span> int32</span><span>(aTmp[</span><span>2</span><span>]) </span><span>*</span><span> int32</span><span>(bTmp[</span><span>2</span><span>])</span></span>
+<span data-line=""><span>		s3 </span><span>:=</span><span> int32</span><span>(aTmp[</span><span>3</span><span>]) </span><span>*</span><span> int32</span><span>(bTmp[</span><span>3</span><span>])</span></span>
+<span data-line=""><span>		sum </span><span>+=</span><span> s0 </span><span>+</span><span> s1 </span><span>+</span><span> s2 </span><span>+</span><span> s3</span></span>
+<span data-line=""><span>	}</span></span>
+<span data-line=""><span>	return</span><span> sum</span></span>
+<span data-line=""><span>}</span></span></code></pre></figure>
+<p>This change yields a 4x reduction in memory usage at the cost of some accuracy (which we carefully measured, but is
+irrelevant to this blog post).</p>
+<p>Unfortunately, re-running the benchmarks shows our search speed regressed a bit from the change. Taking a look at the
+generated assembly (with <code>go tool compile -S</code>), there are some new instructions for converting <code>int8</code> to <code>int32</code>, which
+might explain the difference. I didn&#39;t dig too deep though, since all our performance improvements up to this point
+become irrelevant in the next section.</p>
+<div><p><code>DotNaive</code></p><p><span>0.94<!-- -->M vec/s</span></p><p><code>DotUnroll4</code></p><p><span>1.3<!-- -->M vec/s</span></p><p><code>DotBCE</code></p><p><span>1.4<!-- -->M vec/s</span></p><p><code>DotInt8BCE</code></p><p><span>1.2<!-- -->M vec/s</span></p></div>
+<h2 id="simd"><a aria-hidden="true" tabindex="-1" href="#simd"><span></span></a>SIMD</h2>
+<p>The speed improvements so far were nice, but still not enough for our largest customers. So we started dabbling with
+more dramatic approaches.</p>
+<p>I always love an excuse to play with SIMD. And this problem seemed like the perfect nail for that hammer.</p>
+<p>For those unfamiliar, SIMD stands for &#34;Single Instruction Multiple Data&#34;. Just like it&#39;s says, it lets you run an
+operation over a bunch of pieces of data with a single instruction. As an example, to add two <code>int32</code> vectors
+element-wise, we could add them together one by one with the <code>ADD</code> instruction and, or we can use the <code>VPADDD</code>
+instruction to add 64 pairs at a time with the <a href="https://uops.info/html-instr/ADD_01_R32_R32.html">same</a>
+<a href="https://uops.info/html-instr/VPADDD_YMM_YMM_M256.html">latency</a> (depending on the architecture).</p>
+<p>We have a problem though. Go does not expose SIMD intrinsics like
+<a href="https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html">C</a> or
+<a href="https://doc.rust-lang.org/beta/core/simd/index.html">Rust</a>. We have two options here: write it in C and use Cgo, or
+write it by hand for Go&#39;s assembler. I try hard to avoid Cgo whenever possible for <a href="https://dave.cheney.net/2016/01/18/cgo-is-not-go">many reasons that are not at all
+original</a>, but one of those reasons is that Cgo imposes a performance
+penalty, and performance of this snippet is paramount. Also, getting my hands dirty with some assembly sounds fun, so
+that&#39;s what I&#39;m going to do.</p>
+<p>I want this routine to be reasonably portable, so I&#39;m going to restrict myself to only AVX2 instructions, which are
+supported on most <code>x86_64</code> server CPUs these days. We can use <a href="https://sourcegraph.com/github.com/sourcegraph/sourcegraph@3ac2170c6523dd074835919a1804f197cf86e451/-/blob/internal/embeddings/dot_amd64.go?L17-21">runtime feature
+detection</a>
+to fall back to a slower option in pure Go.</p>
+<details><summary>Full code for <code>DotAVX2</code></summary><figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="" data-theme="github-light"><code data-language="" data-theme="github-light"><span data-line=""><span>#include &#34;textflag.h&#34;</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>TEXT ·DotAVX2(SB), NOSPLIT, $0-52</span></span>
+<span data-line=""><span>	// Offsets based on slice header offsets.</span></span>
+<span data-line=""><span>	// To check, use `GOARCH=amd64 go vet`</span></span>
+<span data-line=""><span>	MOVQ a_base+0(FP), AX</span></span>
+<span data-line=""><span>	MOVQ b_base+24(FP), BX</span></span>
+<span data-line=""><span>	MOVQ a_len+8(FP), DX</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	XORQ R8, R8 // return sum</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	// Zero Y0, which will store 8 packed 32-bit sums</span></span>
+<span data-line=""><span>	VPXOR Y0, Y0, Y0</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>// In blockloop, we calculate the dot product 16 at a time</span></span>
+<span data-line=""><span>blockloop:</span></span>
+<span data-line=""><span>	CMPQ DX, $16</span></span>
+<span data-line=""><span>	JB reduce</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	// Sign-extend 16 bytes into 16 int16s</span></span>
+<span data-line=""><span>	VPMOVSXBW (AX), Y1</span></span>
+<span data-line=""><span>	VPMOVSXBW (BX), Y2</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	// Multiply words vertically to form doubleword intermediates,</span></span>
+<span data-line=""><span>	// then add adjacent doublewords.</span></span>
+<span data-line=""><span>	VPMADDWD Y1, Y2, Y1</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	// Add results to the running sum</span></span>
+<span data-line=""><span>	VPADDD Y0, Y1, Y0</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	ADDQ $16, AX</span></span>
+<span data-line=""><span>	ADDQ $16, BX</span></span>
+<span data-line=""><span>	SUBQ $16, DX</span></span>
+<span data-line=""><span>	JMP blockloop</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>reduce:</span></span>
+<span data-line=""><span>	// X0 is the low bits of Y0.</span></span>
+<span data-line=""><span>	// Extract the high bits into X1, fold in half, add, repeat.</span></span>
+<span data-line=""><span>	VEXTRACTI128 $1, Y0, X1</span></span>
+<span data-line=""><span>	VPADDD X0, X1, X0</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	VPSRLDQ $8, X0, X1</span></span>
+<span data-line=""><span>	VPADDD X0, X1, X0</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	VPSRLDQ $4, X0, X1</span></span>
+<span data-line=""><span>	VPADDD X0, X1, X0</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	// Store the reduced sum</span></span>
+<span data-line=""><span>	VMOVD X0, R8</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>end:</span></span>
+<span data-line=""><span>	MOVL R8, ret+48(FP)</span></span>
+<span data-line=""><span>	VZEROALL</span></span>
+<span data-line=""><span>	RET</span></span></code></pre></figure></details>
+<p>The core loop of the implementation depends on three main instructions:</p>
+<ul>
+<li><a href="https://www.felixcloutier.com/x86/pmovsx"><code>VPMOVSXBW</code></a>, which loads <code>int8</code>s into a vector <code>int16</code>s</li>
+<li><a href="https://www.felixcloutier.com/x86/pmaddwd"><code>VPMADDWD</code></a>, which multiplies two <code>int16</code> vectors element-wise, then adds
+fuzzy stack.
+together adjacent pairs to produce a vector of <code>int32</code>s</li>
+<li><a href="https://www.felixcloutier.com/x86/paddb:paddw:paddd:paddq"><code>VPADDD</code></a>, which accumulates the resulting <code>int32</code> vector
+into our running sum</li>
+</ul>
+<p><code>VPMADDWD</code> is a real heavy lifter here. By combining the multiply and add steps into one, not only does it save
+instructions, it also helps us avoid overflow issues by simultaneously widening the result to an <code>int32</code>.</p>
+<p>Let&#39;s see what this earned us.</p>
+<div><p><code>DotNaive</code></p><p><span>0.94<!-- -->M vec/s</span></p><p><code>DotUnroll4</code></p><p><span>1.3<!-- -->M vec/s</span></p><p><code>DotBCE</code></p><p><span>1.4<!-- -->M vec/s</span></p><p><code>DotInt8BCE</code></p><p><span>1.2<!-- -->M vec/s</span></p><p><code>DotAVX2</code></p><p><span>7.0<!-- -->M vec/s</span></p></div>
+<p>Woah, that&#39;s a 530% increase in throughput from our previous best! SIMD for the win 🚀</p>
+<p>Now, it wasn&#39;t all sunshine and rainbows. Hand-writing assembly in Go is weird. It uses a <a href="https://go.dev/doc/asm">custom
+assembler</a>, which means that its assembly language looks just-different-enough-to-be-confusing
+compared to the assembly snippets you usually find online. It has some weird quirks like <a href="https://www.quasilyte.dev/blog/post/go-asm-complementary-reference/#operands-order">changing the order of
+instruction operands</a> or <a href="https://www.quasilyte.dev/blog/post/go-asm-complementary-reference/#mnemonics">using
+different names for instructions</a>. Some
+instructions don&#39;t even <em>have</em> names in the go assembler and can only be used via their <a href="https://go.dev/doc/asm#unsupported_opcodes">binary
+encoding</a>. Shameless plug: I found
+<a href="https://sourcegraph.com/search">sourcegraph.com</a> invaluable for finding examples of Go assembly to draw from.</p>
+<p>That said, compared to Cgo, there are some nice benefits. Debugging still works well, the assembly can be stepped
+through, and registers can be inspected using <code>delve</code>. There are no extra build steps (a C toolchain doesn&#39;t need to be
+set up). It&#39;s easy to set up a pure-Go fallback so cross-compilation still works. Common problems are caught by <code>go vet</code>.</p>
+<h2 id="simdbut-bigger"><a aria-hidden="true" tabindex="-1" href="#simdbut-bigger"><span></span></a>SIMD...but bigger</h2>
+<p>Previously, we limited ourselves to AVX2, but what if we <em>didn&#39;t</em>? The VNNI extension to AVX-512 added the
+<a href="https://www.felixcloutier.com/x86/vpdpbusd"><code>VPDPBUSD</code></a> instruction, which computes the dot product on <code>int8</code> vectors
+rather than <code>int16</code>s. This means we can process four times as many elements in a single instruction because we don&#39;t
+have to convert to <code>int16</code> first and our vector width doubles with AVX-512!</p>
+<p>The only problem is that the instruction requires one vector to be signed bytes, and the other to be <em>unsigned</em> bytes.
+Both of our vectors are signed. We can employ <a href="https://www.intel.com/content/www/us/en/docs/onednn/developer-guide-reference/2023-0/nuances-of-int8-computations.html#DOXID-DEV-GUIDE-INT8-COMPUTATIONS-1DG-I8-COMP-S12">a trick from Intel&#39;s developer
+guide</a>
+to help us out. Given two <code>int8</code> elements, <code>a<sub>n</sub></code> and <code>b<sub>n</sub></code>, we do the
+element-wise calculation as <code>a<sub>n</sub>* (b<sub>n</sub> + 128) - a<sub>n</sub> * 128</code>. The
+<code>a<sub>n</sub> * 128</code> term is the overshoot from adding 128 to bump <code>b<sub>n</sub></code> into <code>u8</code>
+range. We keep track of that separately and subtract it at the end. Each of the operations in that expression can be
+vectorized.</p>
+<details><summary>Full code for <code>DotVNNI</code></summary><figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="" data-theme="github-light"><code data-language="" data-theme="github-light"><span data-line=""><span>#include &#34;textflag.h&#34;</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>// DotVNNI calculates the dot product of two slices using AVX512 VNNI</span></span>
+<span data-line=""><span>// instructions The slices must be of equal length and that length must be a</span></span>
+<span data-line=""><span>// multiple of 64.</span></span>
+<span data-line=""><span>TEXT ·DotVNNI(SB), NOSPLIT, $0-52</span></span>
+<span data-line=""><span>	// Offsets based on slice header offsets.</span></span>
+<span data-line=""><span>	// To check, use `GOARCH=amd64 go vet`</span></span>
+<span data-line=""><span>	MOVQ a_base+0(FP), AX</span></span>
+<span data-line=""><span>	MOVQ b_base+24(FP), BX</span></span>
+<span data-line=""><span>	MOVQ a_len+8(FP), DX</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>    ADDQ AX, DX // end pointer</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	// Zero our accumulators</span></span>
+<span data-line=""><span>	VPXORQ Z0, Z0, Z0 // positive</span></span>
+<span data-line=""><span>	VPXORQ Z1, Z1, Z1 // negative</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	// Fill Z2 with 128</span></span>
+<span data-line=""><span>	MOVD $0x80808080, R9</span></span>
+<span data-line=""><span>	VPBROADCASTD R9, Z2</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>blockloop:</span></span>
+<span data-line=""><span>	CMPQ AX, DX</span></span>
+<span data-line=""><span>	JE reduce</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	VMOVDQU8 (AX), Z3</span></span>
+<span data-line=""><span>	VMOVDQU8 (BX), Z4</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	// The VPDPBUSD instruction calculates of the dot product 4 columns at a</span></span>
+<span data-line=""><span>	// time, accumulating into an i32 vector. The problem is it expects one</span></span>
+<span data-line=""><span>	// vector to be unsigned bytes and one to be signed bytes. To make this</span></span>
+<span data-line=""><span>	// work, we make one of our vectors unsigned by adding 128 to each element.</span></span>
+<span data-line=""><span>	// This causes us to overshoot, so we keep track of the amount we need</span></span>
+<span data-line=""><span>	// to compensate by so we can subtract it from the sum at the end.</span></span>
+<span data-line=""><span>	//</span></span>
+<span data-line=""><span>	// Effectively, we are calculating SUM((Z3 + 128) · Z4) - 128 * SUM(Z4).</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	VPADDB Z3, Z2, Z3   // add 128 to Z3, making it unsigned</span></span>
+<span data-line=""><span>	VPDPBUSD Z4, Z3, Z0 // Z0 += Z3 dot Z4</span></span>
+<span data-line=""><span>	VPDPBUSD Z4, Z2, Z1 // Z1 += broadcast(128) dot Z4</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	ADDQ $64, AX</span></span>
+<span data-line=""><span>	ADDQ $64, BX</span></span>
+<span data-line=""><span>	JMP blockloop</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>reduce:</span></span>
+<span data-line=""><span>    // Subtract the overshoot from our calculated dot product</span></span>
+<span data-line=""><span>	VPSUBD Z1, Z0, Z0 // Z0 -= Z1</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>    // Sum Z0 horizontally. There is no horizontal sum instruction, so instead</span></span>
+<span data-line=""><span>    // we sum the upper and lower halves of Z0, fold it in half again, and</span></span>
+<span data-line=""><span>    // repeat until we are down to 1 element that contains the final sum.</span></span>
+<span data-line=""><span>    VEXTRACTI64X4 $1, Z0, Y1</span></span>
+<span data-line=""><span>    VPADDD Y0, Y1, Y0</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	VEXTRACTI128 $1, Y0, X1</span></span>
+<span data-line=""><span>	VPADDD X0, X1, X0</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	VPSRLDQ $8, X0, X1</span></span>
+<span data-line=""><span>	VPADDD X0, X1, X0</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	VPSRLDQ $4, X0, X1</span></span>
+<span data-line=""><span>	VPADDD X0, X1, X0</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>	// Store the reduced sum</span></span>
+<span data-line=""><span>	VMOVD X0, R8</span></span>
+<span data-line=""><span></span></span>
+<span data-line=""><span>end:</span></span>
+<span data-line=""><span>	MOVL R8, ret+48(FP)</span></span>
+<span data-line=""><span>	VZEROALL</span></span>
+<span data-line=""><span>	RET</span></span></code></pre></figure></details>
+<p>This implementation yielded another 21% improvement. Not bad!</p>
+<div><p><code>DotNaive</code></p><p><span>0.94<!-- -->M vec/s</span></p><p><code>DotUnroll4</code></p><p><span>1.3<!-- -->M vec/s</span></p><p><code>DotBCE</code></p><p><span>1.4<!-- -->M vec/s</span></p><p><code>DotInt8BCE</code></p><p><span>1.2<!-- -->M vec/s</span></p><p><code>DotAVX2</code></p><p><span>7.0<!-- -->M vec/s</span></p><p><code>DotVNNI</code></p><p><span>8.8<!-- -->M vec/s</span></p></div>
+
+<p>Well, I&#39;m pretty happy with an 9.3x increase in throughput and a 4x reduction in memory usage, so I&#39;ll probably leave it
+here.</p>
+<p>The real life answer here is probably &#34;use an index&#34;. There is a ton of good work out there focused on making nearest
+neighbor search fast, and there are plenty of batteries-included vector DBs that make it pretty easy to deploy.</p>
+<p><em>However</em>, if you want some fun food for thought, a colleague of mine built a proof-of-concept <a href="https://github.com/sourcegraph/sourcegraph/compare/simd-post-gpu-embeddings~3...simd-post-gpu-embeddings">dot product on the
+GPU</a>.</p>
+<h2 id="bonus-material"><a aria-hidden="true" tabindex="-1" href="#bonus-material"><span></span></a>Bonus material</h2>
+<ul>
+<li>If you haven&#39;t used <a href="https://pkg.go.dev/golang.org/x/perf/cmd/benchstat">benchstat</a>, you should. It&#39;s great. Super
+simple statistical comparison of benchmark results.</li>
+<li>Don&#39;t miss the <a href="https://go.godbolt.org/z/qT3M7nPGf">compiler explorer</a>, which is an extremely useful tool for digging
+into compiler codegen.</li>
+<li>There&#39;s also that time I got <a href="https://twitter.com/sluongng/status/1654066471230636033">nerd sniped</a> into implementing
+<a href="https://github.com/camdencheek/simd_blog/blob/main/dot_arm64.s">a version with ARM NEON</a>, which made for some
+interesting comparisons.</li>
+<li>If you haven&#39;t come across it, the <a href="https://www.agner.org/optimize/">Agner Fog Instruction Tables</a> make for some great
+reference material for low-level optimizations. For this work, I used them to help grok differences instruction
+latencies and why some pipeline better than others.</li>
+</ul></div></div></div>
+  </body>
+</html>
