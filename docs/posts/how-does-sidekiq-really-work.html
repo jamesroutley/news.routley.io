@@ -1,0 +1,1408 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://dansvetlov.me/sidekiq-internals/">Original</a>
+    <h1>How does Sidekiq really work?</h1>
+    
+    <div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p><a href="https://github.com/sidekiq/sidekiq">Sidekiq</a> is one of the most ubiquitous<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup> Ruby background job processors out there. To anybody who has worked with Ruby on and off Rails, it needs no introduction. Sidekiq has a 10+ year track record of being an efficient, battle-tested and simple-to-use solution for offloading the execution of application logic into the background.</p>
+
+<p>It utilizes a threaded model for job processing, uses Redis as a backend and claims to have an ‘at least once’ semantic when it comes to processing jobs (with a caveat) in a free open-source version. Sidekiq also offers 2 additional paid versions - Pro and Enterprise, each of them introducing additional features and extensions. For obvious reasons, I will not go into the details of these versions.</p>
+
+<p>This article will delve into the internals of Sidekiq to highlight its key aspects, as well as design and implementation decisions that I personally find interesting or peculiar, by diving directly into the source code and following a job through its full lifecycle.</p>
+
+<p>I will not cover the user-facing API and general “how-to’s” of Sidekiq. Its <a href="https://github.com/sidekiq/sidekiq/wiki/Getting-Started">wiki</a> provides a better resource for this. Basic acquaintance with the library, as well as Ruby, is expected.</p>
+
+<p>The code examined in this article was sourced from Sidekiq version 7.2 and Ruby 3.2 on <a href="https://github.com/ruby/ruby">MRI/cruby</a>. Even though the code discussed may become obsolete with newer Sidekiq versions, it would take a drastic philosophy change on the maintainers’ part for the general principles and architecture to be become outdated. Nonetheless, the article could serve as a valuable resource for anyone looking to practice their systems programming skills by building a job processor.</p>
+
+<p>It’s worth noting that I’m neither a maintainer nor a contributor of Sidekiq. All of my observations and conclusions stem from reading the source code, comments, and discussions from issues and pull requests sourced via <code>git blame</code>.</p>
+
+<h2 id="booting-up">Booting up</h2>
+
+<p>I believe that the best way to get acquainted with code is by examining its entry points first. Sidekiq, being a <em>background</em> job processor, must be initiated as a separate process. <code>bin/sidekiq</code> is the script that is used to initiate this process, with its primary responsibility being the instantiation of the <code>Sidekiq::CLI</code> singleton class.</p>
+
+<p>The <code>CLI</code> object parses the configuration passed to the process as command line arguments via Ruby’s <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/cli.rb#L26-L32"><code>OptionParser</code></a>, and initialises the <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/config.rb#L11-L35">global default <code>Sidekiq::Config</code></a>.</p>
+
+<p>If a valid path to a YAML config is passed via <code>--config/-C</code> CLI argument, it will be used; otherwise, it will assume that this configuration can be found under the relative <code>./config</code> path. Alternatively it’s also possible to supply a custom <code>--require/-R</code> argument that is supposed to point to the root directory of an application where the job classes are located. Configuration in that case would be sourced from <code>&lt;path-specified-by-require&gt;/config</code>.</p>
+
+<p>If the configuration file exists, Sidekiq will evaluate it using <code>ERB</code>. This allows defining the config file as a template. However, one notable caveat is that this file will be evaluated before the Rails application or a file specified via <code>--require</code> is required, which makes referencing constants defined in the application code impossible.</p>
+
+<p>Then, <code>queues</code> and <code>concurrency</code> configuration options are <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/cli.rb#L275-L277">populated</a> if their values were not explicitly set. With default values, Sidekiq will process only the <code>default</code> queue and set its <code>concurrency</code> to the value of the <code>RAILS_MAX_THREADS</code> environment variable if Sidekiq is being used with a Rails application.</p>
+
+<p>As a penultimate step in the configuration process, both the <code>queues</code> and <code>concurrency</code> options get set on every capsule. Capsules will be examined in detail in the following sections, but for now, capsules can be thought of as compartmentalised groups of configuration options. In a basic Sidekiq setup, capsules are not exposed to the user; however, a default capsule is implicitly used. It is possible to define custom capsules in the configuration YAML file and via <code>Sidekiq.configure_server</code>.</p>
+
+<p>Finally, <code>CLI</code> instance validates that the <code>--require</code> argument points to an existing file, or, in case it points to a directory, that <code>config/application.rb</code> exists. It also checks that <code>concurrency</code> and <code>timeout</code> are positive integer numbers.</p>
+
+<h2 id="entering-the-main-loop">Entering the main loop</h2>
+
+<p>After loading and validating the configuration, the <code>bin/sidekiq</code> executable calls <code>run</code> on the CLI instance. At this point, the application gets loaded.</p>
+
+<p>If the path in the <code>require</code> config param is a directory, which is <code>.</code> by default unless explicitly configured, Sidekiq assumes that it’s being <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/cli.rb#L294-L308">used in a Rails application</a> and requires <code>rails</code> and <code>sidekiq/rails</code>, followed by a <code>require File.expand_path(&#34;#{@config[:require]}/config/environment.rb&#34;)</code>.</p>
+
+<p>Otherwise, if <code>require</code> points to a file, that file gets required. This means that the <code>require</code> config param always has to be explicitly supplied and point to an entry point that loads the application code if used in a non-Rails application.</p>
+
+<p>Calls to <code>Sidekiq.configure_server</code> and <code>Sidekiq.configure_client</code> also get evaluated during the application boot since they’re typically part of the eagerly loadable application code. This setup most commonly occurs in a <code>config/initializers/sidekiq.rb</code> Rails initializer.</p>
+
+<h3 id="signal-handling">Signal handling</h3>
+
+<p>Before proceeding to the next step in the <code>run</code> method, it might be worth refreshing our memory on what <a href="https://man7.org/linux/man-pages/man7/signal.7.html">signals</a> are.</p>
+
+<p>In essence, signals can be considered a type of inter-process communication. It’s possible to define custom handlers for most signals, which will execute arbitrary logic once the process receives a corresponding one. One use case for signals is controlling long-lived daemon processes, such as Sidekiq. For example, Kubernetes sends a SIGTERM to pods so that they can shut down gracefully and perform necessary cleanup, which is relevant for a job processor like Sidekiq. Most modern orchestration tools and hosting platforms support graceful termination by sending either a SIGINT or SIGTERM to running processes.</p>
+
+<p>With theory out of the way, let’s see how Sidekiq interacts with signals <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/cli.rb#L49-L74">here</a>:</p>
+
+<div><div><pre><code><span>self_read</span><span>,</span> <span>self_write</span> <span>=</span> <span>IO</span><span>.</span><span>pipe</span>
+<span>sigs</span> <span>=</span> <span>%w[INT TERM TTIN TSTP]</span>
+<span># ...</span>
+<span>sigs</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>sig</span><span>|</span>
+  <span>old_handler</span> <span>=</span> <span>Signal</span><span>.</span><span>trap</span><span>(</span><span>sig</span><span>)</span> <span>do</span>
+    <span>if</span> <span>old_handler</span><span>.</span><span>respond_to?</span><span>(</span><span>:call</span><span>)</span>
+      <span>begin</span>
+        <span>old_handler</span><span>.</span><span>call</span>
+      <span>rescue</span> <span>Exception</span> <span>=&gt;</span> <span>exc</span>
+        <span># signal handlers can&#39;t use Logger so puts only</span>
+        <span>puts</span> <span>[</span><span>&#34;Error in </span><span>#{</span><span>sig</span><span>}</span><span> handler&#34;</span><span>,</span> <span>exc</span><span>].</span><span>inspect</span>
+      <span>end</span>
+    <span>end</span>
+
+    <span>self_write</span><span>.</span><span>puts</span><span>(</span><span>sig</span><span>)</span>
+  <span>end</span>
+<span>rescue</span> <span>ArgumentError</span>
+  <span>puts</span> <span>&#34;Signal </span><span>#{</span><span>sig</span><span>}</span><span> not supported&#34;</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>The first interesting thing to note is the creation of an unnamed pipe using the <code>IO.pipe</code> API provided by Ruby. Its <a href="https://github.com/ruby/ruby/blob/a7335e11e354d1ee2e15233f32f087230069ad5c/io.c#L408-L440">return value</a> is a 2-member array of <code>IO</code> instances wrapping the file descriptors returned by the underlying system call (<a href="https://man7.org/linux/man-pages/man2/pipe.2.html"><code>pipe2</code> or <code>pipe</code></a> on most UNIX-like systems):</p>
+
+<div><div><pre><code><span>int</span>
+<span>rb_cloexec_pipe</span><span>(</span><span>int</span> <span>descriptors</span><span>[</span><span>2</span><span>])</span>
+<span>{</span>
+<span>#ifdef HAVE_PIPE2
+</span>    <span>int</span> <span>result</span> <span>=</span> <span>pipe2</span><span>(</span><span>descriptors</span><span>,</span> <span>O_CLOEXEC</span> <span>|</span> <span>O_NONBLOCK</span><span>);</span>
+<span>#else
+</span>    <span>int</span> <span>result</span> <span>=</span> <span>pipe</span><span>(</span><span>descriptors</span><span>);</span>
+<span>#endif
+</span>
+    <span>if</span> <span>(</span><span>result</span> <span>&lt;</span> <span>0</span><span>)</span>
+        <span>return</span> <span>result</span><span>;</span>
+
+<span>// ...</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Unnamed pipes are extremely handy in forking environments since they can be used by the parent process to communicate with its children and vice versa without much complicated setup. However, Sidekiq does not employ a forking model (in a free OS version) and instead utilizes threads extensively, which all share the process’s memory. So why use a pipe? Before we answer this question, let’s examine what happens in Sidekiq’s signal handlers.</p>
+
+<p>As evident from the Ruby snippet above, Sidekiq sets up handlers for SIGINT, SIGTERM, SIGTTIN, and SIGTSTP. Each handler is defined sequentially using <code>Signal.trap</code>, which, on UNIX-like systems, internally constructs a handler and invokes the <a href="https://man7.org/linux/man-pages/man2/sigaction.2.html"><code>sigaction</code></a> system call:</p>
+
+<div><div><pre><code><span>static</span> <span>sighandler_t</span>
+<span>ruby_signal</span><span>(</span><span>int</span> <span>signum</span><span>,</span> <span>sighandler_t</span> <span>handler</span><span>)</span>
+<span>{</span>
+    <span>struct</span> <span>sigaction</span> <span>sigact</span><span>,</span> <span>old</span><span>;</span>
+
+  <span>// Code that populates the sigact struct is omitted</span>
+
+  <span>// Register the signal handler</span>
+    <span>if</span> <span>(</span><span>sigaction</span><span>(</span><span>signum</span><span>,</span> <span>&amp;</span><span>sigact</span><span>,</span> <span>&amp;</span><span>old</span><span>)</span> <span>&lt;</span> <span>0</span><span>)</span> <span>{</span>
+        <span>return</span> <span>SIG_ERR</span><span>;</span>
+    <span>}</span>
+
+    <span>if</span> <span>(</span><span>old</span><span>.</span><span>sa_flags</span> <span>&amp;</span> <span>SA_SIGINFO</span><span>)</span>
+        <span>handler</span> <span>=</span> <span>(</span><span>sighandler_t</span><span>)</span><span>old</span><span>.</span><span>sa_sigaction</span><span>;</span>
+    <span>else</span>
+        <span>handler</span> <span>=</span> <span>old</span><span>.</span><span>sa_handler</span><span>;</span>
+    <span>ASSUME</span><span>(</span><span>handler</span> <span>!=</span> <span>SIG_ERR</span><span>);</span>
+
+    <span>// Return the previous handler of the same signal</span>
+    <span>return</span> <span>handler</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>As observed, this function returns an instance of a handler previously registered for the same signal.</p>
+
+<p>Let’s revisit the signal registration in <code>Sidekiq::CLI</code>:</p>
+
+<div><div><pre><code><span>old_handler</span> <span>=</span> <span>Signal</span><span>.</span><span>trap</span><span>(</span><span>sig</span><span>)</span> <span>do</span>
+  <span>if</span> <span>old_handler</span><span>.</span><span>respond_to?</span><span>(</span><span>:call</span><span>)</span>
+    <span>begin</span>
+      <span>old_handler</span><span>.</span><span>call</span>
+    <span>rescue</span> <span>Exception</span> <span>=&gt;</span> <span>exc</span>
+      <span>puts</span> <span>[</span><span>&#34;Error in </span><span>#{</span><span>sig</span><span>}</span><span> handler&#34;</span><span>,</span> <span>exc</span><span>].</span><span>inspect</span>
+    <span>end</span>
+  <span>end</span>
+  <span>self_write</span><span>.</span><span>puts</span><span>(</span><span>sig</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>This code might appear confusing at first glance - how is <code>old_handler</code> being called from within a block when <code>old_handler</code> itself is the return value of the said block? To unravel this little Inception moment, consider the following facts:</p>
+<ul>
+  <li>As we have seen, <code>Signal.trap</code> returns the handler that was previously registered for the signal, which is propagated from the <code>ruby_signal</code> C function. This can be an instance of <code>Proc</code> or a string. For possible string return values, you can refer to <a href="https://github.com/ruby/ruby/blob/a7335e11e354d1ee2e15233f32f087230069ad5c/signal.c#L1310-L1323">this part of the <code>trap</code> function</a>, which is responsible for returning the old handler to the Ruby land.</li>
+  <li>The block passed to <code>Signal.trap</code> is not evaluated instantly; instead, it is called only when the corresponding signal is received by the process. The proc object is <a href="https://github.com/ruby/ruby/blob/a7335e11e354d1ee2e15233f32f087230069ad5c/signal.c#L1325">stored in the global <code>vm-&gt;trap_list</code> struct</a>.</li>
+  <li>Local <code>old_handler</code> variable is available within a block due to the way bindings work in Ruby; <code>old_handler</code> is simply inherited by the inner scope of the block. This behavior is akin to how it’s possible to reference local variables in a rescue block even if an exception is raised before they are defined.</li>
+</ul>
+
+<p>So, <code>Signal.trap</code> converts the passed block into an instance of <code>Proc</code>, does not evaluate it, and registers it in the global <code>trap_list</code> instead. When a signal is received, the corresponding handler gets called. <code>old_handler</code> will evaluate to either a string signifying the handler behavior (e.g., DEFAULT or IGNORE), which will be the case if no custom signal traps were defined previously, or an old custom handler. Sidekiq politely handles previously defined trap handlers since it cannot make assumptions about the environment it is running in. It’s possible that a developer or another library already declared a signal handler that is expected to be called.</p>
+
+<p>However, the trap context ends with the signal name being written to the unnamed pipe created earlier. The fact that the exception is emitted directly to STDOUT in case it’s raised instead of being logged using <code>Sidekiq.logger</code> could serve as a hint as to why the handler logic is not being evaluated directly. For the exact reason why this happens and for the actual behavior of SIGINT, SIGTERM, and other handlers, read on.</p>
+
+<p>The rest of <code>run</code>’s method execution is spent on eagerly loading resources, namely the <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/cli.rb#L73-L76">Redis connection pool</a> and the <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/cli.rb#L101-L102">server middleware chain</a>. This pattern is commonly used to avoid race conditions during the initialization of global resources in multi-threaded environments. The <code>run</code> method is the perfect opportunity to do so, since at this point there’s only one main thread, making synchronization redundant for the creation of state. Alternatively, if the resource were lazily loadable, its accessor would have to be wrapped in a synchronization primitive such as a mutex, which would incur performance penalties for every happy path triggered, where the resource is already allocated and just has to be referenced.</p>
+
+<p>Finally, <code>run</code> calls <code>launch</code> and passes the reader end of the pipe as an argument. <code>launch</code> is the method where the main thread will spend the rest of its time while the Sidekiq process is running:</p>
+
+<div><div><pre><code><span>def</span> <span>launch</span><span>(</span><span>self_read</span><span>)</span>
+  <span>@launcher</span> <span>=</span> <span>Sidekiq</span><span>::</span><span>Launcher</span><span>.</span><span>new</span><span>(</span><span>@config</span><span>)</span>
+
+  <span>begin</span>
+    <span>launcher</span><span>.</span><span>run</span>
+
+    <span>while</span> <span>self_read</span><span>.</span><span>wait_readable</span>
+      <span>signal</span> <span>=</span> <span>self_read</span><span>.</span><span>gets</span><span>.</span><span>strip</span>
+      <span>handle_signal</span><span>(</span><span>signal</span><span>)</span>
+    <span>end</span>
+  <span>rescue</span> <span>Interrupt</span>
+    <span>launcher</span><span>.</span><span>stop</span>
+
+    <span>exit</span><span>(</span><span>0</span><span>)</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>A <code>Sidekiq::Launcher</code> instance is created, and <code>run</code> is called on it. The block where this happens is wrapped in a <code>rescue Interrupt</code>.</p>
+
+<p>By default, <code>Interrupt</code> is raised only when the process <a href="https://github.com/ruby/ruby/blob/a7335e11e354d1ee2e15233f32f087230069ad5c/signal.c#L1105-L1109">does not have a custom <code>SIGINT</code> handler registered</a>, which is not the case here as <code>Signal.trap</code> was already explicitly called with SIGINT. In that case, let’s see where it might be getting raised from.</p>
+
+<p>After the launcher gets commanded to run, the main thread enters an endless loop that calls <code>self_read.wait_readable</code>. This method, without a timeout argument, waits indefinitely until the underlying file descriptor has any data available to read. Whenever any signal that was trapped with <code>Signal.trap</code> earlier gets sent to the process, it will eventually be written to the writer end of the pipe and get read here. <code>handle_signal</code> will call a corresponding handler <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/cli.rb#L190-L217">defined in the <code>Sidekiq::CLI::SIGNAL_HANDLERS</code> hash</a>:</p>
+
+<div><div><pre><code><span>SIGNAL_HANDLERS</span> <span>=</span> <span>{</span>
+  <span>&#34;INT&#34;</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>cli</span><span>)</span> <span>{</span> <span>raise</span> <span>Interrupt</span> <span>},</span>
+  <span>&#34;TERM&#34;</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>cli</span><span>)</span> <span>{</span> <span>raise</span> <span>Interrupt</span> <span>},</span>
+  <span>&#34;TSTP&#34;</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>cli</span><span>)</span> <span>{</span>
+    <span>cli</span><span>.</span><span>logger</span><span>.</span><span>info</span> <span>&#34;Received TSTP, no longer accepting new work&#34;</span>
+    <span>cli</span><span>.</span><span>launcher</span><span>.</span><span>quiet</span>
+  <span>},</span>
+  <span>&#34;TTIN&#34;</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>cli</span><span>)</span> <span>{</span>
+    <span>Thread</span><span>.</span><span>list</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>thread</span><span>|</span>
+      <span>cli</span><span>.</span><span>logger</span><span>.</span><span>warn</span> <span>&#34;Thread TID-</span><span>#{</span><span>(</span><span>thread</span><span>.</span><span>object_id</span> <span>^</span> <span>::</span><span>Process</span><span>.</span><span>pid</span><span>).</span><span>to_s</span><span>(</span><span>36</span><span>)</span><span>}</span><span> </span><span>#{</span><span>thread</span><span>.</span><span>name</span><span>}</span><span>&#34;</span>
+      <span>if</span> <span>thread</span><span>.</span><span>backtrace</span>
+        <span>cli</span><span>.</span><span>logger</span><span>.</span><span>warn</span> <span>thread</span><span>.</span><span>backtrace</span><span>.</span><span>join</span><span>(</span><span>&#34;</span><span>\n</span><span>&#34;</span><span>)</span>
+      <span>else</span>
+        <span>cli</span><span>.</span><span>logger</span><span>.</span><span>warn</span> <span>&#34;&lt;no backtrace available&gt;&#34;</span>
+      <span>end</span>
+    <span>end</span>
+  <span>}</span>
+<span>}</span>
+<span>UNHANDLED_SIGNAL_HANDLER</span> <span>=</span> <span>-&gt;</span><span>(</span><span>cli</span><span>)</span> <span>{</span> <span>cli</span><span>.</span><span>logger</span><span>.</span><span>info</span> <span>&#34;No signal handler registered, ignoring&#34;</span> <span>}</span>
+<span>SIGNAL_HANDLERS</span><span>.</span><span>default</span> <span>=</span> <span>UNHANDLED_SIGNAL_HANDLER</span>
+
+<span>def</span> <span>handle_signal</span><span>(</span><span>sig</span><span>)</span>
+  <span>logger</span><span>.</span><span>debug</span> <span>&#34;Got </span><span>#{</span><span>sig</span><span>}</span><span> signal&#34;</span>
+  <span>SIGNAL_HANDLERS</span><span>[</span><span>sig</span><span>].</span><span>call</span><span>(</span><span>self</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>The key signal handlers to note are SIGINT, SIGTERM, and SIGTSTP.<sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">2</a></sup> The former two handlers consist only of a <code>raise Interrupt</code>, which will be rescued in the <code>CLI.launch</code> loop we looked at previously. SIGTSTP is a bit different - it calls <code>quiet</code> on the <code>Sidekiq::Launcher</code> instance.</p>
+
+<p>Before we dive deeper into the launcher, let’s first answer why the signal handlers are not being executed directly from trap contexts and instead get sent to a pipe and processed in a main thread loop.</p>
+
+<p>Any code invoked from a trap context must be reentrant. What this means in practice is that a handful of Ruby constructs and methods cannot be used inside <code>Signal.trap</code> blocks, most notably <code>Mutex</code>.</p>
+
+<p>The reason why such operations are not permitted in the trap context is simple: custom signal handlers defined in Ruby (i.e., <code>Signal.trap</code> called with a block) can get executed at mostly any point in a Ruby program. This means that even thread-safe code, which may be considered ‘correct’ when executed concurrently, will encounter deadlocks if the signal trap code accesses any synchronization resources shared not only by other threads, but also by the main thread itself.<sup id="fnref:3" role="doc-noteref"><a href="#fn:3" rel="footnote">3</a></sup></p>
+
+<p>None of the Sidekiq signal handlers reference a mutex directly. However, almost all of them emit messages using <code>Sidekiq.logger</code>, which by default is a subclass of the plain Ruby <code>Logger</code> class. <code>Logger</code>, in turn, <a href="https://github.com/ruby/ruby/blob/a7335e11e354d1ee2e15233f32f087230069ad5c/lib/logger/log_device.rb#L33-L45">uses a mutex</a> to synchronize writes internally:</p>
+
+<div><div><pre><code><span>def</span> <span>write</span><span>(</span><span>message</span><span>)</span>
+  <span>begin</span>
+    <span># ...</span>
+    <span>synchronize</span> <span>do</span> <span># A convenience method that calls Monitor#synchronize</span>
+      <span>@dev</span><span>.</span><span>write</span><span>(</span><span>message</span><span>)</span>
+    <span>end</span>
+    <span># ...</span>
+  <span>rescue</span> <span>Exception</span> <span>=&gt;</span> <span>ignored</span>
+    <span>warn</span><span>(</span><span>&#34;log writing failed. </span><span>#{</span><span>ignored</span><span>}</span><span>&#34;</span><span>)</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>This means that it’s possible for the signal handler, which accesses the same logger instance, to be called while the main thread owns the mutex during logging.</p>
+
+<p>Keeping the signal traps short and deferring the actual logic by notifying the main thread through a pipe allows for lifting restrictions that are usually applied to signal handlers.</p>
+
+<h3 id="managing-the-lifecycle">Managing the lifecycle</h3>
+
+<p>As covered in the previous section, the <code>Sidekiq::CLI</code> instance instantiates a <code>Sidekiq::Launcher</code> instance, calls <code>run</code> on it, and enters an infinite loop waiting for incoming signals. SIGINT and SIGTERM call <code>stop</code>, and SIGTSTP calls <code>quiet</code> on the launcher instance, and so far that’s the extent of our knowledge of the launcher. Let’s dissect it.</p>
+
+<p>It’s worth to note the creation of managers during initialization of a launcher:</p>
+
+<div><div><pre><code><span># Launcher</span>
+
+<span>def</span> <span>initialize</span><span>(</span><span>config</span><span>)</span>
+  <span># ...</span>
+  <span>@managers</span> <span>=</span> <span>config</span><span>.</span><span>capsules</span><span>.</span><span>values</span><span>.</span><span>map</span> <span>do</span> <span>|</span><span>cap</span><span>|</span>
+    <span>Sidekiq</span><span>::</span><span>Manager</span><span>.</span><span>new</span><span>(</span><span>cap</span><span>)</span>
+  <span>end</span>
+  <span># ...</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>Here’s where the capsules come fully into the spotlight. Their configuration is done in the <code>Sidekiq::CLI</code> instance, and now they’re being used to instantiate instances of <code>Sidekiq::Manager</code>. Capsules can be thought of as compartments inside a Sidekiq process. They are represented as Ruby objects containing individual <code>concurrency</code> and <code>queues</code> configuration parameters.</p>
+
+<p>Without custom configuration, Sidekiq uses a single ‘default’ capsule implicitly, and it’s possible to define custom capsules if the need arises.</p>
+
+<p>Before we proceed to researching the launcher lifecycle methods, let’s first go deeper down the stack for a moment and examine the key components relevant to the main processing loop.</p>
+
+<p>Each capsule is manifested as a manager, serving as a container that oversees the lifecycle of a set of processors. The number of processors is determined by the <code>concurrency</code> setting. Managers provide control over their processors through publicly exposed methods such as <code>start</code>, <code>quiet</code>, and <code>stop</code>.</p>
+
+<p>A processor serves as the unit of execution within Sidekiq, responsible for performing jobs. Its public API includes methods such as <code>terminate</code>, <code>kill</code>, and <code>start</code>, providing control over its execution lifecycle to its manager.</p>
+
+<h4 id="starting-up">Starting up</h4>
+
+<p>Let’s now return to the launcher. The following is its simplified <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/launcher.rb#L38-L44"><code>run</code></a> method:</p>
+
+<div><div><pre><code><span># Launcher</span>
+
+<span>def</span> <span>run</span>
+  <span>@thread</span> <span>=</span> <span>safe_thread</span><span>(</span><span>&#34;heartbeat&#34;</span><span>,</span> <span>&amp;</span><span>method</span><span>(</span><span>:start_heartbeat</span><span>))</span>
+  <span>@managers</span><span>.</span><span>each</span><span>(</span><span>&amp;</span><span>:start</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>It initially starts a heartbeat thread that dumps some stats into Redis every 10 seconds.</p>
+
+<p><code>safe_thread</code> is essentially a helper method provided by Sidekiq, which wraps the passed proc in a rescue block, calling the internal exception handler via <code>Config#handle_exception</code>. By default, this handler simply logs the exception without re-raising it.</p>
+
+<p>Manager’s <code>start</code> method looks like this:</p>
+
+<div><div><pre><code><span># Manager</span>
+
+<span>def</span> <span>start</span>
+  <span>@workers</span><span>.</span><span>each</span><span>(</span><span>&amp;</span><span>:start</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p><code>@workers</code> contains instances of the <code>Processor</code> class.</p>
+
+<p>Digging one stack frame deeper, here’s the processor’s <code>start</code> method:</p>
+
+<div><div><pre><code><span># Processor</span>
+
+<span>def</span> <span>start</span>
+  <span>@thread</span> <span>||=</span> <span>safe_thread</span><span>(</span><span>&#34;</span><span>#{</span><span>config</span><span>.</span><span>name</span><span>}</span><span>/processor&#34;</span><span>,</span> <span>&amp;</span><span>method</span><span>(</span><span>:run</span><span>))</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>In a similar fashion to the launcher, a processor starts a thread that executes the <code>Processor#run</code> method. For now, let’s consider it as a black box and just assume that it starts an endless loop that picks jobs from the queue and executes them.</p>
+
+<p>At this point, the Sidekiq process actually starts performing enqueued jobs. However, this is not sufficient for stability, as shutdown is an inevitable part of every process lifecycle. Handling them gracefully in a job processor such as Sidekiq is arguably even more important than it is in web servers, and the reasons for this will be covered in the following sections.</p>
+
+<h4 id="quieting-down">Quieting down</h4>
+
+<p>As we have seen already, certain signals translate into calls to the launcher - namely <code>quiet</code> and <code>stop</code>. Let’s start with <code>quiet</code> first as it usually should precede <code>stop</code>.</p>
+
+<p>Here’s a trimmed version of <code>Launcher#quiet</code>:</p>
+
+<div><div><pre><code><span># Launcher</span>
+
+<span>def</span> <span>quiet</span>
+  <span>return</span> <span>if</span> <span>@done</span>
+
+  <span>@done</span> <span>=</span> <span>true</span>
+  <span>@managers</span><span>.</span><span>each</span><span>(</span><span>&amp;</span><span>:quiet</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>The early return is there in order to handle a case where the process receives several extra SIGTSTP signals.</p>
+
+<p><code>Manager#quiet</code> takes the same precaution:</p>
+
+<div><div><pre><code><span># Manager</span>
+
+<span>def</span> <span>quiet</span>
+  <span>return</span> <span>if</span> <span>@done</span>
+  <span>@done</span> <span>=</span> <span>true</span>
+
+  <span>@workers</span><span>.</span><span>each</span><span>(</span><span>&amp;</span><span>:terminate</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>And this is how processors handle <code>terminate</code>:</p>
+
+<div><div><pre><code><span># Processor</span>
+
+<span>def</span> <span>terminate</span>
+  <span>@done</span> <span>=</span> <span>true</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>That’s it. Despite its name, the method doesn’t perform anything more drastic than setting an instance variable. This is where we pull the curtain on the <code>Processor#run</code> method:</p>
+
+<div><div><pre><code><span># Processor</span>
+
+<span>def</span> <span>run</span>
+  <span>process_one</span> <span>until</span> <span>@done</span>
+  <span>@callback</span><span>.</span><span>call</span><span>(</span><span>self</span><span>)</span>
+<span>rescue</span> <span>Sidekiq</span><span>::</span><span>Shutdown</span>
+  <span>@callback</span><span>.</span><span>call</span><span>(</span><span>self</span><span>)</span>
+<span>rescue</span> <span>Exception</span> <span>=&gt;</span> <span>ex</span>
+  <span>@callback</span><span>.</span><span>call</span><span>(</span><span>self</span><span>,</span> <span>ex</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>This aligns with our previous assumption: the <code>run</code> method is executed within a thread spawned by the processor in its <code>start</code> method, and it enters a loop where the break condition is the <code>@done</code> instance variable being false.</p>
+
+<p>It’s important to realize that invoking terminate does not immediately stop the processor from processing the current job. Instead, it will continue processing the current job until it completes.</p>
+
+<p>So, when <code>terminate</code> is called, the <code>run</code> method will exit the loop after finishing the current job. At this point, a <code>@callback</code> is invoked. This callback is actually a <code>Method</code> instance that wraps <code>Manager#processor_result</code>, which is passed by the manager during the initialization of each processor.</p>
+
+<div><div><pre><code><span>class</span> <span>Manager</span>
+  <span>def</span> <span>initialize</span><span>(</span><span>capsule</span><span>)</span>
+    <span>@done</span> <span>=</span> <span>false</span>
+    <span>@workers</span> <span>=</span> <span>Set</span><span>.</span><span>new</span>
+    <span>@plock</span> <span>=</span> <span>Mutex</span><span>.</span><span>new</span>
+    <span>@count</span><span>.</span><span>times</span> <span>do</span>
+      <span>@workers</span> <span>&lt;&lt;</span> <span>Processor</span><span>.</span><span>new</span><span>(</span><span>@config</span><span>,</span> <span>&amp;</span><span>method</span><span>(</span><span>:processor_result</span><span>))</span>
+    <span>end</span>
+  <span>end</span>
+  
+  <span># ...</span>
+
+  <span>def</span> <span>processor_result</span><span>(</span><span>processor</span><span>,</span> <span>reason</span> <span>=</span> <span>nil</span><span>)</span>
+    <span>@plock</span><span>.</span><span>synchronize</span> <span>do</span>
+      <span>@workers</span><span>.</span><span>delete</span><span>(</span><span>processor</span><span>)</span>
+      <span>unless</span> <span>@done</span>
+        <span>p</span> <span>=</span> <span>Processor</span><span>.</span><span>new</span><span>(</span><span>@config</span><span>,</span> <span>&amp;</span><span>method</span><span>(</span><span>:processor_result</span><span>))</span>
+        <span>@workers</span> <span>&lt;&lt;</span> <span>p</span>
+        <span>p</span><span>.</span><span>start</span>
+      <span>end</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>Reading through the source code of <code>processor_result</code>, it becomes clear that processors themselves are responsible for checking out of the <code>Manager</code>’s <code>@workers</code> set. Therefore, if a processor encounters a <code>Sidekiq::Shutdown</code> or any other uncaught exception, it will remove itself from the set, create a new processor in a similar manner to how it’s done in <code>Manager#initialize</code>, add that processor to the set, and call <code>start</code> on it.</p>
+
+<p>However, in the code path we’re examining, which follows a call to <code>quiet</code>, the callback will only remove the processor from the workers set. Therefore, invoking <code>quiet</code> will cause processors to stop picking up new jobs to run, and <em>eventually</em>, the worker set will become empty. As we’ve already noticed, the jobs currently being executed by processors will not be abruptly halted; instead, they will continue until completion naturally.</p>
+
+<p>This makes the SIGTSTP signal the perfect candidate to be sent some time before the process is terminated. <code>Launcher#quiet</code> is a way to inform Sidekiq that processors should avoid picking up new jobs after they finish processing their current ones, as the process is about to be terminated. This minimizes the need for intrusive actions when a process needs to fully stop.</p>
+
+<h4 id="stopping">Stopping</h4>
+
+<p>The <code>Launcher#stop</code> method begins with a calculation of a deadline utilizing POSIX <code>clock_gettime</code>. <code>CLOCK_MONOTONIC</code> is employed to acquire the current absolute elapsed time rather than wall clock time, which can vary unpredictably:</p>
+
+<div><div><pre><code><span># Launcher</span>
+
+<span>def</span> <span>stop</span>
+  <span>deadline</span> <span>=</span> <span>::</span><span>Process</span><span>.</span><span>clock_gettime</span><span>(</span><span>::</span><span>Process</span><span>::</span><span>CLOCK_MONOTONIC</span><span>)</span> <span>+</span> <span>@config</span><span>[</span><span>:timeout</span><span>]</span>
+
+  <span>quiet</span>
+  <span>stoppers</span> <span>=</span> <span>@managers</span><span>.</span><span>map</span> <span>do</span> <span>|</span><span>mgr</span><span>|</span>
+    <span>Thread</span><span>.</span><span>new</span> <span>do</span>
+      <span>mgr</span><span>.</span><span>stop</span><span>(</span><span>deadline</span><span>)</span>
+    <span>end</span>
+  <span>end</span>
+
+  <span>stoppers</span><span>.</span><span>each</span><span>(</span><span>&amp;</span><span>:join</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>The default <code>timeout</code> config is set to 25 seconds and this number is not picked randomly; historically a lot of hosting platforms and orchestrators have been using a 30 second grace period for processes to react to SIGTERM gracefully. Sidekiq makes this timeout a bit lower in order to have better chances at finishing the required cleanup work.</p>
+
+<p><code>quiet</code> gets called as the first step in the <code>stop</code> method in order to minimize work that will have to be waited on in the next step. Another purpose of calling <code>quiet</code> here is to ensure that processors stop picking up new jobs in case SIGTSTP was not explicitly sent prior to SIGINT or SIGTERM:</p>
+
+<div><div><pre><code><span># Manager</span>
+
+<span>def</span> <span>stop</span><span>(</span><span>deadline</span><span>)</span>
+  <span>quiet</span>
+
+  <span>return</span> <span>if</span> <span>@workers</span><span>.</span><span>empty?</span>
+
+  <span>logger</span><span>.</span><span>info</span> <span>{</span> <span>&#34;Pausing to allow jobs to finish...&#34;</span> <span>}</span>
+  <span>wait_for</span><span>(</span><span>deadline</span><span>)</span> <span>{</span> <span>@workers</span><span>.</span><span>empty?</span> <span>}</span>
+  <span>return</span> <span>if</span> <span>@workers</span><span>.</span><span>empty?</span>
+
+  <span>hard_shutdown</span>
+<span>ensure</span>
+  <span>capsule</span><span>.</span><span>stop</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>In case processors manage to finish their current work in time, they will remove themselves from their manager’s <code>@workers</code> array after completing their current job. The 2 conditionals in <code>stop</code> are there to handle the happy path by preemptively terminating execution without additional unnecessary work in such cases. This is why it’s important to make sure that <code>quiet</code> gets called first.</p>
+
+<p>If the manager sees that there are any processors that couldn’t finish immediately before the first <code>return if @workers.empty?</code> check, it must wait for them in its <code>stop</code> method. Remember that the deadline, set to 25 seconds by default, is passed down from the launcher. The <code>wait_for</code> method executes the block in a loop until the block’s return value is truthy:</p>
+
+<div><div><pre><code><span># Manager</span>
+
+<span>def</span> <span>wait_for</span><span>(</span><span>deadline</span><span>,</span> <span>&amp;</span><span>condblock</span><span>)</span>
+  <span>remaining</span> <span>=</span> <span>deadline</span> <span>-</span> <span>::</span><span>Process</span><span>.</span><span>clock_gettime</span><span>(</span><span>::</span><span>Process</span><span>::</span><span>CLOCK_MONOTONIC</span><span>)</span>
+  <span>while</span> <span>remaining</span> <span>&gt;</span> <span>PAUSE_TIME</span>
+    <span>return</span> <span>if</span> <span>condblock</span><span>.</span><span>call</span>
+    <span>sleep</span> <span>PAUSE_TIME</span>
+    <span>remaining</span> <span>=</span> <span>deadline</span> <span>-</span> <span>::</span><span>Process</span><span>.</span><span>clock_gettime</span><span>(</span><span>::</span><span>Process</span><span>::</span><span>CLOCK_MONOTONIC</span><span>)</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>If there are still active processors lingering after the deadline, <code>hard_shutdown</code> is called. Here’s the <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/manager.rb#L87-L119">body of this method</a> with the original comments preserved:</p>
+
+<div><div><pre><code><span># Manager</span>
+
+<span>def</span> <span>hard_shutdown</span>
+  <span># We&#39;ve reached the timeout and we still have busy threads.</span>
+  <span># They must die but their jobs shall live on.</span>
+  <span>cleanup</span> <span>=</span> <span>nil</span>
+  <span>@plock</span><span>.</span><span>synchronize</span> <span>do</span>
+    <span>cleanup</span> <span>=</span> <span>@workers</span><span>.</span><span>dup</span>
+  <span>end</span>
+
+  <span>if</span> <span>cleanup</span><span>.</span><span>size</span> <span>&gt;</span> <span>0</span>
+    <span>jobs</span> <span>=</span> <span>cleanup</span><span>.</span><span>map</span> <span>{</span> <span>|</span><span>p</span><span>|</span> <span>p</span><span>.</span><span>job</span> <span>}.</span><span>compact</span>
+    <span># ...</span>
+    <span>capsule</span><span>.</span><span>fetcher</span><span>.</span><span>bulk_requeue</span><span>(</span><span>jobs</span><span>)</span>
+  <span>end</span>
+
+  <span>cleanup</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>processor</span><span>|</span>
+    <span>processor</span><span>.</span><span>kill</span>
+  <span>end</span>
+
+  <span># when this method returns, we immediately call `exit` which may not give</span>
+  <span># the remaining threads time to run `ensure` blocks, etc. We pause here up</span>
+  <span># to 3 seconds to give threads a minimal amount of time to run `ensure` blocks.</span>
+  <span>deadline</span> <span>=</span> <span>::</span><span>Process</span><span>.</span><span>clock_gettime</span><span>(</span><span>::</span><span>Process</span><span>::</span><span>CLOCK_MONOTONIC</span><span>)</span> <span>+</span> <span>3</span>
+  <span>wait_for</span><span>(</span><span>deadline</span><span>)</span> <span>{</span> <span>@workers</span><span>.</span><span>empty?</span> <span>}</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>We won’t explore the functionality of <code>capsule.fetcher.bulk_requeue</code> at this point. This is one of the most critical pieces of logic in Sidekiq and for now, let’s assume that, as the method’s name implies, it requeues jobs.</p>
+
+<p>Every processor that did not check itself out of the <code>@workers</code> array by the time <code>hard_shutdown</code> was invoked gets killed. Here’s what <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/processor.rb#L49-L59"><code>Processor#kill</code></a> does:</p>
+
+<div><div><pre><code><span># Processor</span>
+
+<span>def</span> <span>kill</span><span>(</span><span>wait</span> <span>=</span> <span>false</span><span>)</span>
+  <span>@done</span> <span>=</span> <span>true</span>
+  <span>return</span> <span>unless</span> <span>@thread</span>
+
+  <span>@thread</span><span>.</span><span>raise</span> <span>::</span><span>Sidekiq</span><span>::</span><span>Shutdown</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>It’s similar to <code>quiet</code>, but it additionally raises a <code>Sidekiq::Shutdown</code>, a subclass of <code>Interrupt</code>, on the processor thread.</p>
+
+<p>This exception being raised, however, does not impose an upper time bound on when the thread will be truly finished. That’s why right after every process has been killed, the manager waits 3 seconds to give them an opportunity to terminate gracefully. We’ll get to what this graceful termination consists of later.</p>
+
+<p>We’ve explored how Sidekiq establishes the necessary class hierarchy to ensure the smooth handling of the process lifecycle. The launcher oversees managers, which in turn manage processors responsible for fetching and processing jobs. Let’s now look at how the processors obtain jobs to execute.</p>
+
+<h3 id="queue-processing">Queue processing</h3>
+
+<p>Sidekiq jobs get routed to queues. At the very least each Sidekiq installation will use a <code>default</code> queue. The queues that Sidekiq should be processing can be defined globally or on a per-capsule basis. You can specify the set of queues using the <code>config/sidekiq.yml</code> configuration file, the <code>-q</code> command-line argument, or <code>Sidekiq.configure_server</code>. This configuration populates the <code>queues</code> parameter of the <code>default</code> capsule, unless specific configuration was provided for a particular capsule in the config file or server configuration.</p>
+
+<p>Eventually, all provided queue lists end up in the <code>Capsule#queues=</code> setter method, which is crucial for the queue processing logic. Here’s <a href="https://github.com/sidekiq/sidekiq/blob/4ec059d53dbf1de67e41e3bd1687c7d90c12d580/lib/sidekiq/capsule.rb#L48-L70">its contents</a> copied verbatim with the original comment:</p>
+
+<div><div><pre><code><span># Sidekiq checks queues in three modes:</span>
+<span># - :strict - all queues have 0 weight and are checked strictly in order</span>
+<span># - :weighted - queues have arbitrary weight between 1 and N</span>
+<span># - :random - all queues have weight of 1</span>
+<span>def</span> <span>queues</span><span>=</span><span>(</span><span>val</span><span>)</span>
+  <span>@weights</span> <span>=</span> <span>{}</span>
+  <span>@queues</span> <span>=</span> <span>Array</span><span>(</span><span>val</span><span>).</span><span>each_with_object</span><span>([])</span> <span>do</span> <span>|</span><span>qstr</span><span>,</span> <span>memo</span><span>|</span>
+    <span>arr</span> <span>=</span> <span>qstr</span>
+    <span>arr</span> <span>=</span> <span>qstr</span><span>.</span><span>split</span><span>(</span><span>&#34;,&#34;</span><span>)</span> <span>if</span> <span>qstr</span><span>.</span><span>is_a?</span><span>(</span><span>String</span><span>)</span>
+    <span>name</span><span>,</span> <span>weight</span> <span>=</span> <span>arr</span>
+    <span>@weights</span><span>[</span><span>name</span><span>]</span> <span>=</span> <span>weight</span><span>.</span><span>to_i</span>
+    <span>[</span><span>weight</span><span>.</span><span>to_i</span><span>,</span> <span>1</span><span>].</span><span>max</span><span>.</span><span>times</span> <span>do</span>
+      <span>memo</span> <span>&lt;&lt;</span> <span>name</span>
+    <span>end</span>
+  <span>end</span>
+  <span>@mode</span> <span>=</span> <span>if</span> <span>@weights</span><span>.</span><span>values</span><span>.</span><span>all?</span><span>(</span><span>&amp;</span><span>:zero?</span><span>)</span>
+    <span>:strict</span>
+  <span>elsif</span> <span>@weights</span><span>.</span><span>values</span><span>.</span><span>all?</span> <span>{</span> <span>|</span><span>x</span><span>|</span> <span>x</span> <span>==</span> <span>1</span> <span>}</span>
+    <span>:random</span>
+  <span>else</span>
+    <span>:weighted</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>There are three options for how queues are polled. If none of the queues have a weight defined (using the <code>default,10</code> notation), the mode is set to <code>strict</code>. If all of the queues have their weights set to 1 explicitly, the mode is set to <code>random</code>. In any other case, the mode is set to <code>weighted</code>.</p>
+
+<p>One peculiar thing to note is that the <code>@queues</code> array will contain <code>m</code> copies of each queue, where <code>m</code> is their weight. For example, if the queues are configured in a weighted manner with <code>default,10 queue_one,5 queue_two,3</code>, <code>@queues</code> will consist of 10 <code>:default</code> elements, 5 <code>:queue_one</code> elements, and 3 <code>:queue_two</code> elements.</p>
+
+<p>Let’s come back over to <code>Processor#run</code>.  As we have already seen, this method makes the processor enter a loop that calls <code>Processor#process_one</code> until <code>terminate</code> or <code>kill</code> is called:</p>
+
+<div><div><pre><code><span># Processor</span>
+
+<span>def</span> <span>get_one</span>
+  <span>uow</span> <span>=</span> <span>capsule</span><span>.</span><span>fetcher</span><span>.</span><span>retrieve_work</span>
+  <span>if</span> <span>@down</span>
+    <span>logger</span><span>.</span><span>info</span> <span>{</span> <span>&#34;Redis is online, </span><span>#{</span><span>::</span><span>Process</span><span>.</span><span>clock_gettime</span><span>(</span><span>::</span><span>Process</span><span>::</span><span>CLOCK_MONOTONIC</span><span>)</span> <span>-</span> <span>@down</span><span>}</span><span> sec downtime&#34;</span> <span>}</span>
+    <span>@down</span> <span>=</span> <span>nil</span>
+  <span>end</span>
+  <span>uow</span>
+<span>rescue</span> <span>Sidekiq</span><span>::</span><span>Shutdown</span>
+<span>rescue</span> <span>=&gt;</span> <span>ex</span>
+  <span>handle_fetch_exception</span><span>(</span><span>ex</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>The conditional branch is there in case Sidekiq recovers from a backoff initiated by <code>handle_fetch_exception</code> in the rescue block. That method simply <code>sleep</code>s  for 1 second if there’s a transient connectivity issue when contacting Redis.</p>
+
+<p><code>Sidekiq::Shutdown</code> is muted here to reduce noise created by the error handler invoked from <code>handle_fetch_exception</code>. Processing of new jobs stops regardless since <code>@done</code> ivar is set to <code>false</code> at this point.</p>
+
+<p>The <code>fetcher</code> method in the <code>Capsule</code> class extracts the fetcher object. Here’s its implementation:</p>
+
+<div><div><pre><code><span>def</span> <span>fetcher</span>
+  <span>@fetcher</span> <span>||=</span> <span>begin</span>
+    <span>inst</span> <span>=</span> <span>(</span><span>config</span><span>[</span><span>:fetch_class</span><span>]</span> <span>||</span> <span>Sidekiq</span><span>::</span><span>BasicFetch</span><span>).</span><span>new</span><span>(</span><span>self</span><span>)</span>
+    <span>inst</span><span>.</span><span>setup</span><span>(</span><span>config</span><span>[</span><span>:fetch_setup</span><span>])</span> <span>if</span> <span>inst</span><span>.</span><span>respond_to?</span><span>(</span><span>:setup</span><span>)</span>
+    <span>inst</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>The OS version of Sidekiq comes with a single fetcher option, <code>BasicFetch</code>.</p>
+
+<p>The Pro version includes <a href="https://github.com/sidekiq/sidekiq/wiki/Reliability#using-super_fetch"><code>SuperFetch</code></a>, which offers a more robust durability guarantee for Sidekiq jobs. However, the specifics of this fetcher are not covered in this article.</p>
+
+<p>Let’s examine the internals of <code>BasicFetch</code>. Here are the relevant methods, with original comments preserved:</p>
+
+<div><div><pre><code><span>class</span> <span>BasicFetch</span>
+  <span># We want the fetch operation to timeout every few seconds so the thread</span>
+  <span># can check if the process is shutting down.</span>
+  <span>TIMEOUT</span> <span>=</span> <span>2</span>
+  
+  <span>UnitOfWork</span> <span>=</span> <span>Struct</span><span>.</span><span>new</span><span>(</span><span>:queue</span><span>,</span> <span>:job</span><span>,</span> <span>:config</span><span>)</span> <span>{</span>
+    <span>def</span> <span>acknowledge</span>
+      <span># nothing to do</span>
+    <span>end</span>
+  
+    <span>def</span> <span>queue_name</span>
+      <span>queue</span><span>.</span><span>delete_prefix</span><span>(</span><span>&#34;queue:&#34;</span><span>)</span>
+    <span>end</span>
+  
+    <span>def</span> <span>requeue</span>
+      <span>config</span><span>.</span><span>redis</span> <span>do</span> <span>|</span><span>conn</span><span>|</span>
+        <span>conn</span><span>.</span><span>rpush</span><span>(</span><span>queue</span><span>,</span> <span>job</span><span>)</span>
+      <span>end</span>
+    <span>end</span>
+  <span>}</span>
+  
+  <span># ...</span>
+  
+  <span>def</span> <span>retrieve_work</span>
+    <span>qs</span> <span>=</span> <span>queues_cmd</span>
+    <span># 4825 Sidekiq Pro with all queues paused will return an</span>
+    <span># empty set of queues</span>
+    <span>if</span> <span>qs</span><span>.</span><span>size</span> <span>&lt;=</span> <span>0</span>
+      <span>sleep</span><span>(</span><span>TIMEOUT</span><span>)</span>
+      <span>return</span> <span>nil</span>
+    <span>end</span>
+  
+    <span>queue</span><span>,</span> <span>job</span> <span>=</span> <span>redis</span> <span>{</span> <span>|</span><span>conn</span><span>|</span> <span>conn</span><span>.</span><span>blocking_call</span><span>(</span><span>conn</span><span>.</span><span>read_timeout</span> <span>+</span> <span>TIMEOUT</span><span>,</span> <span>&#34;brpop&#34;</span><span>,</span> <span>*</span><span>qs</span><span>,</span> <span>TIMEOUT</span><span>)</span> <span>}</span>
+    <span>UnitOfWork</span><span>.</span><span>new</span><span>(</span><span>queue</span><span>,</span> <span>job</span><span>,</span> <span>config</span><span>)</span> <span>if</span> <span>queue</span>
+  <span>end</span>
+  
+  <span># ...</span>
+  
+  <span># Creating the Redis#brpop command takes into account any</span>
+  <span># configured queue weights. By default Redis#brpop returns</span>
+  <span># data from the first queue that has pending elements. We</span>
+  <span># recreate the queue command each time we invoke Redis#brpop</span>
+  <span># to honor weights and avoid queue starvation.</span>
+  <span>def</span> <span>queues_cmd</span>
+    <span>if</span> <span>@strictly_ordered_queues</span>
+      <span>@queues</span>
+    <span>else</span>
+      <span>permute</span> <span>=</span> <span>@queues</span><span>.</span><span>shuffle</span>
+      <span>permute</span><span>.</span><span>uniq!</span>
+      <span>permute</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>True to its name, the logic in this class is straightforward: construct an array of queues (keep in mind that queue weights result in duplicate entries in the <code>@queues</code> array), shuffle it if there’s no strict ordering, and then pass it to Redis’ <code>BRPOP</code> command.</p>
+
+<p>It might seem counterintuitive to call <code>#uniq!</code> on the resulting array when there are weighted queues, but it’s not. The more identical entries there are in the array, the higher the chance that one of these entries will appear at the head of the array. <code>uniq!</code> preserves the ordering of elements.</p>
+
+<p><a href="https://redis.io/commands/brpop/"><code>BRPOP</code></a> takes multiple <a href="https://redis.io/docs/data-types/lists/">list</a> names as arguments and pops the tail element of the first non-empty list in a blocking manner. This means that the first queue in the <code>@queues</code> array gets priority. An important detail here is the timeout. As the comment above the <code>TIMEOUT</code> constant suggests, Sidekiq wants these operations to time out regularly so that a process can check if <code>terminate</code> or <code>kill</code> was called in the meantime.</p>
+
+<p>If the command successfully fetches a job from the list, the return values are wrapped in a <code>UnitOfWork</code> DTO.</p>
+
+<p>The critical aspect of <code>BasicFetch</code> is that <code>BRPOP</code> removes the job from the list. Despite Sidekiq’s efforts to be as resilient as possible and cover most failure scenarios, this has a significant implication: jobs can be lost. We’ll explore some of the scenarios where this might occur and how Sidekiq attempts to mitigate them in a later section.</p>
+
+<p>As you have probably noticed, the <code>acknowledge</code> method is empty for a <code>BasicFetch</code> <code>UnitOfWork</code>. While I haven’t had the opportunity to explore the Pro or Enterprise licensed versions of Sidekiq myself, it’s reasonable to assume that this method is relevant for the <code>SuperFetch</code> fetcher. <code>SuperFetch</code> preserves the job in Redis in some form instead of removing it immediately after fetching, which contributes to its enhanced reliability, but makes it necessary to somehow mark the jobs as being successfully processed. <code>SuperFetch</code>’s <code>acknowledge</code> most likely does exactly that. We will encounter situations where the <code>acknowledge</code> method becomes relevant as we dive deeper.</p>
+
+<p>Back in <code>Processor#process_one</code>, if the fetch was successful, <code>Processor#process</code> is invoked. Since this method is lengthy, we’ll examine modified smaller segments at a time.</p>
+
+<div><div><pre><code><span># Processor</span>
+
+<span>def</span> <span>process</span><span>(</span><span>uow</span><span>)</span>
+  <span>jobstr</span> <span>=</span> <span>uow</span><span>.</span><span>job</span>
+  <span>queue</span> <span>=</span> <span>uow</span><span>.</span><span>queue_name</span>
+
+  <span>job_hash</span> <span>=</span> <span>nil</span>
+  <span>begin</span>
+    <span>job_hash</span> <span>=</span> <span>JSON</span><span>.</span><span>parse</span><span>(</span><span>jobstr</span><span>)</span>
+  <span>rescue</span> <span>=&gt;</span> <span>ex</span>
+    <span>handle_exception</span><span>(</span><span>ex</span><span>,</span> <span>{</span><span>context: </span><span>&#34;Invalid JSON for job&#34;</span><span>,</span> <span>jobstr: </span><span>jobstr</span><span>})</span>
+    <span>now</span> <span>=</span> <span>Time</span><span>.</span><span>now</span><span>.</span><span>to_f</span>
+    <span>redis</span> <span>do</span> <span>|</span><span>conn</span><span>|</span>
+      <span>conn</span><span>.</span><span>multi</span> <span>do</span> <span>|</span><span>xa</span><span>|</span>
+        <span>xa</span><span>.</span><span>zadd</span><span>(</span><span>&#34;dead&#34;</span><span>,</span> <span>now</span><span>.</span><span>to_s</span><span>,</span> <span>jobstr</span><span>)</span>
+        <span>xa</span><span>.</span><span>zremrangebyscore</span><span>(</span><span>&#34;dead&#34;</span><span>,</span> <span>&#34;-inf&#34;</span><span>,</span> <span>now</span> <span>-</span> <span>@capsule</span><span>.</span><span>config</span><span>[</span><span>:dead_timeout_in_seconds</span><span>])</span>
+        <span>xa</span><span>.</span><span>zremrangebyrank</span><span>(</span><span>&#34;dead&#34;</span><span>,</span> <span>0</span><span>,</span> <span>-</span> <span>@capsule</span><span>.</span><span>config</span><span>[</span><span>:dead_max_jobs</span><span>])</span>
+      <span>end</span>
+    <span>end</span>
+    <span>return</span> <span>uow</span><span>.</span><span>acknowledge</span>
+  <span>end</span>
+
+  <span># ...</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>The job fetched from Redis is a JSON payload represented as a string, so it needs to be parsed first. Here, we encounter the concept of the morgue and dead jobs. Trying to process a malformed job won’t yield positive results no matter how many times it is retried, so marking the job as ‘dead’ is a practical approach.</p>
+
+<p>This is achieved by the <a href="https://redis.io/commands/zadd/"><code>ZADD</code></a> command, which adds a member to a <a href="https://redis.io/docs/data-types/sorted-sets/">sorted set</a>, where sorting key is the time at which the job was pronounced dead.</p>
+
+<p>The next 2 commands are there to remove dead jobs that surpassed the allowed time in the morgue, which is 6 months by default, and preserve only the latest 10000 jobs in the set. All of this is done in a Redis transaction using the <a href="https://redis.io/commands/multi/"><code>MULTI</code></a> command.</p>
+
+<p>After the job payload gets parsed successfully, it needs to be executed. The rest of the <code>#process</code> method does exactly that (comments are preserved):</p>
+
+<div><div><pre><code><span># Processor</span>
+
+<span>def</span> <span>process</span><span>(</span><span>uow</span><span>)</span>
+  <span># ...</span>
+
+  <span>ack</span> <span>=</span> <span>false</span>
+  <span>Thread</span><span>.</span><span>handle_interrupt</span><span>(</span><span>Sidekiq</span><span>::</span><span>Shutdown</span> <span>=&gt;</span> <span>:never</span><span>)</span> <span>do</span>
+    <span>Thread</span><span>.</span><span>handle_interrupt</span><span>(</span><span>Sidekiq</span><span>::</span><span>Shutdown</span> <span>=&gt;</span> <span>:immediate</span><span>)</span> <span>do</span>
+      <span>dispatch</span><span>(</span><span>job_hash</span><span>,</span> <span>queue</span><span>,</span> <span>jobstr</span><span>)</span> <span>do</span> <span>|</span><span>inst</span><span>|</span>
+        <span>config</span><span>.</span><span>server_middleware</span><span>.</span><span>invoke</span><span>(</span><span>inst</span><span>,</span> <span>job_hash</span><span>,</span> <span>queue</span><span>)</span> <span>do</span>
+          <span>execute_job</span><span>(</span><span>inst</span><span>,</span> <span>job_hash</span><span>[</span><span>&#34;args&#34;</span><span>])</span>
+        <span>end</span>
+      <span>end</span>
+      <span>ack</span> <span>=</span> <span>true</span>
+    <span>rescue</span> <span>Sidekiq</span><span>::</span><span>Shutdown</span>
+      <span># Had to force kill this job because it didn&#39;t finish</span>
+      <span># within the timeout.  Don&#39;t acknowledge the work since</span>
+      <span># we didn&#39;t properly finish it.</span>
+    <span>rescue</span> <span>Sidekiq</span><span>::</span><span>JobRetry</span><span>::</span><span>Handled</span> <span>=&gt;</span> <span>h</span>
+      <span># this is the common case: job raised error and Sidekiq::JobRetry::Handled</span>
+      <span># signals that we created a retry successfully.  We can acknowlege the job.</span>
+      <span>ack</span> <span>=</span> <span>true</span>
+      <span>e</span> <span>=</span> <span>h</span><span>.</span><span>cause</span> <span>||</span> <span>h</span>
+      <span>handle_exception</span><span>(</span><span>e</span><span>,</span> <span>{</span><span>context: </span><span>&#34;Job raised exception&#34;</span><span>,</span> <span>job: </span><span>job_hash</span><span>})</span>
+      <span>raise</span> <span>e</span>
+    <span>rescue</span> <span>Exception</span> <span>=&gt;</span> <span>ex</span>
+      <span># Unexpected error!  This is very bad and indicates an exception that got past</span>
+      <span># the retry subsystem (e.g. network partition).  We won&#39;t acknowledge the job</span>
+      <span># so it can be rescued when using Sidekiq Pro.</span>
+      <span>handle_exception</span><span>(</span><span>ex</span><span>,</span> <span>{</span><span>context: </span><span>&#34;Internal exception!&#34;</span><span>,</span> <span>job: </span><span>job_hash</span><span>,</span> <span>jobstr: </span><span>jobstr</span><span>})</span>
+      <span>raise</span> <span>ex</span>
+    <span>end</span>
+  <span>ensure</span>
+    <span>if</span> <span>ack</span>
+      <span>uow</span><span>.</span><span>acknowledge</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>First thing that stands out is the use of <code>Thread.handle_interrupt</code>. In short, it allows to alter the handling of internal Ruby asynchronous events such as <code>Thread#raise</code> and <code>Thread#kill</code> - the former is exactly what is being used by <code>Processor#kill</code> as we have already seen.</p>
+
+<p>In this particular case, first <code>handle_interrupt</code> is called with <code>Sidekiq::Shutdown =&gt; :never</code> and wraps the <code>ensure</code> block that calls <code>#acknowledge</code> on the unit of work. The second call is nested directly after the first one, and it resets the behaviour back to <code>:immediate</code>.</p>
+
+<p>This achieves the following: if a processor is killed (using <code>Thread#raise(Sidekiq::Shutdown)</code>) when the ensure block is being evaluated, the raised exception will be ignored and the work will be acknowledged. Without setting the behaviour to <code>:never</code>, an acknowledgment would be missed in such case. The inner block resets it back to <code>:immediate</code> immediately afterward because this is the desired behavior - <code>Sidekiq::Shutdown</code> should interrupt the execution of the job’s code.</p>
+
+<p>This is not that relevant in the OS version since <code>BasicFetch</code>’s <code>UnitOfWork#acknowledge</code> is a no op, but it’s important for <code>SuperFetch</code>, since its version of <code>acknowledge</code> most likely removes the job from Redis in order to mark it as processed.</p>
+
+<p>The rescue blocks are self-explanatory thanks to the comments. One noteworthy aspect is that <code>Sidekiq::JobRetry::Handled</code> exceptions, which are raised when a retry is successfully created, get re-raised and propagated all the way up to <code>Processor#run</code>. This, in turn, triggers the callback supplied by the <code>Manager</code>, which deletes the processor and creates a new one. As a result, job retries will force the processor to be recreated, spawning a new Ruby thread in place of the original.</p>
+
+<p>Let’s unwrap the <code>Processor#dispatch</code> and <code>Processor#execute_job</code> methods:</p>
+
+<div><div><pre><code><span># Processor</span>
+<span># Relevant bits from #dispatch, #process &amp; #execute_job combined together</span>
+
+<span>@job_logger</span><span>.</span><span>prepare</span><span>(</span><span>job_hash</span><span>)</span> <span>do</span>
+  <span>@retrier</span><span>.</span><span>global</span><span>(</span><span>jobstr</span><span>,</span> <span>queue</span><span>)</span> <span>do</span>
+    <span>@job_logger</span><span>.</span><span>call</span><span>(</span><span>job_hash</span><span>,</span> <span>queue</span><span>)</span> <span>do</span>
+      <span>stats</span><span>(</span><span>jobstr</span><span>,</span> <span>queue</span><span>)</span> <span>do</span>
+        <span>@reloader</span><span>.</span><span>call</span> <span>do</span>
+          <span>klass</span> <span>=</span> <span>Object</span><span>.</span><span>const_get</span><span>(</span><span>job_hash</span><span>[</span><span>&#34;class&#34;</span><span>])</span>
+          <span>inst</span> <span>=</span> <span>klass</span><span>.</span><span>new</span>
+          <span>inst</span><span>.</span><span>jid</span> <span>=</span> <span>job_hash</span><span>[</span><span>&#34;jid&#34;</span><span>]</span>
+          <span>@retrier</span><span>.</span><span>local</span><span>(</span><span>inst</span><span>,</span> <span>jobstr</span><span>,</span> <span>queue</span><span>)</span> <span>do</span>
+            <span>config</span><span>.</span><span>server_middleware</span><span>.</span><span>invoke</span><span>(</span><span>inst</span><span>,</span> <span>job_hash</span><span>,</span> <span>queue</span><span>)</span> <span>do</span>
+              <span>inst</span><span>.</span><span>perform</span><span>(</span><span>*</span><span>job_hash</span><span>[</span><span>&#34;args&#34;</span><span>])</span>
+            <span>end</span>
+          <span>end</span>
+        <span>end</span>
+      <span>end</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>The <code>@job_logger</code> variable is an instance of <code>Sidekiq::JobLogger</code>. Its <code>prepare</code> method is responsible for putting job metadata into thread-local context, ensuring that logs emitted further down the stack contain useful correlation information.</p>
+
+<p>Another crucial step in this pipeline is the <code>@reloader.call</code> invocation. This is where Sidekiq integrates with the Rails framework. A <a href="https://guides.rubyonrails.org/threading_and_code_execution.html#reloader">reloader</a>, as the name suggests, is responsible for code reloading. This is relevant because jobs typically reside in the <code>app/</code> directory of a Rails application, which should be reloadable. Additionally, the reloader handles <a href="https://github.com/rails/rails/blob/a255742b2eb711baa8fd7a8937852851ddc8a679/activerecord/lib/active_record/railtie.rb#L326-L331">ActiveRecord connection cleanup</a> and other related concerns.</p>
+
+<p>Sidekiq extracts the job class via <code>Object.const_get(job_hash[&#34;class&#34;])</code> and calls <code>#perform</code> on it after invoking the server middleware chain. Sidekiq’s middlewares are similar to those of Rack - arbitrary classes that respond to <code>#call</code> and yield if the chain should not be halted. This is the public API for integrations that want to augment or alter Sidekiq’s processing logic, which is exactly what monitoring libraries like <a href="https://github.com/getsentry/sentry-ruby/blob/master/sentry-sidekiq/lib/sentry/sidekiq/sentry_context_middleware.rb">Sentry</a>, <a href="https://github.com/DataDog/dd-trace-rb/blob/e4498741b7e85b7f886a8feb72ec62e64f86ad25/lib/datadog/tracing/contrib/sidekiq/server_tracer.rb">Datadog</a> and others do.</p>
+
+<h3 id="handling-exceptions">Handling exceptions</h3>
+
+<p>Naturally, application code called from within jobs can raise exceptions. Sidekiq provides several ways to handle them, with the default behavior being to retry failed jobs up to 25 times with an exponential backoff.</p>
+
+<p>Let’s examine the <code>#local</code> method of <code>Processor</code>’s <code>@retrier</code> ivar, an instance of <code>Sidekiq::JobRetry</code> which wraps the <code>#perform</code> method of every job class:</p>
+
+<div><div><pre><code><span>class</span> <span>JobRetry</span>
+  <span>class</span> <span>Handled</span> <span>&lt;</span> <span>::</span><span>RuntimeError</span><span>;</span> <span>end</span>
+  <span>class</span> <span>Skip</span> <span>&lt;</span> <span>Handled</span><span>;</span> <span>end</span>
+  
+  <span># ...</span>
+  
+  <span>def</span> <span>local</span><span>(</span><span>jobinst</span><span>,</span> <span>jobstr</span><span>,</span> <span>queue</span><span>)</span>
+    <span>yield</span>
+  <span>rescue</span> <span>Handled</span> <span>=&gt;</span> <span>ex</span>
+    <span>raise</span> <span>ex</span>
+  <span>rescue</span> <span>Sidekiq</span><span>::</span><span>Shutdown</span> <span>=&gt;</span> <span>ey</span>
+    <span>raise</span> <span>ey</span>
+  <span>rescue</span> <span>Exception</span> <span>=&gt;</span> <span>e</span>
+    <span>raise</span> <span>Sidekiq</span><span>::</span><span>Shutdown</span> <span>if</span> <span>exception_caused_by_shutdown?</span><span>(</span><span>e</span><span>)</span>
+
+    <span>msg</span> <span>=</span> <span>JSON</span><span>.</span><span>parse</span><span>(</span><span>jobstr</span><span>)</span>
+    <span>if</span> <span>msg</span><span>[</span><span>&#34;retry&#34;</span><span>].</span><span>nil?</span>
+      <span>msg</span><span>[</span><span>&#34;retry&#34;</span><span>]</span> <span>=</span> <span>jobinst</span><span>.</span><span>class</span><span>.</span><span>get_sidekiq_options</span><span>[</span><span>&#34;retry&#34;</span><span>]</span>
+    <span>end</span>
+
+    <span>raise</span> <span>e</span> <span>unless</span> <span>msg</span><span>[</span><span>&#34;retry&#34;</span><span>]</span>
+    <span>process_retry</span><span>(</span><span>jobinst</span><span>,</span> <span>msg</span><span>,</span> <span>queue</span><span>,</span> <span>e</span><span>)</span>
+
+    <span>raise</span> <span>Skip</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>This method is called “local” since it can be directly correlated to a particular instantiated job instance. We will see why it’s relevant once we get to <code>#process_retry</code>.</p>
+
+<p><code>Sidekiq::Shutdown</code> is re-raised because it should bypass the retry system, and <code>Handled</code> is being re-raised as well in case a developer decides to manually raise it from within a job.</p>
+
+<p>Rescuing <code>Exception</code> (i.e. all exceptions) is the interesting part.</p>
+
+<p>First of all, Sidekiq detects if an exception was raised due to the thread receiving a <code>Sidekiq::Shutdown</code> from <code>Processor#kill</code>. With this detection, only errors that are caused by a bug or some other transient error within the application code will trigger a retry. This prevents monitoring tools from being polluted unnecessarily and does not force well-behaving jobs into a retry set. We’ll skip the internals of <code>#exception_caused_by_shutdown?</code> for brevity, only mentioning that its secret sauce is Ruby’s <a href="https://rubyapi.org/3.3/o/exception#method-i-cause"><code>exception#cause</code></a> method.</p>
+
+<p>Next, Sidekiq checks if the job was explicitly configured without retries - it simply re-raises the exception if that’s the case. By default, every Sidekiq job is retried up to 25 times.</p>
+
+<p>Before we proceed to <code>#process_retry</code>, we need to look at the final line: <code>raise Skip</code>. Instead of re-raising the original exception, Sidekiq raises a subclass of <code>JobRetry::Handled</code>. We’ll see how it relates to the <code>#global</code> method once we get to it.</p>
+
+<p>The original <code>#process_retry</code> method handles metadata management and formatting; the following snippet is a trimmed-down version of it:</p>
+
+<div><div><pre><code><span># JobRetry</span>
+
+<span>def</span> <span>process_retry</span><span>(</span><span>jobinst</span><span>,</span> <span>msg</span><span>,</span> <span>queue</span><span>,</span> <span>exception</span><span>)</span>
+  <span>max_retry_attempts</span> <span>=</span> <span>retry_attempts_from</span><span>(</span><span>msg</span><span>[</span><span>&#34;retry&#34;</span><span>],</span> <span>@max_retries</span><span>)</span>
+
+  <span>msg</span><span>[</span><span>&#34;queue&#34;</span><span>]</span> <span>=</span> <span>(</span><span>msg</span><span>[</span><span>&#34;retry_queue&#34;</span><span>]</span> <span>||</span> <span>queue</span><span>)</span>
+
+  <span># Code that updates the `retry_count` job payload attribute, saves the `retried_at` and `failed_at` timestamps, filters and saves the backtrace, etc</span>
+  <span>count</span> <span>=</span> <span>msg</span><span>[</span><span>&#34;retry_count&#34;</span><span>]</span> <span># Increment logic of this value is omitted</span>
+
+  <span>return</span> <span>retries_exhausted</span><span>(</span><span>jobinst</span><span>,</span> <span>msg</span><span>,</span> <span>exception</span><span>)</span> <span>if</span> <span>count</span> <span>&gt;=</span> <span>max_retry_attempts</span>
+
+  <span>rf</span> <span>=</span> <span>msg</span><span>[</span><span>&#34;retry_for&#34;</span><span>]</span>
+  <span>return</span> <span>retries_exhausted</span><span>(</span><span>jobinst</span><span>,</span> <span>msg</span><span>,</span> <span>exception</span><span>)</span> <span>if</span> <span>rf</span> <span>&amp;&amp;</span> <span>((</span><span>msg</span><span>[</span><span>&#34;failed_at&#34;</span><span>]</span> <span>+</span> <span>rf</span><span>)</span> <span>&lt;</span> <span>Time</span><span>.</span><span>now</span><span>.</span><span>to_f</span><span>)</span>
+
+  <span>strategy</span><span>,</span> <span>delay</span> <span>=</span> <span>delay_for</span><span>(</span><span>jobinst</span><span>,</span> <span>count</span><span>,</span> <span>exception</span><span>,</span> <span>msg</span><span>)</span>
+  <span>case</span> <span>strategy</span>
+  <span>when</span> <span>:discard</span>
+    <span>return</span>
+  <span>when</span> <span>:kill</span>
+    <span>return</span> <span>retries_exhausted</span><span>(</span><span>jobinst</span><span>,</span> <span>msg</span><span>,</span> <span>exception</span><span>)</span>
+  <span>end</span>
+
+  <span>jitter</span> <span>=</span> <span>rand</span><span>(</span><span>10</span><span>)</span> <span>*</span> <span>(</span><span>count</span> <span>+</span> <span>1</span><span>)</span>
+  <span>retry_at</span> <span>=</span> <span>Time</span><span>.</span><span>now</span><span>.</span><span>to_f</span> <span>+</span> <span>delay</span> <span>+</span> <span>jitter</span>
+  <span>payload</span> <span>=</span> <span>JSON</span><span>.</span><span>parse</span><span>(</span><span>msg</span><span>)</span>
+  <span>redis</span> <span>do</span> <span>|</span><span>conn</span><span>|</span>
+    <span>conn</span><span>.</span><span>zadd</span><span>(</span><span>&#34;retry&#34;</span><span>,</span> <span>retry_at</span><span>.</span><span>to_s</span><span>,</span> <span>payload</span><span>)</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>First, note that Sidekiq provides an ability to reroute the job into a different queue if it fails; this is what the second line of code is responsible for.</p>
+
+<p>Immediately after, <code>#retries_exhausted</code> is called if the job exceeds its maximum retry count, or if the time frame during which it should be retried has passed.</p>
+
+<p>If Sidekiq should attempt to retry the job, it calls <code>#delay_for</code>. This method returns a strategy and a delay in seconds. We’ll see where the strategy value comes from, but for now, understand that a job can be either <code>discard</code>ed or <code>kill</code>ed, with the former causing Sidekiq to completely forget about the job instead of retrying it.</p>
+
+<p>In case the job should actually be retried, the timestamp at which it should happen is calculated based on the obtained delay. Jitter is applied to this value to avoid the thundering herd problem, where a bunch of jobs are scheduled for a retry at the same second.</p>
+
+<p>Finally, the job is added to a <code>retry</code> sorted set using <code>ZADD</code>, following a simillar process to dead jobs.</p>
+
+<div><div><pre><code><span># JobRetry</span>
+<span>def</span> <span>delay_for</span><span>(</span><span>jobinst</span><span>,</span> <span>count</span><span>,</span> <span>exception</span><span>,</span> <span>msg</span><span>)</span>
+  <span>rv</span> <span>=</span> <span>begin</span>
+    <span>block</span> <span>=</span> <span>jobinst</span><span>&amp;</span><span>.</span><span>sidekiq_retry_in_block</span>
+    <span># ...</span>
+    <span>block</span><span>&amp;</span><span>.</span><span>call</span><span>(</span><span>count</span><span>,</span> <span>exception</span><span>,</span> <span>msg</span><span>)</span>
+  <span>rescue</span> <span>Exception</span> <span>=&gt;</span> <span>e</span>
+    <span># ...</span>
+    <span>nil</span>
+  <span>end</span>
+
+  <span>rv</span> <span>=</span> <span>rv</span><span>.</span><span>to_i</span> <span>if</span> <span>rv</span><span>.</span><span>respond_to?</span><span>(</span><span>:to_i</span><span>)</span>
+  <span>delay</span> <span>=</span> <span>(</span><span>count</span><span>**</span><span>4</span><span>)</span> <span>+</span> <span>15</span>
+  <span>if</span> <span>Integer</span> <span>===</span> <span>rv</span> <span>&amp;&amp;</span> <span>rv</span> <span>&gt;</span> <span>0</span>
+    <span>delay</span> <span>=</span> <span>rv</span>
+  <span>elsif</span> <span>rv</span> <span>==</span> <span>:discard</span>
+    <span>return</span> <span>[</span><span>:discard</span><span>,</span> <span>nil</span><span>]</span>
+  <span>elsif</span> <span>rv</span> <span>==</span> <span>:kill</span>
+    <span>return</span> <span>[</span><span>:kill</span><span>,</span> <span>nil</span><span>]</span>
+  <span>end</span>
+
+  <span>[</span><span>:default</span><span>,</span> <span>delay</span><span>]</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p><code>#delay_for</code> sources the <code>strategy</code> from an optional <code>sidekiq_retry_in_block</code> block defined on the job class by a developer. It can either return a symbol representing the strategy or an integer value representing the number of seconds for a delay.</p>
+
+<p>If the delay value was not provided by a developer, it gets calculated with an exponential backoff formula, where <code>count</code> is the number of retries already conducted. With the default max retry count being 25, this means that a job (without a custom <code>sidekiq_retry_in_block</code> defined) will be retried 25 times over approximately 20 days.</p>
+
+<p>Here’s what happens in the <code>#retries_exhausted</code> method:</p>
+
+<div><div><pre><code><span># JobRetry</span>
+
+<span>def</span> <span>retries_exhausted</span><span>(</span><span>jobinst</span><span>,</span> <span>msg</span><span>,</span> <span>exception</span><span>)</span>
+  <span>rv</span> <span>=</span> <span>begin</span>
+    <span>block</span> <span>=</span> <span>jobinst</span><span>&amp;</span><span>.</span><span>sidekiq_retries_exhausted_block</span>
+    <span># ...</span>
+    <span>block</span><span>&amp;</span><span>.</span><span>call</span><span>(</span><span>msg</span><span>,</span> <span>exception</span><span>)</span>
+  <span>rescue</span> <span>=&gt;</span> <span>e</span>
+    <span># Log the error and do not reraise it</span>
+    <span># ...</span>
+  <span>end</span>
+
+  <span>return</span> <span>if</span> <span>rv</span> <span>==</span> <span>:discard</span>
+  <span>unless</span> <span>msg</span><span>[</span><span>&#34;dead&#34;</span><span>]</span> <span>==</span> <span>false</span>
+    <span>payload</span> <span>=</span> <span>Sidekiq</span><span>.</span><span>dump_json</span><span>(</span><span>msg</span><span>)</span>
+    <span>now</span> <span>=</span> <span>Time</span><span>.</span><span>now</span><span>.</span><span>to_f</span>
+
+    <span>redis</span> <span>do</span> <span>|</span><span>conn</span><span>|</span>
+      <span>conn</span><span>.</span><span>multi</span> <span>do</span> <span>|</span><span>xa</span><span>|</span>
+        <span>xa</span><span>.</span><span>zadd</span><span>(</span><span>&#34;dead&#34;</span><span>,</span> <span>now</span><span>.</span><span>to_s</span><span>,</span> <span>payload</span><span>)</span>
+        <span>xa</span><span>.</span><span>zremrangebyscore</span><span>(</span><span>&#34;dead&#34;</span><span>,</span> <span>&#34;-inf&#34;</span><span>,</span> <span>now</span> <span>-</span> <span>@capsule</span><span>.</span><span>config</span><span>[</span><span>:dead_timeout_in_seconds</span><span>])</span>
+        <span>xa</span><span>.</span><span>zremrangebyrank</span><span>(</span><span>&#34;dead&#34;</span><span>,</span> <span>0</span><span>,</span> <span>-</span> <span>@capsule</span><span>.</span><span>config</span><span>[</span><span>:dead_max_jobs</span><span>])</span>
+      <span>end</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>Another optional user-supplied job-level configuration being used here is <code>sidekiq_retries_exhausted_block</code>, which allows discarding a job once its retries are exhausted. If it’s not provided, a job gets sent to the morgue in the exact same fashion as in <code>Processor#process</code> when a job payload is malformed.</p>
+
+<p>The last relevant method in the retrier is <code>#global</code>. It’s worth remembering that it wraps a call to <code>#local</code>, <code>Processor#reloader</code>, invocation of middlewares, and pretty much every other step in the <code>Processor#process</code> pipeline. It’s needed to catch any exceptions raised when processing a job, including those that are not raised from within application code, on a best-effort basis. Its only difference from <code>#local</code> is that it sends the job straight to the dead set if it doesn’t have a <code>retry</code> attribute set:</p>
+
+<div><div><pre><code><span># JobRetry</span>
+
+<span>def</span> <span>global</span><span>(</span><span>jobstr</span><span>,</span> <span>queue</span><span>)</span>
+  <span>yield</span>
+<span>rescue</span> <span>Handled</span> <span>=&gt;</span> <span>ex</span>
+  <span>raise</span> <span>ex</span>
+<span>rescue</span> <span>Sidekiq</span><span>::</span><span>Shutdown</span> <span>=&gt;</span> <span>ey</span>
+  <span>raise</span> <span>ey</span>
+<span>rescue</span> <span>Exception</span> <span>=&gt;</span> <span>e</span>
+  <span>raise</span> <span>Sidekiq</span><span>::</span><span>Shutdown</span> <span>if</span> <span>exception_caused_by_shutdown?</span><span>(</span><span>e</span><span>)</span>
+
+  <span>msg</span> <span>=</span> <span>Sidekiq</span><span>.</span><span>load_json</span><span>(</span><span>jobstr</span><span>)</span>
+  <span>if</span> <span>msg</span><span>[</span><span>&#34;retry&#34;</span><span>]</span>
+    <span>process_retry</span><span>(</span><span>nil</span><span>,</span> <span>msg</span><span>,</span> <span>queue</span><span>,</span> <span>e</span><span>)</span>
+  <span>else</span>
+    <span>@capsule</span><span>.</span><span>config</span><span>.</span><span>death_handlers</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>handler</span><span>|</span>
+      <span>handler</span><span>.</span><span>call</span><span>(</span><span>msg</span><span>,</span> <span>e</span><span>)</span>
+    <span>rescue</span> <span>=&gt;</span> <span>handler_ex</span>
+      <span>handle_exception</span><span>(</span><span>handler_ex</span><span>,</span> <span>{</span><span>context: </span><span>&#34;Error calling death handler&#34;</span><span>,</span> <span>job: </span><span>msg</span><span>})</span>
+    <span>end</span>
+  <span>end</span>
+
+  <span>raise</span> <span>Handled</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>You might notice that similarly to <code>#local</code>, this method also rescues <code>JobRetry::Handled</code> and does not retry in such cases, since these exceptions are already handled in the <code>#local</code> rescue block that raises a <code>JobRetry::Skip</code> - a subclass of <code>Handled</code>. This avoids duplicate retry processing.</p>
+
+<p>We have now explored the primary process of how Sidekiq handles job processing on the server. However, what about jobs that need to be retried? Also, doesn’t Sidekiq offer a mechanism for delaying the execution of jobs until a specified time in the future? We will learn how Sidekiq handles these in the section following the next one.</p>
+
+<h2 id="enqueueing-jobs">Enqueueing jobs</h2>
+
+<p>So far, we’ve looked at the internals of Sidekiq server: <code>Launcher</code>, <code>Manager</code>, and <code>Processor</code> constructs, which operate within a background process responsible for job processing. Now, let’s explore how jobs make their way into the queues, which leads us to <code>Sidekiq::Client</code>.</p>
+
+<p>Although most Sidekiq users typically don’t interact directly with <code>Sidekiq::Client</code>, preferring higher-level abstractions like the <a href="https://github.com/sidekiq/sidekiq/blob/c1607198815d68f60d138010907dd3426d6521bb/lib/sidekiq/job.rb">Job API</a>, all the convenience methods provided by this module rely on fundamental building blocks: <code>Client#push</code> and <code>Client#push_bulk</code>, which accept different combinations of arguments.</p>
+
+<p>Let’s see what <code>Client#push</code> does:</p>
+
+<div><div><pre><code><span># Client</span>
+
+<span>def</span> <span>push</span><span>(</span><span>item</span><span>)</span>
+  <span>normed</span> <span>=</span> <span>normalize_item</span><span>(</span><span>item</span><span>)</span>
+  <span>payload</span> <span>=</span> <span>middleware</span><span>.</span><span>invoke</span><span>(</span><span>item</span><span>[</span><span>&#34;class&#34;</span><span>],</span> <span>normed</span><span>,</span> <span>normed</span><span>[</span><span>&#34;queue&#34;</span><span>],</span> <span>@redis_pool</span><span>)</span> <span>do</span>
+    <span>normed</span>
+  <span>end</span>
+  <span>if</span> <span>payload</span>
+    <span>verify_json</span><span>(</span><span>payload</span><span>)</span>
+    <span>raw_push</span><span>([</span><span>payload</span><span>])</span>
+    <span>payload</span><span>[</span><span>&#34;jid&#34;</span><span>]</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p><code>normalize_item</code> performs several operations on the payload, including argument validation and generation of a unique job identifier.</p>
+
+<p>Subsequently, the payload undergoes processing through the client middleware chain, mirroring the way <code>Processor</code> sends job payloads through server middlewares. This enables external integrations to enhance the job payload with extra attributes and implement custom logic around job dispatches.</p>
+
+<p><code>verify_json</code> might not need additional explanation as it does exactly what its name suggests, but it’s how it does it that makes it worthwhile to look into:</p>
+
+<div><div><pre><code><span>def</span> <span>verify_json</span><span>(</span><span>item</span><span>)</span>
+  <span>job_class</span> <span>=</span> <span>item</span><span>[</span><span>&#34;wrapped&#34;</span><span>]</span> <span>||</span> <span>item</span><span>[</span><span>&#34;class&#34;</span><span>]</span>
+  <span>args</span> <span>=</span> <span>item</span><span>[</span><span>&#34;args&#34;</span><span>]</span>
+  <span>mode</span> <span>=</span> <span>Sidekiq</span><span>::</span><span>Config</span><span>::</span><span>DEFAULTS</span><span>[</span><span>:on_complex_arguments</span><span>]</span>
+
+  <span>if</span> <span>mode</span> <span>==</span> <span>:raise</span> <span>||</span> <span>mode</span> <span>==</span> <span>:warn</span>
+    <span>if</span> <span>(</span><span>unsafe_item</span> <span>=</span> <span>json_unsafe?</span><span>(</span><span>args</span><span>))</span>
+      <span>msg</span> <span>=</span> <span>&lt;&lt;~</span><span>EOM</span><span>
+        Job arguments to </span><span>#{</span><span>job_class</span><span>}</span><span> must be native JSON types, but </span><span>#{</span><span>unsafe_item</span><span>.</span><span>inspect</span><span>}</span><span> is a </span><span>#{</span><span>unsafe_item</span><span>.</span><span>class</span><span>}</span><span>.
+        See https://github.com/sidekiq/sidekiq/wiki/Best-Practices
+        To disable this error, add `Sidekiq.strict_args!(false)` to your initializer.
+</span><span>      EOM</span>
+
+      <span>if</span> <span>mode</span> <span>==</span> <span>:raise</span>
+        <span>raise</span><span>(</span><span>ArgumentError</span><span>,</span> <span>msg</span><span>)</span>
+      <span>else</span>
+        <span>warn</span><span>(</span><span>msg</span><span>)</span>
+      <span>end</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+
+<span># ...</span>
+
+<span>RECURSIVE_JSON_UNSAFE</span> <span>=</span> <span>{</span>
+  <span>Integer</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>val</span><span>)</span> <span>{},</span>
+  <span>Float</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>val</span><span>)</span> <span>{},</span>
+  <span>TrueClass</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>val</span><span>)</span> <span>{},</span>
+  <span>FalseClass</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>val</span><span>)</span> <span>{},</span>
+  <span>NilClass</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>val</span><span>)</span> <span>{},</span>
+  <span>String</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>val</span><span>)</span> <span>{},</span>
+  <span>Array</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>val</span><span>)</span> <span>{</span>
+    <span>val</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>e</span><span>|</span>
+      <span>unsafe_item</span> <span>=</span> <span>RECURSIVE_JSON_UNSAFE</span><span>[</span><span>e</span><span>.</span><span>class</span><span>].</span><span>call</span><span>(</span><span>e</span><span>)</span>
+      <span>return</span> <span>unsafe_item</span> <span>unless</span> <span>unsafe_item</span><span>.</span><span>nil?</span>
+    <span>end</span>
+    <span>nil</span>
+  <span>},</span>
+  <span>Hash</span> <span>=&gt;</span> <span>-&gt;</span><span>(</span><span>val</span><span>)</span> <span>{</span>
+    <span>val</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>k</span><span>,</span> <span>v</span><span>|</span>
+      <span>return</span> <span>k</span> <span>unless</span> <span>String</span> <span>===</span> <span>k</span>
+
+      <span>unsafe_item</span> <span>=</span> <span>RECURSIVE_JSON_UNSAFE</span><span>[</span><span>v</span><span>.</span><span>class</span><span>].</span><span>call</span><span>(</span><span>v</span><span>)</span>
+      <span>return</span> <span>unsafe_item</span> <span>unless</span> <span>unsafe_item</span><span>.</span><span>nil?</span>
+    <span>end</span>
+    <span>nil</span>
+  <span>}</span>
+<span>}</span>
+
+<span>RECURSIVE_JSON_UNSAFE</span><span>.</span><span>default</span> <span>=</span> <span>-&gt;</span><span>(</span><span>val</span><span>)</span> <span>{</span> <span>val</span> <span>}</span>
+<span>RECURSIVE_JSON_UNSAFE</span><span>.</span><span>compare_by_identity</span>
+<span>private_constant</span> <span>:RECURSIVE_JSON_UNSAFE</span>
+
+<span>def</span> <span>json_unsafe?</span><span>(</span><span>item</span><span>)</span>
+  <span>RECURSIVE_JSON_UNSAFE</span><span>[</span><span>item</span><span>.</span><span>class</span><span>].</span><span>call</span><span>(</span><span>item</span><span>)</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>Boiled down, the <code>verify_json</code> method validates job arguments expected by the <code>#perform</code> method to ensure they adhere to valid JSON format. In versions predating Sidekiq 7.0, the <code>json_unsafe?</code> method employed a straightforward check by verifying if the arguments remained unchanged after being dumped and parsed as JSON: <code>JSON.parse(JSON.dump(item[&#34;args&#34;])) == item[&#34;args&#34;]</code>. However, this approach, involving the dumping and parsing of potentially large arguments for each job, clearly warranted performance enhancements.</p>
+
+<p>To address this, the <code>RECURSIVE_JSON_UNSAFE</code> constant was introduced. Additional improvement lies in <code>RECURSIVE_JSON_UNSAFE.compare_by_identity</code>, which makes the hash resolve key objects based on their <code>object_id</code> instead of calling <a href="https://rubyapi.org/3.3/o/object#method-i-hash"><code>hash</code></a>, resulting in a faster process. Extracting a static <code>object_id</code> that remains unchanged during an object’s lifetime, albeit recursively, is much faster than going through 2 iterations of JSON processing.</p>
+
+<p>In this new version, every Ruby class known to be ‘JSON-safe’ returns a proc that returns <code>nil</code> when executed. Arrays and hashes receive special treatment since they contain other objects, making this hash recursive. If a job payload contains an object of any other class not declared as a key in the hash, the arguments are deemed unsafe, and an appropriate action will be taken, with the default being to raise an error.</p>
+
+<p><code>raw_push</code> is the place where job gets put into Redis:</p>
+
+<div><div><pre><code><span># Client</span>
+
+<span>def</span> <span>raw_push</span><span>(</span><span>payloads</span><span>)</span>
+  <span>@redis_pool</span><span>.</span><span>with</span> <span>do</span> <span>|</span><span>conn</span><span>|</span>
+    <span>retryable</span> <span>=</span> <span>true</span>
+    <span>begin</span>
+      <span>conn</span><span>.</span><span>pipelined</span> <span>do</span> <span>|</span><span>pipeline</span><span>|</span>
+        <span>atomic_push</span><span>(</span><span>pipeline</span><span>,</span> <span>payloads</span><span>)</span>
+      <span>end</span>
+    <span>rescue</span> <span>RedisClient</span><span>::</span><span>Error</span> <span>=&gt;</span> <span>ex</span>
+      <span>if</span> <span>retryable</span> <span>&amp;&amp;</span> <span>ex</span><span>.</span><span>message</span> <span>=~</span> <span>/READONLY|NOREPLICAS|UNBLOCKED/</span>
+        <span>conn</span><span>.</span><span>close</span>
+        <span>retryable</span> <span>=</span> <span>false</span>
+        <span>retry</span>
+      <span>end</span>
+      <span>raise</span>
+    <span>end</span>
+  <span>end</span>
+  <span>true</span>
+<span>end</span>
+
+<span>def</span> <span>atomic_push</span><span>(</span><span>conn</span><span>,</span> <span>payloads</span><span>)</span>
+  <span>if</span> <span>payloads</span><span>.</span><span>first</span><span>.</span><span>key?</span><span>(</span><span>&#34;at&#34;</span><span>)</span>
+    <span>conn</span><span>.</span><span>zadd</span><span>(</span><span>&#34;schedule&#34;</span><span>,</span> <span>payloads</span><span>.</span><span>flat_map</span> <span>{</span> <span>|</span><span>hash</span><span>|</span>
+      <span>at</span> <span>=</span> <span>hash</span><span>.</span><span>delete</span><span>(</span><span>&#34;at&#34;</span><span>).</span><span>to_s</span>
+      <span># ...</span>
+      <span>[</span><span>at</span><span>,</span> <span>JSON</span><span>.</span><span>generate</span><span>(</span><span>hash</span><span>)]</span>
+    <span>})</span>
+  <span>else</span>
+    <span>queue</span> <span>=</span> <span>payloads</span><span>.</span><span>first</span><span>[</span><span>&#34;queue&#34;</span><span>]</span>
+    <span>now</span> <span>=</span> <span>Time</span><span>.</span><span>now</span><span>.</span><span>to_f</span>
+    <span>to_push</span> <span>=</span> <span>payloads</span><span>.</span><span>map</span> <span>{</span> <span>|</span><span>entry</span><span>|</span>
+      <span>entry</span><span>[</span><span>&#34;enqueued_at&#34;</span><span>]</span> <span>=</span> <span>now</span>
+      <span>JSON</span><span>.</span><span>generate</span><span>(</span><span>entry</span><span>)</span>
+    <span>}</span>
+    <span>conn</span><span>.</span><span>sadd</span><span>(</span><span>&#34;queues&#34;</span><span>,</span> <span>[</span><span>queue</span><span>])</span>
+    <span>conn</span><span>.</span><span>lpush</span><span>(</span><span>&#34;queue:</span><span>#{</span><span>queue</span><span>}</span><span>&#34;</span><span>,</span> <span>to_push</span><span>)</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>This method accepts an array of payloads to support <code>#push_bulk</code>. <code>#push</code> passes a single array element as an argument.</p>
+
+<p>The rescue is included to handle Redis failovers that necessitate reopening the connection socket, attempting one transparent retry.</p>
+
+<p>Subsequently, the Redis commands called by <code>atomic_push</code> are <a href="https://redis.io/docs/manual/pipelining/">pipelined</a>, significantly reducing the round-trip time (RTT) to Redis when pushing a large number of jobs at once. For instance, instead of initiating 1000 network calls for 1000 jobs, pipelining enables sending all 1000 commands in a single request.</p>
+
+<p><code>atomic_push</code> has 2 branches. The second branch is for immediate dispatches of jobs that will be processed as soon as possible. The <a href="https://redis.io/commands/sadd/"><code>SADD</code></a> command is there to store a set of queues for monitoring purposes and is not necessarily relevant to job processing itself. However, the subsequent <a href="https://redis.io/commands/lpush/"><code>LPUSH</code></a> command is crucial as it puts jobs into the list that is regularly fetched by a <code>Processor</code> instance on the server side, which we have already covered. An important detail is that <code>LPUSH</code> adds the elements to the front of the list - <code>BasicFetch#retrieve_work</code> pops the element from the tail, making Sidekiq queues employ a FIFO model.</p>
+
+<p>It must be strongly emphasized here that despite the first-come first-serve nature of queues, Sidekiq does not guarantee the order of job execution. A subsequent job can and will be popped from the queue list before the preceding one may be finished by another processor. However, it is possible to set the <code>concurrency</code> setting of a specific capsule responsible for a set of specified queues to 1. This ensures that only 1 <code>Processor</code> is active at any time, making job fetching sequential. Nevertheless, this still does not guarantee ordering in case a job fails to be processed and is sent to the retry set, or in case a preceding job is lost. We will explore when the latter case can happen in the following section. In any case, if strict ordering of jobs is truly needed, Sidekiq is not the best option.</p>
+
+<p>The first branch of <code>atomic_push</code> accommodates scheduled jobs, which we haven’t touched until now. Scheduled jobs enable users to defer their job’s execution until a specific time in the future. In order to achieve this, <code>ZADD</code> is used again with a sorted set, similar to <code>dead</code> and <code>retry</code> sets.</p>
+
+<h2 id="retrying--scheduling">Retrying &amp; scheduling</h2>
+
+<p>By now, we have explored most of the server’s internals, and we have also examined how <code>Sidekiq#client</code> pushes jobs into the queues, including an option to schedule a job for execution in the future. However, we have not yet explored the final component that enables the processing of scheduled jobs and jobs that need to be retried. We noted that both types of jobs get added into corresponding sorted sets using <code>ZADD</code>, but how do they get processed?</p>
+
+<p>When we previously examined the <code>Launcher</code>, we intentionally glossed over <code>Sidekiq::Scheduled::Poller</code>. Whenever a Sidekiq process boots, it calls <code>Launcher#run</code>, which in turn initiates the poller thread.</p>
+
+<div><div><pre><code><span>def</span> <span>start</span>
+  <span>@thread</span> <span>||=</span> <span>safe_thread</span><span>(</span><span>&#34;scheduler&#34;</span><span>)</span> <span>{</span>
+    <span>initial_wait</span>
+
+    <span>until</span> <span>@done</span>
+      <span>enqueue</span>
+      <span>wait</span>
+    <span>end</span>
+  <span>}</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>Its main loop is extremely similar to that of <code>Processor</code>, so I won’t cover where <code>@done</code> is set.</p>
+
+<p>Before we delve into the details of the <code>initial_wait</code>, <code>enqueue</code>, and <code>wait</code> methods, let’s take a step back. Based on what we’ve seen so far, we can confidently say that multiple Sidekiq processes require no coordination at all. It’s common practice to use a single Redis instance and launch multiple Sidekiq processes, each sharing the same set of queues, to increase throughput and availability. These processes simply attempt to <code>BRPOP</code> jobs from queue lists atomically, and each processor gets its share of work.</p>
+
+<p>However, the <code>scheduled</code> and <code>retry</code> sets operate differently. Jobs in these sets should not be processed immediately; they are pushed into the respective queues when their time comes for processing by the <code>Processor</code>s. The <code>Poller</code> handles this task, but what if there are several Sidekiq processes? Each will have its own poller thread competing for access to shared Redis sets. While this isn’t an issue for normal processing of queue lists, as <code>BRPOP</code> operations take constant time, extracting desired keys from a <code>scheduled</code> or <code>retry</code> sorted set has a different computational complexity. Continuously bombarding Redis with commands used by the poller from several processes negatively impacts its health and performance. Therefore, the pollers must either coordinate to ensure that only one runs at a time, or their executions must be artificially spread out. Sidekiq opts for the latter option, and we’ll explore how it achieves that.</p>
+
+<p><code>Sidekiq::Scheduled</code> is one of the most commented modules in Sidekiq, so all of the original comments are preserved in following snippets. Here’s <code>#initial_wait</code> that gets called once per Sidekiq process:</p>
+
+<div><div><pre><code><span># Scheduled::Poller</span>
+
+<span>INITIAL_WAIT</span> <span>=</span> <span>10</span>
+
+<span># ...</span>
+
+<span>def</span> <span>initial_wait</span>
+  <span># Have all processes sleep between 5-15 seconds. 10 seconds to give time for</span>
+  <span># the heartbeat to register (if the poll interval is going to be calculated by the number</span>
+  <span># of workers), and 5 random seconds to ensure they don&#39;t all hit Redis at the same time.</span>
+  <span>total</span> <span>=</span> <span>0</span>
+  <span>total</span> <span>+=</span> <span>INITIAL_WAIT</span> <span>unless</span> <span>@config</span><span>[</span><span>:poll_interval_average</span><span>]</span>
+  <span>total</span> <span>+=</span> <span>(</span><span>5</span> <span>*</span> <span>rand</span><span>)</span>
+
+  <span>@sleeper</span><span>.</span><span>pop</span><span>(</span><span>total</span><span>)</span>
+<span>rescue</span> <span>Timeout</span><span>::</span><span>Error</span>
+<span>ensure</span>
+  <span># periodically clean out the `processes` set in Redis which can collect</span>
+  <span># references to dead processes over time. The process count affects how</span>
+  <span># often we scan for scheduled jobs.</span>
+  <span>cleanup</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>Heartbeat is mentioned in the first comment - similar to a poller, it’s another thread that routinely updates some process metadata stored in Redis. The only thing relevant to the poller is the updating of the <code>processes</code> set, which contains unique identifiers of each Sidekiq process; we will see how it exactly comes into play shortly.</p>
+
+<p><code>@sleeper.pop(total)</code> simply makes the thread wait for a specified amount of time.</p>
+
+<div><div><pre><code><span># Scheduled::Poller</span>
+
+<span>def</span> <span>cleanup</span>
+  <span># dont run cleanup more than once per minute</span>
+  <span>return</span> <span>0</span> <span>unless</span> <span>redis</span> <span>{</span> <span>|</span><span>conn</span><span>|</span> <span>conn</span><span>.</span><span>set</span><span>(</span><span>&#34;process_cleanup&#34;</span><span>,</span> <span>&#34;1&#34;</span><span>,</span> <span>&#34;NX&#34;</span><span>,</span> <span>&#34;EX&#34;</span><span>,</span> <span>&#34;60&#34;</span><span>)</span> <span>}</span>
+
+  <span>count</span> <span>=</span> <span>0</span>
+  <span>redis</span> <span>do</span> <span>|</span><span>conn</span><span>|</span>
+    <span>procs</span> <span>=</span> <span>conn</span><span>.</span><span>sscan</span><span>(</span><span>&#34;processes&#34;</span><span>).</span><span>to_a</span>
+    <span>heartbeats</span> <span>=</span> <span>conn</span><span>.</span><span>pipelined</span> <span>{</span> <span>|</span><span>pipeline</span><span>|</span>
+      <span>procs</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>key</span><span>|</span>
+        <span>pipeline</span><span>.</span><span>hget</span><span>(</span><span>key</span><span>,</span> <span>&#34;info&#34;</span><span>)</span>
+      <span>end</span>
+    <span>}</span>
+
+    <span># the hash named key has an expiry of 60 seconds.</span>
+    <span># if it&#39;s not found, that means the process has not reported</span>
+    <span># in to Redis and probably died.</span>
+    <span>to_prune</span> <span>=</span> <span>procs</span><span>.</span><span>select</span><span>.</span><span>with_index</span> <span>{</span> <span>|</span><span>proc</span><span>,</span> <span>i</span><span>|</span>
+      <span>heartbeats</span><span>[</span><span>i</span><span>].</span><span>nil?</span>
+    <span>}</span>
+    <span>count</span> <span>=</span> <span>conn</span><span>.</span><span>srem</span><span>(</span><span>&#34;processes&#34;</span><span>,</span> <span>to_prune</span><span>)</span> <span>unless</span> <span>to_prune</span><span>.</span><span>empty?</span>
+  <span>end</span>
+
+  <span>count</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>As can be seen, the poller is responsible for cleaning out dead processes’ metadata from Redis. Despite what the comment in <code>#initial_wait</code> says, this only happens once a poller starts, and, under normal circumstances, it starts only when a process boots up.</p>
+
+<p>Why exactly this is necessary can be seen in the <code>#wait</code> method, which is being called in a loop after every <code>#enqueue</code>:</p>
+
+<div><div><pre><code><span># Scheduled::Poller</span>
+
+<span>def</span> <span>wait</span>
+  <span>@sleeper</span><span>.</span><span>pop</span><span>(</span><span>random_poll_interval</span><span>)</span>
+<span>rescue</span> <span>Timeout</span><span>::</span><span>Error</span>
+  <span># expected</span>
+<span>rescue</span> <span>=&gt;</span> <span>ex</span>
+  <span># if poll_interval_average hasn&#39;t been calculated yet, we can</span>
+  <span># raise an error trying to reach Redis.</span>
+  <span>logger</span><span>.</span><span>error</span> <span>ex</span><span>.</span><span>message</span>
+  <span>handle_exception</span><span>(</span><span>ex</span><span>)</span>
+  <span>sleep</span> <span>5</span>
+<span>end</span>
+
+<span>def</span> <span>random_poll_interval</span>
+  <span># We want one Sidekiq process to schedule jobs every N seconds.  We have M processes</span>
+  <span># and **don&#39;t** want to coordinate.</span>
+  <span>#</span>
+  <span># So in N*M second timespan, we want each process to schedule once.  The basic loop is:</span>
+  <span>#</span>
+  <span># * sleep a random amount within that N*M timespan</span>
+  <span># * wake up and schedule</span>
+  <span>#</span>
+  <span># We want to avoid one edge case: imagine a set of 2 processes, scheduling every 5 seconds,</span>
+  <span># so N*M = 10.  Each process decides to randomly sleep 8 seconds, now we&#39;ve failed to meet</span>
+  <span># that 5 second average. Thankfully each schedule cycle will sleep randomly so the next</span>
+  <span># iteration could see each process sleep for 1 second, undercutting our average.</span>
+  <span>#</span>
+  <span># So below 10 processes, we special case and ensure the processes sleep closer to the average.</span>
+  <span># In the example above, each process should schedule every 10 seconds on average. We special</span>
+  <span># case smaller clusters to add 50% so they would sleep somewhere between 5 and 15 seconds.</span>
+  <span># As we run more processes, the scheduling interval average will approach an even spread</span>
+  <span># between 0 and poll interval so we don&#39;t need this artifical boost.</span>
+  <span>#</span>
+  <span>count</span> <span>=</span> <span>process_count</span>
+  <span>interval</span> <span>=</span> <span>poll_interval_average</span><span>(</span><span>count</span><span>)</span>
+  
+  <span>if</span> <span>count</span> <span>&lt;</span> <span>10</span>
+    <span># For small clusters, calculate a random interval that is ±50% the desired average.</span>
+    <span>interval</span> <span>*</span> <span>rand</span> <span>+</span> <span>interval</span><span>.</span><span>to_f</span> <span>/</span> <span>2</span>
+  <span>else</span>
+    <span># With 10+ processes, we should have enough randomness to get decent polling</span>
+    <span># across the entire timespan</span>
+    <span>interval</span> <span>*</span> <span>rand</span>
+  <span>end</span>
+<span>end</span>
+
+<span># We do our best to tune the poll interval to the size of the active Sidekiq</span>
+<span># cluster.  If you have 30 processes and poll every 15 seconds, that means one</span>
+<span># Sidekiq is checking Redis every 0.5 seconds - way too often for most people</span>
+<span># and really bad if the retry or scheduled sets are large.</span>
+<span>#</span>
+<span># Instead try to avoid polling more than once every 15 seconds.  If you have</span>
+<span># 30 Sidekiq processes, we&#39;ll poll every 30 * 15 or 450 seconds.</span>
+<span># To keep things statistically random, we&#39;ll sleep a random amount between</span>
+<span># 225 and 675 seconds for each poll or 450 seconds on average.  Otherwise restarting</span>
+<span># all your Sidekiq processes at the same time will lead to them all polling at</span>
+<span># the same time: the thundering herd problem.</span>
+<span>#</span>
+<span># We only do this if poll_interval_average is unset (the default).</span>
+<span>def</span> <span>poll_interval_average</span><span>(</span><span>count</span><span>)</span>
+  <span>@config</span><span>[</span><span>:poll_interval_average</span><span>]</span> <span>||</span> <span>scaled_poll_interval</span><span>(</span><span>count</span><span>)</span>
+<span>end</span>
+
+<span># Calculates an average poll interval based on the number of known Sidekiq processes.</span>
+<span># This minimizes a single point of failure by dispersing check-ins but without taxing</span>
+<span># Redis if you run many Sidekiq processes.</span>
+<span>def</span> <span>scaled_poll_interval</span><span>(</span><span>process_count</span><span>)</span>
+  <span>process_count</span> <span>*</span> <span>@config</span><span>[</span><span>:average_scheduled_poll_interval</span><span>]</span>
+<span>end</span>
+
+<span>def</span> <span>process_count</span>
+  <span>pcount</span> <span>=</span> <span>Sidekiq</span><span>.</span><span>redis</span> <span>{</span> <span>|</span><span>conn</span><span>|</span> <span>conn</span><span>.</span><span>scard</span><span>(</span><span>&#34;processes&#34;</span><span>)</span> <span>}</span>
+  <span>pcount</span> <span>=</span> <span>1</span> <span>if</span> <span>pcount</span> <span>==</span> <span>0</span>
+  <span>pcount</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>Poll interval logic is explained in detail thanks to the comprehensive comments. The amount of active Sidekiq processes consuming jobs from the same Redis installation is taken into consideration when calculating an interval with which pollers should contact Redis. It all boils down to minimizing concurrent poller operations.</p>
+
+<p>Finally, let’s see what all of this effort is for. <code>Poller#enqueue</code> instantiates <code>Sidekiq::Scheduled::Enq</code>, which encapsulates scheduled dequeue logic and calls <code>#enqueue_jobs</code> on it:</p>
+
+<div><div><pre><code><span>class</span> <span>Enq</span>
+  <span>LUA_ZPOPBYSCORE</span> <span>=</span> <span>&lt;&lt;~</span><span>LUA</span><span>
+    local key, now = KEYS[1], ARGV[1]
+    local jobs = redis.call(&#34;zrange&#34;, key, &#34;-inf&#34;, now, &#34;byscore&#34;, &#34;limit&#34;, 0, 1)
+    if jobs[1] then
+      redis.call(&#34;zrem&#34;, key, jobs[1])
+      return jobs[1]
+    end
+</span><span>  LUA</span>
+
+  <span># ...</span>
+
+  <span>def</span> <span>enqueue_jobs</span><span>(</span><span>sorted_sets</span> <span>=</span> <span>%w[retry schedule]</span><span>)</span>
+    <span># A job&#39;s &#34;score&#34; in Redis is the time at which it should be processed.</span>
+    <span># Just check Redis for the set of jobs with a timestamp before now.</span>
+    <span>redis</span> <span>do</span> <span>|</span><span>conn</span><span>|</span>
+      <span>sorted_sets</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>sorted_set</span><span>|</span>
+        <span># Get next item in the queue with score (time to execute) &lt;= now.</span>
+        <span># We need to go through the list one at a time to reduce the risk of something</span>
+        <span># going wrong between the time jobs are popped from the scheduled queue and when</span>
+        <span># they are pushed onto a work queue and losing the jobs.</span>
+        <span>while</span> <span>!</span><span>@done</span> <span>&amp;&amp;</span> <span>(</span><span>job</span> <span>=</span> <span>zpopbyscore</span><span>(</span><span>conn</span><span>,</span> <span>keys: </span><span>[</span><span>sorted_set</span><span>],</span> <span>argv: </span><span>[</span><span>Time</span><span>.</span><span>now</span><span>.</span><span>to_f</span><span>.</span><span>to_s</span><span>]))</span>
+          <span>@client</span><span>.</span><span>push</span><span>(</span><span>JSON</span><span>.</span><span>generate</span><span>(</span><span>job</span><span>))</span>
+        <span>end</span>
+      <span>end</span>
+    <span>end</span>
+  <span>end</span>
+
+  <span># ...</span>
+
+  <span>private</span>
+
+  <span>def</span> <span>zpopbyscore</span><span>(</span><span>conn</span><span>,</span> <span>keys: </span><span>nil</span><span>,</span> <span>argv: </span><span>nil</span><span>)</span>
+    <span>if</span> <span>@lua_zpopbyscore_sha</span><span>.</span><span>nil?</span>
+      <span>@lua_zpopbyscore_sha</span> <span>=</span> <span>conn</span><span>.</span><span>script</span><span>(</span><span>:load</span><span>,</span> <span>LUA_ZPOPBYSCORE</span><span>)</span>
+    <span>end</span>
+
+    <span>conn</span><span>.</span><span>call</span><span>(</span><span>&#34;EVALSHA&#34;</span><span>,</span> <span>@lua_zpopbyscore_sha</span><span>,</span> <span>keys</span><span>.</span><span>size</span><span>,</span> <span>*</span><span>keys</span><span>,</span> <span>*</span><span>argv</span><span>)</span>
+  <span>rescue</span> <span>RedisClient</span><span>::</span><span>CommandError</span> <span>=&gt;</span> <span>e</span>
+    <span>raise</span> <span>unless</span> <span>e</span><span>.</span><span>message</span><span>.</span><span>start_with?</span><span>(</span><span>&#34;NOSCRIPT&#34;</span><span>)</span>
+
+    <span>@lua_zpopbyscore_sha</span> <span>=</span> <span>nil</span>
+    <span>retry</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>First thing to note is the <code>LUA_ZPOPBYSCORE</code> string, along with <a href="https://redis.io/commands/script-load/"><code>SCRIPT</code></a> and <a href="https://redis.io/commands/evalsha/"><code>EVALSHA</code></a> Redis commands. This is Sidekiq making use of a <a href="https://redis.io/docs/interact/programmability/eval-intro/">Redis feature</a> that allows execution of atomic Lua scripts on the server. The script is preloaded and cached in Redis using <code>conn.script</code> so that subsequent commands utilizing it can benefit from increased performance.</p>
+
+<p>The script itself takes an array of sets (<code>retry</code> and <code>schedule</code>) and a current timestamp (note that Lua array indexing starts with 1). It then calls <a href="https://redis.io/commands/zrange/"><code>ZRANGE</code></a>, which returns a single job with the lowest timestamp that should be dispatched to the queue. The job element is then removed from the set using <a href="https://redis.io/commands/zrem/"><code>ZREM</code></a>.</p>
+
+<p>The complexity of <code>ZRANGE</code> is O(log(N) + M), where N is the total number of elements in the set and M is the number of elements returned. However, Sidekiq dequeues one scheduled or to-be-retried job at a time to be safe, as the comment suggests, meaning that the overall complexity will be O(M * log(N)).</p>
+
+<p><code>ZREM</code> itself is already O(M * log(N)), so the overall complexity doesn’t change by the fact that the whole script is called for every relevant job.</p>
+
+<p>For every successfully dequeued job, <code>Client#push</code> is called to dispatch the job to its target queue.</p>
+
+<p>This, along with the fact that Redis is mostly single-threaded, makes it clear why spreading out the pollers in time is so important. With several processes and a large enough retry or scheduled set (and in my experience, retry set sizes can easily be in the order of thousands, if not more), executing this logic concurrently can significantly impair Redis’s performance or even grind it to a halt.</p>
+
+<h2 id="job-loss-potential">Job loss potential</h2>
+
+<p>Now that we’ve explored the complete lifecycle of a job as it’s processed by the server, let’s examine potential scenarios where a job might become lost.</p>
+
+<p>We know that the OS version of Sidekiq only provides <code>BasicFetch</code> as a means to dequeue jobs from Redis, which effectively removes them from the corresponding queue lists. This means that if a Sidekiq process is terminated abruptly, such as with a SIGKILL, all in-progress jobs will be lost. For instance, this can occur if the process exhausts its memory, prompting Kubernetes to forcefully terminate the pod with a <code>kill -9</code> command, or if other orchestrators and hosting providers take similar actions.</p>
+
+<p>But how does Sidekiq manage hanging, long-running, or simply in-progress jobs during a graceful termination?</p>
+
+<p>Let’s revisit <code>Manager#hard_shutdown</code>, which is called when a Sidekiq process receives a SIGTERM or SIGINT:</p>
+
+<div><div><pre><code><span># Manager</span>
+
+<span>def</span> <span>hard_shutdown</span>
+  <span>cleanup</span> <span>=</span> <span>nil</span>
+  <span>@plock</span><span>.</span><span>synchronize</span> <span>do</span>
+    <span>cleanup</span> <span>=</span> <span>@workers</span><span>.</span><span>dup</span>
+  <span>end</span>
+
+  <span>if</span> <span>cleanup</span><span>.</span><span>size</span> <span>&gt;</span> <span>0</span>
+    <span>jobs</span> <span>=</span> <span>cleanup</span><span>.</span><span>map</span> <span>{</span> <span>|</span><span>p</span><span>|</span> <span>p</span><span>.</span><span>job</span> <span>}.</span><span>compact</span>
+
+    <span>capsule</span><span>.</span><span>fetcher</span><span>.</span><span>bulk_requeue</span><span>(</span><span>jobs</span><span>)</span>
+  <span>end</span>
+
+  <span>cleanup</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>processor</span><span>|</span>
+    <span>processor</span><span>.</span><span>kill</span>
+  <span>end</span>
+
+  <span># ...</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p><code>capsule.fetcher.bulk_requeue(jobs)</code> is called before processor threads are terminated. At this point, waiting for them to handle the <code>Sidekiq::Shutdown</code> exception and gracefully exit is not feasible.<sup id="fnref:4" role="doc-noteref"><a href="#fn:4" rel="footnote">4</a></sup> Therefore, the best option is to requeue all jobs that are in progress, even though it means that some jobs that finish just before the process exits will also be requeued.</p>
+
+<p><code>BasicFetch#bulk_requeue</code> simply takes the job payloads extracted from active processors and puts them back into the corresponding Redis lists:</p>
+
+<div><div><pre><code><span># BasicFetch</span>
+
+<span>def</span> <span>bulk_requeue</span><span>(</span><span>inprogress</span><span>)</span>
+  <span>return</span> <span>if</span> <span>inprogress</span><span>.</span><span>empty?</span>
+
+  <span># ...</span>
+  <span>jobs_to_requeue</span> <span>=</span> <span>{}</span>
+  <span>inprogress</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>unit_of_work</span><span>|</span>
+    <span>jobs_to_requeue</span><span>[</span><span>unit_of_work</span><span>.</span><span>queue</span><span>]</span> <span>||=</span> <span>[]</span>
+    <span>jobs_to_requeue</span><span>[</span><span>unit_of_work</span><span>.</span><span>queue</span><span>]</span> <span>&lt;&lt;</span> <span>unit_of_work</span><span>.</span><span>job</span>
+  <span>end</span>
+
+  <span>redis</span> <span>do</span> <span>|</span><span>conn</span><span>|</span>
+    <span>conn</span><span>.</span><span>pipelined</span> <span>do</span> <span>|</span><span>pipeline</span><span>|</span>
+      <span>jobs_to_requeue</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>queue</span><span>,</span> <span>jobs</span><span>|</span>
+        <span>pipeline</span><span>.</span><span>rpush</span><span>(</span><span>queue</span><span>,</span> <span>jobs</span><span>)</span>
+      <span>end</span>
+    <span>end</span>
+  <span>end</span>
+  <span># ...</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p><code>BasicFetch</code>’s requeue logic is a potential scenario where job loss can occur. Redis might run out of memory while a job is being processed, making it impossible to put the job back into the queue. This is also a concern for ordinary retries.</p>
+
+<p>Additionally, although not directly related to Sidekiq, jobs can be lost due to specific Redis server misconfigurations. The <a href="https://redis.io/docs/reference/eviction/">eviction policy</a>, which determines how Redis handles memory when it’s full, plays a significant role here. Any setting other than <code>noevict</code> may result in jobs being evicted from Redis under certain circumstances. Furthermore, Redis can encounter failures and lose data after a reboot, particularly with certain <a href="https://redis.io/docs/management/persistence/">persistence</a> configurations. This situation can lead to Sidekiq clients incorrectly assuming that a job will be processed after a successful push, when in fact it may not reach the Sidekiq server at all.</p>
+
+<p>It is also possible for the SIGTERM or SIGINT handler not to be executed within the predefined timeout period, which the orchestrator running Sidekiq waits for before sending SIGKILL. Redis connectivity issues are the most likely culprit here. Theoretically, GC pauses and the condition of the host machine can also impede the Sidekiq process during this crucial task, but I personally have never encountered, nor have I heard of, such cases where a Ruby program is stalled for 25 seconds.</p>
+
+<p>It goes without saying that killing the Sidekiq process with SIGKILL without having sent SIGINT or SIGTERM prior will result in all of the in-progress jobs being lost.</p>
+
+<p>It should be noted that the decision to design <code>BasicFetch</code> in its current manner is intentional. By using a single <code>BRPOP</code> command to fetch a job, Sidekiq remains extremely simple and lightweight in terms of its load on Redis. However, this also means that if your jobs absolutely must never be lost, relying solely on Sidekiq might not be the best choice. Nevertheless, it may be possible to refactor the application code and business logic that warrants strong durability guarantees to include a liveness component, such as a recurring cron job, that would attempt to ensure the completion of a specific workflow by repeatedly enqueuing a job until the desired final state is achieved.</p>
+
+<p>This makes Sidekiq employ an ‘at least once’ delivery semantic, with the possibility of losing jobs during severe degradation of the system’s health. However, the Pro version ensures that job loss is impossible, as jobs never leave Redis until they are acknowledged with <code>SuperFetch</code> enabled, effectively making it truly ‘at least once’ without any caveats.</p>
+
+<p>Sidekiq leverages simple Redis data structures like lists with constant-time push and pop operations, along with adjustable thread counts, to achieve scalability, efficiency, and ease of management. In the OS version, scaling can involve deploying multiple Sidekiq processes, each consuming jobs from the same Redis installation. The Enterprise version offers a forking model for multi-process execution, providing an alternative way to scale. For fine-grained control over queues, capsules can be used to organize processing with specific concurrency settings. Additionally, you can prioritize certain queues, enforce strict queue processing order (distinct from job ordering), or evenly poll queues. However, it’s important to note that job ordering within queues isn’t supported. Nevertheless, employing a single processor per queue could provide a rudimentary form of ordering, which may suffice depending on your application’s requirements.</p>
+
+
+
+  </div>
+</article>
+
+      </div>
+    </div></div>
+  </body>
+</html>
