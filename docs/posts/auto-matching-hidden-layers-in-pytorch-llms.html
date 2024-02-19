@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://chanind.github.io/ai/2024/02/19/auto-match-hidden-layers-pytorch-llm.html">Original</a>
+    <h1>Auto-matching hidden layers in Pytorch LLMs</h1>
+    
+    <div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p><span><em>Note: This is cross-posted on <a href="https://www.lesswrong.com/posts/MhFDxivjJrvZ2DMxw/auto-matching-hidden-layers-in-pytorch-llms?utm_campaign=post_share&amp;utm_source=link">LessWrong</a>.</em></span></p>
+
+<p>Mechanistic interpretability and steering LLMs requires being able to read and modify activations during inference. For instance, to <a href="https://arxiv.org/abs/2312.06681">apply steering vectors</a> to control model generation, we need to first collect hidden activations to find a steering direction, then intervene by modifying hidden activations of the model during inference.</p>
+
+<p>To read and patch activations from a LLM, you first need to find the relevant layers that you care about and either add hooks or wrap them. This tends to lead to two approaches, either 1. writing a custom model wrapper for every model you might want to work with (approach taken by <a href="https://github.com/andyzoujm/representation-engineering">Repe</a>, <a href="https://github.com/nrimsky/CAA">CAA</a>) or 2. leave it to the user to manually specify layer names to patch, and apply the patch using Pytorch hooks (approach taken by <a href="https://github.com/davidbau/baukit">Baukit</a>). The first approach is a never-ending battle as new models are released, and the second approach, while very flexible, passes on the complexity to anyone using what you’ve written.</p>
+
+<p>In this post, I’ll discuss a third option, which is to auto-detect the types of layers in a Pytorch LLM and read/patch using Pytorch hooks, and is the approach used by the steering-vectors library. This leverages the fact that all transformer LMs have the same basic structure: a series of layers containing attention and MLP blocks. This post assumes the model is from Huggingface, although this same technique will likely work with any transformer LM that’s sanely constructed. This post will use the terms “transformer LM” and “LLM” interchangeably to refer to a decoder-only generative language model like GPT or LLaMa.</p>
+
+<h2 id="guessing-layer-templates">Guessing layer templates</h2>
+
+<p>Finding the component parts of any Pytorch module is easy by calling <code>named_modules()</code> on the model. This will return a dictionary containing the name of the submodule, and the submodule itself. This is demonstrated for GPT2-small below:</p>
+
+<div><div><pre><code><span>from</span> <span>transformers</span> <span>import</span> <span>AutoModelForCausalLM</span>
+
+<span>model</span> <span>=</span> <span>AutoModelForCausalLM</span><span>.</span><span>from_pretrained</span><span>(</span><span>&#34;gpt2&#34;</span><span>)</span>
+<span>print</span><span>(</span><span>dict</span><span>(</span><span>model</span><span>.</span><span>named_modules</span><span>()).</span><span>keys</span><span>())</span>
+
+<span># transformer
+# transformer.wte
+# transformer.wpe
+# transformer.drop
+# transformer.h
+# transformer.h.0
+# transformer.h.0.ln_1
+# transformer.h.0.attn
+# transformer.h.0.attn.c_attn
+# transformer.h.0.attn.c_proj
+# transformer.h.0.attn.attn_dropout
+# transformer.h.0.attn.resid_dropout
+# transformer.h.0.ln_2
+# transformer.h.0.mlp
+# transformer.h.0.mlp.c_fc
+# transformer.h.0.mlp.c_proj
+# transformer.h.0.mlp.act
+# transformer.h.0.mlp.dropout
+# ...
+# transformer.h.11
+# transformer.h.11.ln_1
+# transformer.h.11.attn
+# transformer.h.11.attn.c_attn
+# transformer.h.11.attn.c_proj
+# transformer.h.11.attn.attn_dropout
+# transformer.h.11.attn.resid_dropout
+# transformer.h.11.ln_2
+# transformer.h.11.mlp
+# transformer.h.11.mlp.c_fc
+# transformer.h.11.mlp.c_proj
+# transformer.h.11.mlp.act
+# transformer.h.11.mlp.dropout
+# transformer.ln_f
+# lm_head
+</span></code></pre></div></div>
+
+<p>Here, it’s clear that the 12 decoder block layers of the model are of the form <code>transformer.h.{num}</code>, the attention layers are <code>transformer.h.{num}.attn</code>, and the MLP layers are <code>transformer.h.{num}.mlp</code>. It’s similarly easy to see the input and ouput layer norms and dropout.</p>
+
+<p>For LLaMa, the layers are of the form <code>model.layers.{num}</code> for each decoder block, <code>model.layers.{num}.self_attn</code> for attention, and <code>model.layers.{num}.mlp</code> for the MLP layers. For Pythia, the decoder block, attention and MLP layers are of the form <code>gpt_neox.layers.{num}</code>, <code>gpt_neox.layers.{num}.attention</code>, and <code>gpt_neox.layers.{num}.mlp</code>, respectively.</p>
+
+<p>This hints at a simple rule to find relevant layer names in any transformer LM - simply look for the shortest template string of the form <code>*.{num}*</code> which also contains any other terms you might care about. For instance, for attention layers, looking for the shortest template that contains either “attn” or “attention” should cover nearly all LLMs. Likewise, looking for the shortest template with “mlp” should get the MLP layers in nearly all cases. We can generalize this in code below:</p>
+
+<div><div><pre><code><span>import</span> <span>re</span>
+<span>from</span> <span>collections</span> <span>import</span> <span>defaultdict</span>
+
+<span># look for layers of the form &#34;*.{num}&#34;
+</span><span>LAYER_GUESS_RE</span> <span>=</span> <span>r</span><span>&#34;^([^\d]+)\.([\d]+)(.*)$&#34;</span>
+
+<span>def</span> <span>guess_matcher_from_layers</span><span>(</span><span>model</span><span>,</span> <span>filter</span> <span>=</span> <span>None</span><span>)</span> <span>-&gt;</span> <span>str</span> <span>|</span> <span>None</span><span>:</span>
+    <span>counts_by_guess</span><span>:</span> <span>dict</span><span>[</span><span>str</span><span>,</span> <span>int</span><span>]</span> <span>=</span> <span>defaultdict</span><span>(</span><span>int</span><span>)</span>
+    <span>for</span> <span>layer</span> <span>in</span> <span>dict</span><span>(</span><span>model</span><span>.</span><span>named_modules</span><span>()).</span><span>keys</span><span>():</span>
+        <span>if</span> <span>re</span><span>.</span><span>match</span><span>(</span><span>LAYER_GUESS_RE</span><span>,</span> <span>layer</span><span>):</span>
+            <span>guess</span> <span>=</span> <span>re</span><span>.</span><span>sub</span><span>(</span><span>LAYER_GUESS_RE</span><span>,</span> <span>r</span><span>&#34;\1.{num}\3&#34;</span><span>,</span> <span>layer</span><span>)</span>
+            <span>if</span> <span>filter</span> <span>is</span> <span>None</span> <span>or</span> <span>filter</span><span>(</span><span>guess</span><span>):</span>
+                <span>counts_by_guess</span><span>[</span><span>guess</span><span>]</span> <span>+=</span> <span>1</span>
+    <span>if</span> <span>len</span><span>(</span><span>counts_by_guess</span><span>)</span> <span>==</span> <span>0</span><span>:</span>
+        <span>return</span> <span>None</span>
+
+    <span># score is higher for guesses that match more often, are and shorter in length
+</span>    <span>guess_scores</span> <span>=</span> <span>[</span>
+        <span>(</span><span>guess</span><span>,</span> <span>count</span> <span>+</span> <span>1</span> <span>/</span> <span>len</span><span>(</span><span>guess</span><span>))</span> <span>for</span> <span>guess</span><span>,</span> <span>count</span> <span>in</span> <span>counts_by_guess</span><span>.</span><span>items</span><span>()</span>
+    <span>]</span>
+    <span>return</span> <span>max</span><span>(</span><span>guess_scores</span><span>,</span> <span>key</span><span>=</span><span>lambda</span> <span>x</span><span>:</span> <span>x</span><span>[</span><span>1</span><span>])[</span><span>0</span><span>]</span>
+</code></pre></div></div>
+
+<p>Then we can find a layer matcher template for the base decoder block, attention, and MLP layers for a model like below:</p>
+
+<div><div><pre><code><span>model</span> <span>=</span> <span>AutoModelForCausalLM</span><span>.</span><span>from_pretrained</span><span>(</span><span>&#34;gpt2&#34;</span><span>)</span>
+
+<span>guess_matcher_from_layers</span><span>(</span><span>model</span><span>)</span>
+<span># &#34;transformer.h.{num}&#34;
+</span>
+<span>guess_matcher_from_layers</span><span>(</span><span>model</span><span>,</span> <span>lambda</span> <span>l</span><span>:</span> <span>&#34;attn&#34;</span> <span>in</span> <span>l</span> <span>or</span> <span>&#34;attention&#34;</span> <span>in</span> <span>l</span><span>)</span>
+<span># &#34;transformer.h.{num}.self_attn
+</span>
+<span>guess_matcher_from_layers</span><span>(</span><span>model</span><span>,</span> <span>lambda</span> <span>l</span><span>:</span> <span>&#34;mlp&#34;</span> <span>in</span> <span>l</span><span>)</span>
+<span># &#34;transformer.h.{num}.mlp
+</span></code></pre></div></div>
+
+<p>This code will also successfully guess the corresponding layer templates for LLaMa, Pythia, and any other transformer LM.</p>
+
+<p>Extracting layers using a layer template
+Now that we have a layer template string for each of the types of layers we care about, we just need a way to specify a layer number and get back the corresponding submodule to patch. Fortunately, we already have everything we need to do this. The <code>named_modules()</code> method of Pytorch modules gives use everything we need. First, lets start by finding all the numbered layers in the model which match a given template string:</p>
+
+<div><div><pre><code><span>def</span> <span>collect_matching_layers</span><span>(</span><span>model</span><span>,</span> <span>layer_matcher</span><span>)</span> <span>-&gt;</span> <span>list</span><span>[</span><span>str</span><span>]:</span>
+    <span>all_layer_names</span> <span>=</span> <span>set</span><span>(</span><span>dict</span><span>(</span><span>model</span><span>.</span><span>named_modules</span><span>()).</span><span>keys</span><span>())</span>
+    <span>matching_layers</span> <span>=</span> <span>[]</span>
+    <span>for</span> <span>layer_num</span> <span>in</span> <span>range</span><span>(</span><span>len</span><span>(</span><span>all_layer_names</span><span>)):</span>
+        <span>layer_name</span> <span>=</span> <span>layer_matcher</span><span>.</span><span>format</span><span>(</span><span>num</span><span>=</span><span>layer_num</span><span>)</span>
+        <span>if</span> <span>layer_name</span> <span>in</span> <span>all_layer_names</span><span>:</span>
+            <span>matching_layers</span><span>.</span><span>append</span><span>(</span><span>layer_name</span><span>)</span>
+        <span>else</span><span>:</span>
+            <span>break</span>
+    <span>return</span> <span>matching_layers</span>
+</code></pre></div></div>
+
+<p>If we run this function on GPT2 with the decoder block layer matcher (<code>transformer.h.{num}</code>), we’ll get back an ordered list of all matching layers: <code>transformer.h.0</code>, <code>transformer.h.1</code>, etc…</p>
+
+<p>Once we have this list, it’s trivial to select any layer number from it, and again, use <code>named_modules()</code> to get back the actual Pytorch module corresponding to that layer:</p>
+
+<div><div><pre><code><span>model</span> <span>=</span> <span>AutoModelForCausalLM</span><span>.</span><span>from_pretrained</span><span>(</span><span>&#34;gpt2&#34;</span><span>)</span>
+<span>layer_matcher</span> <span>=</span> <span>guess_matcher_from_layers</span><span>(</span><span>model</span><span>)</span> <span># &#34;transformer.h.{num}&#34;
+</span><span>modules_by_name</span> <span>=</span> <span>dict</span><span>(</span><span>model</span><span>.</span><span>named_modules</span><span>())</span>
+
+<span>layer_names</span> <span>=</span> <span>collect_matching_layers</span><span>(</span><span>model</span><span>,</span> <span>layer_matcher</span><span>)</span>
+
+<span># layer 2
+</span><span>layer2</span> <span>=</span> <span>modules_by_name</span><span>[</span><span>layer_names</span><span>[</span><span>2</span><span>]]</span>
+
+<span># layer 7
+</span><span>layer7</span> <span>=</span> <span>modules_by_name</span><span>[</span><span>layer_names</span><span>[</span><span>7</span><span>]]</span>
+<span>Add</span> <span>hooks</span> <span>and</span> <span>profit</span>
+<span>We</span> <span>now</span> <span>have</span> <span>a</span> <span>way</span> <span>to</span> <span>automatically</span> <span>find</span> <span>and</span> <span>extract</span> <span>all</span> <span>the</span> <span>relevant</span> <span>layers</span> <span>from</span> <span>a</span> <span>Pytorch</span> <span>LLM</span><span>.</span> <span>The</span> <span>next</span> <span>step</span> <span>is</span> <span>to</span> <span>add</span> <span>Pytorch</span> <span>hooks</span> <span>to</span> <span>read</span> <span>or</span> <span>modify</span> <span>activations</span><span>.</span>
+
+<span># add a hook to layer2 and layer7 from above
+</span>
+<span>def</span> <span>do_something_cool</span><span>(</span><span>module</span><span>,</span> <span>args</span><span>,</span> <span>output</span><span>):</span>
+	<span># save or modify the layer output
+</span>	<span>...</span>
+
+<span>for</span> <span>layer</span> <span>in</span> <span>[</span><span>layer2</span><span>,</span> <span>layer7</span><span>]:</span>
+	<span>layer</span><span>.</span><span>register_module_forward_hook</span><span>(</span><span>do_something_cool</span><span>)</span>
+</code></pre></div></div>
+
+<p>… and that’s all there is to it! To see this in action, check out <a href="https://github.com/steering-vectors/steering-vectors/blob/main/steering_vectors/layer_matching.py">layer_matching.py</a> in the <a href="https://github.com/steering-vectors/steering-vectors">steering_vectors library</a>.</p>
+
+  </div>
+  
+  
+</article>
+
+      </div>
+    </div></div>
+  </body>
+</html>
