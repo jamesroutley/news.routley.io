@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="http://arighi.blogspot.com/2024/02/writing-scheduler-for-linux-in-rust.html">Original</a>
+    <h1>Writing a scheduler for Linux in Rust that runs in user-space</h1>
+    
+    <div id="readability-page-1" class="page"><div id="post-body-8850124366552799685" itemprop="description articleBody">
+
+<p>I’ve decided to start a series of blog posts to cover some details
+about <code>scx_rustland</code>, my little Linux scheduler written in
+Rust that runs in user-space.</p>
+<p>This project started for fun over the Christmas break, mostly because
+I wanted to learn more about sched-ext and I also needed some motivation
+to keep practicing Rust (that I’m still learning).</p>
+<p>In this series of articles I would like to focus at some
+implementation details to better explains how this scheduler works.</p>
+<p>A scheduler is kernel component that needs to:</p>
+<ul>
+<li><p>determine the order of executions of all the tasks that want to
+run (<strong>ranking</strong>)</p></li>
+<li><p>determine where each task needs to run (<strong>target
+CPU</strong>)</p></li>
+<li><p>determine for how long a task can run (<strong>time
+slice</strong>)</p></li>
+</ul>
+<p>The main goal of this project is to prove that we can channel these
+operations into a regular user-space program and still have a system
+that can perform as good as using a in-kernel scheduler.</p>
+
+<p>The most noticeable benefits of a user-space scheduler are the
+following:</p>
+<ul>
+<li><p>Availability of a large pool of languages (e.g., Rust),
+libraries, debugging and profiling tools.</p></li>
+<li><p>Lower down the barrier of CPU scheduling experimentation:
+implementing and testing a particular scheduling policy can be done
+inside a regular user-space process, it doesn’t require rebooting into a
+new kernel, in case of bugs the user-space scheduler will just crash and
+sched-ext will transparently restore the default Linux
+scheduler.</p></li>
+</ul>
+<p>Downside of a user-space scheduler:</p>
+<ul>
+<li><p>Overhead: even if the scheduler itself is not really a
+CPU-intensive workload (unless the system is massively overloaded), the
+communication between kernel and user-space is going to add some
+overhead, so the goal is to try to reduce this overhead as much as
+possible</p></li>
+<li><p>Protection: the user-space task that implements the scheduling
+policy needs some special protection, if it’s blocked (e.g., due to a
+page fault), tasks can’t be scheduled. So, in order to avoid deadlocks
+the user-space scheduler should never be blocked indefinitely, waiting
+for some actions performed by another task (a page fault is a good
+example of such “forbidden” behavior).</p></li>
+</ul>
+
+<p>First of all this scheduler has nothing to do with Rust-for-Linux
+(the kernel subsystem that allows to write kernel modules in Rust).</p>
+<p>In fact the Rust part of the scheduler runs 100% in user-space and
+all the scheduling decisions are also done in user-space.</p>
+<p>The connection with the kernel happens thanks to eBPF and sched-ext:
+together they allow to channel all the scheduling events to a user-space
+program, which then communicates the tasks to be executed back to the
+kernel via eBPF as well.</p>
+<h2 id="ebpf-component">eBPF component</h2>
+<p>sched-ext is a Linux kernel feature (not upstream yet - hopefully
+it’ll be upstream soon) that allows to implement a scheduler in
+eBPF.</p>
+<p>Basically all you have to do is to implement some callbacks and put
+them in a struct <code>sched_ext_ops</code>.</p>
+<p><code>scx_rustland</code> implements the following callbacks in the
+<a href="https://github.com/sched-ext/scx/blob/v0.1.7/scheds/rust/scx_rustland/src/bpf/main.bpf.c">eBPF
+component</a>:</p>
+<pre><code>/*
+ * Scheduling class declaration.
+ */
+SEC(&#34;.struct_ops.link&#34;)
+struct sched_ext_ops rustland = {
+        .select_cpu             = (void *)rustland_select_cpu,
+        .enqueue                = (void *)rustland_enqueue,
+        .dispatch               = (void *)rustland_dispatch,
+        .running                = (void *)rustland_running,
+        .stopping               = (void *)rustland_stopping,
+        .update_idle            = (void *)rustland_update_idle,
+        .set_cpumask            = (void *)rustland_set_cpumask,
+        .cpu_release            = (void *)rustland_cpu_release,
+        .init_task              = (void *)rustland_init_task,
+        .exit_task              = (void *)rustland_exit_task,
+        .init                   = (void *)rustland_init,
+        .exit                   = (void *)rustland_exit,
+        .flags                  = SCX_OPS_ENQ_LAST | SCX_OPS_KEEP_BUILTIN_IDLE,
+        .timeout_ms             = 5000,
+        .name                   = &#34;rustland&#34;,
+};</code></pre>
+<p>The workflow is the following:</p>
+<ul>
+<li><code>.select_cpu()</code> implements the logic to assign a target
+CPU to a task that wants to run, typically you have to decide if you
+want to keep the task on the same CPU or if it needs to be migrated to a
+different one (for example if the current CPU is busy); if we can find
+an idle CPU at this stage there’s no reason to call the scheduler, the
+task can be immediately dispatched here.</li>
+</ul>
+<pre><code>s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
+                   u64 wake_flags)
+{
+        bool is_idle = false;
+        s32 cpu;
+
+        cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &amp;is_idle);
+        if (is_idle) {
+                /*
+                 * Using SCX_DSQ_LOCAL ensures that the task will be executed
+                 * directly on the CPU returned by this function.
+                 */
+                dispatch_task(p, SCX_DSQ_LOCAL, 0, 0);
+                __sync_fetch_and_add(&amp;nr_kernel_dispatches, 1);
+        }
+
+        return cpu;
+}</code></pre>
+<p>If we can’t find an idle CPU this step will just return the
+previously used CPU, that can be used as a hint for the user-space
+scheduler (keeping tasks on the same CPU has multiple benefits, such as
+reusing hot caches and avoid any kind migration overhead). However this
+decision is not the final one, the user-space scheduler can decide to
+move the task to a different CPU if needed.</p>
+<p><strong>NOTE: bypassing the user-space scheduler when we can find an
+idle CPU can strongly improve the responsiveness of certain “low
+latency” workloads, such as gaming for example.</strong></p>
+<ul>
+<li><p>Once a tentative CPU has been determined for the task we enter
+the <code>.enqueue()</code> callback, usually here you may decide to
+store the task in a queue, tree, or any other data structure to
+determine the proper order of execution of the different tasks that
+require to run.</p>
+<p>In rustland the <code>.enqueue()</code> callback is used to store
+tasks into a BPF map <code>BPF_MAP_TYPE_QUEUE</code>
+<code>queued</code>, this represents the first connection with the
+user-space counter-part. Items in this queue are managed in a
+producer/consumer way: the BPF part is the producer, user-space is the
+consumer.</p></li>
+</ul>
+<pre><code>void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
+{
+...
+        /*
+         * Add tasks to the @queued list, they will be processed by the
+         * user-space scheduler.
+         *
+         * If @queued list is full (user-space scheduler is congested) tasks
+         * will be dispatched directly from the kernel (re-using their
+         * previously used CPU in this case).
+         */
+        get_task_info(&amp;task, p, false);
+        dbg_msg(&#34;enqueue: pid=%d (%s)&#34;, p-&gt;pid, p-&gt;comm);
+        if (bpf_map_push_elem(&amp;queued, &amp;task, 0)) {
+                sched_congested(p);
+                dispatch_task(p, SHARED_DSQ, 0, enq_flags);
+                __sync_fetch_and_add(&amp;nr_kernel_dispatches, 1);
+                return;
+        }
+        __sync_fetch_and_add(&amp;nr_queued, 1);
+}</code></pre>
+<p>At this point it’s up to the user-space counter-part to determine the
+proper order of execution of tasks and where they need to run, the
+user-space has the option to maintain the CPU assignment determined by
+the built-in idle selection logic or pick another CPU.</p>
+<ul>
+<li><p>Once the order of execution is determined tasks are then stored
+to another <code>BPF_MAP_TYPE_QUEUE</code> <code>dispatched</code>,
+again in a producer/consumer way, but this time the producer is the
+user-space part and the consumer is the BPF part.</p></li>
+<li><p>Then the workflow goes back to the BPF part. The dispatch path
+operates using multiple per-CPU dispatch queues (DSQ) and a global
+dispatch queue.</p>
+<p>The per-CPU DSQs are used to dispatch tasks on specific CPUs, while
+the global DSQ is used to dispatch tasks on the first CPU that becomes
+available (usually when the user-space doesn’t specify any preference to
+run the task on a particular CPU).</p>
+<p>When a CPU becomes ready to dispatch tasks, the
+<code>.dispatch()</code> callback is called, if there are tasks in the
+<code>dispatched</code> queue they will be bounced to the target CPU’s
+queue (DSQ), or to the global dispatch queue, based on the user-space
+scheduler’s decision.</p>
+<pre><code>void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
+{
+     /*
+      * Check if the user-space scheduler needs to run, and in that case try
+      * to dispatch it immediately.
+      */
+     dispatch_user_scheduler();
+
+     /*
+      * Consume all tasks from the @dispatched list and immediately try to
+      * dispatch them on their target CPU selected by the user-space
+      * scheduler (at this point the proper ordering has been already
+      * determined by the scheduler).
+      */
+     bpf_repeat(MAX_ENQUEUED_TASKS) {
+             struct task_struct *p;
+             struct dispatched_task_ctx task;
+
+             /*
+              * Pop first task from the dispatched queue, stop if dispatch
+              * queue is empty.
+              */
+             if (bpf_map_pop_elem(&amp;dispatched, &amp;task))
+                     break;
+
+             /* Ignore entry if the task doesn&#39;t exist anymore */
+             p = bpf_task_from_pid(task.pid);
+             if (!p)
+                     continue;
+             /*
+              * Check whether the user-space scheduler assigned a different
+              * CPU to the task and migrate (if possible).
+              *
+              * If no CPU has been specified (task.cpu &lt; 0), then dispatch
+              * the task to the shared DSQ and rely on the built-in idle CPU
+              * selection.
+              */
+             dbg_msg(&#34;usersched: pid=%d cpu=%d cpumask_cnt=%llu payload=%llu&#34;,
+                     task.pid, task.cpu, task.cpumask_cnt, task.payload);
+             if (task.cpu &lt; 0)
+                     dispatch_task(p, SHARED_DSQ, 0, 0);
+             else
+                     dispatch_task(p, cpu_to_dsq(task.cpu), task.cpumask_cnt, 0);
+             bpf_task_release(p);
+             __sync_fetch_and_add(&amp;nr_user_dispatches, 1);
+     }
+
+     /* Consume all tasks enqueued in the current CPU&#39;s DSQ first */
+     bpf_repeat(MAX_ENQUEUED_TASKS) {
+             if (!scx_bpf_consume(cpu_to_dsq(cpu)))
+                     break;
+     }
+
+     /* Consume all tasks enqueued in the shared DSQ */
+     bpf_repeat(MAX_ENQUEUED_TASKS) {
+             if (!scx_bpf_consume(SHARED_DSQ))
+                     break;
+     }
+}</code></pre></li>
+<li><p>The <code>.running()</code> and <code>.stopping()</code> callback
+are called respectively when a task starts its execution on a CPU and it
+releases the CPU; rustland uses this information to keep track of the
+CPUs that are idle or busy, sharing this information to the user-space
+counter-part (via the <code>cpu_mapcpu_map</code> BPF map
+array).</p></li>
+</ul>
+<pre><code>/*
+ * Task @p starts on its selected CPU (update CPU ownership map).
+ */
+void BPF_STRUCT_OPS(rustland_running, struct task_struct *p)
+{
+        s32 cpu = scx_bpf_task_cpu(p);
+
+        dbg_msg(&#34;start: pid=%d (%s) cpu=%ld&#34;, p-&gt;pid, p-&gt;comm, cpu);
+        /*
+         * Mark the CPU as busy by setting the pid as owner (ignoring the
+         * user-space scheduler).
+         */
+        if (!is_usersched_task(p))
+                set_cpu_owner(cpu, p-&gt;pid);
+}
+
+/*
+ * Task @p stops running on its associated CPU (update CPU ownership map).
+ */
+void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
+{
+        s32 cpu = scx_bpf_task_cpu(p);
+
+        dbg_msg(&#34;stop: pid=%d (%s) cpu=%ld&#34;, p-&gt;pid, p-&gt;comm, cpu);
+        /*
+         * Mark the CPU as idle by setting the owner to 0.
+         */
+        if (!is_usersched_task(p)) {
+                set_cpu_owner(scx_bpf_task_cpu(p), 0);
+                /*
+                 * Kick the user-space scheduler immediately when a task
+                 * releases a CPU and speculate on the fact that most of the
+                 * time there is another task ready to run.
+                 */
+                set_usersched_needed();
+        }
+}</code></pre>
+<ul>
+<li>Both the <code>.stopping()</code> and <code>.update_idle()</code>
+callbacks are used as checkpoints to wake-up the user-space scheduler
+(being the scheduler a regular user-space task, it needs to implement a
+logic to schedule itself).</li>
+</ul>
+<pre><code>void BPF_STRUCT_OPS(rustland_update_idle, s32 cpu, bool idle)
+{
+        /*
+         * Don&#39;t do anything if we exit from and idle state, a CPU owner will
+         * be assigned in .running().
+         */
+        if (!idle)
+                return;
+        /*
+         * A CPU is now available, notify the user-space scheduler that tasks
+         * can be dispatched.
+         */
+        if (usersched_has_pending_tasks()) {
+                set_usersched_needed();
+                /*
+                 * Wake up the idle CPU, so that it can immediately accept
+                 * dispatched tasks.
+                 */
+                scx_bpf_kick_cpu(cpu, 0);
+        }
+}
+</code></pre>
+<p>There is also a periodic heartbeat timer that kicks the user-space
+scheduler to prevent triggering the sched-ext watchdog when the system
+is almost idle (since in this condition we won’t hit any of the wake-up
+point).</p>
+<pre><code>static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer)
+{
+        int err = 0;
+
+        /* Kick the scheduler */
+        set_usersched_needed();
+
+        /* Re-arm the timer */
+        err = bpf_timer_start(timer, NSEC_PER_SEC, 0);
+        if (err)
+                scx_bpf_error(&#34;Failed to arm stats timer&#34;);
+
+        return 0;
+}</code></pre>
+<ul>
+<li>lastly the <code>.set_cpumask()</code> is used to detect when a task
+changes its affinity; the scheduler will try to honor the affinity
+looking at the cpumask (we check the validity of the cpumask using a
+generation number, that is incremented every time the
+<code>.set_cpumask()</code> callback is executed).</li>
+</ul>
+<pre><code>void BPF_STRUCT_OPS(rustland_set_cpumask, struct task_struct *p,
+                    const struct cpumask *cpumask)
+{
+        struct task_ctx *tctx;
+
+        tctx = lookup_task_ctx(p);
+        if (!tctx)
+                return;
+        tctx-&gt;cpumask_cnt++;
+}</code></pre>
+<h2 id="user-space-component-rust">User-space component (Rust)</h2>
+<p>The user-space part is fully implemented in Rust as a regular
+user-space program. The address space is shared with the eBPF part, so
+some variables can be accessed and modified directly, while the
+communication of tasks happen using the <code>bpf()</code> syscall,
+accessing the <code>queued</code> and <code>dispatched</code> maps.</p>
+<p><strong>NOTE: we could make this part more efficient by using eBPF
+ring buffers, this would allow direct access to the maps without using a
+syscall (there’s an ongoing work on this - patches are welcome if you
+want to contribute).</strong></p>
+<p>The user-space part is made of four components:</p>
+<ul>
+<li><p><a href="https://github.com/sched-ext/scx/blob/v0.1.7/scheds/rust/scx_rustland/src/bpf.rs">eBPF
+abstraction layer</a>: this part implements some Rust abstractions to
+hide the internal eBPF details, so that the scheduler itself can be
+implemented in a more abstracted and understandable way, focusing only
+at the details of the implemented scheduling policy.</p></li>
+<li><p>A custom memory allocator <a href="https://github.com/sched-ext/scx/blob/v0.1.7/scheds/rust/scx_rustland/src/bpf/alloc.rs">RustLandAllocator</a>:
+as mentioned in the pros and cons section, if the user-space scheduler
+is blocked on a page fault, no other task can be scheduled, but we may
+need to schedule some kernel threads to resolve the page fault, hence
+the deadlock. To prevent this condition, the user-space scheduler locks
+all the memory, via <code>mlockall()</code>, and it uses a custom memory
+allocator that operates on a pre-allocated memory area. Quite tricky,
+but this allows to prevent page faults in the user-space scheduler
+task.</p></li>
+<li><p>A <a href="https://github.com/sched-ext/scx/blob/v0.1.7/scheds/rust/scx_rustland/src/topology.rs">CPU
+topology abstraction</a>: simple library to detect the current system
+CPU topology (this part will be improved in the future and moved to a
+more generic place, so that other schedulers may benefit from
+it).</p></li>
+<li><p>The <a href="https://github.com/sched-ext/scx/blob/v0.1.7/scheds/rust/scx_rustland/src/main.rs">scheduling
+policy</a> itself, implemented in a totally abstracted way: the
+scheduler uses a simple vruntime-based policy (similar to CFS) with a
+little trick to detect interactive tasks and boost their priority a
+little more (the trick is to look at the number of voluntary context
+switches to determine if a task is interactive or not: a task that
+releases the CPU without using its full assigned time slice is likely to
+be interactive).</p>
+<p>All tasks are stored in a <a href="https://github.com/sched-ext/scx/blob/v0.1.7/scheds/rust/scx_rustland/src/main.rs#L184">BTreeSet</a>
+ordered by their weighted vruntime and dispatched on the CPUs selected
+by the sched-ext built-in idle selection logic (unless their assigned
+CPU becomes busy and in this case the task will be dispatched on the
+first CPU that becomes available).</p>
+<p>For the time slice assigned to each task the scheduler uses a
+variable time slice approach: it starts with a fixed time slice (20ms),
+that is scaled down based on the amount of tasks waiting to be scheduled
+(the more the system becomes overloaded, the shorter the assigned time
+slice becomes; this can help to reduce the average wait time, making the
+system more responsive when it is overloaded).</p></li>
+</ul>
+
+<p>That’s all for now, the goal of this post (probably the first one of
+multiple series) is to give an idea how the scheduler works.</p>
+<p>The scheduler is still under development, but some early results are
+very <a href="https://www.youtube.com/watch?v=oCfVbz9jvVQ">promising</a>.</p>
+<p><strong>NOTE: keep in mind that in this video the scheduler was still
+in an early stage, since then it has been improved a lot in terms of
+stability, robustness and performance.</strong></p>
+<p>In the next post I will cover more technical details, mentioning some
+open issues and plans for future development and improvements.</p>
+<p>I’m also planning to run more benchmarks with this scheduler (using
+the <a href="https://www.phoronix-test-suite.com/">Phoronix test
+suite</a>) and share some results, so stay tuned!</p>
+
+<ul>
+<li><p><a href="https://github.com/sched-ext/sched_ext">sched-ext
+kernel</a></p></li>
+<li><p><a href="https://github.com/sched-ext/scx">sched-ext schedulers
+and tools</a></p></li>
+<li><p><a href="https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_rustland">scx_rustland
+source code</a></p></li>
+</ul>
+
+</div></div>
+  </body>
+</html>
