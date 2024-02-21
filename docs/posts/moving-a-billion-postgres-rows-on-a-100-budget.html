@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://blog.peerdb.io/moving-a-billion-postgres-rows-on-a-100-budget">Original</a>
+    <h1>Moving a billion Postgres rows on a $100 budget</h1>
+    
+    <div id="readability-page-1" class="page"><div id="post-content-parent"><div id="post-content-wrapper"><p>Inspired by the <a target="_blank" href="https://github.com/gunnarmorling/1brc">1BR Challenge</a>, I wanted to see how much it would cost to transfer 1 billion rows from Postgres to Snowflake. Moving 1 billion rows is no easy task. The process involves not just the transfer of data but ensuring its integrity, error recovery and consistency post-migration.</p>
+<p>Central to this task is the selection of tools and techniques. We will discuss the use of open-source tools, customized scripts, ways to read data from Postgres, and Snowflake’s data loading capabilities. Key aspects like parallel processing, efficiently reading Postgres’ <a target="_blank" href="https://www.postgresql.org/docs/current/wal-intro.html">WAL</a>, data compression and incremental batch loading on Snowflake will be highlighted.</p>
+<p>I will list and discuss some of the optimizations that are implemented to minimize compute, network, and warehouse costs. Additionally, I will highlight some of the trade-offs made as part of this process. Given that most of the approaches covered in this blog stem from my explorations at <a target="_blank" href="https://github.com/PeerDB-io/peerdb">PeerDB</a> aimed at enhancing our product – The task was accomplished primarily through <a target="_blank" href="https://www.peerdb.io/">PeerDB</a>.</p>
+<p>I want to make it clear that there are some feature gaps in comparison to a mature system, and it might not be practical for all use cases. However, it does handle the most common use cases effectively while significantly reducing costs. I also want to caveat that there might be some ways in which the estimations may be off and I’d be happy to adjust based on feedback.</p>
+
+<ul>
+<li><p><strong>Initial data load:</strong> We will consider that there are 300M rows already in the table at the start of the task, and our system should handle the initial load of all the rows.</p>
+</li>
+<li><p><strong>Inserts, Updates and Deletes (Change Data Capture):</strong> The rest of the 700M rows will be a combination of inserts, updates and deletes. <a target="_blank" href="https://wiki.postgresql.org/wiki/TOAST">Including support for toast columns</a>.</p>
+<ul>
+<li>1024 rows changed per second for ~8 days.</li>
+</ul>
+</li>
+<li><p><strong>Recoverability:</strong> We will reboot the system every 30 mins to ensure that it&#39;s robust and can recover from disasters.</p>
+</li>
+</ul>
+<p>Now let us walk through an engineering design that optimally handles the above workload with the objective of <strong>minimizing costs</strong> and <strong>improving performance</strong>, one step at a time.</p>
+
+<p>Let’s start with the first operation any data sync job has to do: load the initial set of data from the source to destination. There are a few challenges that come with this:</p>
+<ol>
+<li><p>How to efficiently retrieve large amounts of data from Postgres?</p>
+</li>
+<li><p>How to process the data in a way where we have minimal cost foot-print?</p>
+</li>
+<li><p>How to efficiently load this data to Snowflake?</p>
+</li>
+</ol>
+<h2 id="heading-optimal-data-retrieval-from-postgres">Optimal Data retrieval from Postgres</h2>
+<p>Reading a table sequentially from Postgres is slow. It would take a long time to read 300M rows from Postgres. To make this process more efficient, <a target="_blank" href="https://duckdb.org/2022/09/30/postgres-scanner.html#parallelization">we have to parallelize</a>. We&#39;ve got a clever way to quickly read parts of a table in Postgres using something called the TID Scan, which is a bit of a hidden gem. Basically, it lets us pick out specific chunks of data as stored on disk, identified by their <a target="_blank" href="https://www.postgresql.org/docs/current/ddl-system-columns.html#id-1.5.4.7.4.6.2.1">Tuple IDs</a> (CTIDs), which look like <code>(page, tuple)</code>. This optimizes IO utilization and is super handy for reading big tables efficiently.</p>
+<p>Here&#39;s how we do it: we divide the table into partitions based on the pages of the database, and each partition gets its own scan task. Each task handles about 500K rows. So, we partition the table into CTID ranges, with each partition having ~500K rows, and we process each partition parallelly (16 partitions at a time).</p>
+<pre><code><span>SELECT</span> <span>count</span>(*) <span>FROM</span> public.challenge_1br; 
+
+
+
+<span>SELECT</span> <span>bucket</span>, <span>MIN</span>(ctid) <span>AS</span> <span>start</span>, <span>MAX</span>(ctid) <span>AS</span> <span>end</span>
+<span>FROM</span> (
+    <span>SELECT</span> NTILE(<span>1000</span>) <span>OVER</span> (<span>ORDER</span> <span>BY</span> ctid) <span>AS</span> <span>bucket</span>, ctid 
+  <span>FROM</span> public.challenge_1br
+) subquery
+<span>GROUP</span> <span>BY</span> <span>bucket</span> <span>ORDER</span> <span>BY</span> <span>start</span>;
+</code></pre>
+<p><img loading="lazy" src="https://lh7-us.googleusercontent.com/qo41LQQwhVKZT9mWROXxYWr-eKYUu2_EcJ9Elcn49Mfk-vpuIBvz54sBmxWr7W2Z0quqiujKPkQWA3omYn_VGaYf8MWJDVNx4EzcGYFWa4ofE-zMfU9k6U76ZcBsZe5A4o0Tkf3p978w9bpqnN_3MkI" alt=""/></p>
+<h2 id="heading-data-in-transit">Data in Transit</h2>
+<p>It is important to process the data in a way where we don’t overload the system. As we are operating under budget constraints, we need to use techniques that use the hardware effectively. We are going to be using the “<a target="_blank" href="https://twitter.com/garybernhardt/status/600783770925420546?s=20">your dataset fits in RAM</a>&#39;&#39; paradigm of systems design. 300M rows for initial load does sound like a lot, but let&#39;s see how we can make it fit in our RAM. We need to process the data to ensure <a target="_blank" href="https://blog.peerdb.io/role-of-data-type-mapping-in-database-replication">data-types are mapped correctly to the destination</a>. We are going to convert the query results to <a target="_blank" href="https://avro.apache.org/docs/1.11.0/index.html">Avro</a> for faster loading into warehouses, and also <a target="_blank" href="https://avro.apache.org/docs/1.11.0/spec.html#Logical+Types">for its logical type support</a>.</p>
+<h3 id="heading-how-big-is-the-data">How big is the data?</h3>
+<p>Let us take a little detour to explore how big the data is. This is a good chance to look at some real world examples to estimate things. Based on interacting with a lot of production customers, and talking to some experts, it’s safe to say that on an average we see ~15 columns per table. In our table, let’s say each row is ~512 bytes.</p>
+<pre><code>
+num_rows = <span>300</span>_000_000
+bytes_per_row = <span>512</span>
+total_num_bytes = num_rows * bytes_per_row
+total_size_gb = total_num_bytes / <span>1</span>_000_000_000
+
+
+
+
+num_rows_per_partition = <span>500</span>_000
+mb_per_partition = num_rows_per_partition * bytes_per_row / <span>1</span>_000_000 
+num_partitions_in_parallel = <span>16</span>
+required_memory = num_partitions_in_parallel * mb_per_partition 
+</code></pre>
+<h3 id="heading-required-memory">Required Memory</h3>
+<p>Based on the above napkin math, we can see that with 4GB of RAM we should be able to do the initial load. We will allocate 8GB of RAM to account for other components.</p>
+<h2 id="heading-efficiently-loading-data-into-snowflake">Efficiently loading data into Snowflake</h2>
+<p>As mentioned earlier we are going to store the query results into Avro on-disk. We are further going to compress the Avro files using <a target="_blank" href="https://github.com/facebook/zstd">zstd</a> to further reduce the disk footprint and also to save on network costs. We will take a slight deviation from the topic to talk about Bandwidth costs.</p>
+<h3 id="heading-bandwidth-costs-they-can-break-the-bank">Bandwidth costs: They can break the bank!</h3>
+<p>Let&#39;s look at the network costs, you can see the variance in numbers.</p>
+<p>It’s interesting to see the variance in the costs, so it’s best to have Postgres, our System and Snowflake in the same cloud provider and the same region. Let’s now calculate the networks costs needed for this workload.</p>
+<h3 id="heading-calculating-network-costs">Calculating Network Costs</h3>
+<p>Another thing to be wary of is the Warehouse configuration.</p>
+<pre><code>bytes_per_row = <span>512</span>
+num_rows = <span>1</span>_000_000_000
+total_data_size = <span>512</span>GB
+compressed_data_size_GB = <span>256</span> 
+bandwidth_cost_per_10GB = $<span>0.1</span>
+
+
+
+network_costs_egress_from_postgres = $<span>5</span>
+
+network_costs_egress_from_system_to_snowflake = $<span>2.56</span> 
+
+network_costs = $<span>7.56</span>
+</code></pre>
+<h3 id="heading-snowflake-warehouse-configuration">Snowflake Warehouse Configuration</h3>
+<p>In many organizations, a significant portion of Snowflake expenses comes from compute usage, particularly when warehouses run idle between tasks. Snowflake&#39;s compute costs are accrued based on warehouse operational time, starting from activation to suspension. Often, idle warehouse time can contribute to 10%-25% of the total Snowflake compute costs. The Baselit team wrote an excellent blog about it: <a target="_blank" href="https://baselit.ai/blogs/fastest-way-save-snowflake">read more about it here</a>.</p>
+<p>The two things we will be doing is to set <code>AUTO_SUSPEND</code> to be 60 seconds, a warehouse idles for up to a minute after the last query before pausing, and make sure that we keep the warehouse active for the least amount of time. This is the default configuration you get if you follow the <a target="_blank" href="https://docs.peerdb.io/connect/snowflake">PeerDB Snowflake setup guide</a>.</p>
+<h2 id="heading-inserts-updates-and-deletes">Inserts, Updates and Deletes</h2>
+<p>The next challenge for us after the initial load would be to read the change data from Postgres and replaying that to Snowflake. We are going to be doing that using Postgres’ Logical Replication. At the start of the replication, we will create a replication slot and use <a target="_blank" href="https://www.postgresql.org/docs/current/logical-replication-architecture.html">pgoutput</a> plugin. This is the recommended way to read changes from the slot. Once we read the changes from the slot, we will batch them and then load them to Snowflake.</p>
+<p>As we discussed earlier, it is important to keep the Snowflake warehouse idle for as long as we can, and batching helps with that. We store records in batches of 1M to Avro like before, and load them to an <a target="_blank" href="https://docs.snowflake.com/en/user-guide/data-load-local-file-system-create-stage">internal stage</a> in Snowflake. Once the data is loaded into the stage, we will <a target="_blank" href="https://docs.snowflake.com/en/sql-reference/sql/merge">MERGE</a> the records from the stage into the destination table. This way most of the heavy-lifting of the resolution is left to the warehouse and it simplifies our system.</p>
+
+<p>At <a target="_blank" href="https://www.peerdb.io/">PeerDB</a>, we are building a specialized data-movement tool for Postgres with laser focus on Postgres to Data Warehouse replication. Most of the above optimizations incl. <a target="_blank" href="https://blog.peerdb.io/parallelized-initial-load-for-cdc-based-streaming-from-postgres">parallel initial load</a>, <a target="_blank" href="https://blog.peerdb.io/reducing-bigquery-costs-by-260x">reducing Data Warehouse costs</a>, <a target="_blank" href="https://blog.peerdb.io/role-of-data-type-mapping-in-database-replication">native data-type mapping</a>, <a target="_blank" href="https://github.com/PeerDB-io/peerdb/pull/111">support of TOAST columns</a>, <a target="_blank" href="https://blog.peerdb.io/using-temporal-to-scale-data-synchronization-at-peerdb">fault-tolerance and auto recovery</a> etc. are already baked into the product. PeerDB is also <a target="_blank" href="https://github.com/PeerDB-io/peerdb">Free and Open</a>. So we chose PeerDB to implement the above workload.</p>
+<h2 id="heading-hardware">Hardware</h2>
+<p>Now that we have landed on 8GB RAM, let us move onto picking the instance type.</p>
+<p>Since ARM uses lower energy compared to x64 (due to being RISC), they are around 25% cheaper as compared to x64 machines. The tradeoff here is that x64 machines run at around 2.9GHz with a 3.5GHz Turbo (M6i instances) as compared to ARM machines at about 2.5GHz (Graviton2 - M6g) but M6i instances are about 30% more expensive as compared to M6g instances.</p>
+<p>Effective cost is $0.0409/GHz for x64 vs $0.03616/GHz for ARM, so cost is about 13% more per GHz on x64 <strong>But cost per GHz is not the determining factor for reading in a single thread from Postres during CDC as replication slots can be read from a single process at once.</strong></p>
+<p>For this current experiment, I went with <code>m6gd.large</code> as it offers a good balance of speed and disk.</p>
+<p><strong>Optional read:</strong> In this blog we will use AWS for our analysis. However, here are some other learnings we had on this topic. OVH Cloud currently <a target="_blank" href="https://github.com/ovh/public-cloud-roadmap/issues/343">does not support ARM</a> Instances and has a similar $0.118/hour <code>c2-7</code> instance (in limited regions) which has a <a target="_blank" href="https://www.ovhcloud.com/asia/public-cloud/prices/#410">very low network speed</a> (250MBps) with 50GB of SSD. <a target="_blank" href="https://www.hetzner.com/cloud/">Hetzner</a> has a <code>CCX13</code> $0.0292/hour instance (including a 118GB SSD) but no dedicated ARM instances.</p>
+<p><img loading="lazy" src="https://lh7-us.googleusercontent.com/Mmy4pyDQ_qnBrX7PJH830MLgSj0s4u1UOZOzMhlr32YrA8ewQzEMOCkk6e3bXkgeVYfwVYrLt_Ofs6YENVIos5N_daFgBp2t6KZ59n9X2EWvwJWmVsCmAU82yyHzAxQuc0BX7ccGmpZqpdsEszTO4lU" alt=""/></p>
+
+<p>One question that I&#39;m often posed with: <strong>“Is this practical?”</strong>. Yes, one machine can die, but systems where there is only one machine have a <a target="_blank" href="https://twitter.com/danluu/status/1586180166631706624?s=20">remarkable amount of uptime</a>, especially when the state is stored in a durable way.</p>
+<p>Back to the topic at hand. If we look at the total cost of the system we built (assuming <code>us-west-2</code> as the region. Over a month time this is the breakdown:</p>
+<div>
+<table>
+<thead>
+<tr>
+<td>Cost Category</td><td>Cost</td><td>Comment</td></tr>
+</thead>
+<tbody>
+<tr>
+<td>Hardware</td><td>$65.992 / month</td><td>AWS m6gd.large (2 vcpus, 8 GB RAM)</td></tr>
+<tr>
+<td>Comes with 118 GB NVMe which is great!</td><td></td><td></td></tr>
+<tr>
+<td>Network</td><td>$7.56</td><td>AWS network transfer same region 500 GB (with compression)</td></tr>
+<tr>
+<td>Warehouse</td><td>N/A</td><td>These are common across various vendors</td></tr>
+<tr>
+<td><strong>Total</strong></td><td><strong>$73.552</strong></td><td><strong>Hardware Costs + Network costs = $65.992 + $7.56 = $73.552 (Within $100 budget)</strong></td></tr>
+</tbody>
+</table>
+</div><p>If we were to look at various ETL tools and how much they charge for moving 1 billion rows, this is what it comes out to:</p>
+<div>
+<table>
+<thead>
+<tr>
+<td><strong>Vendor</strong></td><td><strong>Cost per 1 billion records</strong></td></tr>
+</thead>
+<tbody>
+<tr>
+<td>Fivetran</td><td>$23,157.89</td></tr>
+<tr>
+<td>Airbyte</td><td>$11,760.00</td></tr>
+<tr>
+<td>Stitch Data</td><td>$4,166.67</td></tr>
+<tr>
+<td>Above Approach (using <a target="_blank" href="https://github.com/PeerDB-io/peerdb">PeerDB OSS</a>)</td><td>$73.552</td></tr>
+</tbody>
+</table>
+</div><p>I am part of a company building a software for moving data specifically from Postgres to Data warehouses. It&#39;s my job to figure out how to provide the best experience to our customers. Doing this project forced me to figure out a way to provide the best bang for buck, and to include a lot of the explored features <a target="_blank" href="https://www.peerdb.io/">into PeerDB</a>. I hope it conveys some appreciation for what modern hardware is capable of, and how much you can get out of it.</p>
+</div></div></div>
+  </body>
+</html>
