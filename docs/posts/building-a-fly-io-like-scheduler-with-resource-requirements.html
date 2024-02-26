@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.aspiring.dev/fly-io-scheduler-part-2/">Original</a>
+    <h1>Building a Fly.io-like scheduler with resource requirements</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+
+    <article>
+
+        <header>
+
+            
+
+            <div>
+                <p><a href="https://www.aspiring.dev/author/dan/">
+                                <img src="https://www.aspiring.dev/content/images/size/w160/2024/02/dalle.jpg" alt="Dan Goodman"/>
+                            </a>
+                </p>
+                <div>
+                    
+                    <p><time datetime="2024-02-25">Feb 25, 2024</time>
+                            <span><span>—</span> 6 min read</span>
+                    </p>
+                </div>
+            </div>
+
+            
+        </header>
+
+        <section>
+            <p>In our the last post, we built a simple coordinator and a worker that could increment a number from a client request. That simple example introduced us to scheduling tasks on workers from a compute cluster in the same style that <a href="https://fly.io/?ref=aspiring.dev" rel="noopener noreferrer nofollow">fly.io</a> uses to schedule machines on their compute nodes.</p><p>But our example was really simple, workers were only available or unavailable based on whether they were already executing a task. In reality workers would have more constraints to consider like available resources (CPU, Memory, GPU, Disk), locality (cloud region), and architecture (arm, x86).</p><p>In this post, we’ll build on our previous coordinator and worker to support specifying workload locality, and how many “slots” (arbitrary compute unit) a task takes. Workers will then only be able to schedule workloads if they meet all requested conditions for an incoming scheduling request.</p><p>All code can be found on <a href="https://github.com/danthegoodman1/ComputeSchedulerPost/?ref=aspiring.dev" rel="noopener noreferrer nofollow">Github</a>.</p><h2 id="understanding-requirements">Understanding requirements</h2><p>When our coordinator broadcasts a task scheduling request, we’ll now include some requirements:</p><figure><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb3225257-f483-4141-9319-73ef1d3852b0_1686x1206.png" alt="" loading="lazy" width="1456" height="1041"/></figure><p>Workers comparse these requirements and respond if they can fulfill the request:</p><figure><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4b41091a-10b2-4c87-b073-85cd16070366_1894x1288.png" alt="" loading="lazy" width="1456" height="990"/></figure><p>When a worker node can’t fulfill a request, it just ignores it.</p><p>This allows us to send out scheduling requests that meet our criteria, either from the client themselves, or our own.</p><h2 id="adding-task-requirements">Adding task requirements</h2><p>The first thing we need to do is add support for different kinds of requirements: Region and Slots as mentioned before.</p><pre><code>type (
+	Requirements struct {
+		Region string
+
+		// Arbitrary compute unit
+		Slots int64 `validate:&#34;required,gte=1&#34;`
+	}
+
+	ScheduleRequest struct {
+		RequestID    string
+		Task         string
+		Requirements Requirements
+	}
+)</code></pre><p>The coordinator will be aware of all possible requirements, so they can be validated and have any defaults set.</p><p>Worker nodes will handle only known resource requirements, and if they come across a requirement they don’t know about, they immediately determine they can’t fulfill the request.</p><p>That will enable us to add new requirements in the future, like GPU and architecture, without having to update all workers.</p><p>Our previous code already included the requirements in the scheduling request emitted to workers, so now we need to add support for the requirements.</p><p>We’ll add some support for new worker configuration options:</p><pre><code>var (
+	REGION    = os.Getenv(&#34;REGION&#34;)
+	SLOTS     = GetEnvOrDefaultInt(&#34;SLOTS&#34;, 10)
+)</code></pre><p>Then, when handling a scheduling request on the worker, we can add support for keeping track of the current number of available slots, and checking we if we fulfill a scheduling request.</p><p>We start by keeping track of resources, and make sure we are able to release them:</p><pre><code>func startWorkerNode(nc *nats.Conn) {
+	logger.Debug().Msgf(&#34;starting worker node %s with slots %d&#34;, utils.WORKER_ID, utils.SLOTS)
+
+	availableSlots := atomic.NewInt64(utils.SLOTS)
+
+	// We need a sync map to track reservations
+	reservations := sync.Map{}
+
+	releaseResources := func(requestID string) {
+		slots, found := reservations.LoadAndDelete(requestID)
+		if !found {
+			// We didn&#39;t even have it, ignore
+			return
+		}
+		availableSlots.Add(slots.(int64))
+		logger.Debug().Msgf(&#34;worker %s released resources&#34;, utils.WORKER_ID)
+	}</code></pre><p>We then check to make sure that our region matches the region of the request. We’ll also allow a request that doesn’t specify a region to be answered by any node:</p><pre><code>// Scheduling loop
+_, err := nc.Subscribe(&#34;scheduling.request.*&#34;, func(msg *nats.Msg) {
+    logger.Debug().Msgf(&#34;Worker %s got scheduling request, reserving resources&#34;, utils.WORKER_ID)
+    var request scheduling.ScheduleRequest
+    utils.JSONMustUnmarshal(msg.Data, &amp;request)
+
+    // Check whether the region matches (if provided)
+    if request.Requirements.Region != &#34;&#34; &amp;&amp; request.Requirements.Region != utils.REGION {
+        logger.Debug().Msgf(
+            &#34;worker %s cannot fulfill request, different region&#34;,
+            utils.WORKER_ID,
+        )
+        return
+    }
+
+    // Check whether we have enough available slots
+    if request.Requirements.Slots &gt; availableSlots.Load() {
+        logger.Debug().Msgf(
+            &#34;worker %s cannot fulfill request, not enough slots&#34;,
+            utils.WORKER_ID,
+        )
+        return
+    }
+
+    // Reserve the slots
+    // Note: would need better handling to protect against going negative in prod
+    availableSlots.Sub(request.Requirements.Slots)
+    reservations.Store(request.RequestID, request.Requirements.Slots)</code></pre><p>If we match a region, and have enough slots, we’ll then respond that are able to take the task as usual.</p><p>We’ll also release the resource reservations when we get a release message, but now we check the request ID from the reservations map:</p><pre><code>// Release loop
+_, err = nc.Subscribe(&#34;scheduling.release&#34;, func(msg *nats.Msg) {
+    var payload scheduling.ReleaseResourcesMessage
+    utils.JSONMustUnmarshal(msg.Data, &amp;payload)
+    if payload.ExemptWorker == utils.WORKER_ID {
+        // We are exempt from this
+        return
+    }
+
+    releaseResources(payload.RequestID)
+
+    logger.Debug().Msgf(&#34;Worker %s releasing resources&#34;, utils.WORKER_ID)
+})</code></pre><p>We’ll also release them when we complete a task:</p><pre><code>_, err = nc.Subscribe(fmt.Sprintf(&#34;scheduling.reserve_task.%s&#34;, utils.WORKER_ID), func(msg *nats.Msg) {
+    // Listen for our own reservations
+    
+    // ... code
+
+    // we are done, we can release resources
+    releaseResources(reservation.RequestID)
+})</code></pre><h2 id="testing-our-new-requirements">Testing our new requirements</h2><p>We can simply define our two workers to be in two different virtual regions, but since incrementing a number is so fast we’ll have a hard time simulating unavailable slots between requests.</p><p>To solve this, we’ll add a `SleepSec` property to our payload, and if that exists we’ll sleep for that many seconds before completing the task:</p><pre><code>if sleepSec, ok := reservation.Payload[&#34;SleepSec&#34;].(float64); ok {
+    logger.Debug().Msgf(
+        &#34;worker %s sleeping for %f seconds&#34;,
+        utils.WORKER_ID,
+        sleepSec,
+    )
+    time.Sleep(time.Second * time.Duration(sleepSec))
+}</code></pre><p>Now, we can try it out!</p><p>After getting NATs running again with</p><pre><code>docker-compose up -d</code></pre><p>we’ll get our coordinator running in one terminal:</p><pre><code>go run . coordinator</code></pre><p>And in another two terminals, start two workers in different regions (we’ll leave the default 10 slots)</p><pre><code>WORKER_ID=a REGION=us-east go run . worker</code></pre><pre><code>WORKER_ID=b REGION=us-west go run . worker</code></pre><p>Then, we can submit a request to schedule:</p><pre><code>curl -d &#39;{
+  &#34;Task&#34;: &#34;increment&#34;,
+  &#34;Payload&#34;: {
+    &#34;Num&#34;: 1
+  },
+  &#34;Requirements&#34;: {
+    &#34;Slots&#34;: 5
+  }
+}&#39; -H &#39;Content-Type: application/json&#39; http://localhost:8080/schedule</code></pre><p>Just as before, this randomly selects a node and schedules on it:</p><pre><code>&gt; Worker b got scheduling request, reserving resources
+&gt; Got reservation on worker node b with payload {Task:increment Payload:map[Num:1] RequestID:123b6d38-1e44-4dd2-8465-371b3a3222db}</code></pre><p>We can now add a region requirement to the request to see that it now only ever gets scheduled on a specific node:</p><pre><code>curl -d &#39;{
+  &#34;Task&#34;: &#34;increment&#34;,
+  &#34;Payload&#34;: {
+    &#34;Num&#34;: 1
+  },
+  &#34;Requirements&#34;: {
+    &#34;Slots&#34;: 5,
+    &#34;Region&#34;: &#34;us-east&#34;
+  }
+}&#39; -H &#39;Content-Type: application/json&#39; http://localhost:8080/schedule</code></pre><p>No matter what, worker b will never schedule this request:</p><pre><code>&gt; Worker b got scheduling request, reserving resources
+&gt; worker b cannot fulfill request, different region</code></pre><p>And worker a will always get it:</p><pre><code>&gt; Worker a got scheduling request, reserving resources
+&gt; Got reservation on worker node a with payload {Task
+94-cd738a1ceaad}
+
+# task completion
+&gt; worker a released resources</code></pre><p>To test running out of slots, we can increase the slots requirement, and add a sleep:</p><pre><code>curl -d &#39;{
+  &#34;Task&#34;: &#34;increment&#34;,
+  &#34;Payload&#34;: {
+    &#34;Num&#34;: 1,
+    &#34;SleepSec&#34;: 4
+  },
+  &#34;Requirements&#34;: {
+    &#34;Slots&#34;: 8,
+    &#34;Region&#34;: &#34;us-east&#34;
+  }
+}&#39; -H &#39;Content-Type: application/json&#39; http://localhost:8080/schedule</code></pre><pre><code>&gt; Worker a got scheduling request, reserving resources
+&gt; worker a sleeping for 4.000000 seconds
+
+# another request:
+&gt; Worker a got scheduling request, reserving resources
+&gt; worker a cannot fulfill request, not enough slots</code></pre><p>If we take out the region requirement, we can see that the second request will now schedule on the other node:</p><pre><code>&gt; Worker a got scheduling request, reserving resources
+&gt; worker a sleeping for 4.000000 seconds
+
+# another request:
+&gt; Worker b got scheduling request, reserving resources
+&gt; worker b sleeping for 4.000000 seconds</code></pre><p>We’ve now successfully added requirements to our tasks so that they can only schedule in specific regions, and when enough resources (Slots) are available on a given node.</p><p>This system can be extended to many more kinds of requirements, a short list could be:</p><ul><li>CPU arch (x86 vs arm)</li><li>GPU support (for AI inference scheduling)</li><li>Available CPU, Memory, or Disk</li><li>Physical hardware (a robot in a factory, a drone, IoT device)</li></ul><p>I also emphasize that there is a lot of “production readiness” missing from this system, and this guide is just to serve as a reference. A few things that are missing:</p><ol><li>Timeouts for temporary resource reservations (e.g. what happens if we never get a release?)</li><li>Proper error handling</li><li>Proper draining and unsubscribing of topics</li></ol><p>That wraps up this post series for now!</p><p>Maybe I’ll add a third part in the future extending the functionality even further, or build some projects off this concept (like extending <a href="https://github.com/danthegoodman1/StableInterfaces?ref=aspiring.dev" rel="noopener noreferrer nofollow">StableInterfaces</a> to run on these kinds of hosts for a better DX).</p><p>Here are some more resources if you’re curious:</p><ul><li><a href="https://github.com/danthegoodman1/ComputeSchedulerPost?ref=aspiring.dev" rel="noopener noreferrer nofollow">The Github repo for this post series</a></li><li><a href="https://plane.dev/?ref=aspiring.dev" rel="noopener noreferrer nofollow">Plane.dev</a> - a sort of open source fly.io on your own infrastructure, using similar scheduling techniques</li><li><a href="https://fly.io/blog/carving-the-scheduler-out-of-our-orchestrator/?ref=aspiring.dev" rel="noopener noreferrer nofollow">The original fly.io artcile on their scheduler</a></li></ul><h2 id="discuss-this-post">Discuss this post!</h2><p>Check out this post on <a href="https://news.ycombinator.com/item?id=39500397&amp;ref=aspiring.dev">HackerNews</a> and <a href="https://lobste.rs/s/9t2wvy/building_fly_io_like_scheduler_with?ref=aspiring.dev">Lobste.rs</a>!</p>
+        </section>
+
+    </article>
+
+
+</div></div>
+  </body>
+</html>
