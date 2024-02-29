@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://ferrous-systems.com/blog/lock-free-ring-buffer/">Original</a>
+    <h1>A lock-free ring-buffer with contiguous reservations (2019)</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        <p>This is the story of how <a href="https://twitter.com/utaal">Andrea Lattuada</a> (PhD student at ETH Zurich) and <a href="https://twitter.com/bitshiftmask">James Munns</a> (from Ferrous Systems) designed and implemented (two versions!) of an high-perf lock-free ring-buffer for cross-thread communication. If any of those words look scary to you, don&#39;t fret, we&#39;ll explain everything from the basics.</p>
+
+<p><em>This post is cross-posted on Andrea Lattuada&#39;s <a href="http://andrea.lattuada.me/blog/2019/the-design-and-implementation-of-a-lock-free-ring-buffer-with-contiguous-reservations.html">blog</a>.</em></p>
+
+<p>This post is for you if you&#39;re interested in (safe!) concurrency, systems programming, and cool ways to write efficient systems software. If you&#39;ve never written a thread-safe data structure, this post may be a great way to get started!</p>
+
+<h2 id="circular-buffers">Circular buffers</h2>
+
+<p>A <a href="https://www.codeproject.com/Articles/3479/The-Bip-Buffer-The-Circular-Buffer-with-a-Twist"><em>BipBuffer</em></a> is a bi-partite circular buffer that always supports writing a contiguous chunk of data, instead of potentially splitting a write in two chunks when it straddles the buffer&#39;s boundaries.</p>
+
+<p>Circular buffers are a common primitive for asynchronous (inter- or intra- thread) communication. Let&#39;s start with a very abstract, idealised view of the circular buffer interface, and then consider real-world constraints one by one, till we get to the <em>BipBuffer</em> design.</p>
+
+<h3 id="an-idealised-infinite-buffer">An idealised infinite buffer</h3>
+
+<p>A writer (producer) and a reader (consumer) want to communicate, and have access to the same, contiguous, and infinite array. They both keep a bookmark of which part of the array they&#39;ve (respectively) written and read. They start with these <code>write</code> and <code>read</code> pointers aligned.</p>
+
+<p>When the writer wants to send data, it appends it after the <code>write</code> pointer and then moves the pointer to the end of the newly written chunk. The reader inspects the <code>write</code> pointer at its leisure (asynchronously). When the <code>write</code> pointer has advanced further than the <code>read</code> pointer, the reader can consume and act on the available data. Once that&#39;s done, it moves the <code>read</code> pointer forwards to keep track of which part of the buffer it has already processed.</p>
+
+<p><img src="https://i.imgur.com/jncR6qd.png" alt=""/></p>
+
+<p>The reader will never attempt to read past the <code>write</code> pointer, because there&#39;s no guarantee there&#39;s valid data there (i.e. that the writer has put anything there). This also means that the <code>read</code> pointer can never overtake <code>write</code>. For now, we&#39;re assuming an ideal memory system that&#39;s always coherent and where writes are visible immediately and sequentially.</p>
+
+<h3 id="a-bounded-circular-buffer">A bounded circular buffer</h3>
+
+<p>Computers don&#39;t have magic infinite buffers. We have to allocate a finite amount of memory to use for potentially infinite communication between the writer and reader. In a circular buffer, the <code>write</code> pointer can wrap around the boundaries of the buffer when it reaches the end.</p>
+
+<p>When new data arrives and the <code>write</code> pointer is close to the end, it splits the write in two chunks: one for the remaining buffer space at the end, and one for the remaining data at the beginning. Note that, if the <code>read</code> pointer is still close to the beginning, this has the potential of clobbering data that hasn&#39;t yet been processed by the reader. For this reason, the <code>write</code> pointer is not allowed to overtake <code>read</code> after it has wrapped around.</p>
+
+<p><img src="https://i.imgur.com/zfwNfD0.png" alt=""/></p>
+
+<p>We end up with two possible memory configurations:</p>
+
+<ol>
+  <li><code>write</code> leads and <code>read</code> follows (<code>write</code> ≥ <code>read</code>), the valid data (written, but not yet processed by the reader) is in the section of the buffer after <code>read</code> and before <code>write</code>;</li>
+  <li><code>read</code> leads and <code>write</code> follows (<code>read</code> &gt; <code>write</code>), the valid data is after <code>read</code>, till the end, and from the start of the buffer till <code>write</code>.</li>
+</ol>
+
+<p>Note that we disallow <code>read</code> == <code>write</code> in the second case, as this would be ambiguous: while <code>read</code> can catch up to <code>write</code>, after a wraparound <code>write</code> has to stay one step behind <code>read</code> to indicate that we&#39;re in case 2 instead of case 1.</p>
+
+<p>We repeatedly move from configuration 1 to 2, then back to 1: when <code>read</code> reaches the end of the buffer, it can also wrap around to continue reading at the start.</p>
+
+<h3 id="contiguous-writesreads">Contiguous writes/reads</h3>
+
+<p>This is all great, but what if we have chunks of data that should remain contiguous in memory when written to the buffer? Look here, there&#39;s a new message to be written, but it doesn&#39;t fit in the remaining buffer space after <code>write</code>.</p>
+
+<p><img src="https://i.imgur.com/szHSC8M.png" alt=""/></p>
+
+<p>If, for whatever reason, we aren&#39;t allowed to split this write in two, we&#39;re stuck. Maybe we can just wait for <code>read</code> to move forwards, and place our new data in a single chunk at the start of the buffer? Well, in fact, yea. But there&#39;s a caveat.</p>
+
+<p><img src="https://i.imgur.com/Lb8C3sq.png" alt=""/></p>
+
+<p>We&#39;ve broken the property in configuration 2 earlier: there&#39;s a section of the buffer that&#39;s between <code>read</code> and the end of the buffer, but doesn&#39;t contain any valid data. If we didn&#39;t do anything about it, the reader would keep consuming data, moving <code>read</code> forwards, and it would be oblivious to the fact that at some point it would be reading a section of the buffer that doesn&#39;t contain any valid information.</p>
+
+<h2 id="a-hardware-interlude">A Hardware Interlude</h2>
+
+<p>Previously we asked:</p>
+
+<blockquote>
+  <p>What if we have chunks of data that should remain contiguous in memory when written to the buffer?</p>
+</blockquote>
+
+<p>But when would we actually require that data be read or written to in a contiguous manner?</p>
+
+<h3 id="dma---direct-memory-access">DMA - Direct Memory Access</h3>
+
+<p>In embedded microcontroller systems, it is common to have a single core CPU. Instead of having multiple cores, they have a set of features referred to as Memory Mapped Peripherals. These Peripherals act as hardware accelerators for specific behaviors, such as sending or receiving data from a serial port.</p>
+
+<p>In order to minimize the amount of time necessary for the CPU to manually copy data from one place to another, these Peripherals can be configured to perform an action completely autonomously, streaming data to or from a section of memory on the CPU. This action of the hardware directly reading from or writing to the memory is called DMA, or Direct Memory Access.</p>
+
+<p>Instead of reading or writing one byte at a time to the Serial Port, the CPU can instead start the transfer, and when it is complete, process a chunk of bytes at a time. This allows for less time waiting, and is generally a more efficient method of processing data.</p>
+
+<p>A typical usage of DMA (called a DMA transaction) looks like this:</p>
+
+<ol>
+  <li>The CPU allocates N bytes of memory to be used for DMA</li>
+  <li>The CPU instructs the peripheral, such as a serial port, to receive N bytes of data, and to place those bytes in the memory allocated in step 1</li>
+  <li>Once the peripheral is configured, the CPU resumes performing other actions, and the Serial Port begins filling data into the memory buffer as it is received</li>
+  <li>When the Serial Port has received all N bytes requested, it notifies the CPU, and stops receiving data</li>
+  <li>The CPU may now process all N bytes requested, and if necessary, repeat the process at step one</li>
+</ol>
+
+<p>Although we often only have one CPU core in most microcontrollers, we can think of these DMA actors as their own thread. They are able to operate independently of the main CPU&#39;s actions, and read and write memory based on their own needs. In these microcontroller systems, there can be tens or hundreds of these hardware actors, all operating in parallel!</p>
+
+<h3 id="stackless-operation">Stackless Operation</h3>
+
+<p>In step one of DMA procedure above, we talked about allocating N bytes of memory. On a non-embedded system, this would generally be done by allocating space on the heap - a <code>Box</code> in Rust, or using <code>malloc()</code> in C. In lightweight or timing critical embedded systems, it is uncommon to have a heap. Instead, all memory must be statically allocated, or allocated through the use of the stack.</p>
+
+<p>In these systems, data structures such as Circular Buffers are used to work around these limitations. A fixed amount of space is reserved for use, and a dynamic amount of data within a fixed maximum region is used to simulate a dynamic memory region.</p>
+
+<p>Unfortunately, these DMA transactions do not understand the concept of a circular buffer. They are only aware of a pointer to where the memory region starts, and how many bytes to use from the starting pointer. This means that a normal circular buffer where the data region could wrap around would not work for DMA transfers.</p>
+
+<h3 id="but-why-is-dma-so-important">But why is DMA so important?</h3>
+
+<p>For operations used with DMA, the speed at which bytes are transferred is often many orders of magnitude slower than the operation of the CPU itself. For a 32 bit ARM CPU, copying 4 bytes from RAM takes a single cycle. In a 64MHz CPU, this means it will take 15.6 nanoseconds to copy these four bytes.</p>
+
+<p>A typical serial port configuration is &#34;115200 8N1&#34;, which means 115,200 baud (or raw bits on the wire per second), with no parity, and 1 stop bit. This means that for every data byte sent, there will be 8 data bits, 1 unused parity bit, and 1 stop bit, to signal the end of the byte, sent over the wire.</p>
+
+<p>This means that we will need 40 bits on the wire to receive a 4 data bytes. At 115,200 bits on the wire per second, this means it will take 347,220 nanoseconds to receive the same four bytes, taking <strong>22,222 times as long</strong> as it takes our CPU to copy the same amount of data!</p>
+
+<p>Instead of making our CPU waste all of this time waiting around, we allow the hardware to manage the simple sending and receiving process, allowing our CPU to either process other important tasks, or go into sleep mode, saving power or battery life.</p>
+
+<h3 id="from-embedded-to-datacenters">From embedded to datacenters</h3>
+
+<p>People writing high-performance application for datacenter grade servers have long realised this is also true for the high-grade, power-hungry CPUs they use.</p>
+
+<p>Modern, efficient network stacks for servers use similar DMA techniques to offload all of this work to the network card, so that valuable CPU time can be spent running data-crunching applications.</p>
+
+<h3 id="a-fork-in-the-road">A fork in the road</h3>
+
+<p>Here&#39;s where the original BipBuffer design decides to maintain two &#34;regions&#34; of valid data, one at the start and one at the end of the buffer: this way it can keep track of which sections of the buffers contain valid data. Have a look at the <a href="https://www.codeproject.com/Articles/3479/The-Bip-Buffer-The-Circular-Buffer-with-a-Twist">BipBuffer</a> blog post on CodeProject for details on how this works.</p>
+
+<p>The design based on two regions works great in a single threaded environment, but requires swapping the references to two regions when the rightmost one is depleted. This is tricky to do without explicit locking (mutexes) for cases in which the writer and reader reside on different threads.</p>
+
+<p>Our use case is communication between two concurrent threads of control: either two actual OS threads, or a main thread of control and an interrupt handler in embedded or a device driver. This is where our design takes inspiration from the <em>BipBuffer</em>, but goes in a different direction.</p>
+
+<h2 id="concurrency-design">Concurrency design</h2>
+
+<p>A common strategy to reduce the amount of coordination that needs to happen between the two threads (writer, reader) is to associate each coordination variable (pointer) with a single thread that has exclusive write access to it. This also happens to simplify reasoning about the design, because it&#39;s always clear who&#39;s in charge of changing which variable.</p>
+
+<p>So, let&#39;s start with a simple circular buffer that has the <code>write</code> and <code>read</code> pointers from before. The writer is the only one who ever changes <code>write</code>, and the reader is the only one who increments <code>read</code>.</p>
+
+<p><img src="https://i.imgur.com/zfwNfD0.png" alt=""/></p>
+
+<p>So far so good. Each thread is only concerned with writing to one variable, and reading from the other.</p>
+
+<h3 id="high-watermark-for-data">High watermark for data</h3>
+
+<p>Now let&#39;s re-introduce the requirement that the data written may need to be contiguous. If there&#39;s no space available at the end of the buffer, the writer wraps around and writes the whole contiguous chunk at the start.</p>
+
+<p><img src="https://i.imgur.com/Lb8C3sq.png" alt=""/></p>
+
+<p>As we&#39;ve seen, we need a way to tell the reader which part of the buffer is valid, and which was skipped to be able to write a single contiguous chunk. We&#39;re tracking the high watermark of valid data in the buffer, so what about a <code>watermark</code> pointer that gets written when the writer wraps around and leaves empty space at the end?</p>
+
+<p>Going back to our idealised infinite buffer from before, here&#39;s what things would look like. Whenever the valid region isn&#39;t split in two parts (at the beginning and end of the actual buffer) we simply ned to track the write and read pointers, as before. On the other hand, when valid data wraps around the buffer, we leave an artificial &#34;hole&#34; in the &#34;infinite buffer&#34; representation. The <code>watermark</code> lets us keep track of where the &#34;hole&#34; starts, and the end of the physical buffers marks the end.</p>
+
+<p><img src="https://i.imgur.com/lZrudcU.png" alt=""/></p>
+
+<h2 id="implementation">Implementation</h2>
+
+<p>We have all the necessary elements for our non-blocking implementation. We start with the <code>write</code> and <code>read</code> pointers aligned at the start of the buffer and the <code>watermark</code> aligned with the end.</p>
+
+<p><img src="https://i.imgur.com/nS0tBm1.png" alt=""/></p>
+
+<div><pre><code><span>struct</span> <span>ContiguousAsyncBuffer</span> <span>{</span>
+  <span>buf</span><span>:</span> <span>*</span><span>mut</span> <span>u8</span><span>,</span>
+  <span>len</span><span>:</span> <span>usize</span><span>,</span>
+  <span>read</span><span>:</span> <span>AtomicUsize</span><span>,</span>
+  <span>write</span><span>:</span> <span>AtomicUsize</span><span>,</span>
+  <span>watermark</span><span>:</span> <span>AtomicUsize</span><span>,</span>
+<span>}</span>
+</code></pre></div>
+<p>We use <code>AtomicUsize</code> to let the two threads read and update the pointers concurrently and safely. The writer/sender thread is in charge of <code>write</code> and <code>watermark</code>, the reader/receiver is in charge of <code>read</code>. This is important! Contended writes from multiple threads on the same memory location are a lot harder for the CPU&#39;s cache coherence protocol to handle, and will cost latency and throughput.
+What&#39;s more, it&#39;s a lot easier to reason about correctness of these concurrent protocols if each of the shared pointers are always written by a certain thread (their &#34;owner&#34;).</p>
+
+<h3 id="writing">Writing</h3>
+
+<p>As long as there&#39;s enough contiguous buffer space before the end of the physical buffer, as new data arrives (of length <code>write_len</code>) the sender thread moves the <code>write</code> pointer forwards to signal that a new chunk of the buffer is now valid and can be read.</p>
+
+<div><pre><code><span>// [writer thread]</span>
+<span>buffer</span><span>.write</span><span>.store</span><span>(</span><span>buffer</span><span>.write</span><span>.load</span><span>()</span> <span>+</span> <span>write_len</span><span>)</span>
+</code></pre></div>
+<p>When new data arrives and the <code>write</code> pointer is close to the end, it moves the watermark to its current location, then wraps around. Again, if the <code>read</code> pointer is still close to the beginning, this has the potential of clobbering data that hasn&#39;t yet been processed by the reader. For this reason, the <code>write</code> pointer is not allowed to overtake <code>read</code> after it has wrapped around.</p>
+
+<div><pre><code><span>// [writer thread]</span>
+<span>if</span> <span>buffer</span><span>.len</span><span>.saturating_sub</span><span>(</span><span>buffer</span><span>.write</span><span>.load</span><span>())</span> <span>&gt;=</span> <span>write_len</span> <span>{</span>
+  <span>// not shown: check `read` to make sure there&#39;s enough free room</span>
+  <span>buffer</span><span>.watermark</span><span>.store</span><span>(</span><span>buffer</span><span>.write</span><span>.load</span><span>()</span> <span>+</span> <span>write_len</span><span>);</span>
+  <span>buffer</span><span>.write</span><span>.store</span><span>(</span><span>buffer</span><span>.write</span><span>.load</span><span>()</span> <span>+</span> <span>write_len</span><span>);</span>
+<span>}</span> <span>else</span> <span>{</span> <span>// not enough space, wrap around</span>
+  <span>// not shown: check `read` to make sure there&#39;s enough free room at the beginning of the buffer</span>
+  <span>buffer</span><span>.watermark</span><span>.store</span><span>(</span><span>buffer</span><span>.write</span><span>.load</span><span>());</span>
+  <span>buffer</span><span>.write</span><span>.store</span><span>(</span><span>0</span> <span>+</span> <span>write_len</span><span>);</span>
+<span>}</span>
+</code></pre></div>
+<p>You may have noticed that the writer also pushes the <code>watermark</code> forward when there&#39;s room at the end of the buffer. We need to do this because we may have moved it back on a previous wrap-around and we want to avoid the reader now misinterpreting it as a sign that there&#39;s a &#34;hole&#34; at the end.</p>
+
+<h3 id="reading">Reading</h3>
+
+<p>We end up again with two possible memory configurations:</p>
+
+<ol>
+  <li><code>write</code> leads and <code>read</code> follows (<code>write</code> ≥ <code>read</code>), the valid data (written, but not yet processed by the reader) is in the section of the buffer after <code>read</code> and before <code>write</code>;</li>
+  <li><code>read</code> leads and <code>write</code> follows (<code>read</code> &gt; <code>write</code>), the valid data is after <code>read</code>, till the <code>watermark</code>, and from the start of the buffer till <code>write</code>.</li>
+</ol>
+
+<p><img src="https://i.imgur.com/vgqghy7.png" alt=""/></p>
+
+<p>This makes the reader thread&#39;s logic simple: read till you hit the <code>write</code> pointer, or the <code>watermark</code>, and update the <code>read</code> pointer accordingly.</p>
+
+<h3 id="a-note-on-memory-ordering">A note on memory ordering</h3>
+
+<p>Some of you may have noticed that all of our calls to <code>load</code> don&#39;t take arguments and our calls to <code>store</code> take a single argument, the new value for the <code>AtomicBool</code>. This isn&#39;t valid code, of course. The real signatures take another argument: <code>ordering: Ordering</code>.
+This instructs llvm on how to emit the proper memory fences and <code>sync</code> instructions to drive the cache coherence and synchronization mechanisms built into the CPUs.</p>
+
+<p>The safe thing to do here is to always choose <code>Ordering::SeqCst</code>, &#34;sequential consistency&#34;, which provides the strongest guarantees. On x86, due to the hardware design, anything other than <code>Ordering::Relaxed</code> is equivalent to <code>SeqCst</code>. On ARMv7/v8, things get more complicated.</p>
+
+<p>We recommend reading up on <a href="https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html"><code>Ordering</code></a> both in the rust doc and in the documentation for your platform. For the purpose of this post, just assume we used <code>Ordering::SeqCst</code> everywhere. This is often good enough in practice, and switching to a weaker <code>Ordering</code> is only necessary to squeeze out the last bit of performance.</p>
+
+<p>In Andrea&#39;s implementation of the lock-free ring-buffer, <a href="https://github.com/utaal/spsc-bip-buffer">spsc-bip-buffer</a>, some of the orderings are relaxed for performance. This has the downside that it can introduce subtle concurrency bugs that may only show up on some platform (ARM, for example): to be a bit more confident that everything&#39;s still fine, Andrea&#39;s has continous integation tests both on x86 and ARM.</p>
+
+<h3 id="support-for-embedded-systems">Support for embedded systems</h3>
+
+<p>In James&#39; implementation of the lock-free ring-buffer, <a href="https://github.com/jamesmunns/bbqueue">bbqueue</a>, convenience interfaces are provided for statically allocating instances of the ring-buffer. The queue can be split into Producer and Consumer halves, allowing for use of one half in interrupt context, and the other half in non-interrupt (or a different interrupt) context.</p>
+
+      </div></div>
+  </body>
+</html>
