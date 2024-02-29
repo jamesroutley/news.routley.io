@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://tontinton.com/posts/scheduling-internals/">Original</a>
+    <h1>Scheduling Internals</h1>
+    
+    <div id="readability-page-1" class="page"><div><article><section><blockquote><p>A sneak peek to what&#39;s coming!</p></blockquote><p>I remember when I first learned that you can write a server handling millions of clients running on just a single thread, my mind was simply blown away 🤯</p><p>I used Node.js while knowing it is single threaded, I used <code>async</code> / <code>await</code> in Python, and I used threads, but never asked myself <em>&#34;How is any of this possible?&#34;</em>.</p><p>This post is written to spread the genius of concurrency and hopefully getting you excited about it too.</p><p>My goal is for you to want to send a link to this post to an engineer in your team asking out loud <em>&#34;Wait, but how does async even work?&#34;</em>.</p><p>Questions I&#39;m going to answer:</p><ul><li>Why not create a thread per client?</li><li>How to sleep when waiting on I/O?</li><li>How does Node.js achieve concurrency?</li><li>What&#39;s concurrency? What&#39;s parallelism?</li><li>What are coroutines? <ul><li>With an implementation we&#39;ll build piece by piece.</li></ul></li><li>What are preemptive and non-preemptive schedulers?</li><li>How does Go and Rust implement concurrency in the language (stackful vs stackless)?</li><li>What scheduling algorithms are used by linux, Go and Rust&#39;s tokio? <ul><li>With animations 🙃</li></ul></li></ul><p>I assume proficiency in reading code and OS internals at an intermediate level, but don&#39;t stress over details you don&#39;t understand, try to get the bigger picture!</p><p>With all of that out of the way, let us begin.</p><p>Let&#39;s try to write a simple echo server (whatever we receive, we send back) in C code, we&#39;ll call it <code>echod</code>:</p><pre data-lang="c"><code data-lang="c"><span>// Assume server_fd is already initialized to start accepting clients.
+</span><span>void </span><span>serve</span><span>(</span><span>int </span><span>server_fd</span><span>) </span><span>{
+</span><span>    </span><span>while </span><span>(</span><span>true</span><span>) </span><span>{
+</span><span>        </span><span>int</span><span> client_fd </span><span>= </span><span>accept</span><span>(server_fd, </span><span>NULL</span><span>, </span><span>NULL</span><span>);
+</span><span>
+</span><span>        </span><span>char</span><span> buffer[</span><span>2048</span><span>];
+</span><span>
+</span><span>        </span><span>while </span><span>(</span><span>true</span><span>) </span><span>{
+</span><span>            </span><span>ssize_t</span><span> len </span><span>= </span><span>read</span><span>(client_fd, buffer, </span><span>sizeof</span><span>(buffer));
+</span><span>            </span><span>if </span><span>(len </span><span>== -</span><span>1</span><span>)
+</span><span>                </span><span>break</span><span>;
+</span><span>
+</span><span>            </span><span>write</span><span>(client_fd, buffer, len);
+</span><span>        </span><span>}
+</span><span>
+</span><span>        </span><span>close</span><span>(client_fd);
+</span><span>    </span><span>}
+</span><span>}
+</span></code></pre><p>Cool, now what should we do if want to handle multiple clients concurrently? While one client is being handled, another tries to <code>connect</code> to our server, without ever succeeding, as our server reaches the <code>accept</code> call only once it is done handling the current client.</p><p>How can we fix that?</p><p>The first thing most people will think is <em>&#34;Can&#39;t you just create a thread for each client?&#34;</em>, something that looks like this:</p><pre data-lang="c"><code data-lang="c"><span>void </span><span>serve_client</span><span>(</span><span>int </span><span>client_fd</span><span>) </span><span>{
+</span><span>    </span><span>char</span><span> buffer[</span><span>2048</span><span>];
+</span><span>
+</span><span>    </span><span>while </span><span>(</span><span>true</span><span>) </span><span>{
+</span><span>        </span><span>ssize_t</span><span> len </span><span>= </span><span>read</span><span>(client_fd, buffer, </span><span>sizeof</span><span>(buffer));
+</span><span>        </span><span>if </span><span>(len </span><span>== -</span><span>1</span><span>)
+</span><span>            </span><span>break</span><span>;
+</span><span>
+</span><span>        </span><span>write</span><span>(client_fd, buffer, len);
+</span><span>    </span><span>}
+</span><span>
+</span><span>    </span><span>close</span><span>(client_fd);
+</span><span>}
+</span><span>
+</span><span>void </span><span>serve</span><span>(</span><span>int </span><span>server_fd</span><span>) </span><span>{
+</span><span>    </span><span>while </span><span>(</span><span>true</span><span>) </span><span>{
+</span><span>        </span><span>int</span><span> client_fd </span><span>= </span><span>accept</span><span>(server_fd, </span><span>NULL</span><span>, </span><span>NULL</span><span>);
+</span><span>        </span><span>run_thread</span><span>(serve_client, client_fd);
+</span><span>    </span><span>}
+</span><span>}
+</span></code></pre><p>The first problem with threads is how the OS allocates a stack for a new thread. The stack is allocated virtual memory (10mb on linux by default), and physical pages are only commited once the pages are actually written to. This is really nice as it means that you don&#39;t really reserve 10mb of RAM for each thread right out of the gate, <strong>but</strong> it does mean the granularity of allocation is at least that of a page (run <code>getconf PAGESIZE</code>, my machine is 4kb). Using <code>pthread_attr_setstacksize</code> won&#39;t fix the problem, you still must provide a value that is a multiple of a page size. A page might be a lot more that what you actually use, depending on the application.</p><blockquote><p>I also think that relying on overcommitment of memory is pretty annoying. We are getting killed by the OOM killer instead of having an opportunity cleaning up resources when an allocation fails indicating we are out of memory.</p></blockquote><p>The second problem we need to fix when creating a bunch of OS threads is to change all the relevant limits:</p><pre data-lang="sh"><code data-lang="sh"><span>$</span><span> cat /proc/sys/kernel/threads-max
+</span><span>63704
+</span><span>
+</span><span># Threads in linux are light weight processes (LWP).
+</span><span>$</span><span> cat /proc/sys/kernel/pid_max
+</span><span>131072
+</span><span>
+</span><span># Maximum number of VMAs a process can own.
+</span><span>$</span><span> cat /proc/sys/vm/max_map_count
+</span><span>65530
+</span><span>
+</span><span># Each of these can be set by simply writing to the file:
+</span><span>$</span><span> echo 2000000 </span><span>&gt;</span><span> /proc/sys/kernel/threads-max
+</span><span>$</span><span> echo 2000000 </span><span>&gt;</span><span> /proc/sys/kernel/pid_max
+</span><span>$</span><span> echo 2000000 </span><span>&gt;</span><span> /proc/sys/vm/max_map_count
+</span></code></pre><p>Just the files I showed you might not be enough for your system, for example <code>systemd</code> also sets maximums.</p><p>The third problem is performance. Context switching between kernel and user mode is expensive in terms of CPU cycles. A single context switch isn&#39;t that expensive on its own, but doing a lot of them adds up.</p><p>The fourth problem is that the stack allocation is static, we can&#39;t modify the stack size (grow) or free up commited physical pages in the stack once they are unused (shrink).</p><p>Because of all these problems, threads should not be your go-to solution for running a lot of tasks concurrently (especially for I/O bound tasks like in <code>echod</code>). Running a thread per client is famously known as <a href="http://kegel.com/c10k.html">The C10K Problem</a>.</p><p>How else can we make <code>echod</code> serve millions of clients concurrently?</p><p>Why block an entire thread from running, when calling <code>read</code> / <code>write</code> / <code>accept</code>? If you think about it, we waste a precious resource (CPU) from doing anything while the application waits for I/O.</p><p>When calling <code>read</code> for example, the kernel waits for a network packet to be received from the network interface card or <code>NIC</code>. The CPU is free to run something else meanwhile.</p><p>In linux, you can mark a socket as non-blocking by either using <code>ioctl(fd, FIONBIO)</code> or <code>fcntl &amp; O_NONBLOCK</code> (posix). A <code>read</code> call on that same socket will return immediately. If there&#39;s a packet written by the <code>NIC</code> we haven&#39;t read yet, <code>read</code> will copy the buffer like usual, otherwise it will return an error, with <code>errno</code> equal to <code>EWOULDBLOCK</code>.</p><p>Let&#39;s patch <code>echod</code> to be single threaded again, but this time, supporting multiple concurrent clients using non-blocking sockets:</p><pre data-lang="c"><code data-lang="c"><span>struct </span><span>client </span><span>{
+</span><span>    </span><span>int</span><span> fd;
+</span><span>    </span><span>char</span><span> buffer[</span><span>2048</span><span>]; </span><span>// Not allocated dynamically for brevity.
+</span><span>    </span><span>ssize_t</span><span> offset; </span><span>// -1 when in reading state, otherwise the offset in buffer to write.
+</span><span>    </span><span>ssize_t</span><span> length; </span><span>// The length left to write (only useful when in writing state).
+</span><span>}</span><span>;
+</span><span>
+</span><span>void </span><span>set_nonblock</span><span>(</span><span>int </span><span>fd</span><span>) </span><span>{
+</span><span>    </span><span>// Ignore errors for brevity.
+</span><span>    </span><span>fcntl</span><span>(fd, F_SETFL, </span><span>fcntl</span><span>(fd, F_GETFL) </span><span>|</span><span> O_NONBLOCK);
+</span><span>}
+</span><span>
+</span><span>void </span><span>serve</span><span>(</span><span>int </span><span>server_fd</span><span>) </span><span>{
+</span><span>    </span><span>set_nonblock</span><span>(server_fd);
+</span><span>
+</span><span>    </span><span>struct</span><span> client clients[</span><span>64</span><span>]; </span><span>// Maximum 64 concurrent clients.
+</span><span>    </span><span>int</span><span> num_clients </span><span>= </span><span>0</span><span>;
+</span><span>
+</span><span>    </span><span>while </span><span>(</span><span>true</span><span>) </span><span>{
+</span><span>        </span><span>if </span><span>(num_clients </span><span>&lt; </span><span>ARRAY_SIZE</span><span>(clients)) </span><span>{
+</span><span>            </span><span>int</span><span> client_fd </span><span>= </span><span>accept</span><span>(server_fd, </span><span>NULL</span><span>, </span><span>NULL</span><span>);
+</span><span>            </span><span>if </span><span>(client_fd </span><span>!= -</span><span>1</span><span>) </span><span>{
+</span><span>                </span><span>set_nonblock</span><span>(client_fd);
+</span><span>                clients[num_clients]</span><span>.</span><span>fd </span><span>=</span><span> client_fd;
+</span><span>                clients[num_clients]</span><span>.</span><span>offset </span><span>= -</span><span>1</span><span>;
+</span><span>                num_clients</span><span>++</span><span>;
+</span><span>            </span><span>}
+</span><span>        </span><span>}
+</span><span>
+</span><span>        </span><span>for </span><span>(</span><span>int</span><span> i </span><span>= </span><span>0</span><span>; i </span><span>&lt;</span><span> num_clients; i</span><span>++</span><span>) </span><span>{
+</span><span>            </span><span>struct</span><span> client</span><span>*</span><span> client </span><span>= &amp;</span><span>clients[i];
+</span><span>            </span><span>bool</span><span> is_reading </span><span>=</span><span> client</span><span>-&gt;</span><span>offset </span><span>== -</span><span>1</span><span>;
+</span><span>
+</span><span>            </span><span>ssize_t</span><span> result;
+</span><span>            </span><span>if </span><span>(is_reading) </span><span>{
+</span><span>                result </span><span>= </span><span>read</span><span>(client</span><span>-&gt;</span><span>fd, client</span><span>-&gt;</span><span>buffer, </span><span>sizeof</span><span>(client</span><span>-&gt;</span><span>buffer));
+</span><span>            </span><span>} </span><span>else </span><span>{
+</span><span>                result </span><span>= </span><span>write</span><span>(client</span><span>-&gt;</span><span>fd, client</span><span>-&gt;</span><span>buffer </span><span>+</span><span> client</span><span>-&gt;</span><span>offset, client</span><span>-&gt;</span><span>length);
+</span><span>            </span><span>}
+</span><span>
+</span><span>            </span><span>if </span><span>(result </span><span>!= -</span><span>1</span><span>) </span><span>{
+</span><span>                </span><span>if </span><span>(is_reading) </span><span>{
+</span><span>                    client</span><span>-&gt;</span><span>offset </span><span>= </span><span>0</span><span>; </span><span>// Move to writing state.
+</span><span>                    client</span><span>-&gt;</span><span>length </span><span>=</span><span> result;
+</span><span>                </span><span>} </span><span>else </span><span>{
+</span><span>                    client</span><span>-&gt;</span><span>length </span><span>-=</span><span> result;
+</span><span>
+</span><span>                    </span><span>if </span><span>(client</span><span>-&gt;</span><span>length </span><span>== </span><span>0</span><span>) </span><span>{
+</span><span>                        client</span><span>-&gt;</span><span>offset </span><span>= -</span><span>1</span><span>; </span><span>// Move to reading state.
+</span><span>                    </span><span>} </span><span>else </span><span>{
+</span><span>                        client</span><span>-&gt;</span><span>offset </span><span>+=</span><span> result;
+</span><span>                    </span><span>}
+</span><span>                </span><span>}
+</span><span>            </span><span>} </span><span>else if </span><span>(errno </span><span>!=</span><span> EWOULDBLOCK) </span><span>{
+</span><span>                </span><span>close</span><span>(client</span><span>-&gt;</span><span>fd);
+</span><span>                num_clients</span><span>--</span><span>;
+</span><span>                </span><span>memcpy</span><span>(client, </span><span>&amp;</span><span>clients[num_clients], </span><span>sizeof</span><span>(</span><span>*</span><span>client));
+</span><span>                i</span><span>--</span><span>; </span><span>// Don&#39;t skip the moved client.
+</span><span>            </span><span>}
+</span><span>        </span><span>}
+</span><span>    </span><span>}
+</span><span>}
+</span></code></pre><blockquote><p>A bit lengthy, don&#39;t try to understand everything, just that we are dealing with a lot of different tasks &#34;at once&#34;. For a compilable version, click <a href="https://github.com/tontinton/echod-hog/blob/master/main.c">here</a>.</p></blockquote><p>The main problem with this solution is that we are now always busy doing something, the CPU runs at 100%, even when most loop iterations will result in <code>EWOULDBLOCK</code>.</p><blockquote><p>Another problem is code complexity, we are now prohibited from running code that will block, to not block our entire server application.</p></blockquote><p>What we really want is to sleep when we have nothing <em>useful</em> to do. I.e. When there is no client waiting to connect, no client has sent any packet and we can&#39;t yet send a packet to the client for whatever reason (maybe the client is busy doing something of its own).</p><p>The reasons we want this are:</p><ul><li>To be good neighbours to other applications are running on the same machine, and not take CPU cycles they might want to utilize.</li><li>The more the CPU runs, the more energy it takes: <ul><li>Worse battery life.</li><li>More expensive.</li><li>Less environmental friendly 🌲🌳🌿</li></ul></li></ul><p>Good news though, most operating systems provide an API to do just that. Maybe even too many APIs:</p><ul><li><strong>select(2)</strong> - A posix API. The man page is excellent, so let&#39;s copy the important bits:</li></ul><pre><code><span>$ man 2 select
+</span><span>
+</span><span>...
+</span><span>
+</span><span>select() allows a program to monitor multiple file descriptors, waiting until one or more of the
+</span><span>file descriptors become &#34;ready&#34; for some class of I/O operation (e.g., input possible). A file
+</span><span>descriptor is considered ready if it is possible to perform a corresponding I/O operation (e.g.,
+</span><span>read(2), or a sufficiently small write(2)) without blocking.
+</span><span>
+</span><span>select() can monitor only file descriptors numbers that are less than FD_SETSIZE; poll(2) and
+</span><span>epoll(7) do not have this limitation. See BUGS.
+</span><span>
+</span><span>...
+</span></code></pre><blockquote><p>Main takeaway is that select is limited to <code>FD_SETSIZE</code> number of fds to monitor, which is usually 1024 (glibc). Another thing to note is that when a FD becomes ready, it scans all its registered FDs (<code>O(n)</code>), so when you have a lot of FDs, you can spend a lot of time just on this.</p></blockquote><ul><li><strong>poll(2)</strong> - A posix API. Not limited to <code>FD_SETSIZE</code> but still <code>O(n)</code> like <code>select</code>.</li><li><strong>epoll(7)</strong> - A linux API. A non portable <code>poll</code> but at least it scales better as it&#39;s <code>O(1)</code>.</li><li><strong>aio(7)</strong> - A linux API. Unlike previous APIs, it supports both sockets and files, but with some major disadvantages: <ul><li>Supports only files opened with <code>O_DIRECT</code>, which are complex to work with.</li><li>Blocks if file metadata isn&#39;t available until it becomes available.</li><li>Blocks when the storage device is out of request slots (each storage device has a fixed number of slots).</li><li>Each IO submission copies 72 bytes and each completion copies 32 bytes. 104 bytes copied for each IO operation using 2 syscalls.</li></ul></li><li><strong>io_uring(7)</strong> - A linux API (since 5.1). Like <code>aio</code>, it unifies disk and network operations under a single API, but without <code>aio</code>&#39;s shortcomings. It is designed to be fast, creating 2 queues that live in shared memory (between user and kernel space), one for submission of I/O operations, the other is populated with the results of the I/O operations once they are ready. For more info head over to <a href="https://unixism.net/loti/what_is_io_uring.html">&#34;What is io_uring?&#34;</a>.</li></ul><blockquote><p><code>ScyllaDB</code> have successfully implemented their database using <code>aio</code> in <a href="https://seastar.io/">seastar</a>, you can read more on async disk I/O on <a href="https://scylladb.com/2017/10/05/io-access-methods-scylla/">their blog</a>.</p><p>If you&#39;re interested about platforms other than linux, windows has <a href="https://learn.microsoft.com/en-us/windows/win32/fileio/i-o-completion-ports">I/O Completion Ports</a>, with FreeBSD and MacOS both using <a href="https://man.freebsd.org/cgi/man.cgi?kqueue">kqueue</a>.</p></blockquote><p>Prior to <code>io_uring</code>, async I/O abstraction libraries used a thread pool to run disk I/O in a non-blocking manner.</p><p>There are libraries like <a href="https://libuv.org/">libuv</a> (what powers Node.js) that you can use to run highly concurrent servers while using just a single thread (they finally changed it to <a href="https://github.com/libuv/libuv/pull/3952">use io_uring</a>). These kind of libraries are often called <code>Event Loops</code>, let&#39;s talk about them a bit.</p><h2 id="event-loop">Event Loop</h2><p>At its essence an event loop (also sometimes called <a href="https://en.wikipedia.org/wiki/Reactor_pattern">reactor pattern</a>) is basically this:</p><pre data-lang="python"><code data-lang="python"><span>while </span><span>should_continue_running</span><span>():
+</span><span>    ready_fds </span><span>= </span><span>poll_fds</span><span>()  </span><span># Implemented using any of the async APIs we talked about.
+</span><span>    events </span><span>= </span><span>fds_to_events</span><span>(ready_fds)
+</span><span>    </span><span>while </span><span>event </span><span>:= </span><span>events</span><span>.</span><span>pop</span><span>():
+</span><span>        event</span><span>.</span><span>callback</span><span>()
+</span></code></pre><p>Yeah, that&#39;s it, just look at <code>libuv</code>&#39;s <code>uv_run</code>:</p><pre data-lang="c"><code data-lang="c"><span>int </span><span>uv_run</span><span>(uv_loop_t</span><span>* </span><span>loop</span><span>, uv_run_mode </span><span>mode</span><span>) </span><span>{
+</span><span>  </span><span>int</span><span> r;
+</span><span>
+</span><span>// ...
+</span><span>
+</span><span>  </span><span>while </span><span>(r </span><span>!= </span><span>0 </span><span>&amp;&amp;</span><span> loop</span><span>-&gt;</span><span>stop_flag </span><span>== </span><span>0</span><span>) </span><span>{
+</span><span>
+</span><span>// ...
+</span><span>
+</span><span>    </span><span>uv__run_pending</span><span>(loop);
+</span><span>    </span><span>uv__run_idle</span><span>(loop);
+</span><span>    </span><span>uv__run_prepare</span><span>(loop);
+</span><span>
+</span><span>// ...
+</span><span>
+</span><span>    </span><span>uv__io_poll</span><span>(loop, timeout);
+</span><span>
+</span><span>// ...
+</span><span>
+</span><span>    r </span><span>= </span><span>uv__loop_alive</span><span>(loop);
+</span><span>  </span><span>}
+</span><span>
+</span><span>// ...
+</span><span>
+</span><span>  </span><span>return</span><span> r;
+</span><span>}
+</span></code></pre><p>And here&#39;s <code>uv__run_pending</code> without omitting any details:</p><pre data-lang="c"><code data-lang="c"><span>static </span><span>void </span><span>uv__run_pending</span><span>(uv_loop_t</span><span>* </span><span>loop</span><span>) </span><span>{
+</span><span>  </span><span>struct</span><span> uv__queue</span><span>*</span><span> q;
+</span><span>  </span><span>struct</span><span> uv__queue pq;
+</span><span>  uv__io_t</span><span>*</span><span> w;
+</span><span>
+</span><span>  </span><span>uv__queue_move</span><span>(</span><span>&amp;</span><span>loop</span><span>-&gt;</span><span>pending_queue, </span><span>&amp;</span><span>pq);
+</span><span>
+</span><span>  </span><span>while </span><span>(</span><span>!</span><span>uv__queue_empty</span><span>(</span><span>&amp;</span><span>pq)) </span><span>{
+</span><span>    q </span><span>= </span><span>uv__queue_head</span><span>(</span><span>&amp;</span><span>pq);
+</span><span>    </span><span>uv__queue_remove</span><span>(q);
+</span><span>    </span><span>uv__queue_init</span><span>(q);
+</span><span>    w </span><span>= </span><span>uv__queue_data</span><span>(q, uv__io_t, pending_queue);
+</span><span>    w</span><span>-&gt;</span><span>cb</span><span>(loop, w, POLLOUT);
+</span><span>  </span><span>}
+</span><span>}
+</span></code></pre><p>Pretty awesome huh? This is what all Node.js applications are running on.</p><p>What if you need to call a blocking 3rd party library function? For that, most event loop libraries have a thread pool you can run arbitrary code on, for example in <code>libuv</code>, you can use <a href="https://docs.libuv.org/en/v1.x/threadpool.html">uv_queue_work()</a>.</p><blockquote><p>Pop quiz: how would something like <code>setTimeout</code> be implemented in an event loop? If nothing comes to mind, try cloning <code>libuv</code> and reading the implementation of <code>uv__run_timers</code> in <code>src/timer.c</code>.</p></blockquote><h3 id="event-driven-development">Event Driven Development</h3><p>The programming model when using an event loop is inherently event driven, with each registered event having a callback to execute once it is ready.</p><p>Let&#39;s see how <code>echod</code> would look like using an imaginary event loop library instead (start with <code>serve</code> from the bottom):</p><pre data-lang="c"><code data-lang="c"><span>struct </span><span>context </span><span>{
+</span><span>    </span><span>char</span><span> buffer[</span><span>2048</span><span>];
+</span><span>    </span><span>size_t</span><span> offset;
+</span><span>    </span><span>size_t</span><span> length;
+</span><span>}</span><span>;
+</span><span>
+</span><span>void </span><span>on_write</span><span>(loop_t</span><span>* </span><span>loop</span><span>, </span><span>struct</span><span> context</span><span>* </span><span>ctx</span><span>, </span><span>int </span><span>client_fd</span><span>, </span><span>ssize_t </span><span>written</span><span>) </span><span>{
+</span><span>    </span><span>if </span><span>(written </span><span>== -</span><span>1</span><span>) </span><span>{
+</span><span>        </span><span>// Error, stop.
+</span><span>        </span><span>free</span><span>(ctx);
+</span><span>        </span><span>return</span><span>;
+</span><span>    </span><span>}
+</span><span>
+</span><span>    ctx</span><span>-&gt;</span><span>offset </span><span>+=</span><span> written;
+</span><span>
+</span><span>    </span><span>if </span><span>(ctx</span><span>-&gt;</span><span>offset </span><span>&lt;</span><span> ctx</span><span>-&gt;</span><span>length) </span><span>{
+</span><span>        </span><span>char</span><span>*</span><span> buf </span><span>=</span><span> ctx</span><span>-&gt;</span><span>buffer </span><span>+</span><span> ctx</span><span>-&gt;</span><span>offset;
+</span><span>        </span><span>size_t</span><span> len </span><span>=</span><span> ctx</span><span>-&gt;</span><span>length </span><span>-</span><span> ctx</span><span>-&gt;</span><span>offset;
+</span><span>        </span><span>register_write</span><span>(loop, ctx, client_fd, buf, len, on_write);
+</span><span>    </span><span>} </span><span>else </span><span>{
+</span><span>        </span><span>register_read</span><span>(loop, ctx, client_fd, on_read);
+</span><span>    </span><span>}
+</span><span>}
+</span><span>
+</span><span>void </span><span>on_read</span><span>(loop_t</span><span>* </span><span>loop</span><span>, </span><span>struct</span><span> context</span><span>* </span><span>ctx</span><span>, </span><span>int </span><span>client_fd</span><span>, </span><span>ssize_t </span><span>read</span><span>) </span><span>{
+</span><span>    </span><span>if </span><span>(read </span><span>== -</span><span>1</span><span>) </span><span>{
+</span><span>        </span><span>// Error, stop.
+</span><span>        </span><span>free</span><span>(ctx);
+</span><span>        </span><span>return</span><span>;
+</span><span>    </span><span>}
+</span><span>
+</span><span>    ctx</span><span>-&gt;</span><span>offset </span><span>= </span><span>0</span><span>;
+</span><span>    ctx</span><span>-&gt;</span><span>length </span><span>=</span><span> read;
+</span><span>
+</span><span>    </span><span>register_write</span><span>(loop, ctx, client_fd, ctx</span><span>-&gt;</span><span>buffer, read, on_write);
+</span><span>}
+</span><span>
+</span><span>void </span><span>on_accept</span><span>(loop_t</span><span>* </span><span>loop</span><span>, </span><span>void</span><span>* </span><span>unused</span><span>, </span><span>int </span><span>server_fd</span><span>, </span><span>int </span><span>client_fd</span><span>) </span><span>{
+</span><span>    </span><span>struct</span><span> context</span><span>*</span><span> ctx </span><span>= </span><span>malloc</span><span>(</span><span>sizeof</span><span>(</span><span>*</span><span>ctx));
+</span><span>    </span><span>register_read</span><span>(loop, ctx, client_fd, ctx</span><span>-&gt;</span><span>buffer, </span><span>sizeof</span><span>(ctx</span><span>-&gt;</span><span>buffer), on_read);
+</span><span>    </span><span>register_accept</span><span>(loop, </span><span>NULL</span><span>, server_fd, on_accept);
+</span><span>}
+</span><span>
+</span><span>void </span><span>serve</span><span>(loop_t</span><span>* </span><span>loop</span><span>, </span><span>int </span><span>server_fd</span><span>) </span><span>{
+</span><span>    </span><span>register_accept</span><span>(loop, </span><span>NULL</span><span>, server_fd, on_accept);
+</span><span>    </span><span>run_event_loop</span><span>(loop);
+</span><span>}
+</span></code></pre><p>If you worked with javascript before, this should look familiar to you.</p><p>The code will be very lightweight in terms of performance, and highly concurrent, but is often criticized for being:</p><ul><li><strong>Not intuitive</strong> - Complex for most programmers who are used to reading and writing synchronous code, see <a href="http://callbackhell.com">&#34;Callback Hell&#34;</a>.</li><li><strong>Hard to debug</strong> - The call stack is very short and will not show you the flow of how you got to a specific breakpoint. The caller of each callback will always be <code>uv_run</code> in <code>libuv</code>, or <code>run_event_loop</code> in our example.</li></ul><p>A lot of modern programming languages and runtimes try to solve these problems by letting you write code that looks synchronous while being fully asynchronous. In the next chapter, we&#39;re gonna learn how.</p><p>Have you ever wondered how is it that you can run more than 1 thread on a computer with just a single CPU core?</p><p>In this section, we&#39;ll go over the secret technique that enables this magic, called <strong>preemption</strong>.</p><p>Let&#39;s say we have the following two tasks we would like to execute concurrently:</p><pre data-lang="python"><code data-lang="python"><span>def </span><span>task_0</span><span>():
+</span><span>    </span><span>while </span><span>True</span><span>:
+</span><span>        </span><span>print</span><span>(</span><span>&#39;0&#39;</span><span>)
+</span><span>
+</span><span>def </span><span>task_1</span><span>():
+</span><span>    </span><span>while </span><span>True</span><span>:
+</span><span>        </span><span>print</span><span>(</span><span>&#39;1&#39;</span><span>)
+</span><span>
+</span><span>run_all</span><span>([task_0, task_1])
+</span></code></pre><p>What should <code>run_all</code> do to make sure that both tasks run <strong>concurrently</strong>?</p><p>If we had 2 CPU cores, we could have simply run 1 task on 1 core, which would mean we would run the two tasks <strong>parallelly</strong>, or in other words the two tasks run at the same time in the <em>real</em> world (at least the one we base physics on).</p><p>A <strong>concurrent</strong> program deals with running multiple things at once, just not at the same time, thus they may seem <strong>parallel</strong> even if they&#39;re really not.</p><p>One way <code>run_all</code> can achieve <strong>concurrency</strong> is by running 1 task for some amount of time, pause, and then resume running the next task, forever in a loop until all tasks exit for example. To magically make it appear as if it&#39;s <strong>parallel</strong>, you simply need to configure the amount of time before pausing to be really small relative to the human experience (e.g. 100μs?).</p><pre data-lang="python"><code data-lang="python"><span>from </span><span>itertools </span><span>import </span><span>cycle  </span><span># cycle([1, 2, 3]) -&gt; (1, 2, 3, 1, 2, 3, ...)
+</span><span>
+</span><span>def </span><span>run_all</span><span>(</span><span>tasks</span><span>):
+</span><span>    </span><span>for </span><span>task </span><span>in </span><span>cycle</span><span>(tasks):
+</span><span>        </span><span>run_task_for_a_little</span><span>(task)
+</span></code></pre><p>But how do you pause and resume execution of code?</p><p>The answer lies in programs being deterministic state machines, as long as you give a program&#39;s executor (e.g. CPU for native code) the same inputs (e.g. registers, memory, etc...), it doesn&#39;t matter if it executes today or in a few years, the output will be the same.</p><p>Basically, pausing a task can be implemented as copying the current state of the program, and resuming a task can be implemented by loading that saved state.</p><blockquote><p>It doesn&#39;t matter if the program runs on a real CPU or a virtual one like in <code>python</code>&#39;s bytecode or on the <code>JVM</code> for example, they are all deterministic state machines. As long as you copy all the necessary state, the task will resume as if it was never even paused.</p></blockquote><p>To make it easy to understand how you might implement preemption (saving and loading of program state), let&#39;s look at <code>setjmp.h</code>, which implements saving and loading program state in a lot of different CPU architectures, and is part of <code>libc</code>.</p><p>See the following example (copied directly from <a href="https://en.wikipedia.org/wiki/Setjmp.h">wikipedia</a>):</p><pre data-lang="c"><code data-lang="c"><span>#include </span><span>&lt;stdio.h&gt;
+</span><span>#include </span><span>&lt;setjmp.h&gt;
+</span><span>
+</span><span>static</span><span> jmp_buf buf;
+</span><span>
+</span><span>void </span><span>second</span><span>() </span><span>{
+</span><span>    </span><span>printf</span><span>(</span><span>&#34;second</span><span>\n</span><span>&#34;</span><span>);         </span><span>// prints
+</span><span>    </span><span>longjmp</span><span>(buf,</span><span>1</span><span>);             </span><span>// jumps back to where setjmp was called - making setjmp now return 1
+</span><span>}
+</span><span>
+</span><span>void </span><span>first</span><span>() </span><span>{
+</span><span>    </span><span>second</span><span>();
+</span><span>    </span><span>printf</span><span>(</span><span>&#34;first</span><span>\n</span><span>&#34;</span><span>);          </span><span>// does not print
+</span><span>}
+</span><span>
+</span><span>int </span><span>main</span><span>() </span><span>{
+</span><span>    </span><span>if </span><span>(</span><span>!</span><span>setjmp</span><span>(buf))
+</span><span>        </span><span>first</span><span>();                </span><span>// when executed, setjmp returned 0
+</span><span>    </span><span>else                        </span><span>// when longjmp jumps back, setjmp returns 1
+</span><span>        </span><span>printf</span><span>(</span><span>&#34;main</span><span>\n</span><span>&#34;</span><span>);       </span><span>// prints
+</span><span>
+</span><span>    </span><span>return </span><span>0</span><span>;
+</span><span>}
+</span></code></pre><p>Running it will output:</p><pre data-lang="sh"><code data-lang="sh"><span>$</span><span> gcc example.c</span><span> -o</span><span> example </span><span>&amp;&amp; </span><span>./example
+</span><span>second
+</span><span>main
+</span></code></pre><p><code>setjmp</code> saves the program state (in <code>buf</code>), and <code>longjmp</code> loads whatever is in <code>buf</code> to the CPU.</p><p>Let&#39;s look behind the curtains, the following is the <code>x86_64</code> assembly code for <code>setjmp</code> and <code>longjmp</code> in <a href="https://musl.libc.org/">musl</a> (a popular <code>libc</code> implementation):</p><pre data-lang="asm"><code data-lang="asm"><span>setjmp:
+</span><span>    </span><span>mov </span><span>%</span><span>rbx</span><span>,</span><span>(%</span><span>rdi</span><span>)</span><span>         ; rdi is jmp_buf, move registers onto it
+</span><span>    </span><span>mov </span><span>%</span><span>rbp</span><span>,</span><span>8</span><span>(%</span><span>rdi</span><span>)
+</span><span>    </span><span>mov </span><span>%</span><span>r12</span><span>,</span><span>16</span><span>(%</span><span>rdi</span><span>)
+</span><span>    </span><span>mov </span><span>%</span><span>r13</span><span>,</span><span>24</span><span>(%</span><span>rdi</span><span>)
+</span><span>    </span><span>mov </span><span>%</span><span>r14</span><span>,</span><span>32</span><span>(%</span><span>rdi</span><span>)
+</span><span>    </span><span>mov </span><span>%</span><span>r15</span><span>,</span><span>40</span><span>(%</span><span>rdi</span><span>)
+</span><span>    </span><span>lea </span><span>8</span><span>(%</span><span>rsp</span><span>)</span><span>,</span><span>%</span><span>rdx</span><span>        ; this is our rsp WITHOUT current ret addr
+</span><span>    </span><span>mov </span><span>%</span><span>rdx</span><span>,</span><span>48</span><span>(%</span><span>rdi</span><span>)
+</span><span>    </span><span>mov </span><span>(%</span><span>rsp</span><span>)</span><span>,</span><span>%</span><span>rdx</span><span>         ; save return addr ptr for new rip
+</span><span>    </span><span>mov </span><span>%</span><span>rdx</span><span>,</span><span>56</span><span>(%</span><span>rdi</span><span>)
+</span><span>    </span><span>xor </span><span>%</span><span>eax</span><span>,</span><span>%</span><span>eax</span><span>           ; always return 0
+</span><span>    </span><span>ret
+</span><span>
+</span><span>longjmp:
+</span><span>    </span><span>xor </span><span>%</span><span>eax</span><span>,</span><span>%</span><span>eax
+</span><span>    </span><span>cmp </span><span>$</span><span>1</span><span>,</span><span>%</span><span>esi</span><span>             ; CF = val ? 0 : 1
+</span><span>    </span><span>adc </span><span>%</span><span>esi</span><span>,</span><span>%</span><span>eax</span><span>           ; eax = val + !val
+</span><span>    </span><span>mov </span><span>(%</span><span>rdi</span><span>)</span><span>,</span><span>%</span><span>rbx</span><span>         ; rdi is the jmp_buf, restore regs from it
+</span><span>    </span><span>mov </span><span>8</span><span>(%</span><span>rdi</span><span>)</span><span>,</span><span>%</span><span>rbp
+</span><span>    </span><span>mov </span><span>16</span><span>(%</span><span>rdi</span><span>)</span><span>,</span><span>%</span><span>r12
+</span><span>    </span><span>mov </span><span>24</span><span>(%</span><span>rdi</span><span>)</span><span>,</span><span>%</span><span>r13
+</span><span>    </span><span>mov </span><span>32</span><span>(%</span><span>rdi</span><span>)</span><span>,</span><span>%</span><span>r14
+</span><span>    </span><span>mov </span><span>40</span><span>(%</span><span>rdi</span><span>)</span><span>,</span><span>%</span><span>r15
+</span><span>    </span><span>mov </span><span>48</span><span>(%</span><span>rdi</span><span>)</span><span>,</span><span>%</span><span>rsp
+</span><span>    </span><span>jmp </span><span>*</span><span>56</span><span>(%</span><span>rdi</span><span>)</span><span>           ; goto saved address without altering rsp
+</span></code></pre><blockquote><p>Don&#39;t stress it if you don&#39;t understand assembly. The point is that saving and loading program state is pretty short and simple.</p></blockquote><p><code>setjmp</code> saves all callee-saved registers into <code>jmp_buf</code>. Callee-saved registers are registers used to hold long-lived values that should be preserved across function calls. <code>longjmp</code> restores the callee-saved registers stored inside a <code>jmp_buf</code> directly to the CPU registers.</p><blockquote><p>To the curious, the reason caller-saved registers (like <code>rcx</code> for example) are not saved, is because to the compiler <code>setjmp</code> is just another function call, meaning it will not use caller-saved registers to hold state. It assumes just like with any function call, that these registers might be changed.</p></blockquote><h2 id="non-preemptive-schedulers">Non-Preemptive Schedulers</h2><p>Already, we have a solid foundation to start running multiple tasks concurrently.</p><p>Instead of relying on time to pause execution of a running task, we can instead assume the programmer manually inserts calls to <code>longjmp</code>, see example (this time in C for <code>setjmp.h</code>):</p><pre data-lang="c"><code data-lang="c"><span>#include </span><span>&lt;stdbool.h&gt;
+</span><span>#include </span><span>&lt;stdio.h&gt;
+</span><span>#include </span><span>&lt;setjmp.h&gt;
+</span><span>
+</span><span>jmp_buf</span><span>*</span><span> current_buffer;
+</span><span>jmp_buf main_buffer;
+</span><span>
+</span><span>#define </span><span>ARRAY_SIZE</span><span>(</span><span>arr</span><span>) (</span><span>sizeof</span><span>(arr) </span><span>/ sizeof</span><span>(arr[</span><span>0</span><span>]))
+</span><span>#define </span><span>YIELD</span><span>() </span><span>{ </span><span>if </span><span>(</span><span>!</span><span>setjmp</span><span>(</span><span>*</span><span>current_buffer)) </span><span>longjmp</span><span>(main_buffer, </span><span>1</span><span>); </span><span>}
+</span><span>
+</span><span>void </span><span>task_0</span><span>() </span><span>{
+</span><span>    </span><span>while </span><span>(</span><span>true</span><span>) </span><span>{
+</span><span>        </span><span>printf</span><span>(</span><span>&#34;0</span><span>\n</span><span>&#34;</span><span>);
+</span><span>        </span><span>YIELD</span><span>();
+</span><span>    </span><span>}
+</span><span>}
+</span><span>
+</span><span>void </span><span>task_1</span><span>() </span><span>{
+</span><span>    </span><span>while </span><span>(</span><span>true</span><span>) </span><span>{
+</span><span>        </span><span>printf</span><span>(</span><span>&#34;1</span><span>\n</span><span>&#34;</span><span>);
+</span><span>        </span><span>YIELD</span><span>();
+</span><span>    </span><span>}
+</span><span>}
+</span><span>
+</span><span>int </span><span>main</span><span>() </span><span>{
+</span><span>    </span><span>void</span><span>(</span><span>*</span><span>tasks[])(</span><span>void</span><span>) </span><span>= </span><span>{</span><span>task_0, task_1</span><span>}</span><span>;
+</span><span>    jmp_buf buffers[</span><span>ARRAY_SIZE</span><span>(tasks)];
+</span><span>    </span><span>bool</span><span> started </span><span>= </span><span>false</span><span>;
+</span><span>
+</span><span>    </span><span>while </span><span>(</span><span>true</span><span>) </span><span>{
+</span><span>        </span><span>for </span><span>(</span><span>int</span><span> i </span><span>= </span><span>0</span><span>; i </span><span>&lt; </span><span>ARRAY_SIZE</span><span>(tasks); i</span><span>++</span><span>) </span><span>{
+</span><span>            </span><span>if </span><span>(</span><span>setjmp</span><span>(main_buffer)) </span><span>{
+</span><span>                </span><span>continue</span><span>;
+</span><span>            </span><span>}
+</span><span>
+</span><span>            current_buffer </span><span>= &amp;</span><span>buffers[i];
+</span><span>            </span><span>if </span><span>(</span><span>!</span><span>started) </span><span>{
+</span><span>                tasks[i]();
+</span><span>            </span><span>} </span><span>else </span><span>{
+</span><span>                </span><span>longjmp</span><span>(buffers[i], </span><span>1</span><span>);
+</span><span>            </span><span>}
+</span><span>        </span><span>}
+</span><span>
+</span><span>        started </span><span>= </span><span>true</span><span>;
+</span><span>    </span><span>}
+</span><span>
+</span><span>    </span><span>return </span><span>0</span><span>;
+</span><span>}
+</span></code></pre><p>Let&#39;s run it:</p><pre data-lang="sh"><code data-lang="sh"><span>$</span><span> gcc example.c</span><span> -o</span><span> example </span><span>&amp;&amp; </span><span>./example
+</span><span>0
+</span><span>1
+</span><span>0
+</span><span>1
+</span><span>...
+</span><span>^C
+</span></code></pre><p>Cool, but... There&#39;s actually a hidden bug (can you find it?).</p><p>Let&#39;s change <code>task_0</code> to hold some state on the stack:</p><pre data-lang="c"><code data-lang="c"><span>void </span><span>task_0</span><span>() </span><span>{
+</span><span>    </span><span>int</span><span> i </span><span>= </span><span>0</span><span>;
+</span><span>    </span><span>while </span><span>(</span><span>true</span><span>) </span><span>{
+</span><span>        </span><span>printf</span><span>(</span><span>&#34;0: </span><span>%d</span><span>\n</span><span>&#34;</span><span>, i</span><span>++</span><span>);
+</span><span>        </span><span>YIELD</span><span>();
+</span><span>    </span><span>}
+</span><span>}
+</span></code></pre><p>Run it again:</p><pre data-lang="sh"><code data-lang="sh"><span>$</span><span> gcc example.c</span><span> -o</span><span> example </span><span>&amp;&amp; </span><span>./example
+</span><span>0:</span><span> 0
+</span><span>1
+</span><span>0:</span><span> 32765
+</span><span>1
+</span><span>0:</span><span> 32765
+</span><span>1
+</span><span>...
+</span><span>^C
+</span></code></pre><p>Whoops... Because all our tasks share the same stack, each task (including our <code>main</code> function) may overwrite whatever is in the stack. See the following illustration:</p><pre><code><span>----------------
+</span><span>| main&#39;s stack |
+</span><span>----------------
+</span><span>               ^
+</span><span>First, a call to setjmp in main saves the stack address here.
+</span></code></pre><pre><code><span>---------------------------------
+</span><span>| main&#39;s stack | task_0&#39;s stack |
+</span><span>---------------------------------
+</span><span>                                ^
+</span><span>Then, a call to setjmp in task_0 saves the stack address here.
+</span></code></pre><pre><code><span>---------------------------------
+</span><span>| main&#39;s stack | task_0&#39;s stack |
+</span><span>---------------------------------
+</span><span>               ^
+</span><span>Once we longjmp back to main, we reset the stack register (rsp in x86_64) back here.
+</span></code></pre><pre><code><span>Then any pushing to the stack, will overwrite any data saved in task_0&#39;s stack.
+</span><span>So once we longjmp back to task_0, this is how our stack will look like:
+</span><span>
+</span><span>---------------------------------
+</span><span>| main&#39;s stack | &#34;random&#34; stuff |
+</span><span>---------------------------------
+</span><span>                                ^
+</span><span>No wonder we get a random looking value when we print something inside the stack.
+</span></code></pre><p>The fix is to create a stack for each task, and switch to it right before calling the task function:</p><pre data-lang="diff"><code data-lang="diff"><span>@@ -25,6 +26,7 @@ void task_1() {
+</span><span> int main() {
+</span><span>     void(*tasks[])(void) = {task_0, task_1};
+</span><span>     jmp_buf buffers[ARRAY_SIZE(tasks)];
+</span><span>+    char stacks[ARRAY_SIZE(tasks)][1024];  // Stack size of 1kb.
+</span><span>     bool started = false;
+</span><span>
+</span><span>     while (true) {
+</span><span>@@ -35,7 +37,12 @@ int main() {
+</span><span>
+</span><span>             current_buffer = &amp;buffers[i];
+</span><span>             if (!started) {
+</span><span>-                tasks[i]();
+</span><span>+                // Stack goes down on push, up on pop.
+</span><span>+                char* stack = stacks[i] + sizeof(stacks[i]);
+</span><span>+                asm(&#34;movq %0, %%rax;&#34;
+</span><span>+                    &#34;movq %1, %%rsp;&#34;
+</span><span>+                    &#34;call *%%rax&#34;
+</span><span>+                    :: &#34;rm&#34; (tasks[i]), &#34;rm&#34; (stack) : &#34;rax&#34;);
+</span><span>             } else {
+</span><span>                 longjmp(buffers[i], 1);
+</span><span>             }
+</span></code></pre><blockquote><p>The reason for saving the task function in the register <code>rax</code>, was to not lookup <code>tasks[i]</code> inside the stack, as we just changed the stack to some other memory location. The <code>asm</code> syntax is fully documented <a href="https://gcc.gnu.org/onlinedocs/gcc/extensions-to-the-c-language-family/how-to-use-inline-assembly-language-in-c-code.html">here</a>.</p></blockquote><p>Run it one last time:</p><pre data-lang="sh"><code data-lang="sh"><span>$</span><span> gcc example.c</span><span> -o</span><span> example </span><span>&amp;&amp; </span><span>./example
+</span><span>0:</span><span> 0
+</span><span>1
+</span><span>0:</span><span> 1
+</span><span>1
+</span><span>0:</span><span> 2
+</span><span>1
+</span><span>...
+</span><span>^C
+</span></code></pre><p>We have successfully implemented a user mode non-preemptive scheduler!</p><p>In real non-preemptive (also called cooperative) systems, the runtime should yield when it knows that the CPU has nothing useful to do anymore in the current task, for example waiting on I/O. They do that by registering for I/O and move the task to a different queue that holds blocked tasks (which the scheduler skips from running). Once there&#39;s I/O, they move the task from the blocked queue back to the regular queue for execution. This can be done for example by integrating with an event loop.</p><p>Here are some examples of non-preemptive schedulers in popular mainstream runtimes:</p><ul><li><strong>Rust&#39;s <a href="https://tokio.rs/">tokio</a></strong> - To yield, you either call <code>tokio::task::yield_now()</code>, or run until blocking (e.g. waiting on I/O or <code>tokio::time::sleep()</code>). In version 0.3.1 they introduced an <a href="https://tokio.rs/blog/2020-04-preemption">automatic yield</a>.</li><li><strong>Go (prior to 1.14)</strong> - At release (version 1.0), to yield, you would either call <code>runtime.Gosched()</code>, or run until blocking. In version 1.2 the scheduler is also invoked occasionally upon entry to a function.</li><li><strong>Erlang</strong> - In <a href="https://blog.stenmans.org/theBeamBook/">BEAM</a> (erlang&#39;s awesome runtime), the scheduler is invoked at function calls. Since there are no other loop constructs than recursion and list comprehensions, there is no way to loop forever without doing a function call. You can cheat though by running native C code using a <code>NIF</code> (native implemented function).</li></ul><p>Non-preemptive schedulers are risky, as we assume developers remember to put <code>yield</code> calls when doing long computations:</p><pre data-lang="go"><code data-lang="go"><span>// In Go (prior to 1.14), this code would not yield until done.
+</span><span>sum </span><span>:= </span><span>0
+</span><span>for </span><span>i </span><span>:= </span><span>0</span><span>; </span><span>i </span><span>&lt; </span><span>1e8</span><span>; </span><span>i</span><span>++ </span><span>{
+</span><span>    </span><span>sum</span><span>++
+</span><span>}
+</span></code></pre><h2 id="preemptive-schedulers">Preemptive Schedulers</h2><p>A preemptive scheduler context switches (yields) once in a while, even without a developer inserting yield calls.</p><p>Most modern operating systems utilize timer interrupts. The CPU receives an interrupt once every X amount of time is passed. The interrupt stops execution of whatever is currently running, and the interrupt handler calls the scheduler which decides whether to context switch.</p><p>That&#39;s cool and all, but user mode applications can&#39;t register to interrupts, so what can we do if we want to implement a preemptive scheduler in user mode?</p><p>One simple solution would be to utilize the kernel&#39;s preemptive scheduler. Create a thread that periodically sends a signal to threads running our scheduler.</p><p>This is exactly how Go made their scheduler preemptive in version 1.14. By periodically sending signals from their monitoring thread (<a href="https://sobyte.net/post/2021-12/golang-sysmon/">runtime.sysmon</a>) to the scheduler threads running goroutines.</p><blockquote><p>For more info on their solution, I recommend you watch <a href="https://youtube.com/watch?v=1I1WmeSjRSw">&#34;Pardon the Interruption: Loop Preemption in Go 1.14&#34;</a>.</p></blockquote><h2 id="stackful-vs-stackless">Stackful vs Stackless</h2><p>Up until now, I have been calling them tasks to not confuse you, but they have many different names like fibers, greenlets, user mode threads, green threads, virtual threads, coroutines and goroutines.</p><blockquote><p>When people say threads, they usually mean OS threads (managed by the kernel scheduler).</p></blockquote><p>A coroutine is simply a program that can be paused and resumed. There are mainly two ways to implement them: either you allocate a stack for each coroutine (stackful), or you make each function marked as <code>async</code> return an object that can hold all the state needed to pause and resume that function (stackless).</p><p>Stackful and stackless impact the API greatly, each with its own advantages and disadvantages. Here&#39;s an overview:</p><ul><li><strong>Stackful</strong> - Coroutines have the exact same API and semantics as OS threads, which makes sense, as they both allocate a stack at runtime. Our example scheduler using <code>setjmp</code> is stackful. Go is another example of a stackful implementation. Just like Go needs to periodically context switch, it also needs to periodically check whether there is enough free stack space to continue running, if not, it reallocates the stack to have more memory, copies what it had before and fixes all pointers that pointed to the old stack to now point to the new stack. Just like the stack can grow dynamically, it can also shrink if needed. The real beauty is that you can choose to run any function either synchronously or asynchronously in the background, without affecting the code around it:</li></ul><pre data-lang="go"><code data-lang="go"><span>go </span><span>fmt</span><span>.</span><span>Println</span><span>(</span><span>&#34;world&#34;</span><span>)
+</span><span>fmt</span><span>.</span><span>Println</span><span>(</span><span>&#34;hello&#34;</span><span>)
+</span></code></pre><ul><li><strong>Stackless</strong> - If you have ever used a language with <code>async</code> &amp; <code>await</code>, you used a stackless implementation. Examples include Rust and Python&#39;s <code>asyncio</code>. Rust&#39;s <code>async</code> transforms a block of code into a state machine that is not run until you <code>await</code> it. The biggest advantage of this approach is how <a href="https://pkolaczk.github.io/memory-consumption-of-async/">lightweight it is at runtime</a>, memory is allocated exactly as needed, which served well for Rust&#39;s embedded use case as well. The main problem with this approach is &#34;function coloring&#34;. An <code>async</code> function can only be called inside another <code>async</code> function:</li></ul><pre data-lang="rs"><code data-lang="rs"><span>async </span><span>fn </span><span>say</span><span>() </span><span>{
+</span><span>    println!(</span><span>&#34;hello world&#34;</span><span>);
+</span><span>}
+</span><span>
+</span><span>fn </span><span>main</span><span>() </span><span>{
+</span><span>    </span><span>// Can&#39;t call say(), as main() is not async.
+</span><span>
+</span><span>    </span><span>let </span><span>mut</span><span> rt </span><span>= </span><span>tokio</span><span>::</span><span>runtime</span><span>::</span><span>Runtime</span><span>::</span><span>new()</span><span>.</span><span>unwrap</span><span>();
+</span><span>    rt</span><span>.</span><span>block_on</span><span>(async </span><span>{
+</span><span>        </span><span>let</span><span> future </span><span>= </span><span>say</span><span>(); </span><span>// Calling does not execute.
+</span><span>        future</span><span>.</span><span>await; </span><span>// Starts executing.
+</span><span>    </span><span>}</span><span>)
+</span><span>}
+</span></code></pre><blockquote><p>Rust started with stackful prior to release, but ultimately ended up switching to stackless: <a href="https://without.boats/blog/why-async-rust/">&#34;Why async rust?&#34;</a>.</p></blockquote><p>A scheduler is also responsible for deciding which task it should run next once one finishes.</p><p>One of the simplest methods is one we have already seen before in the event loop section, and that is to run tasks in the order that they are added to the task queue.</p><p>Linux&#39;s <code>SCHED_FIFO</code> scheduler does exactly this:</p><blockquote><p>Each circle is a task. The white progress circle around tasks is the time left to run until the task is blocked.</p></blockquote><p>Taking <code>SCHED_FIFO</code> and adding a task runtime limit is what <code>SCHED_RR</code> does, allowing the CPU to be shared in a more uniform manner:</p><p>What if you have a task that <em>must</em> run once every 5ms, even if for a really short amount of time? For example in audio programming, you have a buffer to fill with a signal in time (e.g. <code>sin(x)</code>) that the audio device reads from at some interval. Missing out on filling this buffer, will result in a random signal which sounds like crackling noise, potentially ruining a recording of an entire orchestra.</p><p>These kind of programs are usually called soft real time programs. Hard real time means missing a deadline will result in the whole system failing, for example autopilot and spacecrafts.</p><p>Linux has a nice answer for soft real time systems called <code>SCHED_DEADLINE</code>, where each thread sets the amount of time until their deadline, and the scheduler always runs the task that is closest to reaching the deadline:</p><blockquote><p>The <span><b>green</b></span> progress circle is how much time is left until the deadline.</p><p><code>SCHED_FIFO</code> and <code>SCHED_RR</code> can also be used in soft real time systems because of their deterministic nature, depending on the problem you need to solve.</p></blockquote><p>To guarantee all tasks are able to run according to their configured deadline, <code>SCHED_DEADLINE</code> calculates and rejects threads with a configuration that will steal too much run time. You can learn more about it on lwn&#39;s <a href="https://lwn.net/Articles/743740/">&#34;Deadline scheduling&#34;</a>.</p><p>For general purpose workloads, like a laptop running arbitrary processes, you usually want fairness. Fairness can be achieved by continuously tracking which processes have gotten less CPU time than others, and always run the task with the lowest tracked runtime. Linux&#39;s default scheduler <code>SCHED_OTHER</code>, also known as <code>CFS</code> (Completely Fair Scheduler), does exactly this. You can also configure priorities to processes by setting a <code>nice</code> value, where processes with a lower <code>nice</code> value will be scheduled more.</p><blockquote><p><code>CFS</code> has served well for the last 26 years, but in v6.6, the new default scheduling algorithm is <a href="https://lwn.net/Articles/925371/">EEVDF</a>.</p></blockquote><h2 id="multi-core">Multi-Core</h2><p>So far, I have pretty much ignored the fact that modern machines have more than 1 CPU core.</p><p>The simplest way to achieve multi-core scheduling, is to do exactly as before. Having a global queue of tasks that are ready to run, and run them once a core is ready:</p><p>You just need to ensure that the task queue is thread-safe for <code>MPMC</code> operations (multi-producer multi-consumer), by using atomics or locks.</p><p><code>MPMC</code> queues are a lot slower than the more restrictive <code>SPMC</code> (single-producer multi-consumer) queues, which is why Go decided to have a fixed size <code>SPMC</code> queue for each scheduler (Go runs a scheduler per core configured by <code>GOMAXPROCS</code>), with a global <code>MPSC</code> queue to push to when the <code>SPMC</code> queue is full.</p><p>To ensure all cores are fully utilized, when a core is free to run but has nothing in its local queue and there are no tasks in the global queue, it <strong>steals</strong> tasks from other local queues (which is why they are multi-consumer).</p><blockquote><p>Go&#39;s solution is so good, tokio borrowed a lot from it. I highly recommend reading it on their blog: <a href="https://tokio.rs/blog/2019-10-scheduler">&#34;Making the Tokio scheduler 10x faster&#34;</a>.</p></blockquote><p>Congratulations 🥳! You are a real hero reaching the end, hopefully you have learned a thing or two.</p><p>The topic has a lot more to cover, the links left throughout this post are a great place to start exploring the endless rabbit hole of concurrency and parallelism.</p><p>If you want to play around with the animations yourself, here&#39;s a link to the <a href="https://github.com/tontinton/sched_animation">code</a>.</p><p><a onclick="window.scrollTo(0,0);">Click here</a> to scroll back to the animation at the top.</p></section></article></div></div>
+  </body>
+</html>
