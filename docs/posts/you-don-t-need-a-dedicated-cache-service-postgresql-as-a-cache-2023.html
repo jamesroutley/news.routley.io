@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://martinheinz.dev/blog/105">Original</a>
+    <h1>You Don&#39;t Need a Dedicated Cache Service – PostgreSQL as a Cache (2023)</h1>
+    
+    <div id="readability-page-1" class="page"><article><div><div><!--[--><p> PostgreSQL became a go-to SQL database for many developers over the past couple of years. While being an SQL database, Postgres also includes a lot of features that make it suitable for other uses, e.g. using it as NoSQL database (JSON and HStore datatypes) or vector database. </p><p> Another - more unusual and possibly unexpected use-case for Postgres - is using it as a cache! </p><p> In this article we will explore how we can leverage features of PostgreSQL to turn it into fully featured and very efficient caching service. </p><h2>Why?</h2><p> You might be asking: <i>&#34;Why would anyone do this, though?&#34;</i>, To answer that question, let&#39;s take a look at what we might expect from a traditional caching service: </p><ul><li>Expiration - Ability to set expiration times for cached data so that the cache doesn&#39;t store outdated information</li><li>Eviction - Remove less frequently used data when the cache is full</li><li>Invalidation - Overwrite data when it changes</li><li>Performance - Main reason to use cache is to avoid slow database queries. SQL databases generally also have slower writes compared to caches</li><li>No persistence - Caching services will generally have limited or no persistence</li><li>Key-value storage</li></ul><p> Well, as we will see in the next section, we can get all of the above when using PostgreSQL, on top of that we also get the following as a bonus: </p><ul><li>Familiar interface - Using SQL and common PostgreSQL client libraries, makes it easier to integrate into application</li><li>Cost - No need to set up and maintain another service. This decreases operational costs. You also don&#39;t need a Redis/Memcached/... expert to maintain it</li></ul><h2>How</h2><p> With the <i>&#34;Why?&#34;</i> out of the way, let&#39;s now talk about <i>&#34;how&#34;</i>. To implement cache in PostgreSQL effectively, we will use <code>UNLOGGED</code> table(s). How are these different from normal tables? </p><p><code>UNLOGGED</code> tables don&#39;t generate <i>WAL (<a href="https://www.postgresql.org/docs/current/wal-intro.html">Write Ahead Log</a>)</i> information. That gives us huge improvements in write performance and saves us some disk space. There&#39;s obviously a trade-off - <code>UNLOGGED</code> tables aren&#39;t crash-safe - without WAL record, if database server crashes, an unlogged table is automatically truncated, but with cache we don&#39;t really expect proper persistence, so that&#39;s OK. Additionally, <code>UNLOGGED</code> tables are only available on primary, not on replicas, so no distributed cache, which might or might not be an issue, you decide. </p><p> That&#39;s the theory, now let&#39;s actually try it out. In the examples I will be using PostgreSQL running in container, if you want to follow along you can use: </p><pre><code>
+docker volume create pgdata
+docker run -d \
+  --name postgres \
+  -v pgdata:/var/lib/postgresql/data \
+  -e POSTGRES_PASSWORD=strongpassword \
+  -p 5432:5432 \
+  postgres:15.3-bullseye
+</code></pre><p> To then create a <code>cache</code> table we can run: </p><pre><code>
+CREATE UNLOGGED TABLE cache (
+    id serial PRIMARY KEY,
+    key text UNIQUE NOT NULL,
+    value jsonb,
+    inserted_at timestamp);
+
+CREATE INDEX idx_cache_key ON cache (key);
+</code></pre><p> Only difference from normal table is the <code>UNLOGGED</code> keyword. As for the columns, here we use <code>JSONB</code> values, but you could use whatever suits your needs, e.g. <code>text</code>, <code>varchar</code> or <code>hstore</code>. We also include <code>inserted_at</code> column, which will be used for cache invalidation. Optionally, we also create an index for better read performance. </p><p> As was already mentioned, one of the features that we expect from caching service is ability to expire records. To do this in PostgreSQL, we can create a stored procedure that removes old rows periodically: </p><pre><code>
+CREATE OR REPLACE PROCEDURE expire_rows (retention_period INTERVAL) AS
+$$
+BEGIN
+    DELETE FROM cache
+    WHERE inserted_at &lt; NOW() - retention_period;
+
+    COMMIT;
+END;
+$$ LANGUAGE plpgsql;
+
+CALL expire_rows(&#39;60 minutes&#39;); -- This will remove rows older than 1 hour
+</code></pre><p> We will need to call this <code>expire_rows</code> procedure on a schedule. To do that we can use <code>pg_cron</code> extension. To use it, you will need to install it on OS level and then create the extension in database. You can do that using <code>Dockerfile</code> and scripts included in this <a href="https://gist.github.com/MartinHeinz/2ea26ad81a5984de6befdacf855a9255">Gist</a>. </p><p> After installing (<code>CREATE EXTENSION pg_cron;</code>), we can schedule the procedure call with: </p><pre><code>
+-- Create a schedule to run the procedure every hour
+SELECT cron.schedule(&#39;0 * * * *&#39;, $$CALL expire_rows(&#39;1 hour&#39;);$$);
+
+-- List all scheduled jobs
+SELECT * FROM cron.job;
+</code></pre><p> If you don&#39;t want to install the extension for this, then you can alternatively write a trigger that runs everytime a row is inserted (I wouldn&#39;t recommend this though): </p><pre><code>
+CREATE OR REPLACE FUNCTION expire_rows_func (retention_hours integer) RETURNS void AS
+$$
+BEGIN
+    DELETE FROM cache
+    WHERE inserted_at &lt; NOW() - (retention_hours || &#39; hours&#39;)::interval;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION expire_rows_func_trigger() RETURNS trigger AS
+$$
+BEGIN
+    PERFORM expire_rows_func (1);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER cache_cleanup_trigger
+    AFTER INSERT ON cache
+    FOR EACH ROW
+    EXECUTE FUNCTION expire_rows_func_trigger();
+</code></pre><p> Obliviously, the actual expiry/purge schedule depends on your data and use-case. </p><p> That was expiration, but what about eviction (removing old data to make space for new records)? </p><p> I&#39;d consider eviction optional, considering that expiration should keep the size down, but we could implement that as well - we can add <code>last_read timestamp</code> column which would get updated on every read. We could then run stored procedure every once-in-a-while to clean-up rows that haven&#39;t been used recently, giving us an LRU cache. You decide whether updating rows on every read is worth it. </p><p> With that, we created a simple cache, which has fast writes, fast reads, key-value storage, better persistence than traditional caching services, cache expiration, eviction and invalidation, without having to deploy yet another (costly) service. </p><h2>Performance</h2><p> So far, I mostly only mentioned how great it is to use PostgreSQL as a cache, but obviously, there are also downsides. One of them being performance, which will be (slightly) worse than with purpose-built optimized caching service. How much worse, depends on your data and usage patterns (read-heavy or write-heavy operations, data sizes, types of queries, etc.) </p><p> Benchmarking and comparing <code>UNLOGGED</code> tables against Memcached or Redis is out-of-scope of this article, but if you want to test performance (and you should) you could start with generating some data: </p><pre><code>
+INSERT INTO cache (key, value, inserted_at)
+VALUES
+    (&#39;key1&#39;, &#39;{&#34;field1&#34;: &#34;value1&#34;, &#34;field2&#34;: &#34;value2&#34;}&#39;, NOW() - INTERVAL &#39;1 hour&#39;),
+    (&#39;key2&#39;, &#39;{&#34;field1&#34;: &#34;value3&#34;, &#34;field2&#34;: &#34;value4&#34;}&#39;, NOW() - INTERVAL &#39;2 hours&#39;),
+    (&#39;key3&#39;, &#39;{&#34;field1&#34;: &#34;value5&#34;, &#34;field2&#34;: &#34;value6&#34;}&#39;, NOW() - INTERVAL &#39;3 hours&#39;),
+    (&#39;key4&#39;, &#39;{&#34;field1&#34;: &#34;value7&#34;, &#34;field2&#34;: &#34;value8&#34;}&#39;, NOW() - INTERVAL &#39;4 hours&#39;),
+    (&#39;key5&#39;, &#39;{&#34;field1&#34;: &#34;value9&#34;, &#34;field2&#34;: &#34;value10&#34;}&#39;, NOW() - INTERVAL &#39;5 hours&#39;);
+
+-- Insert more data
+INSERT INTO cache (key, value, inserted_at)
+SELECT &#39;key&#39; || s,
+       (&#39;{&#34;field1&#34;: &#34;value&#39; || s || &#39;&#34;}&#39;)::jsonb,
+       NOW() - (s || &#39; hours&#39;)::interval
+FROM generate_series(1, 25) AS s;
+</code></pre><p> And then analyze queries to get a sense of what the performance might look like: </p><pre><code>
+EXPLAIN ANALYZE SELECT * FROM cache WHERE key = &#39;key1&#39;;
+
+EXPLAIN ANALYZE INSERT INTO cache (key, value, inserted_at)
+VALUES (&#39;new_key&#39;, &#39;{&#34;field1&#34;: &#34;new_value1&#34;, &#34;field2&#34;: &#34;new_value2&#34;}&#39;, NOW());
+</code></pre><p> I would also recommend reading <a href="https://www.crunchydata.com/blog/postgresl-unlogged-tables">this great article</a> about <code>UNLOGGED</code> tables which shows more details about the feature including some performance comparisons. </p><h2>Closing Thoughts</h2><p> In my opinion, most of the time, you don&#39;t need an additional service or special database. There&#39;s a reason why half the new fancy DBs are implemented on top of good old SQL databases. Just look at the list of <a href="https://wiki.postgresql.org/wiki/PostgreSQL_derived_databases">PostgreSQL-derived databases</a>. Not to mention things like <a href="https://www.timescale.com/">Timescale</a> and many others, which are really just PostgreSQL with some extra features sprinkled on top. </p><p> While purpose-built, optimized solutions have their place, it&#39;s good to consider pros and cons of running extra service for every little thing, such as cache, scheduler, vector database, etc. </p><p> Maybe, just maybe, using one tool for multiple things and saving costs and overhead outweighs the few benefits the extra service provides. </p><!--]--></div></div></article></div>
+  </body>
+</html>
