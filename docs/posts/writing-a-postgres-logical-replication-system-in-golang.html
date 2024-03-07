@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.dolthub.com/blog/2024-03-08-postgres-logical-replication/">Original</a>
+    <h1>Writing a Postgres logical replication system in Golang</h1>
+    
+    <div id="readability-page-1" class="page"><div data-cy="blog-post-text">
+<p>We&#39;re building <a href="https://doltdb.com">Dolt</a>, the world&#39;s first version-controlled SQL database. Dolt
+is MySQL compatible, but many of our prospective customers wanted a Postgres-compatible version
+instead, so we have been hard at work building <a href="https://github.com/dolthub/doltgresql">DoltgreSQL</a>.</p>
+<p>The first prospective DoltgreSQL customer to reach out to us wants to continue using Postgres for
+their primary database server, but get diffs of all their changes in Doltgres. So we talked it over
+with them and decided that Postgres&#39;s <a href="https://www.postgresql.org/docs/current/logical-replication.html">logical
+replication</a> would be the best fit
+for this functionality, and started building it. A few weeks later, DoltgreSQL&#39;s
+replicate-from-Postgres feature is almost ready for production use, and you&#39;ll be able to try it out
+in the next release of the product.</p>
+<p>This blog discusses what we learned building this feature, and walks you step-by-step through how to
+build a replication system consuming Postgres&#39;s logical replication protocol in Go. We&#39;ll be using
+the <a href="https://github.com/jackc/pglogrepl/">jackc/pglogrepl</a> library to consume and send messages with
+the Postgres primary, but most of the lessons generalize to other clients as well.</p>
+
+<p>Logical replication is one of two modes of replication supported by Postgres. Both consume the
+write-ahead log (WAL) produced by the primary database, which is where Postgres serializes all data
+it writes to disk. The WAL is very low-level binary data containing information related to physical
+blocks on disk that Postgres wrote as a result of write operations. It is difficult to interpret if
+you&#39;re not a Postgres database server yourself. The two types of replication Postgres supports are:</p>
+<ul>
+<li><strong>Physical replication</strong> copies the bytes of the WAL directly from primary to replica. It&#39;s really
+only appropriate for replicating between a primary and replica running the same binary release of
+Postgres.</li>
+<li><strong>Logical replication</strong> interprets updates to the WAL on the primary database, then sends them to
+the replica as a series of tuple messages describing an <code>INSERT</code>, <code>UPDATE</code>, or <code>DELETE</code>
+operation. Because it abstracts away the physical serialization of the WAL, it can be used to
+replicate between different versions of Postgres, such as different major releases or even
+operating systems. Or, as we&#39;ll see, to replicate to a totally non-Postgres system.</li>
+</ul>
+<p>What we found is that, while it&#39;s certainly possible (even easy) to receive replication messages
+from Postgres, interpreting and applying them correctly in the face of concurrent transactions and
+client crashes is quite challenging, and requires a pretty deep understanding of how the protocol
+works.</p>
+<p>Let&#39;s dig in.</p>
+
+<p>Before we discuss the details of our replication implementation, we should start by defining design
+goals for how a reliable replication system should behave. These may seem obvious, but it&#39;s very
+easy to write a system that accidentally omits one of these crticial properties in some
+circumstances. We must always keep them front of mind while writing any replication system,
+and have tests thoroughly exercising them in the face of a variety of scenarios.</p>
+<ul>
+<li><strong>The system must not miss any updates.</strong> Every tuple change sent by the primary must be durably
+recorded by the replica.</li>
+<li><strong>The system must not apply any update more than once.</strong> Every tuple update must be applied
+exactly once.</li>
+<li><strong>Changes in a transaction must be applied atomically.</strong> The primary sends each tuple update in
+its own message, but none of them must become visible to clients of the replica until the
+corresponding transaction on the replica has been committed.</li>
+<li><strong>The system must be resilient to sudden crashes.</strong> A replication process could die at any point
+during execution, and the above properties must still be preserved.</li>
+<li><strong>The system must inform the primary about its progress</strong>. Admins on the primary database can run
+queries to determine how far behind each replica is. This information doesn&#39;t need to be exactly
+up to date, but if it&#39;s too far behind the primary will be prevented from performing necessary
+cleanup on older WAL files that are not actually needed any longer.</li>
+</ul>
+<p>In addition to these critical requirements, a replication system may also implement some
+quality-of-life features. These are nice-to-haves.</p>
+<ul>
+<li><strong>Easy to cold-start.</strong> It should be possible to start a new replica with no downtime on the
+primary and a minimum amount of effort on the replica.</li>
+<li><strong>Easy to recover from errors.</strong> For a variety of reasons, it may not be possible to apply every
+change on the primary to the replica. When this happens, it should be easy to find the error and
+restart the process to continue replication from where the error first occurred.</li>
+</ul>
+<p>Now that we understand how our system must behave, lets look at the logical replication protocol
+messages sent by a Postgres primary and discuss how to handle them.</p>
+
+<p>Like many complex systems, the logical replication system on Postgres is assiduously documented in
+the fine details but profoundly lacking in the big picture. That is to say: it&#39;s easy enough to
+learn how many aspects of the system work, but very difficult to understand how they should fit
+together to achieve some goal. In our case, in addition to reading many (many!) pages of
+documentation, it was also necessary to write and test various prototypes to understand the behavior
+of the primary in various scenarios.</p>
+<p>Logical replication is a two-way process in which the primary and the replica must both behave as
+expected to prevent incorrect behavior. We discovered these properties through trial and error, but
+hopefully someone reading this in the future will be able to use our learning process as a shortcut
+in their own implementation.</p>
+<h2 id="creating-a-publication-and-a-slot"><a href="#creating-a-publication-and-a-slot" aria-label="creating a publication and a slot permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>Creating a publication and a slot</h2>
+<p>Postgres requires all replicas to register themselves ahead of time in a two-step process.</p>
+<p>First, <strong>create a publication on the primary</strong>. A publication tells the primary which tables you
+want to replicate. You can also replicate all tables if you want. As a database admin, run the
+following SQL on the primary:</p>
+<div data-language="sql"><pre><code><span>CREATE</span> PUBLICATION pub1 <span>FOR</span> <span>ALL</span> <span>TABLES</span><span>;</span><span>&#34;
+CREATE PUBLICATION pub2 FOR TABLE t1;&#34;</span>
+<span>.</span><span>.</span><span>.</span></code></pre></div>
+<p>Next, <strong>create a replication slot on the primary</strong>. Each publication can have multiple independent
+subscribers, and each needs a replication slot. The total number of slots is limited by the primary
+server and can be changed via configuration. As a database admin, run the following SQL on the
+primary:</p>
+<div data-language="sql"><pre><code>CREATE_REPLICATION_SLOT slot1 LOGICAL pgoutput<span>;</span></code></pre></div>
+<p>The <code>pglogrepl</code> library has a convenience method to do this for you:</p>
+<div data-language="go"><pre><code>pglogrepl<span>.</span><span>CreateReplicationSlot</span><span>(</span>context<span>.</span><span>Background</span><span>(</span><span>)</span><span>,</span> conn<span>.</span><span>PgConn</span><span>(</span><span>)</span><span>,</span> <span>&#34;slot1&#34;</span><span>,</span> <span>&#34;pgoutput&#34;</span><span>,</span> pglogrepl<span>.</span>CreateReplicationSlotOptions<span>{</span><span>}</span><span>)</span></code></pre></div>
+<p>Now that we have a publication and a slot, we can begin replication.</p>
+<h2 id="starting-replication"><a href="#starting-replication" aria-label="starting replication permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>Starting replication</h2>
+<p>The rest of the replication protocol takes place on a single connection. Messages flow back and
+forth between the primary and the replica.</p>
+<p>To begin, open a connection to the primary and run the <code>START_REPLICATION</code> command like so:</p>
+<div data-language="sql"><pre><code>START_REPLICATION SLOT slot1 LOGICAL <span>0</span><span>/</span><span>0</span> <span>(</span>proto_version <span>&#39;2&#39;</span><span>,</span> publication_names <span>&#39;pub1&#39;</span><span>,</span> messages <span>&#39;true&#39;</span><span>,</span> streaming <span>&#39;true&#39;</span><span>)</span><span>;</span></code></pre></div>
+<p>Again, <code>plgogrepl</code> has a wrapper you can use to work in an object-oriented style:</p>
+<div data-language="go"><pre><code>conn<span>,</span> err <span>:=</span> pgconn<span>.</span><span>Connect</span><span>(</span>context<span>.</span><span>Background</span><span>(</span><span>)</span><span>,</span> <span>&#34;postgres://postgres:password@127.0.0.1:5432/postgres?replication=database&#34;</span><span>)</span>
+<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+    <span>return</span> <span>nil</span><span>,</span> err
+<span>}</span>
+    
+pluginArguments <span>:=</span> <span>[</span><span>]</span><span>string</span><span>{</span>
+    <span>&#34;proto_version &#39;2&#39;&#34;</span><span>,</span>
+    fmt<span>.</span><span>Sprintf</span><span>(</span><span>&#34;publication_names &#39;%s&#39;&#34;</span><span>,</span> publicationName<span>)</span><span>,</span>
+    <span>&#34;messages &#39;true&#39;&#34;</span><span>,</span>
+    <span>&#34;streaming &#39;true&#39;&#34;</span><span>,</span>
+<span>}</span>
+
+
+
+
+
+log<span>.</span><span>Printf</span><span>(</span><span>&#34;Starting logical replication on slot %s at WAL location %s&#34;</span><span>,</span> slotName<span>,</span> lastFlushLsn<span>+</span><span>1</span><span>)</span>
+err <span>=</span> pglogrepl<span>.</span><span>StartReplication</span><span>(</span>context<span>.</span><span>Background</span><span>(</span><span>)</span><span>,</span> conn<span>,</span> slotName<span>,</span> lastFlushLsn<span>+</span><span>1</span><span>,</span> pglogrepl<span>.</span>StartReplicationOptions<span>{</span>
+    PluginArgs<span>:</span> pluginArguments<span>,</span>
+<span>}</span><span>)</span>
+
+<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+    <span>return</span> <span>nil</span><span>,</span> err
+<span>}</span>
+
+<span>return</span> conn<span>,</span> <span>nil</span></code></pre></div>
+<p>We&#39;ll return to details about the <code>lastFlushLsn</code> in a bit.</p>
+<p>Note that the connection you execute this command on must include a <code>replication=database</code> query
+param. If you forget to include this query param, the <code>START_REPLICATION</code> command will actually
+<em>fail with a syntax error</em>. Invoking a separate parser syntax depending on the presence of a query
+param is a bizarre design decision on the part of Postgres that makes errors needlessly difficult to
+debug, so be aware of it.</p>
+<p>If the <code>START_REPLICATION</code> command succceds, your connection is in replication streaming mode, and
+replication messages will flow to your replica. You&#39;re expected to reply to them appropriately.</p>
+<h2 id="replication-message-flow"><a href="#replication-message-flow" aria-label="replication message flow permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>Replication message flow</h2>
+<p>The primary sends one of two <a href="https://www.postgresql.org/docs/current/protocol-replication.html">top-level
+messages</a> over and over:</p>
+<ul>
+<li><strong>Primary keepalive message</strong>: This is the idle message that the primary sends whenever there&#39;s
+nothing else happening. It contains the current server time and position in the WAL, and a boolean
+requesting a reply. The replica should reply as soon as possible when requested to avoid
+disconnection.</li>
+<li><strong>XLogData</strong>: This message bundles another logical message within itself, containing the actual
+replication instructions. It also includes some metadata about the message, such as the server
+time and WAL position of this message.</li>
+</ul>
+<p>Using pglogrepl, we can receive the next replication message like so:</p>
+<div data-language="go"><pre><code>rawMsg<span>,</span> err <span>:=</span> primaryConn<span>.</span><span>ReceiveMessage</span><span>(</span>ctx<span>)</span>
+msg<span>,</span> ok <span>:=</span> rawMsg<span>.</span><span>(</span><span>*</span>pgproto3<span>.</span>CopyData<span>)</span>
+<span>if</span> <span>!</span>ok <span>{</span>
+    log<span>.</span><span>Printf</span><span>(</span><span>&#34;Received unexpected message: %T\n&#34;</span><span>,</span> rawMsg<span>)</span>
+    <span>return</span> <span>nil</span>
+<span>}</span>
+
+<span>switch</span> msg<span>.</span>Data<span>[</span><span>0</span><span>]</span> <span>{</span>
+<span>case</span> pglogrepl<span>.</span>PrimaryKeepaliveMessageByteID<span>:</span>
+    pkm<span>,</span> err <span>:=</span> pglogrepl<span>.</span><span>ParsePrimaryKeepaliveMessage</span><span>(</span>msg<span>.</span>Data<span>[</span><span>1</span><span>:</span><span>]</span><span>)</span>
+    <span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+        log<span>.</span><span>Fatalln</span><span>(</span><span>&#34;ParsePrimaryKeepaliveMessage failed:&#34;</span><span>,</span> err<span>)</span>
+    <span>}</span>
+
+    <span>return</span> <span>handleKeepalive</span><span>(</span>pkm<span>)</span>
+<span>case</span> pglogrepl<span>.</span>XLogDataByteID<span>:</span>
+    xld<span>,</span> err <span>:=</span> pglogrepl<span>.</span><span>ParseXLogData</span><span>(</span>msg<span>.</span>Data<span>[</span><span>1</span><span>:</span><span>]</span><span>)</span>
+    <span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+        <span>return</span> err
+    <span>}</span>
+
+    err <span>:=</span> <span>processXdMessage</span><span>(</span>xld<span>,</span> state<span>)</span></code></pre></div>
+<p>The replica replies to these messages with a single message in all cases: the <a href="https://www.postgresql.org/docs/current/protocol-replication.html#PROTOCOL-REPLICATION-STANDBY-STATUS-UPDATE">standby status update
+message</a>. This
+message contains three pieces of vital info used to synchronize the replica in case of connection
+loss or unexpected restart:</p>
+<ul>
+<li>Last written WAL position</li>
+<li>Last flushed WAL position</li>
+<li>Last applied WAL position</li>
+</ul>
+<p>Using <code>pglogrepl</code>, you cand send the status update like this:</p>
+<div data-language="go"><pre><code>err <span>:=</span> pglogrepl<span>.</span><span>SendStandbyStatusUpdate</span><span>(</span>context<span>.</span><span>Background</span><span>(</span><span>)</span><span>,</span> primaryConn<span>,</span> pglogrepl<span>.</span>StandbyStatusUpdate<span>{</span>
+    WALWritePosition<span>:</span> lastWrittenLSN <span>+</span> <span>1</span><span>,</span>
+    WALFlushPosition<span>:</span> lastWrittenLSN <span>+</span> <span>1</span><span>,</span>
+    WALApplyPosition<span>:</span> lastReceivedLSN <span>+</span> <span>1</span><span>,</span>
+<span>}</span><span>)</span></code></pre></div>
+<p>The primary server tracks these values and will use them to re-establish replication at the right
+WAL position on a restart. They are also used to inform any admins of how far this replica is behind
+the primary (replication lag). See the following sections for details on the meanings of the WAL
+parameters in this message.</p>
+<p>The most important messages are the <code>XLogData</code> messages, which contain actual tuple data changes.</p>
+<h2 id="processing-xlogdata-messages"><a href="#processing-xlogdata-messages" aria-label="processing xlogdata messages permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>Processing XLogData messages</h2>
+<p>Finally, we arrive at the meat of the problem: processing data updates and applying them to our own
+replica. Each <code>XLogData</code> message wraps one other logical message for us to decode and interpret. But
+here too Postgres adds an additional layer of complexity, sending two kinds of wrapped logical
+messages:</p>
+<ul>
+<li><strong>Metadata messages</strong> that descibe the tables being replicated and their types. The most important
+is the <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-RELATION">Relation
+message</a>,
+which gives information about the schema of tables being replicated. You may also receive <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-TYPE">Type
+messages</a>,
+which identify custom types including their names and OIDs.</li>
+<li><strong>Data messages</strong> that describe the changes to the WAL being replicated. In addition to messages
+corresponding to <code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code> statements, the primary also sends <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-BEGIN">Begin
+messages</a>,
+which mark the start of a set of tuple changes committed in a transaction, and a <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-COMMIT">Commit
+message</a>,
+which ends the set.</li>
+</ul>
+<p>So, after beginning replication, you&#39;ll begin receiving <code>XLogData</code> messages from the primary. These
+follow a reliable sequence:</p>
+<ol>
+<li>First, any <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-RELATION">Relation
+messages</a>
+for the tables being replicated. Depending on what you&#39;re trying to do, you probably want to
+parse these messages and remember the schemas they describe.</li>
+<li>Then, for each committed transaction, you&#39;ll receive a <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-BEGIN">Begin
+message</a>,
+which includes the WAL position of the eventual commit. Only transactions that were successfully
+committed to the primary are sent to logical replicas: you won&#39;t even receive a Begin message
+that corresonds to a transaction that was rolled back.</li>
+<li>Next, for every row that changed as a result of this transaction, you&#39;ll receive one of: an
+<a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-INSERT">Insert
+message</a>;
+an <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-UPDATE">Update
+message</a>;
+or a <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-DELETE">Delete
+message</a>. Each
+of these correspond to their equivalent SQL statement and have enough information to apply them
+accordingly. Note that these are not the statements executed on the primary as part of each
+transaction: they are logical updates to a single row that occurred as a result of whatever
+statements were executed.</li>
+<li>Finally, you&#39;ll receive a <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-COMMIT">Commit
+message</a>
+indicating the previously received set of tuple updates should be committed in a
+transaction. Unlike the <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-BEGIN">Begin
+message</a>,
+the Commit message doesn&#39;t include any WAL position metadata.</li>
+</ol>
+<p>This flow is best illustrated with an example.</p>
+
+<p>To understand how messages flow from the primary to the replica, it helps to understand how changes
+in Postgres&#39;s write-ahead log (WAL) get translated into replication messages. Postgres writes all
+data changes from queries into the WAL as they happen. Each record in the WAL contains
+physical-data-level changes to tuples, as well as metadata such as the transaction responsible for
+that change. Crucially, entries in the WAL are written throughout a transaction&#39;s lifecycle, but do
+not become permanent or visible to other transactions until that transaction is successfully
+committed. The <code>COMMIT</code> is itself a message written to the WAL as well, and makes all the data
+changes that were a part of that transaction permanent.</p>
+<p>You can picture the WAL as a series of data updates coming from their various transactions. Under
+concurrency, these entries can and will be interleaved. Here we see statements being executed by
+three concurrent transactions (color-coded red, blue, and green) and their respective WAL entries.</p>
+<p><span>
+      <a href="https://organicdonut.com/blog/static/d29cce4e67f6b73aa782c4cce8b6d178/37523/WAL_example.png" target="_blank" rel="noopener">
+    <span></span>
+  <img alt="WAL illustration" title="" src="https://organicdonut.com/blog/static/d29cce4e67f6b73aa782c4cce8b6d178/37523/WAL_example.png" srcset="/blog/static/d29cce4e67f6b73aa782c4cce8b6d178/a48b3/WAL_example.png 214w,
+/blog/static/d29cce4e67f6b73aa782c4cce8b6d178/47730/WAL_example.png 428w,
+/blog/static/d29cce4e67f6b73aa782c4cce8b6d178/37523/WAL_example.png 720w" sizes="(max-width: 720px) 100vw, 720px" loading="lazy" decoding="async"/>
+  </a>
+    </span></p>
+<p>When Postgres replicates these transactions to logical subscribers, it does so on a per-transaction
+basis, in the order that each transaction commits. For each transaction, the subscriber will receive
+a <code>Begin</code> message, followed by one or more tuple change messages, and concluding with a <code>Commit</code>
+message. Unlike in the physical WAL, messages for different transactions are not interleaved. For
+the above WAL example, the replication messages received by the subscriber will look something like
+this:</p>
+<p><span>
+      <a href="https://organicdonut.com/blog/static/b9a5647051600784d06e2c77d49352b1/01dae/WAL-replication.png" target="_blank" rel="noopener">
+    <span></span>
+  <img alt="WAL replication" title="" src="https://organicdonut.com/blog/static/b9a5647051600784d06e2c77d49352b1/01dae/WAL-replication.png" srcset="/blog/static/b9a5647051600784d06e2c77d49352b1/a48b3/WAL-replication.png 214w,
+/blog/static/b9a5647051600784d06e2c77d49352b1/47730/WAL-replication.png 428w,
+/blog/static/b9a5647051600784d06e2c77d49352b1/01dae/WAL-replication.png 721w" sizes="(max-width: 721px) 100vw, 721px" loading="lazy" decoding="async"/>
+  </a>
+    </span></p>
+<p>There are a few things to note here:</p>
+<ul>
+<li><code>TX3</code> (the green one) is not replicated, since it was rolled back.</li>
+<li><code>TX2</code> comes first since it committed first, even though <code>TX1</code> started writing WAL entries first.</li>
+<li>The WAL position of each tuple is behind the eventual <code>COMMIT</code>&#39;s WAL position. The <code>Keepalive</code>
+message sends the current WAL of the primary as a whole, which is typically ahead of the tuple
+messasges being received.</li>
+<li>Each replication statement corresponds to a single tuple that was changed as a result of an
+<code>INSERT</code>, <code>UPDATE</code>, or <code>DELETE</code> statement. So there may be multiple tuple replication messages
+sent for each statement executed on the primary.</li>
+</ul>
+<p>Next, let&#39;s look at some example Go code for processing the tuple data we get in <code>XLogData</code>
+messages.</p>
+
+<p>Using <code>pglogrepl</code>, we can process these messages like this:</p>
+<div data-language="go"><pre><code><span>func</span> <span>(</span>r <span>*</span>LogicalReplicator<span>)</span> <span>processMessage</span><span>(</span>
+	xld pglogrepl<span>.</span>XLogData<span>,</span>
+	state <span>*</span>replicationState<span>,</span>
+<span>)</span> <span>(</span><span>bool</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	walData <span>:=</span> xld<span>.</span>WALData
+	logicalMsg<span>,</span> err <span>:=</span> pglogrepl<span>.</span><span>ParseV2</span><span>(</span>walData<span>,</span> state<span>.</span>inStream<span>)</span>
+	<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+		<span>return</span> <span>false</span><span>,</span> err
+	<span>}</span>
+
+	log<span>.</span><span>Printf</span><span>(</span><span>&#34;XLogData (%T) =&gt; WALStart %s ServerWALEnd %s ServerTime %s&#34;</span><span>,</span> logicalMsg<span>,</span> xld<span>.</span>WALStart<span>,</span> xld<span>.</span>ServerWALEnd<span>,</span> xld<span>.</span>ServerTime<span>)</span>
+	state<span>.</span>lastReceivedLSN <span>=</span> xld<span>.</span>ServerWALEnd
+
+	<span>switch</span> logicalMsg <span>:=</span> logicalMsg<span>.</span><span>(</span><span>type</span><span>)</span> <span>{</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>RelationMessageV2<span>:</span>
+		state<span>.</span>relations<span>[</span>logicalMsg<span>.</span>RelationID<span>]</span> <span>=</span> logicalMsg
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>BeginMessage<span>:</span>
+		<span>if</span> state<span>.</span>lastWrittenLSN <span>&gt;</span> logicalMsg<span>.</span>FinalLSN <span>{</span>
+			log<span>.</span><span>Printf</span><span>(</span><span>&#34;Received stale message, ignoring. Last written LSN: %s Message LSN: %s&#34;</span><span>,</span> state<span>.</span>lastWrittenLSN<span>,</span> logicalMsg<span>.</span>FinalLSN<span>)</span>
+			state<span>.</span>processMessages <span>=</span> <span>false</span>
+			<span>return</span> <span>false</span><span>,</span> <span>nil</span>
+		<span>}</span>
+
+		state<span>.</span>processMessages <span>=</span> <span>true</span>
+		state<span>.</span>currentTransactionLSN <span>=</span> logicalMsg<span>.</span>FinalLSN
+
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;BeginMessage: %v&#34;</span><span>,</span> logicalMsg<span>)</span>
+		err <span>=</span> r<span>.</span><span>replicateQuery</span><span>(</span>state<span>.</span>replicaConn<span>,</span> <span>&#34;START TRANSACTION&#34;</span><span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>CommitMessage<span>:</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;CommitMessage: %v&#34;</span><span>,</span> logicalMsg<span>)</span>
+		err <span>=</span> r<span>.</span><span>replicateQuery</span><span>(</span>state<span>.</span>replicaConn<span>,</span> <span>&#34;COMMIT&#34;</span><span>)</span>
+		<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+			<span>return</span> <span>false</span><span>,</span> err
+		<span>}</span>
+		state<span>.</span>processMessages <span>=</span> <span>false</span>
+
+		<span>return</span> <span>true</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>InsertMessageV2<span>:</span>
+        <span>return</span> r<span>.</span><span>handleInsert</span><span>(</span>logicalMsg<span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>UpdateMessageV2<span>:</span>
+        <span>return</span> r<span>.</span><span>handleUpdate</span><span>(</span>logicalMsg<span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>DeleteMessageV2<span>:</span>
+        <span>return</span> r<span>.</span><span>handleDelete</span><span>(</span>logicalMsg<span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>TruncateMessageV2<span>:</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;truncate for xid %d\n&#34;</span><span>,</span> logicalMsg<span>.</span>Xid<span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>TypeMessageV2<span>:</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;typeMessage for xid %d\n&#34;</span><span>,</span> logicalMsg<span>.</span>Xid<span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>OriginMessage<span>:</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;originMessage for xid %s\n&#34;</span><span>,</span> logicalMsg<span>.</span>Name<span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>LogicalDecodingMessageV2<span>:</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;Logical decoding message: %q, %q, %d&#34;</span><span>,</span> logicalMsg<span>.</span>Prefix<span>,</span> logicalMsg<span>.</span>Content<span>,</span> logicalMsg<span>.</span>Xid<span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>StreamStartMessageV2<span>:</span>
+		state<span>.</span>inStream <span>=</span> <span>true</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;Stream start message: xid %d, first segment? %d&#34;</span><span>,</span> logicalMsg<span>.</span>Xid<span>,</span> logicalMsg<span>.</span>FirstSegment<span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>StreamStopMessageV2<span>:</span>
+		state<span>.</span>inStream <span>=</span> <span>false</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;Stream stop message&#34;</span><span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>StreamCommitMessageV2<span>:</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;Stream commit message: xid %d&#34;</span><span>,</span> logicalMsg<span>.</span>Xid<span>)</span>
+	<span>case</span> <span>*</span>pglogrepl<span>.</span>StreamAbortMessageV2<span>:</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;Stream abort message: xid %d&#34;</span><span>,</span> logicalMsg<span>.</span>Xid<span>)</span>
+	<span>default</span><span>:</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;Unknown message type in pgoutput stream: %T&#34;</span><span>,</span> logicalMsg<span>)</span>
+	<span>}</span>
+    
+    <span>return</span> <span>false</span><span>,</span> <span>nil</span>
+<span>}</span></code></pre></div>
+<p>We don&#39;t handle all the logical replication events possible, just the ones we need to. What you do
+with these messages is of course up to you. We&#39;re replicating them into another database system, so
+we want to transform the tuple data into equivalant SQL statements. The one for <code>INSERT</code> looks like
+this:</p>
+<div data-language="go"><pre><code><span>func</span> <span>(</span>r <span>*</span>LogicalReplicator<span>)</span> <span>handleInsert</span><span>(</span>
+	xld pglogrepl<span>.</span>XLogData<span>,</span>
+	state <span>*</span>replicationState<span>,</span>
+<span>)</span> <span>(</span><span>bool</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>if</span> <span>!</span>state<span>.</span>processMessages <span>{</span>
+		log<span>.</span><span>Printf</span><span>(</span><span>&#34;Received stale message, ignoring. Last written LSN: %s Message LSN: %s&#34;</span><span>,</span> state<span>.</span>lastWrittenLSN<span>,</span> xld<span>.</span>ServerWALEnd<span>)</span>
+		<span>return</span> <span>false</span><span>,</span> <span>nil</span>
+	<span>}</span>
+
+	rel<span>,</span> ok <span>:=</span> state<span>.</span>relations<span>[</span>logicalMsg<span>.</span>RelationID<span>]</span>
+	<span>if</span> <span>!</span>ok <span>{</span>
+		log<span>.</span><span>Fatalf</span><span>(</span><span>&#34;unknown relation ID %d&#34;</span><span>,</span> logicalMsg<span>.</span>RelationID<span>)</span>
+	<span>}</span>
+
+	columnStr <span>:=</span> strings<span>.</span>Builder<span>{</span><span>}</span>
+	valuesStr <span>:=</span> strings<span>.</span>Builder<span>{</span><span>}</span>
+	<span>for</span> idx<span>,</span> col <span>:=</span> <span>range</span> logicalMsg<span>.</span>Tuple<span>.</span>Columns <span>{</span>
+		<span>if</span> idx <span>&gt;</span> <span>0</span> <span>{</span>
+			columnStr<span>.</span><span>WriteString</span><span>(</span><span>&#34;, &#34;</span><span>)</span>
+			valuesStr<span>.</span><span>WriteString</span><span>(</span><span>&#34;, &#34;</span><span>)</span>
+		<span>}</span>
+
+		colName <span>:=</span> rel<span>.</span>Columns<span>[</span>idx<span>]</span><span>.</span>Name
+		columnStr<span>.</span><span>WriteString</span><span>(</span>colName<span>)</span>
+
+		<span>switch</span> col<span>.</span>DataType <span>{</span>
+		<span>case</span> <span>&#39;n&#39;</span><span>:</span> 
+			valuesStr<span>.</span><span>WriteString</span><span>(</span><span>&#34;NULL&#34;</span><span>)</span>
+		<span>case</span> <span>&#39;t&#39;</span><span>:</span> 
+
+			
+			val<span>,</span> err <span>:=</span> <span>decodeTextColumnData</span><span>(</span>state<span>.</span>typeMap<span>,</span> col<span>.</span>Data<span>,</span> rel<span>.</span>Columns<span>[</span>idx<span>]</span><span>.</span>DataType<span>)</span>
+			<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+				log<span>.</span><span>Fatalln</span><span>(</span><span>&#34;error decoding column data:&#34;</span><span>,</span> err<span>)</span>
+			<span>}</span>
+			colData<span>,</span> err <span>:=</span> <span>encodeColumnData</span><span>(</span>state<span>.</span>typeMap<span>,</span> val<span>,</span> rel<span>.</span>Columns<span>[</span>idx<span>]</span><span>.</span>DataType<span>)</span>
+			<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+				<span>return</span> <span>false</span><span>,</span> err
+			<span>}</span>
+			valuesStr<span>.</span><span>WriteString</span><span>(</span>colData<span>)</span>
+		<span>default</span><span>:</span>
+			log<span>.</span><span>Printf</span><span>(</span><span>&#34;unknown column data type: %c&#34;</span><span>,</span> col<span>.</span>DataType<span>)</span>
+		<span>}</span>
+	<span>}</span>
+
+	err <span>=</span> r<span>.</span><span>replicateQuery</span><span>(</span>state<span>.</span>replicaConn<span>,</span> fmt<span>.</span><span>Sprintf</span><span>(</span><span>&#34;INSERT INTO %s.%s (%s) VALUES (%s)&#34;</span><span>,</span> rel<span>.</span>Namespace<span>,</span> rel<span>.</span>RelationName<span>,</span> columnStr<span>.</span><span>String</span><span>(</span><span>)</span><span>,</span> valuesStr<span>.</span><span>String</span><span>(</span><span>)</span><span>)</span><span>)</span>
+	<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+		<span>return</span> <span>false</span><span>,</span> err
+	<span>}</span>
+<span>}</span> </code></pre></div>
+
+<p>There&#39;s one final important detail that you need to be aware of when processing replication messages
+from the Postgres primary: you must locally track the last location in the primary&#39;s WAL that you
+have flushed to disk. You have to persist this somewhere durably, preferably with the same
+durability guarantees as wherever you&#39;re replicating the data updates, and atomically with the data
+updates themselves. In a pinch, you could use a normal file to track this piece of data, but then
+you have a data race. If your process dies between flushing tuple data to disk and flushing the WAL
+location to disk, on a restart you&#39;ll either begin processing a duplicate message, or skip a
+message, depending on the order of the writes.</p>
+<p>In our implementation, the <code>processMessage</code> method returns a boolean value indicating whether the
+logical message was a <code>Commit</code>, which corresponds to us commiting our own transaction. If it was, we
+also store the last WAL position of the transaction we just committed, which we originally received
+from a <code>Begin message</code> from the primary.</p>
+<div data-language="go"><pre><code>committed<span>,</span> err <span>:=</span> r<span>.</span><span>processMessage</span><span>(</span>xld<span>,</span> state<span>)</span>
+<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+    <span>return</span> <span>handleErrWithRetry</span><span>(</span>err<span>)</span>
+<span>}</span>
+
+<span>if</span> committed <span>{</span>
+    state<span>.</span>lastWrittenLSN <span>=</span> state<span>.</span>currentTransactionLSN
+    log<span>.</span><span>Printf</span><span>(</span><span>&#34;Writing LSN %s to file\n&#34;</span><span>,</span> state<span>.</span>lastWrittenLSN<span>.</span><span>String</span><span>(</span><span>)</span><span>)</span>
+    err <span>:=</span> r<span>.</span><span>writeWALPosition</span><span>(</span>state<span>.</span>lastWrittenLSN<span>)</span>
+    <span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+        <span>return</span> err
+    <span>}</span>
+<span>}</span></code></pre></div>
+<p>Somewhat confusingly, Postgres also durably tracks each subscriber&#39;s last confirmed flush location
+in the WAL, and it&#39;s tempting to believe you can just let Postgres track this state for you. But
+that solution is not workable, for the same reason you can get data races when using a normal file
+to track the WAL location. It&#39;s even worse in the case of Postgres, because now the state and
+failure modes are split across two nodes in the distributed system.</p>
+<p>It&#39;s important to periodically update the Postgres primary on your replication standby&#39;s status,
+because it keeps track of which WAL files are safe to recycle. Over time, a primary with subscribers
+who don&#39;t update their flushed position in the WAL will suffer file bloat and potentially degraded
+performance in some scenarios.</p>
+<p>The <a href="https://www.postgresql.org/docs/current/protocol-replication.html#PROTOCOL-REPLICATION-STANDBY-STATUS-UPDATE">message to update the
+primary</a>
+contains three fields for WAL positions:</p>
+<div data-language="text"><pre><code>Int64
+The location of the last WAL byte + 1 received and written to disk in the standby.
+
+Int64
+The location of the last WAL byte + 1 flushed to disk in the standby.
+
+Int64
+The location of the last WAL byte + 1 applied in the standby.</code></pre></div>
+<p>Note the <code>+ 1</code> in all these field descriptions. Postgres expects to you add 1 to every WAL location
+you receive or write in order to get the correct behavior. The docs don&#39;t make this 100% clear, but
+the most important of these fields is the second one (flushed to disk), since that&#39;s the location
+Postgres uses when resuming replication streaming after an interruption. It&#39;s really important to
+read the fine print in the <a href="https://www.postgresql.org/docs/current/protocol-replication.html#PROTOCOL-REPLICATION-START-REPLICATION-SLOT-LOGICAL"><code>START_REPLICATION</code>
+command</a>
+about how this works:</p>
+<blockquote>
+<p>Instructs server to start streaming WAL for logical replication, starting at either WAL location
+XXX/XXX or the slot&#39;s confirmed_flush_lsn (see Section 54.19), whichever is greater. This behavior
+makes it easier for clients to avoid updating their local LSN status when there is no data to
+process. However, starting at a different LSN than requested might not catch certain kinds of
+client errors; so the client may wish to check that confirmed_flush_lsn matches its expectations
+before issuing START_REPLICATION.</p>
+</blockquote>
+<p>In other words, it&#39;s possible to skip ahead of the WAL location you last confirmed flushed to the
+primary, but impossible to rewind the stream. Once you send a <code>Standby status update</code> message with a
+particular flush location, the primary will never send you another replication event before then.</p>
+<p>You also can (and should) periodically update the primary with the last WAL position you received,
+including the one included in a <code>keepalive</code> message. Just make certain to not send a <code>flushed</code> WAL
+location that you haven&#39;t actually flushed.</p>
+<p>Our implementation loads the last flushed WAL location at startup and uses that in its
+<code>START_REPLICATION</code> message.</p>
+<div data-language="go"><pre><code>lastWrittenLsn<span>,</span> err <span>:=</span> r<span>.</span><span>readWALPosition</span><span>(</span><span>)</span>
+<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+    <span>return</span> err
+<span>}</span></code></pre></div>
+<p>This behavior handles the edge case where our replica flushes a transaction to disk but the process
+dies before telling Postgres about it. In our testing we also found that even if you successfully
+send a <code>Standby update</code> message with the last flushed WAL position, Postgres might not durably
+persist it if the connection is interrupted after receipt. Our implementation is very conservative
+about these edge cases, which is the reason for the <code>processMessages</code> bool we track in our state
+struct. From what we can tell, the replication process on the Postgres primary is fundamentally
+aysnchronous, and in certain failure modes it&#39;s possible to be sent messages from before the WAL
+position you asked for. Our implementation just skips all such messages until we see a <code>Begin</code>
+message past our last known flush point.</p>
+
+<p><a href="https://github.com/dolthub/doltgresql/">DoltgreSQL</a> is free and open source, so go check it out if
+you&#39;re interested in replicating your PostgreSQL primary to a data store with built-in diff
+capabilities, or if you&#39;re building your own Postgres replication solution and want a working
+example.</p>
+<p>Have questions about DoltgreSQL or Postgres replication? <a href="https://discord.gg/gqr7K4VNKe">Join us on
+Discord</a> to talk to our engineering team and meet other Dolt users.</p></div></div>
+  </body>
+</html>
