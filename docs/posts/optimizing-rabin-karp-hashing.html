@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://mattsills.github.io/2024/03/02/rabin-karp/">Original</a>
+    <h1>Optimizing Rabin-Karp Hashing</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        <div>
+  
+  <p><span>02 Mar 2024</span></p><p><strong>Note: After re-reading this, I think the post could use a bit more exposition about how the SIMD instructions work. I’ve left it up, and will hopefully be able to flesh it out in more detail when I have some more time.</strong></p>
+
+<h2 id="intro">Intro</h2>
+
+<p><a href="[Daniel Lemire, Computer Science Professor](https://lemire.me/en/)">Daniel Lemire</a> is a professor of computer science at TÉLUQ, who specializes in performance engineering. He is also a prolific <a href="https://lemire.me/blog">blogger</a>, and his posts are occasionally featured on Hacker News. If you somehow found your way to this blog, you are likely familiar with his writing. A few weeks ago, he posed the following question: <a href="https://lemire.me/blog/2024/02/04/how-fast-is-rolling-karp-rabin-hashing/">“How fast is rolling Rabin-Karp hashing?”</a>, for example as might be used in the Rabin-Karp string search <a href="https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm">algorithm</a>.</p>
+
+<p>A friend and I had some extra time over the past couple of days, and we figured it would be fun to explore the problem. As it turns out, the algorithm is a good way to build an understanding for low-level performance optimizations, in particular the role of dependency chain latency.</p>
+
+<p>If you haven’t read Lemire’s post yet, I would suggest at least giving it a quick glance.</p>
+
+<h2 id="notes">Notes</h2>
+
+<p>I should point out a few things about the benchmarking code provided by Lemire, that you might find useful if you decide to experiment yourself:</p>
+
+<ol>
+  <li>
+    <p>The choice of window sizes does not reflect any real world scenario (if the target string is 8 bytes, we can just load and compare the whole string in a normal register). In our benchmarks we used much larger values.</p>
+  </li>
+  <li>
+    <p>The reported throughput is the <strong>maximum</strong> recorded throughput per run. This isn’t necessarily a bad choice, but it can make the result a bit unstable. We changed that to reflect the average throughput over all runs. No results were substantially affected by this change.</p>
+  </li>
+  <li>
+    <p>The choice of \(31\) as the default evaluation point for the polynomial means that if the method gets inlined, and your compiler is aggressive enough (as clang is), you can end up with a highly specialized and very fast implementation being emitted, that elides the multiplications, and which will confound all of your benchmarks. Lemire seems to be aware of this, and has <code>__attribute__(noinline)</code>everywhere. If you want to add methods to experiment with using his test harness, you’ll want to make sure to add that attribute to those methods.</p>
+  </li>
+  <li>
+    <p>I have tried to stay aligned with the conventions and naming from Lemire’s code. This may lead to some strange-looking style mismatches in the code.</p>
+  </li>
+</ol>
+
+<h2 id="notation-and-setup">Notation and Setup</h2>
+
+<p>To stay aligned with Lemire’s benchmarks, we will reuse the signature from his <a href="https://github.com/lemire/Code-used-on-Daniel-Lemire-s-blog/tree/839ccf7c9e501a0706950bdb81d0351f058b8157/2024/02/04">code</a>:</p>
+
+<div><div><pre><code><span>size_t</span> <span>count_hits</span><span>(</span>
+    <span>const</span> <span>char</span> <span>*</span><span>data</span><span>,</span>
+    <span>size_t</span> <span>input_length</span><span>,</span>
+    <span>size_t</span> <span>window_length</span><span>,</span>
+    <span>uint32_t</span> <span>B</span><span>,</span>
+    <span>uint32_t</span> <span>target</span>
+<span>);</span>
+</code></pre></div></div>
+
+<p>This counts the number of substrings of <code>window_length</code>within the input string that match the target hashcode. While it is not a particularly useful method, it does force us to compute and use the hashes.</p>
+
+<p><strong>For reference, all benchmarks were run on a Intel Xeon Platinum 8481C CPU (Sapphire Rapids)</strong>.</p>
+
+<h2 id="naive-approach">Naive Approach</h2>
+
+<p>I won’t dwell on the naive approach too much, except to introduce the notation we’ll use throughout:</p>
+
+<ul>
+  <li>
+    <p>The length of the input to be searched is \(n\). In the source code, we use the variable <code>len</code> to represent this.</p>
+  </li>
+  <li>
+    <p>The window length, \(w\), is the length of the target string. Somewhat confusingly, in much of the source code, we use the variable <code>N</code> to represent this (this is from the original benchmark code).</p>
+  </li>
+  <li>
+    <p>The input data array will either be referred to as <code>data</code> or as <code>a</code>. The latter comes from thinking of the input as an array \([a_0,a_1,...,a_{n-1}]\), or from the hash code as the series, for example \(a_0+a_1B+a_2B^2+...+a_{w-1}B^{w-1}\).</p>
+  </li>
+  <li>
+    <p>The base is \(B\).</p>
+  </li>
+</ul>
+
+<p>The naive approach takes time \(O(nw)\). We can’t even really benchmark it, as it very quickly becomes intractable to run.</p>
+
+<h2 id="simple-rolling-approach">Simple Rolling Approach</h2>
+
+<p>Again, I won’t dwell on this too much, except to paste the reference code, and establish a baseline benchmark. I’ll also point out that this algorithm is asymptotically optimal (requiring only a constant amount of work per input item), and uses <code>O(w)</code> memory.</p>
+
+<p>Here’s the code from Lemire’s post:</p>
+
+<div><div><pre><code><span>__attribute__</span> <span>((</span><span>noinline</span><span>))</span>
+<span>size_t</span> <span>karprabin_rolling</span><span>(</span><span>const</span> <span>char</span> <span>*</span><span>data</span><span>,</span> <span>size_t</span> <span>len</span><span>,</span> <span>size_t</span> <span>N</span><span>,</span> <span>uint32_t</span> <span>B</span><span>,</span> <span>uint32_t</span> <span>target</span><span>)</span> <span>{</span>
+    <span>size_t</span> <span>counter</span> <span>=</span> <span>0</span><span>;</span>
+    <span>uint32_t</span> <span>BtoN</span> <span>=</span> <span>1</span><span>;</span>
+    <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>N</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+        <span>BtoN</span> <span>*=</span> <span>B</span><span>;</span>
+    <span>}</span>
+    <span>uint32_t</span> <span>hash</span> <span>=</span> <span>0</span><span>;</span>
+    <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>N</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+        <span>hash</span> <span>=</span> <span>hash</span> <span>*</span> <span>B</span> <span>+</span> <span>data</span><span>[</span><span>i</span><span>];</span>
+    <span>}</span>
+    <span>if</span> <span>(</span><span>hash</span> <span>==</span> <span>target</span><span>)</span> <span>{</span>
+        <span>counter</span><span>++</span><span>;</span>
+    <span>}</span>
+    <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>N</span><span>;</span> <span>i</span> <span>&lt;</span> <span>len</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+        <span>hash</span> <span>=</span> <span>hash</span> <span>*</span> <span>B</span> <span>+</span> <span>data</span><span>[</span><span>i</span><span>]</span> <span>-</span> <span>BtoN</span> <span>*</span> <span>data</span><span>[</span><span>i</span> <span>-</span> <span>N</span><span>];</span>
+        <span>if</span> <span>(</span><span>hash</span> <span>==</span> <span>target</span><span>)</span> <span>{</span>
+            <span>counter</span><span>++</span><span>;</span>
+        <span>}</span>
+    <span>}</span>
+    <span>return</span> <span>counter</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p><strong><mark>This runs at 0.73 GB/s.</mark></strong></p>
+
+<h2 id="thinking-about-performance">Thinking about performance</h2>
+
+<p>Tools like <a href="https://perf.wiki.kernel.org/index.php/Tutorial">perf</a> are great. But in my experience, it’s useful to try to form a hypothesis before breaking out a profiler. This helps ground the process, and forces us to develop and update a mental model of the performance of the code as we investigate. I’ve also found this general approach to be useful at other scales (for example when analyzing bottlenecks in distributed systems).</p>
+
+<p>A good starting point is to be able to bound the problem in some way. So with that in mind, let’s throw together a quick benchmark for computing the simpler hash function, that’s just a sum of the values over the sliding window (you could think of this as a Rabin-Karp hash with \(B=1\)):</p>
+
+<div><div><pre><code><span>__attribute__</span> <span>((</span><span>noinline</span><span>))</span>
+<span>size_t</span> <span>sum_rolling</span><span>(</span><span>const</span> <span>char</span> <span>*</span><span>data</span><span>,</span> <span>size_t</span> <span>len</span><span>,</span> <span>size_t</span> <span>N</span><span>,</span> <span>uint32_t</span> <span>B</span><span>,</span> <span>uint32_t</span> <span>target</span><span>)</span> <span>{</span>
+    <span>size_t</span> <span>counter</span> <span>=</span> <span>0</span><span>;</span>
+
+    <span>uint32_t</span> <span>hash</span> <span>=</span> <span>0</span><span>;</span>
+    <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>N</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+        <span>hash</span> <span>=</span> <span>hash</span> <span>+</span> <span>data</span><span>[</span><span>i</span><span>];</span>
+    <span>}</span>
+    <span>if</span> <span>(</span><span>hash</span> <span>==</span> <span>target</span><span>)</span> <span>{</span>
+        <span>counter</span><span>++</span><span>;</span>
+    <span>}</span>
+    <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>N</span><span>;</span> <span>i</span> <span>&lt;</span> <span>len</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+        <span>hash</span> <span>=</span> <span>hash</span> <span>+</span> <span>data</span><span>[</span><span>i</span><span>]</span> <span>-</span> <span>data</span><span>[</span><span>i</span> <span>-</span> <span>N</span><span>];</span>
+        <span>if</span> <span>(</span><span>hash</span> <span>==</span> <span>target</span><span>)</span> <span>{</span>
+            <span>counter</span><span>++</span><span>;</span>
+        <span>}</span>
+    <span>}</span>
+    <span>return</span> <span>counter</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p><strong><mark>This runs at 1.49 GB/s.</mark></strong></p>
+
+<p>Returning to our actual problem, let’s try to build an intuition for where the opportunities to optimize lie. Consider the instructions that are executed on each loop iteration:</p>
+
+<ol>
+  <li>
+    <p>Load two values (the incoming and outgoing elements).</p>
+  </li>
+  <li>
+    <p>Multiply the outgoing element by \(B^n\).</p>
+  </li>
+  <li>
+    <p>Multiply the hash by \(B\).</p>
+  </li>
+  <li>
+    <p>Add the incoming element and subtract the (scaled) outgoing element to the hash.</p>
+  </li>
+  <li>
+    <p>Do some bounds checking, update loop variables, etc..</p>
+  </li>
+</ol>
+
+<p>On one hand, this seems pretty good. Multiplication on Sapphire Rapids has a latency of 4 cycles. This core is clocked (when boosted) at 3.8GHz, so this implementation is processing one item every 5 ticks. We could try to squeeze out a little bit more performance by manually unrolling the loop (as Lemire does in his <a href="https://github.com/bavardage/Code-used-on-Daniel-Lemire-s-blog/blob/839ccf7/2024/02/04/benchmarks/benchmark.cpp#L59">reference code</a>). In our case, that doesn’t make any difference, because the compiler has already helpfully unrolled the loop for us.</p>
+
+<p>The bigger issue is that we have a lot of idle silicon sitting around. And the cause of this is the <strong>dependency chain</strong> between the hash code computations. For example, the first three hashes are:</p><p>
+
+\[\begin{align*}
+&amp;H_0=...
+\\
+&amp;H_1 = B*H_0 + ...
+\\
+&amp;H_2 = B*H_1 + ...
+\end{align*}\]
+
+</p><p>We clearly cannot start to compute \(H_2\) before we have computed \(H_1\), and so must wait to issue the multiplication \(B*H_1\) until we have computed \(H_1\), which involves computing \(B*H_0\), which takes at least 4 cycles. This is what’s known as a <em>loop-carried dependency</em>. The processor can try to stay busy by executing the other operations while the multiply is running, but ultimately the latency of the multiplication puts a limit on the overall throughput.</p>
+
+<p>To see this, I find it helpful to draw out the computation graph over time (<a href="https://fgiesen.wordpress.com/2018/03/05/a-whirlwind-introduction-to-dataflow-graphs/">here is a very good overview of the general technique</a>). Time flows downward, and arrows represent data dependencies between instructions. I’ve drawn out part of an iteration of an unrolled loop (I only included the loads for two windows to avoid cluttering things up too much):</p>
+
+<p><img src="https://mattsills.github.io/assets/images/rabin-karp/dataflow01.jpg" alt="df01" width="100%"/></p>
+
+<p>This may not line up exactly with the exact instructions that the processor executes in parallel, but does give the gist of it. Of particular note, you can see that the multiplications of the elements falling out of the window can be issued long before they are needed. It’s the dependency on multiplying the hash by \(B\) is the bottleneck.</p>
+
+<h2 id="parallelizing-the-process">“Parallelizing” the Process</h2>
+
+<p>One approach to getting around the chain dependency would be to simply split the input in half, and process each half in its own thread. Note that you have to do a little redundant work here. If we decide on the convention that each thread processes all hashes that <em>begin</em> within its half of the data, then the first thread needs to process an extra window’s worth of values.</p>
+
+<p>Here’s an example of what the process might look like with a window of size 8:</p>
+
+<p><img src="https://mattsills.github.io/assets/images/rabin-karp/sliding-window.jpg" alt="sliding" width="100%"/></p>
+
+<p>In practice, the input length is much larger than the target window size, so this is not a very high cost to pay.</p>
+
+<p>Spinning up a thread pool doesn’t seem in keeping with the spirit of the exercise. But as we just discovered, even a single core has plenty of extra capacity. So if we just simply issue the two hash code computations in a single thread, we should still be able to take advantage of all of the OOO-superscalar features of modern processors. And indeed we see a dramatic speedup.</p>
+
+<p><strong><mark>This runs at 1.25 GB/s.</mark></strong></p>
+
+<p>How far can we push this approach? At least on our test host, doubling from 2 independent hash codes to 4 yielded no benefits, but YMMV.</p>
+
+<h2 id="making-it-streaming-friendly">Making it Streaming Friendly</h2>
+
+<p>Processing the data in this way introduces a very big shortcoming: the algorithm can no longer be applied to a single stream (because we need to be able to seek halfway through the input). I can imagine plenty of use cases where that would be a dealbreaker. How can we get that behavior back? The best approach I can think of is to read a fairly large chunk of data, say some constant \(C\) windows’ worth, for \(C\) around 10 or so. Then process that chunk in “parallel” as described above. Then read and process the next chunk. Now, instead of processing an extra window once, we process two extra windows <strong><em>per chunk</em></strong> (one in the middle and one at the end), and we have to hold \(C\) windows in memory. So the memory consumption is \(O(C*W)\), and the runtime is \(O(N*(1+\frac{2}{c}))\). By playing with the constant \(C\), we can trade off memory consumption and runtime overhead. We get back a streaming-friendly algorithm, which I call the <strong><em>chunked streaming</em></strong> algorithm, and the performance doesn’t suffer too much. For \(C=32\), <strong><mark>we can process the input at 1.20 GB/s</mark></strong>.</p>
+
+<h2 id="simd">SIMD</h2>
+
+<p>One nice feature of this approach is that is very easily adapted to the Intel AVX2 instructions. Instead of splitting each chunk into 2 parts, we can split each chunk into 8 parts, which I’ll call “slices” (each AVX2 register consists of 8 32-bit values), and process each part independently within a single 32-bit slice.</p>
+
+<p><img src="https://mattsills.github.io/assets/images/rabin-karp/simd.jpg" alt="simd"/></p>
+
+<p>Note that in the code below, in each loop iteration we read 4 values per slice (so 32 in total), and explicitly unroll the loop. This lets us issue only two gathers per iteration, which is a big savings.</p>
+
+<div><div><pre><code><span>static</span> <span>inline</span> <span>__m256i</span> <span>constant_ymm</span><span>(</span><span>uint32_t</span> <span>x</span><span>)</span> <span>{</span>
+    <span>return</span> <span>_mm256_set_epi32</span><span>(</span><span>x</span><span>,</span> <span>x</span><span>,</span> <span>x</span><span>,</span> <span>x</span><span>,</span> <span>x</span><span>,</span> <span>x</span><span>,</span> <span>x</span><span>,</span> <span>x</span><span>);</span>
+<span>}</span>
+
+<span>// Byte extractors</span>
+
+<span>static</span> <span>inline</span> <span>__m256i</span> <span>byte0</span><span>(</span><span>__m256i</span> <span>bytes</span><span>)</span> <span>{</span>
+    <span>return</span> <span>_mm256_srai_epi32</span><span>(</span><span>_mm256_slli_epi32</span><span>(</span><span>bytes</span><span>,</span> <span>24</span><span>),</span> <span>24</span><span>);</span>
+<span>}</span>
+
+<span>static</span> <span>inline</span> <span>__m256i</span> <span>byte1</span><span>(</span><span>__m256i</span> <span>bytes</span><span>)</span> <span>{</span>
+    <span>return</span> <span>_mm256_srai_epi32</span><span>(</span><span>_mm256_slli_epi32</span><span>(</span><span>bytes</span><span>,</span> <span>16</span><span>),</span> <span>24</span><span>);</span>
+<span>}</span>
+
+<span>static</span> <span>inline</span> <span>__m256i</span> <span>byte2</span><span>(</span><span>__m256i</span> <span>bytes</span><span>)</span> <span>{</span>
+    <span>return</span> <span>_mm256_srai_epi32</span><span>(</span><span>_mm256_slli_epi32</span><span>(</span><span>bytes</span><span>,</span> <span>8</span><span>),</span> <span>24</span><span>);</span>
+<span>}</span>
+
+<span>static</span> <span>inline</span> <span>__m256i</span> <span>byte3</span><span>(</span><span>__m256i</span> <span>bytes</span><span>)</span> <span>{</span>
+    <span>return</span> <span>_mm256_srai_epi32</span><span>(</span><span>bytes</span><span>,</span> <span>24</span><span>);</span>
+<span>}</span>
+
+<span>__attribute__</span> <span>((</span><span>noinline</span><span>))</span>
+<span>size_t</span> <span>karprabin_rolling4_chunked_streaming_8x4_avx2</span><span>(</span><span>const</span> <span>char</span> <span>*</span><span>data</span><span>,</span> <span>size_t</span> <span>len</span><span>,</span> <span>size_t</span> <span>N</span><span>,</span> <span>uint32_t</span> <span>B</span><span>,</span> <span>uint32_t</span> <span>target</span><span>)</span> <span>{</span>
+    <span>uint32_t</span> <span>BtoN</span> <span>=</span> <span>1</span><span>;</span>
+    <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>N</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+        <span>BtoN</span> <span>*=</span> <span>B</span><span>;</span>
+    <span>}</span>
+
+    <span>size_t</span> <span>counter</span> <span>=</span> <span>0</span><span>;</span>
+
+    <span>size_t</span> <span>subblock_size</span> <span>=</span> <span>4</span> <span>*</span> <span>N</span><span>;</span>
+    <span>size_t</span> <span>block_size</span> <span>=</span> <span>8</span> <span>*</span> <span>subblock_size</span><span>;</span>
+
+    <span>__m256i</span> <span>targets</span> <span>=</span> <span>constant_ymm</span><span>(</span><span>target</span><span>);</span>
+    <span>__m256i</span> <span>bs</span> <span>=</span> <span>constant_ymm</span><span>(</span><span>B</span><span>);</span>
+    <span>__m256i</span> <span>bns</span> <span>=</span> <span>constant_ymm</span><span>(</span><span>BtoN</span><span>);</span>
+    <span>__m256i</span> <span>offsets</span> <span>=</span> <span>_mm256_set_epi32</span><span>(</span>
+        <span>7</span> <span>*</span> <span>subblock_size</span><span>,</span>
+        <span>6</span> <span>*</span> <span>subblock_size</span><span>,</span>
+        <span>5</span> <span>*</span> <span>subblock_size</span><span>,</span>
+        <span>4</span> <span>*</span> <span>subblock_size</span><span>,</span>
+        <span>3</span> <span>*</span> <span>subblock_size</span><span>,</span>
+        <span>2</span> <span>*</span> <span>subblock_size</span><span>,</span>
+        <span>subblock_size</span><span>,</span>
+        <span>0</span>
+    <span>);</span>
+
+    <span>__m256i</span> <span>hashes</span> <span>=</span> <span>_mm256_setzero_si256</span><span>();</span>
+    <span>const</span> <span>char</span><span>*</span> <span>block_start</span> <span>=</span> <span>data</span><span>;</span>
+    <span>while</span> <span>((</span><span>block_start</span> <span>-</span> <span>data</span><span>)</span> <span>+</span> <span>block_size</span> <span>+</span> <span>N</span> <span>&lt;</span> <span>len</span><span>)</span> <span>{</span>
+        <span>// Initialize hashes</span>
+        <span>hashes</span> <span>=</span> <span>_mm256_setzero_si256</span><span>();</span>
+
+        <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>N</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+            <span>__m256i</span> <span>as</span> <span>=</span> <span>_mm256_srai_epi32</span><span>(</span>
+                <span>_mm256_slli_epi32</span><span>(</span>
+                    <span>_mm256_i32gather_epi32</span><span>((</span><span>const</span> <span>int</span> <span>*</span><span>)</span> <span>(</span><span>block_start</span> <span>+</span> <span>i</span><span>),</span> <span>offsets</span><span>,</span> <span>1</span><span>),</span>
+                    <span>24</span>
+                <span>),</span>
+                <span>24</span>
+            <span>);</span>
+            <span>hashes</span> <span>=</span> <span>_mm256_add_epi32</span><span>(</span>
+                <span>_mm256_mullo_epi32</span><span>(</span><span>hashes</span><span>,</span> <span>bs</span><span>),</span>
+                <span>as</span>
+            <span>);</span>
+        <span>}</span>
+
+        <span>uint32_t</span> <span>first</span> <span>=</span> <span>_mm256_extract_epi32</span><span>(</span><span>hashes</span><span>,</span> <span>0</span><span>);</span>
+        <span>if</span> <span>(</span><span>first</span> <span>==</span> <span>target</span><span>)</span> <span>{</span>
+            <span>counter</span><span>++</span><span>;</span>
+        <span>}</span>
+
+        <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>subblock_size</span><span>;</span> <span>i</span><span>+=</span><span>4</span><span>)</span> <span>{</span>
+            <span>// Values to be added in</span>
+            <span>__m256i</span> <span>as</span> <span>=</span> <span>_mm256_i32gather_epi32</span><span>(</span>
+                <span>(</span><span>const</span> <span>int</span><span>*</span><span>)</span> <span>(</span><span>block_start</span> <span>+</span> <span>i</span> <span>+</span> <span>N</span><span>),</span>
+                <span>offsets</span><span>,</span>
+                <span>1</span>
+            <span>);</span>
+            <span>// Values to be dropped off</span>
+            <span>__m256i</span> <span>ans</span> <span>=</span> <span>_mm256_i32gather_epi32</span><span>(</span>
+                <span>(</span><span>const</span> <span>int</span><span>*</span><span>)</span> <span>(</span><span>block_start</span> <span>+</span> <span>i</span><span>),</span>
+                <span>offsets</span><span>,</span>
+                <span>1</span>
+            <span>);</span>
+
+            <span>// Value 0</span>
+            <span>hashes</span> <span>=</span> <span>_mm256_sub_epi32</span><span>(</span>
+                <span>_mm256_add_epi32</span><span>(</span>
+                    <span>_mm256_mullo_epi32</span><span>(</span><span>hashes</span><span>,</span> <span>bs</span><span>),</span>
+                    <span>byte0</span><span>(</span><span>as</span><span>)</span>
+                <span>),</span>
+                <span>_mm256_mullo_epi32</span><span>(</span><span>byte0</span><span>(</span><span>ans</span><span>),</span> <span>bns</span><span>)</span>
+            <span>);</span>
+            <span>counter</span> <span>+=</span> <span>__builtin_popcount</span><span>(</span><span>_mm256_cmpeq_epi32_mask</span><span>(</span><span>hashes</span><span>,</span> <span>targets</span><span>));</span>
+
+            <span>// Value 1</span>
+            <span>hashes</span> <span>=</span> <span>_mm256_sub_epi32</span><span>(</span>
+                <span>_mm256_add_epi32</span><span>(</span>
+                    <span>_mm256_mullo_epi32</span><span>(</span><span>hashes</span><span>,</span> <span>bs</span><span>),</span>
+                    <span>byte1</span><span>(</span><span>as</span><span>)</span>
+                <span>),</span>
+                <span>_mm256_mullo_epi32</span><span>(</span><span>byte1</span><span>(</span><span>ans</span><span>),</span> <span>bns</span><span>)</span>
+            <span>);</span>
+            <span>counter</span> <span>+=</span> <span>__builtin_popcount</span><span>(</span><span>_mm256_cmpeq_epi32_mask</span><span>(</span><span>hashes</span><span>,</span> <span>targets</span><span>));</span>
+
+            <span>// Value 2</span>
+            <span>hashes</span> <span>=</span> <span>_mm256_sub_epi32</span><span>(</span>
+                <span>_mm256_add_epi32</span><span>(</span>
+                    <span>_mm256_mullo_epi32</span><span>(</span><span>hashes</span><span>,</span> <span>bs</span><span>),</span>
+                    <span>byte2</span><span>(</span><span>as</span><span>)</span>
+                <span>),</span>
+                <span>_mm256_mullo_epi32</span><span>(</span><span>byte2</span><span>(</span><span>ans</span><span>),</span> <span>bns</span><span>)</span>
+            <span>);</span>
+            <span>counter</span> <span>+=</span> <span>__builtin_popcount</span><span>(</span><span>_mm256_cmpeq_epi32_mask</span><span>(</span><span>hashes</span><span>,</span> <span>targets</span><span>));</span>
+
+            <span>// Value 3</span>
+            <span>hashes</span> <span>=</span> <span>_mm256_sub_epi32</span><span>(</span>
+                <span>_mm256_add_epi32</span><span>(</span>
+                    <span>_mm256_mullo_epi32</span><span>(</span><span>hashes</span><span>,</span> <span>bs</span><span>),</span>
+                    <span>byte3</span><span>(</span><span>as</span><span>)</span>
+                <span>),</span>
+                <span>_mm256_mullo_epi32</span><span>(</span><span>byte3</span><span>(</span><span>ans</span><span>),</span> <span>bns</span><span>)</span>
+            <span>);</span>
+            <span>counter</span> <span>+=</span> <span>__builtin_popcount</span><span>(</span><span>_mm256_cmpeq_epi32_mask</span><span>(</span><span>hashes</span><span>,</span> <span>targets</span><span>));</span>
+        <span>}</span>
+
+        <span>block_start</span> <span>+=</span> <span>block_size</span> <span>+</span> <span>1</span><span>;</span>
+    <span>}</span>
+
+    <span>// Deal with what&#39;s left over</span>
+    <span>size_t</span> <span>last_end</span> <span>=</span> <span>(</span><span>block_start</span> <span>-</span> <span>data</span><span>)</span> <span>+</span> <span>N</span> <span>-</span> <span>1</span><span>;</span>
+    <span>uint32_t</span> <span>hash</span> <span>=</span> <span>_mm256_extract_epi32</span><span>(</span><span>hashes</span><span>,</span> <span>7</span><span>);</span>
+    <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>last_end</span><span>;</span> <span>i</span> <span>&lt;</span> <span>len</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+        <span>hash</span> <span>=</span> <span>hash</span> <span>*</span> <span>B</span> <span>+</span> <span>data</span><span>[</span><span>i</span><span>]</span> <span>-</span> <span>BtoN</span> <span>*</span> <span>data</span><span>[</span><span>i</span> <span>-</span> <span>N</span><span>];</span>
+        <span>if</span> <span>(</span><span>hash</span> <span>==</span> <span>target</span><span>)</span> <span>{</span>
+            <span>counter</span><span>++</span><span>;</span>
+        <span>}</span>
+    <span>}</span>
+
+    <span>return</span> <span>counter</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p><strong><mark>This runs at 1.59 GB/s.</mark></strong></p>
+
+<h2 id="optimizing-further">Optimizing Further</h2>
+
+<p>The SIMD operations make things much faster, but frustratingly, we are again bound on the chain dependency between multiplying the hashcodes by \(B\). In some sense, we are a victim of our success here. By combining the separate multiplications into a single instruction, we freed up formerly occupied execution ports. But it would be nice to remove this bottleneck. One approach (which I have not tried) is to do the same trick as before, and process two of these parts in parallel.</p>
+
+<p>Another (which we will go with) is to notice that while the multiplication instruction (<code>vpmulld</code>) has a latency of <a href="https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#ig_expand=3836,3705,6375,6319,6003,1041,3704,4769,2929,3847,2962,866,3707,3708,4772,4772&amp;techs=SSE_ALL,AVX_ALL,AVX_512&amp;text=_mm256_mul">10 cycles</a>, the processor can issue that instruction every <code>0.66</code> cycles. Put another way, issuing a bunch of SIMD multiplications in a row is not much more expensive than issuing a single one.</p>
+
+<h3 id="recasting-the-problem">Recasting the problem</h3>
+
+<p>To take advantage of this fact, let’s recast the problem slightly. In our current implementation, we compute the hash over each window and then compare it to the target:</p><p>
+
+\[H_n := hash\ of\ chars\ [n, ..., n+w-1]\]
+
+\[\begin{align*}
+&amp;H_0 = a_0B^{w-1}+&amp;&amp;a_1B^{w-2}+a_2B^{w-3}+...+a_{w-1}
+\\
+&amp;H_{1} = &amp;&amp;a_1B^{w-1}+a_2B^{w-2} \ \ +...+a_{w-1}B\ \ +a_{w}
+\end{align*}
+\\
+...
+\\
+H_{n+1} = B*H_{n}+a_{n+w} - B^wa_{n}\]
+
+</p><p>We did this because it makes the recurrance very straightforward to calculate. But we could just as easily have reversed things:</p><p>
+
+\[\begin{align*}
+&amp;H_0 = a_0+&amp;&amp;a_1B+a_2B^2+...+a_{w-1}B^{w-1}
+\\
+&amp;H_{1} = &amp;&amp;a_1\ \ \ +a_2B \ \ +...+a_{w-1}B^{w-2}\ \ +a_{w}B^{w-1}
+\end{align*}
+\\
+...\]
+
+</p><p>Assuming that \(B\) is odd, we can compute the multiplicative inverse \(B^{-1}\), and compute the hash with the recurrance:</p><p>
+
+\[H_{n+1} = B^{-1}(H_n - a_n) + B^{w-1}a_{n+w}\]
+
+</p><p>We still need to multiply that hash in each loop iteration. What would happen if we did not scale them in each loop iteration?</p><p>
+
+\[\begin{align*}
+&amp;H_0 = a_0+&amp;&amp;a_1B+a_2B^2+...+a_{w-1}B^{w-1}
+\\
+&amp;H_{1} = &amp;&amp;a_1B+a_2B^2 +...+a_{w-1}B^{w-1}\ \ +a_{w}B^{w}
+\end{align*}
+\\
+...
+\\
+H_{n+1} = H_{n}+a_{n+w}B^{n+w} - B^{n}a_{n}\]
+
+</p><p>This is just the result of taking rolling sums of the power series:</p><p>
+
+\[\begin{align*}
+&amp;a_0+a_1B+a_2B^2+a_3B^3+a_4B^4+a_5B^5+a_6B^6...
+\\
+&amp;|-----H_0-------|
+\\
+&amp;\ \ \ \ \ \ \ \ |-------H_1-----|
+\\
+&amp;\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ |--------H_2-----|
+\\
+&amp; \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ ...
+\end{align*}\]
+
+</p><p>At first, this may not seem particularly useful, but it’s easy to see that the new hash \(H&#39;\) and old hash \(H\) are related by:</p><p>
+
+\[H_n&#39;=H_n*B^n\]
+
+</p><p>And thus:</p><p>
+
+\[H_n=target \ \iff \ H_n&#39;=target*B^n\]
+
+</p><p>So to determine if the hash matches the target, we just need to scale the target by \(B^n\), before comparing them.</p>
+
+<p>Why is this an improvment? While we (paradoxically) actually have to compute more multiplications, we have gained something, namely that the multiplications can now all be issued at the same time. To illustrate this, let’s consider the non-SIMD case. I’ve grouped instructions at the earliest cycle where they could execute. In practice, they will probably execute later, when an execution port becomes available. Values in registers are represented by diamonds.</p>
+
+<p><img src="https://mattsills.github.io/assets/images/rabin-karp/dataflow02.jpg" alt="df02" width="100%"/></p>
+
+<p>We can see that the chain dependency has gone from a multiplication, addition and subtraction to just an addition and subtraction. All of the multiplications can be issued at the beginning of the loop iteration.</p>
+
+<p><strong><mark>This runs at 1.77 GB/s.</mark></strong></p>
+
+<p>Here’s what a non-SIMD version of this approach might look like. To see how the multiplications can be issued at once, I’ve explicitly unrolled the loop (just to a factor of 2):</p>
+
+<div><div><pre><code><span>__attribute__</span> <span>((</span><span>noinline</span><span>))</span>
+<span>size_t</span> <span>karprabin_rolling2_alternate</span><span>(</span><span>const</span> <span>char</span> <span>*</span><span>data</span><span>,</span> <span>size_t</span> <span>len</span><span>,</span> <span>size_t</span> <span>N</span><span>,</span> <span>uint32_t</span> <span>B</span><span>,</span> <span>uint32_t</span> <span>target</span><span>)</span> <span>{</span>
+    <span>size_t</span> <span>counter</span> <span>=</span> <span>0</span><span>;</span>
+    <span>uint32_t</span> <span>B2</span> <span>=</span> <span>B</span><span>*</span><span>B</span><span>;</span>
+    <span>uint32_t</span> <span>BtoN</span> <span>=</span> <span>1</span><span>;</span>
+    <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>N</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+        <span>BtoN</span> <span>*=</span> <span>B</span><span>;</span>
+    <span>}</span>
+
+    <span>uint32_t</span> <span>hash</span> <span>=</span> <span>0</span><span>;</span>
+    <span>for</span> <span>(</span><span>size_t</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>N</span><span>;</span> <span>i</span><span>++</span><span>)</span> <span>{</span>
+        <span>hash</span> <span>=</span> <span>hash</span> <span>*</span> <span>B</span> <span>+</span> <span>data</span><span>[</span><span>i</span><span>];</span>
+    <span>}</span>
+    <span>// This is always equal to B^i</span>
+    <span>uint32_t</span> <span>shift_in0</span> <span>=</span> <span>1</span><span>;</span>
+    <span>// This is always equal to B^(i+1)</span>
+    <span>uint32_t</span> <span>shift_in1</span> <span>=</span> <span>shiftin_0</span> <span>*</span> <span>b</span><span>;</span>
+    <span>// This is always equal to B^(i-N)</span>
+    <span>uint32_t</span> <span>shift_out0</span> <span>=</span> <span>1</span><span>;</span>
+    <span>// This is always equal to B^(i-N+1)</span>
+    <span>uint32_t</span> <span>shift_out1</span> <span>=</span> <span>B</span><span>;</span>
+    <span>// This is always equal to target * B^(i-N)</span>
+    <span>uint32_t</span> <span>target0</span> <span>=</span> <span>target</span><span>;</span>
+    <span>// This is always equal to target * B^(i-N+1)</span>
+    <span>uint32_t</span> <span>target1</span> <span>=</span> <span>target</span> <span>*</span> <span>B</span><span>;</span>
+
+    <span>if</span> <span>(</span><span>hash</span> <span>==</span> <span>target</span><span>)</span> <span>{</span>
+        <span>counter</span><span>++</span><span>;</span>
+    <span>}</span>
+    <span>size_t</span> <span>i</span> <span>=</span> <span>N</span><span>;</span>
+    <span>for</span> <span>(;</span> <span>i</span> <span>+</span> <span>1</span> <span>&lt;</span> <span>len</span><span>;</span> <span>i</span> <span>+=</span> <span>2</span><span>)</span> <span>{</span>
+
+        <span>hash</span> <span>=</span> <span>hash</span> <span>+</span> <span>shift_in0</span> <span>*</span> <span>data</span><span>[</span><span>i</span><span>]</span> <span>-</span> <span>shift_out0</span> <span>*</span> <span>data</span><span>[</span><span>i</span> <span>-</span> <span>N</span><span>];</span>
+        <span>if</span> <span>(</span><span>hash</span> <span>==</span> <span>target0</span><span>)</span> <span>{</span>
+            <span>counter</span><span>++</span><span>;</span>
+        <span>}</span>
+        <span>hash</span> <span>=</span> <span>hash</span> <span>+</span> <span>shift_in1</span> <span>*</span> <span>data</span><span>[</span><span>i</span><span>+</span><span>1</span><span>]</span> <span>-</span> <span>shift_out1</span> <span>*</span> <span>data</span><span>[</span><span>i</span> <span>-</span> <span>N</span> <span>+</span> <span>1</span><span>];</span>
+        <span>if</span> <span>(</span><span>hash</span> <span>==</span> <span>target1</span><span>)</span> <span>{</span>
+            <span>counter</span><span>++</span><span>;</span>
+        <span>}</span>
+
+        <span>// Update the shift factors and targets</span>
+        <span>// They are multiplied by B^2 because the loop is unrolled with a factor of 2</span>
+        <span>// Note that all of these instructions can be issued at once</span>
+        <span>shift_in0</span> <span>*=</span> <span>B2</span><span>;</span>
+        <span>shift_in1</span> <span>*=</span> <span>B2</span><span>;</span>
+        <span>shift_out0</span> <span>*=</span> <span>B2</span><span>;</span>
+        <span>shift_out1</span> <span>*=</span> <span>B2</span><span>;</span>
+        <span>target0</span> <span>*=</span> <span>B2</span><span>;</span>
+        <span>target1</span> <span>*=</span> <span>B2</span><span>;</span>
+    <span>}</span>
+
+    <span>// ...</span>
+    <span>// Deal with any remaining elements</span>
+    <span>// ...</span>
+
+    <span>return</span> <span>counter</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<h2 id="a-final-optimization">A final optimization</h2>
+
+<p>There’s one more optimization I’d like to discuss. I don’t really like it, because it makes the method much less useful, but we can do a bit better at counting the number of matches. Instead of counting up hash matches in a single accumulator, we can keep track of the number of matches in each “slice”, and then sum them up at the end. That is, replace:</p>
+
+<div><div><pre><code><span>size_t</span> <span>counter</span> <span>=</span> <span>0</span><span>;</span>
+<span>// ...</span>
+<span>counter</span> <span>+=</span> <span>__builtin_popcount</span><span>(</span><span>_mm256_cmpeq_epi32_mask</span><span>(</span><span>hashes</span><span>,</span> <span>targets</span><span>));</span>
+<span>// ...</span>
+<span>return</span> <span>counter</span><span>;</span>
+</code></pre></div></div>
+
+<p>with:</p>
+
+<div><div><pre><code><span>__m256i</span> <span>counts</span> <span>=</span> <span>_mm256_setzero_si256</span><span>();</span>
+<span>// ...</span>
+<span>matches</span> <span>=</span> <span>_mm256_srli_epi32</span><span>(</span><span>_mm256_cmpeq_epi32</span><span>(</span><span>hashes</span><span>,</span> <span>targets</span><span>),</span> <span>31</span><span>);</span>
+<span>counts</span> <span>=</span> <span>_mm256_add_epi32</span><span>(</span><span>counts</span><span>,</span> <span>matches</span><span>);</span>
+<span>// ...</span>
+<span>return</span> <span>_mm256_extract_epi32</span><span>(</span><span>counts</span><span>,</span> <span>0</span><span>)</span>
+    <span>+</span> <span>_mm256_extract_epi32</span><span>(</span><span>counts</span><span>,</span> <span>1</span><span>)</span>
+    <span>+</span> <span>...;</span>
+</code></pre></div></div>
+
+<p><code>_mm256_cmpeq_epi32</code> fills the corresponding 32-bit value with <code>0xFFFFFFFF</code> if the values match, so shifting by <code>31</code> will result in a <code>1</code> in the slice if the hash matches the target.</p>
+
+<p>The reason I don’t like this is that while <code>_mm256_cmpeq_epi32_mask</code> produces an output that can be used for actual string search, I cannot think of a good use case for simply counting the number of hash matches. But it was an interesting optimization, so I left it in.</p>
+
+<p><strong><mark>This runs at 1.86 GB/s.</mark></strong></p>
+
+<h2 id="summary">Summary</h2>
+
+<p>All in all, we were able to achieve a greater than <code>2.5x</code> speedup. It was interesting to poke around the AVX instructions after a while away from them, and I definitely feel like I have a better intuition for these kinds of problems after working through this. Thanks to Daniel Lemire for posing the problem and providing his benchmark harness.</p>
+
+</div>
+
+
+
+
+
+      </div></div>
+  </body>
+</html>
