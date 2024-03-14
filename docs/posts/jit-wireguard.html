@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://fly.io/blog/jit-wireguard-peers/">Original</a>
+    <h1>JIT WireGuard</h1>
+    
+    <div id="readability-page-1" class="page"><article>
+         <dl>
+             <dt>Author</dt>
+             <dd>
+                 <img alt="Lillian Berry" src="https://fly.io/static/images/fly-social-square.webp"/>
+               <dl>
+                 <dt>Name</dt>
+                 <dd>
+                   Lillian Berry
+                 </dd>
+                  <dt>star-ark.net</dt>
+                  <dd>
+                    <a href="https://star-ark.net/" target="_blank">
+                      star-ark.net
+                    </a>
+                  </dd>
+               </dl>
+             </dd>
+         </dl>
+
+        <section>
+            <figure>
+                <img src="https://fly.io/blog/jit-wireguard-peers/assets/network-cover.webp" alt="A cartoon of devices floating around and networked together with lines and nodes"/>
+                <figcaption>
+                  <span>Image by</span>
+                  
+<svg role="img" style="pointer-events: none; width: 17px; height: 17px;" viewBox="0 0 20 20" fill="currentColor" fill-rule="evenodd">
+  <g buffered-rendering="static">
+    <path fill-rule="evenodd" d="M1 8a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 018.07 3h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0016.07 6H17a2 2 0 012 2v7a2 2 0 01-2 2H3a2 2 0 01-2-2V8zm13.5 3a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zM10 14a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"></path>
+  </g>
+</svg>
+
+                    <a href="https://annieruygtillustration.com/" target="_blank">
+                      Annie Ruygt
+                    </a>
+                </figcaption>
+            </figure>
+          <p>We’re Fly.io and we transmute containers into VMs, running them on our hardware around the world with the power of Firecracker alchemy. We do a lot of stuff with WireGuard, which has become a part of our customer API. This is a quick story about some tricks we played to make WireGuard faster and more scalable for the hundreds of thousands of people who now use it here.</p>
+<p>One of many odd decisions we’ve made at Fly.io is how we use WireGuard. It’s not just that we use it in many places where other shops would use HTTPS and REST APIs. We’ve gone a step beyond that: every time you run <code>flyctl</code>, our lovable, sprawling CLI, it conjures a TCP/IP stack out of thin air, with its own IPv6 address, and speaks directly to Fly Machines running on our networks.</p>
+
+<p>There are plusses and minuses to this approach, which we talked about <a href="https://fly.io/blog/our-user-mode-wireguard-year/" title="">in a blog post a couple years back</a>. Some things, like remote-operated Docker builders, get easier to express (a Fly Machine, as far as <code>flyctl</code> is concerned, might as well be on the same LAN). But everything generally gets trickier to keep running reliably.</p>
+
+<p>It was a decision. We own it.</p>
+
+<p>Anyways, we’ve made some improvements recently, and I’d like to talk about them.</p>
+<h2 id="where-we-left-off"><a href="#where-we-left-off" aria-label="Anchor"></a>Where we left off</h2>
+<p>Until a few weeks ago, our gateways ran on a pretty simple system.</p>
+
+<ol>
+<li>We operate dozens of “gateway” servers around the world, whose sole purpose is to accept incoming WireGuard connections and connect them to the appropriate private networks.
+</li><li>Any time you run <code>flyctl</code> and it needs to talk to a Fly Machine (to build a container, pop an SSH console, copy files, or proxy to a service you’re running), it spawns or connects to a background agent process.
+</li><li>The first time it runs, the agent generates a new WireGuard peer configuration from our GraphQL API. WireGuard peer configurations are very simple: just a public key and an address to connect to.
+</li><li>Our API in turn takes that peer configuration and sends it to the appropriate gateway (say, <code>ord</code>, if you’re near Chicago) via an RPC we send over the NATS messaging system.
+</li><li>On the gateway, a service called <code>wggwd</code> accepts that configuration, saves it to a SQLite database, and adds it to the kernel using WireGuard’s Golang libraries. <code>wggwd</code> acknowledges the installation of the peer to the API.
+</li><li>The API replies to your GraphQL request, with the configuration.
+</li><li>Your <code>flyctl</code> connects to the WireGuard peer, which works, because you receiving the configuration means it’s installed on the gateway.
+</li></ol>
+
+<p>I copy-pasted those last two bullet points from <a href="https://fly.io/blog/our-user-mode-wireguard-year/" title="">that two-year-old post</a>, because when it works, it does <em>just work</em> reasonably well. (We ultimately did end up defaulting everybody to WireGuard-over-WebSockets, though.)</p>
+
+<p>But if it always worked, we wouldn’t be here, would we?</p>
+
+<p>We ran into two annoying problems:</p>
+
+<p>One: NATS is fast, but doesn’t guarantee delivery. Back in 2022, Fly.io was pretty big on NATS internally. We’ve moved away from it. For instance, our <a href="https://fly.io/blog/carving-the-scheduler-out-of-our-orchestrator/" title="">internal <code>flyd</code> API</a> used to be driven by NATS; today, it’s HTTP.  Our NATS cluster was losing too many messages to host a reliable API on it. Scaling back our use of NATS made WireGuard gateways better, but still not great.</p>
+
+<p>Two: When <code>flyctl</code> exits, the WireGuard peer it created sticks around on the gateway. Nothing cleans up old peers. After all, you’re likely going to come back tomorrow and deploy a new version of your app, or <code>fly ssh console</code> into it to debug something. Why remove a peer just to re-add it the next day? </p>
+
+<p>Unfortunately, the vast majority of peers are created by <code>flyctl</code> in CI jobs, which don’t have persistent storage and can’t reconnect to the same peer the next run; they generate new peers every time, no matter what.</p>
+
+<p>So, we ended up with a not-reliable-enough provisioning system, and gateways with hundreds of thousands of peers that will never be used again. The high stale peer count made kernel WireGuard operations very slow - especially loading all the peers back into the kernel after a gateway server reboot - as well as some kernel panics.</p>
+
+<p>There had to be</p>
+<h2 id="a-better-way"><a href="#a-better-way" aria-label="Anchor"></a>A better way.</h2>
+<p>Storing bajillions of WireGuard peers is no big challenge for any serious n-tier RDBMS. This isn’t “big data”. The problem we have at Fly.io is that our gateways don’t have serious n-tier RDBMSs. They’re small. Scrappy. They live off the land.</p>
+
+<p>Seriously, though: you could store every WireGuard peer everybody has ever used at Fly.io in a single SQLite database, easily.  What you can’t do is store them all in the Linux kernel.</p>
+
+<p>So, at some point, as you push more and more peer configurations to a gateway, you have to start making decisions about which peers you’ll enable in the kernel, and which you won’t.</p>
+
+<p>Wouldn’t it be nice if we just didn’t have this problem? What if, instead of pushing configs to gateways, we had the gateways pull them from our API on demand?</p>
+
+<p>If you did that, peers would only have to be added to the kernel when the client wanted to connect. You could yeet them out of the kernel any time you wanted; the next time the client connected, they’d just get pulled again, and everything would work fine.</p>
+
+<p>The problem you quickly run into to build this design is that Linux kernel WireGuard doesn’t have a feature for installing peers on demand. However:</p>
+<h2 id="it-is-possible-to-jit-wireguard-peers"><a href="#it-is-possible-to-jit-wireguard-peers" aria-label="Anchor"></a>It is possible to JIT WireGuard peers</h2>
+<p>The Linux kernel’s <a href="https://github.com/WireGuard/wgctrl-go" title="">interface for configuring WireGuard</a> is <a href="https://docs.kernel.org/userspace-api/netlink/intro.html" title="">Netlink</a> (which is basically a way to create a userland socket to talk to a kernel service). Here’s a <a href="https://github.com/WireGuard/wg-dynamic/blob/master/netlink.h" title="">summary of it as a C API</a>. Note that there’s no API call to subscribe for “incoming connection attempt” events.</p>
+
+<p>That’s OK! We can just make our own events. WireGuard connection requests are packets, and they’re easily identifiable, so we can efficiently snatch them with a BPF filter and a <a href="https://github.com/google/gopacket" title="">packet socket</a>.</p>
+<p>Most of the time, it’s even easier for us to get the raw WireGuard packets, because our users now default to WebSockets WireGuard (which is just an unauthenticated WebSockets connect that shuttles framed UDP packets to and from an interface on the gateway), so that people who have trouble talking end-to-end in UDP can bring connections up.</p>
+<p>We own the daemon code for that, and can just hook the packet receive function to snarf WireGuard packets.</p>
+
+<p>It’s not obvious, but WireGuard doesn’t have notions of “client” or “server”. It’s a pure point-to-point protocol; peers connect to each other when they have traffic to send. The first peer to connect is called the <strong>initiator</strong>, and the peer it connects to is the <strong>responder</strong>.</p>
+
+<p>For Fly.io, <code>flyctl</code> is typically our initiator,  sending a single UDP packet to the gateway, which is the responder. According <a href="https://www.wireguard.com/papers/wireguard.pdf" title="">to the WireGuard paper</a>, this first packet is a <code>handshake initiation</code>.  It gets better: the packet type is recorded in a single plaintext byte. So this simple BPF filter catches all the incoming connections: <code>udp and dst port 51820 and udp[8] = 1</code>.</p>
+
+<p>In most other protocols, we’d be done at this point; we’d just scrape the username or whatnot out of the packet, go fetch the matching configuration, and install it in the kernel. With WireGuard, not so fast. WireGuard is based on Trevor Perrin’s <a href="http://www.noiseprotocol.org/" title="">Noise Protocol Framework</a>, and Noise goes way out of its way to <a href="http://www.noiseprotocol.org/noise.html#identity-hiding" title="">hide identities</a> during handshakes. To identify incoming requests, we’ll need to run enough Noise cryptography to decrypt the identity.</p>
+
+<p>The code to do this is fussy, but it’s relatively short (about 200 lines). Helpfully, the kernel Netlink interface will give a privileged process the private key for an interface, so the secrets we need to unwrap WireGuard are easy to get. Then it’s just a matter of running the first bit of the Noise handshake. If you’re that kind of nerdy, <a href="https://gist.github.com/tqbf/9f2c2852e976e6566f962d9bca83062b" title="">here’s the code.</a></p>
+
+<p>At this point, we have the event feed we wanted: the public keys of every user trying to make a WireGuard connection to our gateways. We keep a rate-limited cache in SQLite, and when we see new peers, we’ll make an internal HTTP API request to fetch the matching peer information and install it. This fits nicely into the little daemon that already runs on our gateways to manage WireGuard, and allows us to ruthlessly and recklessly remove stale peers with a <code>cron</code> job.</p>
+
+<p>But wait! There’s more! We bounced this plan off Jason Donenfeld, and he tipped us off on a sneaky feature of the Linux WireGuard Netlink interface.</p>
+<p>Jason is the hardest working person in show business.</p>
+<p>Our API fetch for new peers is generally not going to be fast enough to respond to the first handshake initiation message a new client sends us. That’s OK; WireGuard is pretty fast about retrying. But we can do better.</p>
+
+<p>When we get an incoming initiation message, we have the 4-tuple address of the desired connection, including the ephemeral source port <code>flyctl</code> is using. We can install the peer as if we’re the initiator, and <code>flyctl</code> is the responder. The Linux kernel will initiate a WireGuard connection back to <code>flyctl</code>. This works; the protocol doesn’t care a whole lot who’s the server and who’s the client. We get new connections established about as fast as they can possibly be installed.</p>
+<figure>
+  <figcaption>
+    
+    <p>Speedrun an app onto Fly.io and get your own JIT WireGuard peer ✨</p>
+      <a href="https://fly.io/docs/speedrun/">
+        Speedrun  <span>→</span>
+      </a>
+  </figcaption>
+  <p><img src="https://fly.io/static/images/cta-turtle.webp" srcset="/static/images/cta-turtle@2x.webp 2x" alt=""/>
+  </p>
+</figure>
+
+<h2 id="look-at-this-graph"><a href="#look-at-this-graph" aria-label="Anchor"></a>Look at this graph</h2>
+<p>We’ve been running this in production for a few weeks and we’re feeling pretty happy about it. We went from thousands, or hundreds of thousands, of stale WireGuard peers on a gateway to what rounds to none. Gateways now hold a lot less state, are faster at setting up peers, and can be rebooted without having to wait for many unused peers to be loaded back into the kernel.</p>
+
+<p>I’ll leave you with this happy Grafana chart from the day of the switchover.</p>
+
+<p><img alt="a Grafana chart of &#39;kernel_stale_wg_peer_count&#39; vs. time. For the first few hours, all traces are flat. Most are at values between 0 and 50,000 and the top-most is just under 550,000. Towards the end of the graph, each line in turn jumps sharply down to the bottom, and at the end of the chart all datapoints are indistinguishable from 0." src="https://fly.io/blog/jit-wireguard-peers/assets/wireguard-peers-graph.webp"/></p>
+
+<p><strong>Editor’s note:</strong> Despite our tearful protests, Lillian has decided to move on from Fly.io to explore new pursuits. We wish her much success and happiness! ✨</p>
+
+          
+        </section>
+        <dl>
+            <dt>
+              Previous post  ↓
+            </dt>
+            <dd>
+              <a href="https://fly.io/blog/fks-beta-live/">
+                Fly Kubernetes does more now
+              </a>
+            </dd>
+        </dl>
+      </article></div>
+  </body>
+</html>
