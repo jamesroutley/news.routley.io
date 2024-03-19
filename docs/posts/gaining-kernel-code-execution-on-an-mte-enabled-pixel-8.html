@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://github.blog/2024-03-18-gaining-kernel-code-execution-on-an-mte-enabled-pixel-8/">Original</a>
+    <h1>Gaining kernel code execution on an MTE-enabled Pixel 8</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+  <div>
+    
+
+
+<section>
+  
+<p>In this post, I’ll look at <a href="https://developer.arm.com/Arm%20Security%20Center/Mali%20GPU%20Driver%20Vulnerabilities#Technical-Specifications">CVE-2023-6241</a>, a vulnerability in the Arm Mali GPU that I reported to Arm on November 15, 2023 and was fixed in the Arm Mali driver version <a href="https://developer.arm.com/downloads/-/mali-drivers/valhall-kernel">r47p0</a>, which was released publicly on December 14, 2023. It was fixed in Android in the <a href="https://source.android.com/docs/security/bulletin/2024-03-01">March security update</a>. When exploited, this vulnerability allows a malicious Android app to gain arbitrary kernel code execution and root on the device. The vulnerability affects devices with newer Arm Mali GPUs that use the <a href="https://community.arm.com/arm-community-blogs/b/graphics-gaming-and-vr-blog/posts/new-suite-of-arm-mali-gpus">Command Stream Frontend (CSF)</a> feature, such as Google’s Pixel 7 and Pixel 8 phones. What is interesting about this vulnerability is that it is a logic bug in the memory management unit of the Arm Mali GPU and it is capable of bypassing <a href="https://community.arm.com/arm-community-blogs/b/architectures-and-processors-blog/posts/enhancing-memory-safety">Memory Tagging Extension (MTE)</a>, a new and powerful mitigation against memory corruption that was first supported in Pixel 8. In this post, I’ll show how to use this bug to gain arbitrary kernel code execution in the Pixel 8 from an untrusted user application. I have confirmed that the exploit works successfully even with kernel MTE enabled by following <a href="https://outflux.net/blog/archives/2023/10/26/enable-mte-on-pixel-8/">these instructions</a>.</p>
+<h2 id="arm64-mte">Arm64 MTE<a href="#arm64-mte" aria-label="Arm64 MTE"></a></h2>
+<p>MTE is a very well documented feature on newer Arm processors that uses hardware implementations to check for memory corruption. As there are already many good articles about MTE, I’ll only briefly go through the idea of MTE and explain its significance in comparison to other mitigations for memory corruption. Readers who are interested in more details can, for example, consult <a href="https://lwn.net/Articles/834289/">this article</a> and the <a href="https://developer.arm.com/documentation/102925/latest/">whitepaper</a> released by Arm.</p>
+<p>While the Arm64 architecture uses 64 bit pointers to access memory, there is usually no need to use such a large address space. In practice, most applications use a much smaller address space (usually 52 bits or less). This leaves the highest bits in a pointer unused. The main idea of memory tagging is to use these higher bits in an address to store a “tag” that can then be used to check against the other tag stored in the memory block associated with the address. The helps to mitigate common types of memory corruptions as follows:</p>
+<p>In the case of a linear overflow, a pointer is used to dereference an adjacent memory block that has a different tag compared to the one stored in the pointer. By checking these tags at dereference time, the corrupted dereference can be detected. For use-after-free type memory corruptions, as long as the tag in a memory block is cleared every time it is freed and a new tag reassigned when it is allocated, dereferencing an already freed and reclaimed object will also lead to a discrepancy between pointer tag and the tag in memory, which allows use-after-free to be detected.</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/image1_d13e94.png?w=1024&amp;resize=1024%2C795" alt="" width="1024" height="795" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/image1_d13e94.png?w=1040 1040w, https://github.blog/wp-content/uploads/2024/03/image1_d13e94.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/image1_d13e94.png?w=768 768w, https://github.blog/wp-content/uploads/2024/03/image1_d13e94.png?w=1024&amp;resize=1024%2C795 1024w" sizes="(max-width: 1000px) 100vw, 1000px" data-recalc-dims="1"/></p>
+<p><em>(The above image is from <a href="https://community.arm.com/arm-community-blogs/b/architectures-and-processors-blog/posts/enhancing-memory-safety">Memory Tagging Extension: Enhancing memory safety through architecture</a> published by Arm.)</em></p>
+<p>The main reason that memory tagging is different from previous mitigations, such as <a href="https://source.android.com/docs/security/test/kcfi">Kernel Control Flow Integrity (kCFI)</a> is that, unlike other mitigations, which disrupts later stages of an exploit, MTE is a very early stage mitigation that tries to catch memory corruption when it first happens. As such, it is able to stop an exploit in a very early stage before the attacker has gained any capabilities and it is therefore very difficult to bypass. It introduces checks that effectively turns an unsafe memory language into one that is memory safe, albeit probabilistically.</p>
+<p>In theory, memory tagging can be implemented in software alone, by making the memory allocator assign and remove tags everytime memory is allocated or free, and by adding tag checking logic when dereferencing pointers. Doing so, however, incurs a performance cost that makes it unsuitable for production use. As a result, hardware implementation is needed to reduce the performance cost and to make memory tagging viable for production use. The hardware support was introduced in the <a href="https://community.arm.com/arm-community-blogs/b/architectures-and-processors-blog/posts/arm-a-profile-architecture-2018-developments-armv85a">v8.5a version</a> of the ARM architecture, in which extra hardware instructions (called MTE) were introduced to perform tagging and checking. For Android devices, most chipsets that support MTE use Arm v9 processors (instead of Arm v8.5a), and currently there are only a handful of devices that support MTE.</p>
+<p>One of the limitations of MTE is that the number of available unused bits is small compared to all possible memory blocks that can ever be allocated. As such, tag collision is inevitable and many memory blocks will have the same tag. This means that a corrupted memory access may still succeed by chance. In practice, even when using only 4 bits for the tag, the success rate is reduced to 1/16, which is still a fairly strong protection against memory corruption. Another limitation is that, by leaking pointer and memory block values using side channel attack such as Spectre, an attacker may be able to ensure that a corrupted memory access is done with the correct tag and thus bypasses MTE. This type of leak, however, is mostly only available to a local attacker. The series of articles, <a href="https://googleprojectzero.blogspot.com/2023/08/mte-as-implemented-part-1.html">MTE As Implemented</a> by Mark Brand, includes an in-depth study of the limitations and impact of MTE on various attack scenarios.</p>
+<p>Apart from having hardware that uses processors that implements Arm v8.5a or above, software support is also required to enable MTE. Currently, only Google’s Pixel 8 allows users to <a href="https://googleprojectzero.blogspot.com/2023/11/first-handset-with-mte-on-market.html">enable MTE in the developer options</a> and MTE is disabled by default. Extra steps are also required to <a href="https://outflux.net/blog/archives/2023/10/26/enable-mte-on-pixel-8/">enable MTE in the kernel</a>.</p>
+<h2 id="the-arm-mali-gpu">The Arm Mali GPU<a href="#the-arm-mali-gpu" aria-label="The Arm Mali GPU"></a></h2>
+<p>The Arm Mali GPU can be integrated in various devices, (for example, see “Implementations” in <a href="https://en.wikipedia.org/wiki/Mali_(GPU)">Mali (GPU) Wikipedia entry</a>). It has been an attractive target on Android phones and has been targeted by in-the-wild exploits multiple times. The current vulnerability is closely related to <a href="https://github.blog/2023-04-06-pwning-pixel-6-with-a-leftover-patch/">another issue</a> that I reported and is a vulnerability in the handling of a type of GPU memory called JIT memory. I’ll now briefly explain JIT memory and explain the vulnerability CVE-2023-6241.</p>
+<h2 id="jit-memory-in-arm-mali">JIT memory in Arm Mali<a href="#jit-memory-in-arm-mali" aria-label="JIT memory in Arm Mali"></a></h2>
+<p>When using the Mali GPU driver, a user app first needs to create and initialize a <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_defs.h#2061"><code>kbase_context</code></a> kernel object. This involves the user app opening the driver file and using the resulting file descriptor to make a series of <code>ioctl</code> calls. A <code>kbase_context</code> object is responsible for managing resources for each driver file that is opened and is unique for each file handle.</p>
+<p>In particular, the <code>kbase_context</code> manages different types of memory that are shared between the GPU device and user space applications. User applications can either map their own memory to the memory space of the GPU so the GPU can access this memory, or they can allocate memory from the GPU. Memory allocated by the GPU is managed by the <code>kbase_context</code> and can be mapped to the GPU memory space and also mapped to user space. A user application can also use the GPU to access mapped memory by submitting commands to the GPU. In general, memory needs to be either allocated and managed by the GPU (native memory) or imported to the GPU from user space, and then mapped to the GPU address space before it can be accessed by the GPU. A memory region in the Mali GPU is represented by the <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem.h#649"><code>kbase_va_region</code></a>. Similar to virtual memory in the CPU, a memory region in the GPU may not have its entire range backed by physical memory. The <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem.h#655"><code>nr_pages</code></a> field in a <code>kbase_va_region</code> specifies the virtual size of the memory region, whereas <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem.h#661"><code>gpu_alloc-&gt;nents</code></a> is the actual number of physical pages that are backing the region. I’ll refer to these pages as the backing pages of the region from now on. While the virtual size of a memory region is fixed, its physical size can change. From now on, when I use terminologies such as resize, grow and shrink regarding a memory region, what I mean is that the physical size of the region is resizing, growing or shrinking.</p>
+<p>The JIT memory is a type of native memory whose lifetime is managed by the kernel driver. User applications request the GPU to allocate and free JIT memory by sending relevant commands to the GPU. While most commands, such as those using GPU to perform arithmetic and memory accesses are executed on the GPU itself, there are some commands, such as the ones used for managing JIT memory, that are implemented in the kernel and executed on the CPU. These are called software commands (in contrast to hardware commands that are executed on the GPU (hardware)). On GPUs that use the Command Stream Frontend (CSF), software commands and hardware commands are placed on different types of command queues. To submit a software command, a <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/csf/mali_kbase_csf_kcpu.h#296"><code>kbase_kcpu_command_queue</code></a> is needed and it can be created by using the <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_core_linux.c#2312"><code>KBASE_IOCTL_KCPU_QUEUE_CREATE</code></a> <code>ioctl</code>. A software command can then be queued using the <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_core_linux.c#2324"><code>KBASE_IOCTL_KCPU_QUEUE_ENQUEUE</code></a> command. To allocate or free JIT memory, commands of type <code>BASE_KCPU_COMMAND_TYPE_JIT_ALLOC</code> and <code>BASE_KCPU_COMMAND_TYPE_JIT_FREE</code> can be used.</p>
+<p>The <code>BASE_KCPU_COMMAND_TYPE_JIT_ALLOC</code> command uses <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem.c#4332"><code>kbase_jit_allocate</code></a> to allocate JIT memory. Similarly, the command <code>BASE_KCPU_COMMAND_TYPE_JIT_FREE</code> can be used to free JIT memory. As explained in the section “<a href="https://github.blog/2023-01-23-pwning-the-all-google-phone-with-a-non-google-bug/#the-life-cycle-of-jit-memory">The life cycle of JIT memory</a>” in one of my previous posts, when JIT memory is freed, it goes into a memory pool managed by the <code>kbase_context</code> and when <code>kbase_jit_allocate</code> is called, it first looks into this memory pool to see if there is any suitable freed JIT memory that can be reused:</p>
+<pre><code>
+struct kbase_va_region *kbase_jit_allocate(struct kbase_context *kctx,
+    const struct base_jit_alloc_info *info,
+    bool ignore_pressure_limit)
+{
+  ...
+  kbase_gpu_vm_lock(kctx);
+  mutex_lock(&amp;kctx-&gt;jit_evict_lock);
+  /*
+   * Scan the pool for an existing allocation which meets our
+   * requirements and remove it.
+   */
+  if (info-&gt;usage_id != 0)
+    /* First scan for an allocation with the same usage ID */
+    reg = find_reasonable_region(info, &amp;kctx-&gt;jit_pool_head, false);
+  ...
+}
+</code></pre>
+<p>If an existing region is found and its virtual size matches the request, but its physical size is too small, then <code>kbase_jit_allocate</code> will attempt to allocate more physical pages to back the region by calling <code>kbase_jit_grow</code>:</p>
+<pre><code>
+struct kbase_va_region *kbase_jit_allocate(struct kbase_context *kctx,
+    const struct base_jit_alloc_info *info,
+    bool ignore_pressure_limit)
+{
+    ...
+    /* kbase_jit_grow() can release &amp; reacquire &#39;kctx-&gt;reg_lock&#39;,
+     * so any state protected by that lock might need to be
+     * re-evaluated if more code is added here in future.
+     */
+    ret = kbase_jit_grow(kctx, info, reg, prealloc_sas,
+             mmu_sync_info);
+   ...
+}
+</code></pre>
+<p>If, on the other hand, no suitable region is found, <code>kbase_jit_allocate</code> will allocate JIT memory from scratch:</p>
+<pre><code>
+struct kbase_va_region *kbase_jit_allocate(struct kbase_context *kctx,
+    const struct base_jit_alloc_info *info,
+    bool ignore_pressure_limit)
+{
+    ...
+  } else {
+    /* No suitable JIT allocation was found so create a new one */
+    u64 flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_GPU_RD |
+        BASE_MEM_PROT_GPU_WR | BASE_MEM_GROW_ON_GPF |
+        BASE_MEM_COHERENT_LOCAL |
+        BASEP_MEM_NO_USER_FREE;
+    u64 gpu_addr;
+        ...
+    mutex_unlock(&amp;kctx-&gt;jit_evict_lock);
+    kbase_gpu_vm_unlock(kctx);
+    reg = kbase_mem_alloc(kctx, info-&gt;va_pages, info-&gt;commit_pages, info-&gt;extension,
+              &amp;flags, &amp;gpu_addr, mmu_sync_info);
+   ...
+}
+</code></pre>
+<p>As we can see from the comment above the call to <code>kbase_jit_grow</code>, <code>kbase_jit_grow</code> can temporarily drop the <code>kctx-&gt;reg_lock</code>:</p>
+<pre><code>
+static int kbase_jit_grow(struct kbase_context *kctx,
+ const struct base_jit_alloc_info *info,
+ struct kbase_va_region *reg,
+ struct kbase_sub_alloc **prealloc_sas,
+ enum kbase_caller_mmu_sync_info mmu_sync_info)
+{
+    ...
+  if (!kbase_mem_evictable_unmake(reg-&gt;gpu_alloc))
+    goto update_failed;
+    ...
+  old_size = reg-&gt;gpu_alloc-&gt;nents;                      //commit_pages - reg-&gt;gpu_alloc-&gt;nents;    //&lt;---------2.
+  pages_required = delta;
+    ...
+  while (kbase_mem_pool_size(pool) mem_partials_lock);
+    kbase_gpu_vm_unlock(kctx);                        //&lt;---------- lock dropped.
+    ret = kbase_mem_pool_grow(pool, pool_delta);
+    kbase_gpu_vm_lock(kctx);
+        ...
+}
+</code></pre>
+<p>In the above, we see that <code>kbase_gpu_vm_unlock</code> is called to temporarily drop the <code>kctx-&gt;reg_lock</code>, while <code>kctx-&gt;mem_partials_lock</code> is also dropped during a call to <code>kbase_mem_pool_grow</code>. In the Mali GPU, the <code>kctx-&gt;reg_lock</code> is used for protecting concurrent accesses to memory regions. So, for example, when <code>kctx-&gt;reg_lock</code> is held, the physical size of the memory region cannot be changed by another thread. In <a href="https://github.blog/2023-04-06-pwning-pixel-6-with-a-leftover-patch/">GHSL-2023-005</a> that I reported previously, I was able to trigger a race so that the JIT region was shrunk by using the <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem_linux.c#2224"><code>KBASE_IOCTL_MEM_COMMIT</code></a> <code>ioctl</code> from another thread while <code>kbase_mem_pool_grow</code> was running. This change in the size of the JIT region caused <code>reg-&gt;gpu_alloc-&gt;nents</code> to change after <code>kbase_mem_pool_grow</code>, meaning that the actual value of <code>reg-&gt;gpu_alloc-&gt;nents</code> was then different from the value that was cached in <code>old_size</code> and <code>delta</code> (1. and 2. in the above). As these values were later used to allocate and map the JIT region, using these stale values caused inconsistency in the GPU memory mapping, causing GHSL-2023-005.</p>
+<pre><code>
+static int kbase_jit_grow(struct kbase_context *kctx,
+ const struct base_jit_alloc_info *info,
+ struct kbase_va_region *reg,
+ struct kbase_sub_alloc **prealloc_sas,
+ enum kbase_caller_mmu_sync_info mmu_sync_info)
+{
+    ...
+   //grow memory pool
+    ...
+    //delta use for allocating pages
+    gpu_pages = kbase_alloc_phy_pages_helper_locked(reg-&gt;gpu_alloc, pool,
+            delta, &amp;prealloc_sas[0]);
+    ...
+    //old_size used for growing gpu mapping
+    ret = kbase_mem_grow_gpu_mapping(kctx, reg, info-&gt;commit_pages,
+            old_size);
+    ...
+}
+</code></pre>
+<p>After GHSL-2023-005 was patched, it was no longer possible to change the size of JIT memory using the <code>KBASE_IOCTL_MEM_COMMIT ioctl</code>.</p>
+<h2 id="the-vulnerability">The vulnerability<a href="#the-vulnerability" aria-label="The vulnerability"></a></h2>
+<p>Similar to virtual memory, when an address in a memory region that is not backed by a physical page is accessed by the GPU, a memory access fault happens. In this case, depending on the type of the memory region, it may be possible to allocate and map a physical page on the fly to back the fault address. A GPU memory access fault is handled by the <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mmu/mali_kbase_mmu.c#974"><code>kbase_mmu_page_fault_worker</code></a>:</p>
+<pre><code>
+void kbase_mmu_page_fault_worker(struct work_struct *data)
+{
+    ...
+    kbase_gpu_vm_lock(kctx);
+    ...
+  if ((region-&gt;flags &amp; GROWABLE_FLAGS_REQUIRED)
+      != GROWABLE_FLAGS_REQUIRED) {
+    kbase_gpu_vm_unlock(kctx);
+    kbase_mmu_report_fault_and_kill(kctx, faulting_as,
+        &#34;Memory is not growable&#34;, fault);
+    goto fault_done;
+  }
+
+  if ((region-&gt;flags &amp; KBASE_REG_DONT_NEED)) {
+    kbase_gpu_vm_unlock(kctx);
+    kbase_mmu_report_fault_and_kill(kctx, faulting_as,
+        &#34;Don&#39;t need memory can&#39;t be grown&#34;, fault);
+    goto fault_done;
+  }
+
+    ...
+  spin_lock(&amp;kctx-&gt;mem_partials_lock);
+  grown = page_fault_try_alloc(kctx, region, new_pages, &amp;pages_to_grow,
+      &amp;grow_2mb_pool, prealloc_sas);
+  spin_unlock(&amp;kctx-&gt;mem_partials_lock);
+    ...
+}
+</code></pre>
+<p>Within the fault handler, a number of checks are performed to ensure that the memory region is allowed to grow in size. The two checks that are relevant to JIT memory are the checks for the <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_defs.h#111"><code>GROWABLE_FLAGS_REQUIRED</code></a> and the <code>KBASE_REG_DONT_NEED</code> flags. The <code>GROWABLE_FLAGS_REQUIRED</code> is defined as follows:</p>
+<pre><code>#define GROWABLE_FLAGS_REQUIRED (KBASE_REG_PF_GROW | KBASE_REG_GPU_WR)
+</code></pre>
+<p>These flags are added to a JIT region when it is created by <code>kbase_jit_allocate</code> and are never changed:</p>
+<pre><code>
+struct kbase_va_region *kbase_jit_allocate(struct kbase_context *kctx,
+    const struct base_jit_alloc_info *info,
+    bool ignore_pressure_limit)
+{
+    ...
+  } else {
+    /* No suitable JIT allocation was found so create a new one */
+    u64 flags = BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_GPU_RD |
+        BASE_MEM_PROT_GPU_WR | BASE_MEM_GROW_ON_GPF |      //jit_evict_lock);
+    kbase_gpu_vm_unlock(kctx);
+    reg = kbase_mem_alloc(kctx, info-&gt;va_pages, info-&gt;commit_pages, info-&gt;extension,
+              &amp;flags, &amp;gpu_addr, mmu_sync_info);
+   ...
+}
+</code></pre>
+<p>While the <code>KBASE_REG_DONT_NEED</code> flag is added to a JIT region when it is freed, it is removed in <code>kbase_jit_grow</code> well before the <code>kctx-&gt;reg_lock</code> and <code>kctx-&gt;mem_partials_lock</code> are dropped and <code>kbase_mem_pool_grow</code> is called:</p>
+<pre><code>
+static int kbase_jit_grow(struct kbase_context *kctx,
+ const struct base_jit_alloc_info *info,
+ struct kbase_va_region *reg,
+ struct kbase_sub_alloc **prealloc_sas,
+ enum kbase_caller_mmu_sync_info mmu_sync_info)
+{
+  ...
+  if (!kbase_mem_evictable_unmake(reg-&gt;gpu_alloc))    //&lt;----- Remove KBASE_REG_DONT_NEED
+  goto update_failed;
+    ...
+  while (kbase_mem_pool_size(pool) mem_partials_lock);
+    kbase_gpu_vm_unlock(kctx);
+    ret = kbase_mem_pool_grow(pool, pool_delta);      //&lt;----- race window: fault handler grows region
+    kbase_gpu_vm_lock(kctx);
+        ...
+}
+</code></pre>
+<p>In particular, during the race window marked in the above snippet, the JIT memory reg is allowed to grow when a page fault happens.</p>
+<p>So, by accessing unmapped memory in the region to create a fault on another thread while <code>kbase_mem_pool_grow</code> is running, I can cause the JIT region to be grown by the GPU fault handler while <code>kbase_mem_pool_grow</code> runs. This then changes <code>reg-&gt;gpu_alloc-&gt;nents</code> and invalidates <code>old_size</code> and <code>delta</code> in 1. and 2. below:</p>
+<pre><code>
+static int kbase_jit_grow(struct kbase_context *kctx,
+ const struct base_jit_alloc_info *info,
+ struct kbase_va_region *reg,
+ struct kbase_sub_alloc **prealloc_sas,
+ enum kbase_caller_mmu_sync_info mmu_sync_info)
+{
+    ...
+  if (!kbase_mem_evictable_unmake(reg-&gt;gpu_alloc))
+    goto update_failed;
+    ...
+  old_size = reg-&gt;gpu_alloc-&gt;nents;                      //commit_pages - reg-&gt;gpu_alloc-&gt;nents;    //&lt;---------2.
+  pages_required = delta;
+    ...
+  while (kbase_mem_pool_size(pool) mem_partials_lock);
+    kbase_gpu_vm_unlock(kctx);
+    ret = kbase_mem_pool_grow(pool, pool_delta);  //gpu_alloc-&gt;nents changed by fault handler
+    kbase_gpu_vm_lock(kctx);
+        ...
+   //delta use for allocating pages
+    gpu_pages = kbase_alloc_phy_pages_helper_locked(reg-&gt;gpu_alloc, pool,   //commit_pages,         //&lt;----- 4.
+            old_size);
+    ...
+}
+</code></pre>
+<p>As a result, when <code>delta</code> and <code>old_size</code> are used in 3. and 4. to allocate backing pages and to map the pages to the GPU memory space, their values are invalid.</p>
+<p>This is very similar to what happened with GHSL-2023-005. As <code>kbase_mem_pool_grow</code> involves large memory allocations, this race can be won very easily. There is, however, one very big difference here: With GHSL-2023-005, I was able to shrink the JIT region while in this case, I was only able to grow the JIT region. To understand why this matters, let’s have a brief recap of how my exploit for GHSL-2023-005 worked.</p>
+<p>As mentioned before, the physical size, or the number of backing pages of a <code>kbase_va_region</code> is stored in the field <code>reg-&gt;gpu_alloc-&gt;nents</code>. A <code>kbase_va_region</code> has two <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem.h#315"><code>kbase_mem_phy_alloc</code></a> objects: the <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem.h#660"><code>cpu_alloc</code></a> and <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem.h#660"><code>gpu_alloc</code></a> that are responsible for managing its backing pages. For Android devices, these two fields are configured to be the same. Within <code>kbase_mem_phy_alloc</code>, the field <code>pages</code> is an array that contains the physical addresses of the backing pages, while <code>nents</code> specifies the length of the <code>pages</code> array:</p>
+<pre><code>
+struct kbase_mem_phy_alloc {
+    ...
+  size_t                nents;
+  struct tagged_addr    *pages;
+    ...
+}
+</code></pre>
+<p>When <code>kbase_alloc_phy_pages_helper_locked</code> is called, it allocates memory pages and appends the physical addresses represented by these pages to the array <code>pages</code>, so the new pages are added to the index <code>nents</code> onwards. The new size is then stored to <code>nents</code>. For example, when it is called in <code>kbase_jit_grow</code>, <code>delta</code> is the number of pages to add:</p>
+<pre><code>
+static int kbase_jit_grow(struct kbase_context *kctx,
+ const struct base_jit_alloc_info *info,
+ struct kbase_va_region *reg,
+ struct kbase_sub_alloc **prealloc_sas,
+ enum kbase_caller_mmu_sync_info mmu_sync_info)
+{
+    ...
+   //delta use for allocating pages
+    gpu_pages = kbase_alloc_phy_pages_helper_locked(reg-&gt;gpu_alloc, pool,
+            delta, &amp;prealloc_sas[0]);
+    ...
+}
+</code></pre>
+<p>In this case, <code>delta</code> pages are inserted at the index <code>nents</code> in the array <code>pages</code> of <code>gpu_alloc</code>:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/image13.png?w=955&amp;resize=955%2C274" alt="" width="955" height="274" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/image13.png?w=955&amp;resize=955%2C274 955w, https://github.blog/wp-content/uploads/2024/03/image13.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/image13.png?w=768 768w" sizes="(max-width: 955px) 100vw, 955px" data-recalc-dims="1"/></p>
+<p>After the backing pages are allocated and inserted into the <code>pages</code> array, the new pages are mapped to the GPU address space by calling <code>kbase_mem_grow_gpu_mapping</code>. The virtual address of a <code>kbase_va_region</code> in the GPU memory space is managed by the <code>kbase_va_region</code> itself and is stored in the fields <code>start_pfn</code> and <code>nr_pages</code>:</p>
+<pre><code>
+struct kbase_va_region {
+    ...
+  u64 start_pfn;
+    ...
+  size_t nr_pages;
+    ...
+}
+</code></pre>
+<p>The start of the virtual address of a <code>kbase_va_region</code> is stored in <code>start_pfn</code> (as a page frame, so the actual address is <code>start_pfn &gt;&gt; PAGE_SIZE</code>) while <code>nr_pages</code> stores the size of the region. These fields remain unchanged after they are set. Within a <code>kbase_va_region</code>, the initial <code>reg-&gt;gpu_alloc-&gt;nents</code> pages in the virtual address space are backed by the physical memory stored in the <code>pages</code> array of <code>gpu_alloc-&gt;pages</code>, while the rest of the addresses are not backed. In particular, the virtual addresses that are backed are always contiguous (so, no gaps between backed regions) and always start from the start of the region. For example, the following is possible:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/image2_5395a6.png?w=825&amp;resize=825%2C267" alt="" width="825" height="267" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/image2_5395a6.png?w=825&amp;resize=825%2C267 825w, https://github.blog/wp-content/uploads/2024/03/image2_5395a6.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/image2_5395a6.png?w=768 768w" sizes="(max-width: 825px) 100vw, 825px" data-recalc-dims="1"/></p>
+<p>While the following case is not allowed because the backing does not start from the beginning of the region:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/image18.png?w=843&amp;resize=843%2C270" alt="" width="843" height="270" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/image18.png?w=843&amp;resize=843%2C270 843w, https://github.blog/wp-content/uploads/2024/03/image18.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/image18.png?w=768 768w" sizes="(max-width: 843px) 100vw, 843px" data-recalc-dims="1"/></p>
+<p>and this following case is also not allowed because of the gaps in the addresses that are backed:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/image19.png?w=834&amp;resize=834%2C260" alt="" width="834" height="260" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/image19.png?w=834&amp;resize=834%2C260 834w, https://github.blog/wp-content/uploads/2024/03/image19.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/image19.png?w=768 768w" sizes="(max-width: 834px) 100vw, 834px" data-recalc-dims="1"/></p>
+<p>In the case when <code>kbase_mem_grow_gpu_mapping</code> is called in <code>kbase_jit_grow</code>, the GPU addresses between <code>(start_pfn + old_size) * 0x1000</code> to <code>(start_pfn + info-&gt;commit_pages) * 0x1000</code> are mapped to the newly added pages in <code>gpu_alloc-&gt;pages</code>, which are the pages between indices <code>pages + old_size</code> and <code>pages + info-&gt;commit_pages</code> (because <code>delta = info-&gt;commit_pages - old_size</code>):</p>
+<pre><code>
+static int kbase_jit_grow(struct kbase_context *kctx,
+ const struct base_jit_alloc_info *info,
+ struct kbase_va_region *reg,
+ struct kbase_sub_alloc **prealloc_sas,
+ enum kbase_caller_mmu_sync_info mmu_sync_info)
+{
+    ...
+    old_size = reg-&gt;gpu_alloc-&gt;nents;
+    delta = info-&gt;commit_pages - reg-&gt;gpu_alloc-&gt;nents;
+    ...
+    //old_size used for growing gpu mapping
+    ret = kbase_mem_grow_gpu_mapping(kctx, reg, info-&gt;commit_pages,
+            old_size);
+    ...
+}
+</code></pre>
+<p>In particular, <code>old_size</code> here is used to specify both the GPU address where the new mapping should start, and also the offset from the <code>pages</code> array where backing pages should be used.</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/image11.png?w=826&amp;resize=826%2C445" alt="" width="826" height="445" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/image11.png?w=826&amp;resize=826%2C445 826w, https://github.blog/wp-content/uploads/2024/03/image11.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/image11.png?w=768 768w" sizes="(max-width: 826px) 100vw, 826px" data-recalc-dims="1"/></p>
+<p>If <code>reg-&gt;gpu_alloc-&gt;nents</code> changes after <code>old_size</code> and <code>delta</code> are cached, then these offsets may become invalid. For example, if the <code>kbase_va_region</code> was shrunk and <code>nents</code> decreased after <code>old_size</code> and <code>delta</code> were stored, then <code>kbase_alloc_phy_pages_helper_locked</code> will insert <code>delta</code> pages to <code>reg-&gt;gpu_alloc-&gt;pages + nents</code>:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/image12.png?w=947&amp;resize=947%2C345" alt="" width="947" height="345" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/image12.png?w=947&amp;resize=947%2C345 947w, https://github.blog/wp-content/uploads/2024/03/image12.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/image12.png?w=768 768w" sizes="(max-width: 947px) 100vw, 947px" data-recalc-dims="1"/></p>
+<p>Similarly, <code>kbase_mem_grow_gpu_mapping</code> will map the GPU addresses starting from <code>(start_pfn + old_size) * 0x1000</code>, using the pages that are between <code>reg-&gt;gpu_alloc-&gt;pages + old_size</code> and <code>reg-&gt;gpu_alloc-&gt;pages + nents + delta</code> (dotted lines in the figure below). This means that the pages between <code>pages-&gt;nents</code> and <code>pages-&gt;old_size</code> don’t end up getting mapped to any GPU addresses, while some addresses end up having no backing pages:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/image17.png?w=960&amp;resize=960%2C540" alt="" width="960" height="540" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/image17.png?w=960&amp;resize=960%2C540 960w, https://github.blog/wp-content/uploads/2024/03/image17.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/image17.png?w=768 768w" sizes="(max-width: 960px) 100vw, 960px" data-recalc-dims="1"/></p>
+<h2 id="exploiting-ghsl-2023-005">Exploiting GHSL-2023-005<a href="#exploiting-ghsl-2023-005" aria-label="Exploiting GHSL-2023-005"></a></h2>
+<p>GHSL-2023-005 enabled me to shrink the JIT region but CVE-2023-6241 does not give me that capability. To understand how to exploit this issue, we need to know a bit more about how GPU mappings are removed. The function <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mmu/mali_kbase_mmu.c#2908"><code>kbase_mmu_teardown_pgd_pages</code></a> is responsible for removing address mappings from the GPU. This function essentially walks through a GPU address range and removes the addresses from the GPU page table by marking them as invalid. If it encounters a high level page table entry (PTE), which covers a large range of addresses, and finds that the entry is invalid, then it’ll skip removing the entire range of addresses covered by the entry. For example, a level 2 page table entry covers a range of 512 pages, so if a level 2 page table entry is found to be invalid (1. in the below), then <code>kbase_mmu_teardown_pgd_pages</code> will assume the next 512 pages are covered by this level 2 and hence are all invalid already. As such, it’ll skip removing these pages (2. in the below).</p>
+<pre><code>
+static int kbase_mmu_teardown_pgd_pages(struct kbase_device *kbdev, struct kbase_mmu_table *mmut,
+          u64 vpfn, size_t nr, u64 *dirty_pgds,
+          struct list_head *free_pgds_list,
+          enum kbase_mmu_op_type flush_op)
+{
+        ...
+        for (level = MIDGARD_MMU_TOPLEVEL;
+                level ate_is_valid(page[index], level))
+                break; /* keep the mapping */
+            else if (!mmu_mode-&gt;pte_is_valid(page[index], level)) {  //&lt;------ 1.
+                /* nothing here, advance */
+                switch (level) {
+                ...
+                case MIDGARD_MMU_LEVEL(2):
+                    count = 512;            // nr)
+                    count = nr;
+                goto next;
+            }
+        ...
+next:
+        kunmap(phys_to_page(pgd));
+        vpfn += count;
+        nr -= count;
+</code></pre>
+<p>The function <code>kbase_mmu_teardown_pgd_pages</code> is called either when a <code>kbase_va_region</code> is shrunk or when it is deleted. As explained in the previous section, the virtual addresses in a <code>kbase_va_region</code> that are mapped and backed by physical pages must be contiguous from the start of the <code>kbase_va_region</code>. As a result, if any address in the region is mapped, then the start address must be mapped and hence the high level page table entry covering the start address must be valid (if no address in the region is mapped, then <code>kbase_mmu_teardown_pgd_pages</code> would not even be called):</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-5.png?w=855&amp;resize=855%2C341" alt="" width="855" height="341" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-5.png?w=855&amp;resize=855%2C341 855w, https://github.blog/wp-content/uploads/2024/03/unnamed-5.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-5.png?w=768 768w" sizes="(max-width: 855px) 100vw, 855px" data-recalc-dims="1"/></p>
+<p>In the above, the level 2 PTE that covers the start address of the region is mapped and so it is valid, therefore in this case, if <code>kbase_mmu_teardown_pgd_pages</code> ever encounters an unmapped high level PTE, the rest of the addresses in the <code>kbase_va_region</code> must have already been unmapped and can be skipped safely.</p>
+<p>In the case where a region is shrunk, the address where the unmapping starts lies within the <code>kbase_va_region</code>, and the entire range between this start address and the end of the region will be unmapped. If the level 2 page table entry covering this address is invalid, then the start address must be in a region that is not mapped, and hence the rest of the address range to unmap must also not have been mapped. In this case, skipping of addresses is again safe:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-6.png?w=852&amp;resize=852%2C336" alt="" width="852" height="336" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-6.png?w=852&amp;resize=852%2C336 852w, https://github.blog/wp-content/uploads/2024/03/unnamed-6.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-6.png?w=768 768w" sizes="(max-width: 852px) 100vw, 852px" data-recalc-dims="1"/></p>
+<p>So, as long as regions are only mapped from their start addresses and have no gaps in the mappings, <code>kbase_mmu_teardown_pgd_pages</code> will behave correctly.</p>
+<p>In the case of GHSL-2023-005, it is possible to create a region that does not meet these conditions. For example, by shrinking the entire region to size zero during the race window, it is possible to create a region where the start of the region is unmapped:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-7.png?w=960&amp;resize=960%2C540" alt="" width="960" height="540" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-7.png?w=960&amp;resize=960%2C540 960w, https://github.blog/wp-content/uploads/2024/03/unnamed-7.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-7.png?w=768 768w" sizes="(max-width: 960px) 100vw, 960px" data-recalc-dims="1"/></p>
+<p>When the region is deleted, and <code>kbase_mmu_teardown_pgd_pages</code> tries to remove the first address, because the level 2 PTE is invalid, it’ll skip the next 512 pages, some of which may actually have been mapped:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-8.png?w=848&amp;resize=848%2C469" alt="" width="848" height="469" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-8.png?w=848&amp;resize=848%2C469 848w, https://github.blog/wp-content/uploads/2024/03/unnamed-8.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-8.png?w=768 768w" sizes="(max-width: 848px) 100vw, 848px" data-recalc-dims="1"/></p>
+<p>In this case, addresses in the “incorrectly skipped” region will remain mapped to some entries in the <code>pages</code> array in the <code>gpu_alloc</code>, which are already freed. And these “incorrectly skipped” GPU addresses can be used to access already freed memory pages.</p>
+<h2 id="exploiting-cve-2023-6241">Exploiting CVE-2023-6241<a href="#exploiting-cve-2023-6241" aria-label="Exploiting CVE-2023-6241"></a></h2>
+<p>The situation, however, is very different when a region is grown during the race window. In this case, <code>nents</code> is larger than <code>old_size</code> when <code>kbase_alloc_phy_pages_helper_locked</code> and <code>kbase_mem_grow_gpu_mapping</code> are called, and <code>delta</code> pages are being inserted at index <code>nents</code> of the <code>pages</code> array:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-9.png?w=769&amp;resize=769%2C330" alt="" width="769" height="330" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-9.png?w=769&amp;resize=769%2C330 769w, https://github.blog/wp-content/uploads/2024/03/unnamed-9.png?w=300 300w" sizes="(max-width: 769px) 100vw, 769px" data-recalc-dims="1"/></p>
+<p>The <code>pages</code> array contains the correct number of pages to backup both the jit grow and the fault access, and is in fact exactly how it should be when <code>kbase_jit_grow</code> is called after the page fault handler.</p>
+<p>When <code>kbase_mem_grow_gpu_mapping</code> is called, <code>delta</code> pages are mapped to the GPU from <code>(start_pfn + old_size) * 0x1000</code>. As the total number of backing pages has now increased by <code>fh + delta</code>, where <code>fh</code> is the number of pages added by the fault handler, this leaves the last <code>fh</code> pages in the <code>pages</code> array unmapped.</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-10.png?w=799&amp;resize=799%2C504" alt="" width="799" height="504" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-10.png?w=799&amp;resize=799%2C504 799w, https://github.blog/wp-content/uploads/2024/03/unnamed-10.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-10.png?w=768 768w" sizes="(max-width: 799px) 100vw, 799px" data-recalc-dims="1"/></p>
+<p>This, however, does not seem to create any problem either. The memory region still only has its start addresses mapped and there is no gap in the mapping. The pages that are not mapped are simply not accessible from the GPU and will get freed when the memory region is deleted, so it isn’t even a memory leak issue.</p>
+<p>However, not all is lost. As we have seen, when a GPU page fault happens, if the cause of the fault is that the address is not mapped, then the fault handler will try to add backing pages to the region and map these new pages to the extent of the region. If the fault address is, say <code>fault_addr</code>, then the minimum number of pages to add is <code>new_pages = fault_addr/0x1000 - reg-&gt;gpu_alloc-&gt;nents</code>. Depending on the <code>kbase_va_region</code>, some padding may also be added. In any case, these new pages will be mapped to the GPU, starting from the address <code>(start_pfn + reg-&gt;gpu_alloc-&gt;nents) * 0x1000</code>, so as to preserve the fact that only the addresses at the start of a region are mapped.</p>
+<p>This means that, if I trigger another GPU fault in the JIT region that was affected by the bug, then some new mappings will be added <em>after</em> the region that is not mapped.</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-11.png?w=960&amp;resize=960%2C540" alt="" width="960" height="540" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-11.png?w=960&amp;resize=960%2C540 960w, https://github.blog/wp-content/uploads/2024/03/unnamed-11.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-11.png?w=768 768w" sizes="(max-width: 960px) 100vw, 960px" data-recalc-dims="1"/></p>
+<p>This creates a gap in the GPU mappings, and I’m starting to get something that looks exploitable.</p>
+<p>Note that as <code>delta</code> has to be non zero to trigger the bug, and as <code>delta + old_size</code> pages at the start of the region are mapped, it is still not possible to have the start of the region unmapped like in the case of GHSL-2023-005. So, my only option here is to shrink the region and have the resulting size lie somewhere inside the unmapped gap.</p>
+<p>The only way to shrink a JIT region is to use the <code>BASE_KCPU_COMMAND_TYPE_JIT_FREE</code> GPU command to “free” the JIT region. As explained before, this does not actually free the <code>kbase_va_region</code> itself, but rather puts it in a memory pool so that it may be reused on subsequent JIT allocation. Prior to this, <code>kbase_jit_free</code> will also shrink the JIT region according to the <code>initial_commit</code> size of the region, as well as the <code>trim_level</code> that is configured in the <code>kbase_context</code>:</p>
+<pre><code>
+void kbase_jit_free(struct kbase_context *kctx, struct kbase_va_region *reg)
+{
+    ...
+  old_pages = kbase_reg_current_backed_size(reg);
+  if (reg-&gt;initial_commit initial_commit,
+      div_u64(old_pages * (100 - kctx-&gt;trim_level), 100));
+    u64 delta = old_pages - new_size;
+    if (delta) {
+      mutex_lock(&amp;kctx-&gt;reg_lock);
+      kbase_mem_shrink(kctx, reg, old_pages - delta);
+      mutex_unlock(&amp;kctx-&gt;reg_lock);
+    }
+  }
+  ...
+}
+</code></pre>
+<p>Either way, I can control the size of this shrinking. With this in mind, I can arrange the region in the following way:</p>
+<ol>
+<li>Create a JIT region and trigger the bug. Arrange the GPU fault so that the fault handler adds <code>fault_size</code> pages, enough pages to cover at least one level 2 PTE.
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-12.png?w=822&amp;resize=822%2C529" alt="" width="822" height="529" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-12.png?w=822&amp;resize=822%2C529 822w, https://github.blog/wp-content/uploads/2024/03/unnamed-12.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-12.png?w=768 768w" sizes="(max-width: 822px) 100vw, 822px" data-recalc-dims="1"/></p>
+<p>After the bug is triggered, only the initial <code>old_size + delta</code> pages are mapped to the GPU address space, while the <code>kbase_va_region</code> has <code>old_size + delta + fault_size</code> backing pages in total.</p>
+</li>
+<li>
+<p>Trigger a second fault at an offset greater than the number of backing pages, so that pages are appended to the region and mapped after the unmapped regions created in the previous step.</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-13.png?w=812&amp;resize=812%2C525" alt="" width="812" height="525" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-13.png?w=812&amp;resize=812%2C525 812w, https://github.blog/wp-content/uploads/2024/03/unnamed-13.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-13.png?w=768 768w" sizes="(max-width: 812px) 100vw, 812px" data-recalc-dims="1"/></p>
+</li>
+<li>
+<p>Free the JIT region using <code>BASE_KCPU_COMMAND_TYPE_JIT_FREE</code>, which will call <code>kbase_jit_free</code> to shrink the region and remove pages from it. Control the size of this trimming either so that the region size after shrinking (<code>final_size</code>) of the backing store lies somewhere within the unmapped region covered by the first level 2 PTE.</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-14.png?w=824&amp;resize=824%2C529" alt="" width="824" height="529" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-14.png?w=824&amp;resize=824%2C529 824w, https://github.blog/wp-content/uploads/2024/03/unnamed-14.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-14.png?w=768 768w" sizes="(max-width: 824px) 100vw, 824px" data-recalc-dims="1"/></p>
+</li>
+</ol>
+<p>When the region is shrunk, <code>kbase_mmu_teardown_pgd_pages</code> is called to unmap the GPU address mappings, starting from <code>region_start + final_size</code> all the way up to the end of the region. As the entire address range covered by the first level 2 PTE is unmapped, when <code>kbase_mmu_teardown_pgd_pages</code> tries to unmap <code>region_start + final_size</code>, the condition <code>!mmu_mode-&gt;pte_is_valid</code> is met at a level 2 PTE and so the unmapping will skip the next 512 pages, starting from <code>region_start + final_size</code>. However, since addresses belonging to the next level 2 PTE are still mapped, these addresses will be skipped incorrectly (the orange region in the next figure), leaving them mapped to pages that are going to be freed:</p>
+<p><img decoding="async" src="https://github.blog/wp-content/uploads/2024/03/unnamed-15.png?w=827&amp;resize=827%2C524" alt="" width="827" height="524" loading="lazy" srcset="https://github.blog/wp-content/uploads/2024/03/unnamed-15.png?w=827&amp;resize=827%2C524 827w, https://github.blog/wp-content/uploads/2024/03/unnamed-15.png?w=300 300w, https://github.blog/wp-content/uploads/2024/03/unnamed-15.png?w=768 768w" sizes="(max-width: 827px) 100vw, 827px" data-recalc-dims="1"/></p>
+<p>Once the shrinking is completed, the backing pages are freed and the addresses in the orange region will retain access to already freed pages.</p>
+<p>This means that the freed backing page can now be reused as any kernel page, which gives me plenty of options to exploit this bug. One possibility is to use my previous <a href="https://github.blog/2022-07-27-corrupting-memory-without-memory-corruption/#breaking-out-of-the-context">technique</a> to replace the backing page as <a href="https://www.kernel.org/doc/gorman/html/understand/understand006.html">page table global directories (PGD)</a> of our GPU <code>kbase_context</code>.</p>
+<p>To recap, let’s take a look at how the backing pages of a <code>kbase_va_region</code> are allocated. When allocating pages for the backing store of a <code>kbase_va_region</code>, the <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem_pool.c#772"><code>kbase_mem_pool_alloc_pages</code></a> function is used:</p>
+<pre><code>
+int kbase_mem_pool_alloc_pages(struct kbase_mem_pool *pool, size_t nr_4k_pages,
+    struct tagged_addr *pages, bool partial_allowed)
+{
+    ...
+  /* Get pages from this pool */
+  while (nr_from_pool--) {
+    p = kbase_mem_pool_remove_locked(pool);     //next_pool) {
+    /* Allocate via next pool */
+    err = kbase_mem_pool_alloc_pages(pool-&gt;next_pool,      //&lt;----- 2.
+        nr_4k_pages - i, pages + i, partial_allowed);
+        ...
+  } else {
+    /* Get any remaining pages from kernel */
+    while (i != nr_4k_pages) {
+      p = kbase_mem_alloc_page(pool);     //&lt;------- 3.
+            ...
+        }
+        ...
+  }
+    ...
+}
+</code></pre>
+<p>The input argument <code>kbase_mem_pool</code> is a memory pool managed by the <code>kbase_context</code> object associated with the driver file that is used to allocate the GPU memory. As the comments suggest, the allocation is actually done in tiers. First the pages will be allocated from the current <code>kbase_mem_pool</code> using <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem_pool.c#241"><code>kbase_mem_pool_remove_locked</code></a> (1 in the above). If there is not enough capacity in the current <code>kbase_mem_pool</code> to meet the request, then <code>pool-&gt;next_pool</code>, is used to allocate the pages (2 in the above). If even <code>pool-&gt;next_pool</code> does not have the capacity, then <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem_pool.c#316"><code>kbase_mem_alloc_page</code></a> is used to allocate pages directly from the kernel via the buddy allocator (the page allocator in the kernel).</p>
+<p>When freeing a page, provided that the memory region is not evicted, the same happens in the opposite direction: <a href="https://android.googlesource.com/kernel/google-modules/gpu/+/refs/heads/android-gs-shusky-5.15-android14-qpr1/mali_kbase/mali_kbase_mem_pool.c#991"><code>kbase_mem_pool_free_pages</code></a> first tries to return the pages to the <code>kbase_mem_pool</code> of the current <code>kbase_context</code>, if the memory pool is full, it’ll try to return the remaining pages to <code>pool-&gt;next_pool</code>. If the next pool is also full, then the remaining pages are returned to the kernel by freeing them via the buddy allocator.</p>
+<p>As noted in my post <a href="https://github.blog/2022-07-27-corrupting-memory-without-memory-corruption/#breaking-out-of-the-context">Corrupting memory without memory corruption</a>, <code>pool-&gt;next_pool</code> is a memory pool managed by the Mali driver and shared by all the <code>kbase_context</code>. It is also used for allocating <a href="https://www.kernel.org/doc/gorman/html/understand/understand006.html">page table global directories (PGD)</a> used by GPU contexts. In particular, this means that by carefully arranging the memory pools, it is possible to cause a freed backing page in a <code>kbase_va_region</code> to be reused as a PGD of a GPU context. (The details of how to achieve this can be found <a href="https://github.blog/2022-07-27-corrupting-memory-without-memory-corruption/#breaking-out-of-the-context">here</a>.)</p>
+<p>Once the freed page is reused as a PGD of a GPU context, the GPU addresses that retain access to the freed page can be used to rewrite the PGD from the GPU. This then allows any kernel memory, including kernel code, to be mapped to the GPU. This then allows me to rewrite kernel code and hence execute arbitrary kernel code. It also allows me to read and write arbitrary kernel data, so I can easily rewrite credentials of my process to gain root, as well as to disable SELinux.</p>
+<p>The exploit for Pixel 8 can be found <a href="https://github.com/github/securitylab/tree/main/SecurityExploits/Android/Mali/CVE_2023_6241">here</a> with some setup notes.</p>
+<h2 id="how-does-this-bypass-mte">How does this bypass MTE?<a href="#how-does-this-bypass-mte" aria-label="How does this bypass MTE?"></a></h2>
+<p>So far, I’ve not mentioned any specific measures to bypass MTE. In fact, MTE does not affect the exploit flow of this bug at all. While MTE protects against dereferences of pointers against inconsistent memory blocks, the exploit does not rely on any of such dereferencing at all. When the bug is triggered, it creates inconsistencies between the <code>pages</code> array and the GPU mappings of the JIT region. At this point, there is no memory corruption and neither the GPU mappings nor the <code>pages</code> array, when considered separately, contain invalid entries. When the bug is used to cause <code>kbase_mmu_teardown_pgd_pages</code>to skip removing GPU mappings, its effect is to cause physical addresses of freed memory pages to be retained in the GPU page table. So, when the GPU accesses the freed pages, it is in fact accessing their physical addresses directly, which does not involve any pointer dereferencing either. On top of that, I’m also not sure whether MTE has any effect on GPU memory accesses anyway. So, by using the GPU to access physical addresses directly, I’m able to completely bypass the protection that MTE offers. Ultimately, there is no memory safe code in the code that manages memory accesses. At some point, physical addresses will have to be used directly to access memory.</p>
+<h2 id="conclusion">Conclusion<a href="#conclusion" aria-label="Conclusion"></a></h2>
+<p>In this post, I’ve shown how CVE-2023-6241 can be used to gain arbitrary kernel code execution on a Pixel 8 with kernel MTE enabled. While MTE is arguably one of the most significant advances in the mitigations against memory corruptions and will render many memory corruption vulnerabilities unexploitable, it is not a silver bullet and it is still possible to gain arbitrary kernel code execution with a single bug. The bug in this post bypasses MTE by using a coprocessor (GPU) to access physical memory directly (Case 4 in <a href="https://googleprojectzero.blogspot.com/2023/08/mte-as-implemented-part-3-kernel.html">MTE As Implemented, Part 3: The Kernel</a>). With more and more hardware and software mitigations implemented on the CPU side, I expect coprocessors and their kernel drivers to continue to be a powerful attack surface.</p>
+
+      
+  </section>
+
+
+  </div>
+</div></div>
+  </body>
+</html>
