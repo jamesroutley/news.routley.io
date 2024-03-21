@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://tavianator.com/2024/btrfs_bug.html">Original</a>
+    <h1>Bug hunting in Btrfs</h1>
+    
+    <div id="readability-page-1" class="page"><div id="content">
+                    <main>
+                        
+<p><i aria-hidden="true"></i> <time datetime="2024-03-18">2024-03-18</time>
+<i aria-hidden="true"></i> Tavian Barnes</p>
+<p>The other day I was implementing <a href="https://tavianator.com/cgit/bfs.git/commit/?id=89ecb2a08467cd8aa6ba70f8519df494652cac96">multi-threaded <code>stat()</code> calls</a> in <a href="https://tavianator.com/projects/bfs.html"><code>bfs</code></a>.
+When I ran some benchmarks, I saw something that made my heart skip a beat:</p>
+<pre><code>$ tailfin run bench/bench.sh --build=main --default
+...
+bfs: error: bench/corpus/chromium/v8/src/heap/heap.cc: Structure needs cleaning
+</code></pre>
+<p>If you&#39;re not familiar, &#34;structure needs cleaning&#34; is the human-readable description of <code>EUCLEAN</code>, an <code>errno</code> value that usually indicates filesystem corruption.
+Fearing the worst, I checked <code>dmesg</code> and saw</p>
+<pre><code>$ dmesg | tail
+...
+BTRFS critical (device dm-2): corrupted node, root=518 block=16438782945911875046 owner mismatch, have 4517169229596899607 expect [256, 18446744073709551360]
+</code></pre>
+<p>I immediately rebooted into a live environment and ran <code>btrfs check</code>, but to my surprise, there were no errors found.
+<code>btrfs scrub</code> also found no evidence of corruption.
+And in fact, the file from the error message was completely fine.
+Whatever the issue was, it seemed to have gone away on its own.</p>
+<p>I searched Google for that &#34;corrupted node&#34; message and found that it had happened to someone else recently too: <a href="https://lore.kernel.org/linux-btrfs/CAHk-=whNdMaN9ntZ47XRKP6DBes2E5w7fi-0U3H2+PS18p+Pzw@mail.gmail.com/">Linus Torvalds</a>, just after merging a Btrfs pull request.
+(This was not the first time Linus and I had hit the same bug.
+We both have the same CPU in our desktops.
+Last time it led to one of my <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=a51ab63b297ce9e26e3ffb9be896018a42d5f32f">favourite bugfixes ever</a>.)</p>
+<p>But the difference between me and Linus was that I could (semi-)reliably reproduce the error.
+Not every time, but maybe 10% of the time I ran <code>bfs</code> with parallel <code>stat()</code> calls on a large directory tree, I would see that &#34;structure needs cleaning&#34; error.
+I reported my <a href="https://lore.kernel.org/linux-btrfs/20240206033807.15498-1-tavianator@tavianator.com/">findings</a> to the Btrfs mailing list, and though it led to some discussion about potential causes, we didn&#39;t narrow down the root cause.</p>
+<h2 id="extent_buffer"><a href="#extent_buffer"><code>extent_buffer</code></a></h2>
+<p>Based on the logs, the Btrfs developers assumed the problem had to do allocation of <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/btrfs/extent_io.h?id=a51ab63b297ce9e26e3ffb9be896018a42d5f32f#n76"><code>struct extent_buffer</code></a> and their memory pages.
+I&#39;m not a Btrfs internals expert by any means, but I understand that <code>extent_buffer</code>s are used for metadata I/O; that is, reading and writing <a href="https://en.wikipedia.org/wiki/B-tree">B-tree</a> nodes.
+An <code>extent_buffer</code> is associated with an array of <code>struct folio</code>/<code>struct page</code> (depending on kernel version), and those pages hold the actual contents of the extents that are read or written.
+The abstraction helps with file system block sizes that are different from the system page size.</p>
+<p>Allocating an <code>extent_buffer</code> and its pages is <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/btrfs/extent_io.c?id=a51ab63b297ce9e26e3ffb9be896018a42d5f32f#n3681">more complicated than you might expect</a>.
+Each <code>struct extent_buffer</code> holds an array of <code>struct folio</code>, and those folios have a private reference that points back to the <code>extent_buffer</code>.
+There should only ever be one <code>extent_buffer</code> at a time for any particular extent.</p>
+<p>To reduce locking on the allocation path, the <code>extent_buffer</code> and the corresponding folios are allocated separately, linked together, and then inserted into a radix tree keyed by the start offset of the extent.
+Only the radix tree insertion needs locking.
+At the point of insertion, if it turns out someone else beat us to allocating the same extent, we instead take an extra reference to that <code>extent_buffer</code> and free the one we just allocated (and its pages).</p>
+<p>This code path had undergone some churn recently, both <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=09e6cef19c9fc0e10547135476865b5272aa0406">changing the race detection/handling strategy</a> and <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=082d5bb9b336d533b7b968f4f8712e7755a9876a">converting from <code>struct page</code> to <code>struct folio</code></a>, so there was suspicion that a race or reference counting bug had crept in.
+But the extra debug logging didn&#39;t show it.
+It appeared that the <code>extent_buffer</code> and the <code>folio</code>s had all the right reference counts, but the memory itself had garbage rather than the appropriate on-disk contents.
+Btrfs does some sanity checks after reading these blocks in, and those checks were failing, causing the errors.
+But the on-disk blocks themselves were fine, and the next time we read them in, everything worked.</p>
+<h2 id="git-bisect-bad"><a href="#git-bisect-bad"><code>git bisect bad</code></a></h2>
+<p>One of the best bug hunting tools for the Linux kernel is <a href="https://git-scm.com/docs/git-bisect"><code>git bisect</code></a>.
+Unfortunately, bisecting bugs like this is challenging.
+For intermittent issues, it&#39;s easy enough to know when to mark a commit bad, but harder to know if a commit is good—maybe the bug just hasn&#39;t triggered <em>yet</em>.
+You also need a known-good commit to start from, but that was hard to find.
+I thought at first the bug was new in Linux 6.7, but I could still reproduce it on 6.6 and 6.5.
+The Btrfs devs suggested I start from 6.0.</p>
+<p>Bisecting can also be dangerous because you are running arbitrary old mid-development-cycle kernel commits that may have since had bugs fixed in the official releases.
+It&#39;s safer to do it from a virtual machine, but so far I had been unable to reproduce the bug on a VM.
+So started bisecting on my actual desktop.</p>
+<p>Normally I would be far too scared to bisect a filesystem corruption bug on my actual computer that I use daily.
+But this seemed like it wasn&#39;t &#34;real&#34; corruption, plus I have backups, so I risked it.
+Unfortunately, after a couple rounds, I ran into <a href="https://lore.kernel.org/linux-btrfs/CABg4E-=u7m_g3HCFUYHS-+RC==pefkUZXiTT2Aor86jruHSF9Q@mail.gmail.com/">actual, on-disk filesystem corruption</a>.
+2,073,625 uncorrectable read errors is a new record for me, so I was too scared to continue the bisect.
+I restored what I could from backups and carried on with my life.</p>
+<h2 id="tracefs"><a href="#tracefs"><code>tracefs</code></a></h2>
+<p>A few weeks later, Btrfs developer Qu Wenruo got back to me with some <a href="https://lore.kernel.org/linux-btrfs/c7241ea4-fcc6-48d2-98c8-b5ea790d6c89@gmx.com/">extra debugging patches</a> and I decided to give it another shot.
+I ran his patch on bare metal, but wasn&#39;t able to reproduce the bug with the debugging patch applied.
+Such is life when debugging race conditions!</p>
+<p>I also tried again to reproduce the issue in a VM.
+I configured it to more closely match my actual system configuration: multiple disks with <a href="https://wiki.archlinux.org/title/dm-crypt/Device_encryption">dm-crypt</a> full disk encryption, joined together in a Btrfs RAID 0 array.
+And I made them emulated NVME drives instead of VirtIO.
+That did the trick: I could now reproduce the issue in a VM, though it took around 30 runs of my reproducer instead of the ~10 it took in real life.
+But this time I could still reproduce it with the debugging patch applied.</p>
+<p>After a couple runs and tweaking the trace messages to make cross-referencing easier, I noticed something odd.
+Looking at just the lines from the trace corresponding to the &#34;corrupted&#34; error message, I saw this:</p>
+<pre><code>$ grep &#39;eb=15302115328&#39; dmesg.log
+BTRFS critical (device dm-0): corrupted leaf, root=258 block=15302115328 owner mismatch, have 13709377558419367261 expect [256, 18446744073709551360] eb=15302115328
+iou-wrk--173727   15..... 2649295481us : alloc_extent_buffer: alloc_extent_buffer: alloc eb=15302115328 len=16384
+kworker/-322      15..... 2649295735us : end_bbio_meta_read: read done, eb=15302115328 page_refs=3 eb level=0 fsid=b66a67f0-8273-4158-b7bf-988bb5683000
+kworker/-5095     31..... 2649295941us : end_bbio_meta_read: read done, eb=15302115328 page_refs=8 eb level=0 fsid=b66a67f0-8273-4158-b7bf-988bb5683000
+</code></pre>
+<p>The only relevant operations seem to be allocating this <code>extent_buffer</code>, and then reading it ... twice.
+Reading it once ought to be enough, I thought, so I looked more closely at the code that actually reads them in and managed to eyeball the bug.</p>
+<h2 id="read_extent_buffer_pages"><a href="#read_extent_buffer_pages"><code>read_extent_buffer_pages()</code></a></h2>
+<p>Just like how multiple threads might try to allocate the same <code>extent_buffer</code> at the same time, they might also try to read it at the same time.
+To ensure the read only happens once, a custom locking protocol is used:</p>
+<pre><code>int read_extent_buffer_pages(struct extent_buffer *eb, /* ... */)
+{
+    if (test_bit(EXTENT_BUFFER_UPTODATE, &amp;eb-&gt;bflags))
+        return 0;
+
+    /* ... */
+
+    /* Someone else is already reading the buffer, just wait for it. */
+    if (test_and_set_bit(EXTENT_BUFFER_READING, &amp;eb-&gt;bflags))
+        goto done;
+
+    /* ... */
+    bbio = btrfs_bio_alloc(INLINE_EXTENT_BUFFER_PAGES,
+                   REQ_OP_READ | REQ_META, eb-&gt;fs_info,
+                   end_bbio_meta_read, eb);
+    /* ... */
+    btrfs_submit_bio(bbio, mirror_num);
+
+done:
+    if (wait == WAIT_COMPLETE) {
+        wait_on_bit_io(&amp;eb-&gt;bflags, EXTENT_BUFFER_READING, TASK_UNINTERRUPTIBLE);
+        if (!test_bit(EXTENT_BUFFER_UPTODATE, &amp;eb-&gt;bflags))
+            return -EIO;
+    }
+
+    return 0;
+}
+
+static void end_bbio_meta_read(struct btrfs_bio *bbio)
+{
+    /* ... */
+    bool uptodate = !bbio-&gt;bio.bi_status;
+    /* ... */
+
+    if (uptodate) {
+        set_extent_buffer_uptodate(eb);
+    } else {
+        clear_extent_buffer_uptodate(eb);
+        set_bit(EXTENT_BUFFER_READ_ERR, &amp;eb-&gt;bflags);
+    }
+
+    /* ... */
+    clear_bit(EXTENT_BUFFER_READING, &amp;eb-&gt;bflags);
+    smp_mb__after_atomic();
+    wake_up_bit(&amp;eb-&gt;bflags, EXTENT_BUFFER_READING);
+    /* ... */
+}
+</code></pre>
+<p>The logic is intended to work like this:</p>
+
+<div id="race-1">
+<pre><code><span>read_extent_buffer_pages()
+</span><span>{
+</span><span>    if (test_bit(UPTODATE))
+</span><span>        return 0;
+</span><span>
+</span><span>    if (test_and_set_bit(READING))
+</span><span>        goto done;
+</span><span>
+</span><span>    btrfs_submit_bio();
+</span><span>
+</span><span>done:
+</span><span>    wait_on_bit_io(READING);
+</span><span>    return 0;
+</span><span>}
+</span><span>
+</span><span>end_bbio_meta_read()
+</span><span>{
+</span><span>    set_bit(UPTODATE);
+</span><span>    clear_bit(READING);
+</span><span>    wake_up_bit(READING);
+</span><span>}
+</span><span></span></code></pre>
+<pre><code><span>read_extent_buffer_pages()
+</span><span>{
+</span><span>    if (test_bit(UPTODATE))
+</span><span>        return 0;
+</span><span>
+</span><span>    if (test_and_set_bit(READING))
+</span><span>        goto done;
+</span><span>
+</span><span>    btrfs_submit_bio();
+</span><span>
+</span><span>done:
+</span><span>    wait_on_bit_io(READING);
+</span><span>    return 0;
+</span><span>}
+</span><span></span></code></pre>
+</div>
+
+
+<p>Unfortunately, this locking protocol has a bug:</p>
+<div id="race-2">
+<pre><code><span>if (test(UPTODATE))
+</span><span>    return 0;
+</span><span>
+</span><span>if (test_and_set(READING))
+</span><span>    goto done;
+</span><span>
+</span><span>btrfs_submit_bio();
+</span><span>
+</span><span>done:
+</span><span>    wait_on(READING);
+</span><span>    return 0;
+</span><span>
+</span><span>set(UPTODATE);
+</span><span>clear(READING);
+</span><span>wake_up(READING);
+</span><span></span></code></pre>
+<pre><code><span>if (test(UPTODATE))
+</span><span>    return 0;
+</span><span>
+</span><span>if (test_and_set(READING))
+</span><span>    goto done;
+</span><span>
+</span><span>btrfs_submit_bio();
+</span><span>
+</span><span>done:
+</span><span>    wait_on(READING);
+</span><span>    return 0;
+</span><span></span></code></pre>
+<pre><code><span>if (test(UPTODATE))
+</span><span>    return 0;
+</span><span>
+</span><span>if (test_and_set(READING))
+</span><span>    goto done;
+</span><span>
+</span><span>btrfs_submit_bio();
+</span><span>
+</span><span>done:
+</span><span>    wait_on(READING);
+</span><span>    return 0;
+</span><span></span></code></pre>
+</div>
+
+<p>If the first thread starts <em>and finishes</em> the I/O between the second thread checking the <code>UPTODATE</code> bit and the <code>READING</code> bit, the second thread will start a totally unnecessary read even though we already read in the extent.
+Worse, because the <code>UPTODATE</code> bit is already set, the third will return without waiting for the read to complete.
+That thread will then think it&#39;s safe to access the <code>extent_buffer</code>&#39;s pages, despite them currently being under I/O, leading to a data race!</p>
+<p>The fix is to use <a href="https://en.wikipedia.org/wiki/Double-checked_locking">double-checked locking</a>: after setting the <code>READING</code> bit, check <code>UPTODATE</code> again so we don&#39;t kick off more useless (actively harmful, even) I/O.</p>
+<div id="race-3">
+<pre><code><span>if (test(UPTODATE))
+</span><span>    return 0;
+</span><span>
+</span><span>if (test_and_set(READING))
+</span><span>    goto done;
+</span><span>
+</span><span>if (test(UPTODATE))
+</span><span>    goto wake;
+</span><span>
+</span><span>btrfs_submit_bio();
+</span><span>
+</span><span>done:
+</span><span>    wait_on(READING);
+</span><span>    return 0;
+</span><span>
+</span><span>end_bbio:
+</span><span>    set(UPTODATE);
+</span><span>wake:
+</span><span>    clear(READING);
+</span><span>    wake_up(READING);
+</span><span></span></code></pre>
+<pre><code><span>if (test(UPTODATE))
+</span><span>    return 0;
+</span><span>
+</span><span>if (test_and_set(READING))
+</span><span>    goto done;
+</span><span>
+</span><span>if (test(UPTODATE))
+</span><span>    goto wake;
+</span><span>
+</span><span>btrfs_submit_bio();
+</span><span>
+</span><span>done:
+</span><span>    wait_on(READING);
+</span><span>    return 0;
+</span><span>
+</span><span>end_bbio:
+</span><span>    set(UPTODATE);
+</span><span>wake:
+</span><span>    clear(READING);
+</span><span>    wake_up(READING);
+</span><span></span></code></pre>
+<pre><code><span>if (test(UPTODATE))
+</span><span>    return 0;
+</span><span>
+</span><span>if (test_and_set(READING))
+</span><span>    goto done;
+</span><span>
+</span><span>if (test(UPTODATE))
+</span><span>    goto wake;
+</span><span>
+</span><span>btrfs_submit_bio();
+</span><span>
+</span><span>done:
+</span><span>    wait_on(READING);
+</span><span>    return 0;
+</span><span>
+</span><span>end_bbio:
+</span><span>    set(UPTODATE);
+</span><span>wake:
+</span><span>    clear(READING);
+</span><span>    wake_up(READING);
+</span><span></span></code></pre>
+</div>
+
+<p>I submitted <a href="https://lore.kernel.org/linux-btrfs/1ca6e688950ee82b1526bb3098852af99b75e6ba.1710551459.git.tavianator@tavianator.com/">a patch</a> that adds this missing check, as well as a couple <a href="https://lore.kernel.org/linux-btrfs/cover.1710769876.git.tavianator@tavianator.com/T/">cleanup patches</a>.
+With that fix, I can run the reproducer overnight without triggering any more errors.</p>
+<h2 id="epilogue"><a href="#epilogue">Epilogue</a></h2>
+<p>You might be surprised that this race was not benign.
+After all, we&#39;re reading some disk blocks into memory that already holds the contents of those same disk blocks.
+It&#39;s still technically a data race to read and write memory at the same time, even if the writes don&#39;t modify the memory, but usually it would be unobservable in practice.</p>
+<div id="overwrite-1">
+<pre><code>uninitialized memory uninitialized memory uninitialized memory uninitialized memory uninitialized memory
+</code></pre>
+<pre><code>metadata metadata metadata metadata metadata metadata metadata metadata metadata metadata metadata metad
+</code></pre>
+<pre><code>metadata metadata metadata metadata metadata metadata metadata metadata metadata metadata metadata metad
+</code></pre>
+</div>
+
+<p>The reason I could observe it was already mentioned above: full disk encryption.
+When dm-crypt processes a disk read, it reads the <em>encrypted</em> contents into memory and then decrypts them in-place.</p>
+<div id="overwrite-2">
+<pre><code>uninitialized memory uninitialized memory uninitialized memory uninitialized memory uninitialized memory
+</code></pre>
+<pre><code>encrypted gibberish encrypted gibberish encrypted gibberish encrypted gibber encrypted gibberish encrypt
+</code></pre>
+<pre><code>metadata metadata metadata metadata metadata metadata metadata metadata metadata metadata metadata metad
+</code></pre>
+<pre><code>encrypted gibberish encrypted gibberish encrypted gibberish encrypted gibber encrypted gibberish encrypt
+</code></pre>
+<pre><code>metadata metadata metadata metadata metadata metadata metadata metadata metadata metadata metadata metad
+</code></pre>
+</div>
+
+<p>It&#39;s obvious why this causes problems: sometimes the racing thread will see valid metadata, but sometimes it will see encrypted bytes that appear totally random.
+I even captured a trace where the error messages show the extent being gradually filled in:</p>
+<pre><code>[  807.737576] BTRFS critical (device dm-0): corrupted node, root=266 block=3178470954007437077 owner mismatch, have 6155297726051334641 expect [256, 18446744073709551360] eb=ffff8ac915d022d0 start=12738904064
+[  807.751913] BTRFS critical (device dm-0): corrupted leaf, root=266 block=12738904064 owner mismatch, have 6155297726051334641 expect [256, 18446744073709551360] eb=ffff8ac915d022d0 start=12738904064
+[  807.800898] BTRFS critical (device dm-0): corrupted leaf, root=266 block=12738904064 owner mismatch, have 6155297726051334641 expect [256, 18446744073709551360] eb=ffff8ac915d022d0 start=12738904064
+</code></pre>
+<p>There you can see the <em>same block</em> switch from an internal node to a leaf, and the block number change from a random number to the start of the extent, over about 0.02 seconds.</p>
+
+                    </main>
+
+                    
+                </div></div>
+  </body>
+</html>
