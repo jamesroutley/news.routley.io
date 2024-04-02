@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://yosefk.com/blog/refix-fast-debuggable-reproducible-builds.html">Original</a>
+    <h1>Refix: Fast, Debuggable, Reproducible Builds</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+<p>There&#39;s a simple way to make your builds all of the following:</p>
+<ul>
+<li><strong>Reproducible</strong>/deterministic - same binaries always built from the same source, so you can cache build
+outputs across users</li>
+<li><strong>Debuggable</strong> - gdb, sanitizers, Valgrind, KCachegrind, etc. find your source code effortlessly</li>
+<li><strong>Fast</strong> - the build time overhead is negligible, even compared to a blazing fast linker like <a href="https://github.com/rui314/mold">mold</a></li>
+</ul>
+<p>What makes it really fast is a small Rust program called <a href="https://github.com/yosefk/refix">refix</a> that
+post-processes your build outputs (if you don&#39;t want to compile from source, <a href="https://yosefk.com/refix/">here&#39;s a static
+Linux binary</a>.) Both the program and this document are written for the context of C/C++ source code compiled to native
+binaries. But this can work with other languages and binary formats, too, and it should be easy to support them in
+<code>refix</code>. (<em>In fact, it mostly supports them already...</em> you&#39;ll see.)</p>
+<p>This &#34;one weird trick&#34; isn&#39;t already popular, not because the solution is hard, nor because the problem isn&#39;t painful.
+Rather, it&#39;s not already popular because people widely consider it impossible for builds to be both debuggable and reproducible,
+and standardize on workarounds instead. Since &#34;established practices&#34; are sticky, and especially so in the darker corners like
+build systems<a href="#fn1" id="fnref1" role="doc-noteref"><sup>1</sup></a>, we&#39;ll need to discuss not only
+how to solve the problem, but also why solve it at all.</p>
+<h2 id="the-curious-case-of-the-disappearing-source-files">The curious case of the disappearing source files</h2>
+<p>Why are people so willing to give up their birthright - the effortless access to the source code of a debugged program? I
+mean, build a &#34;Hello, world&#34; cmake project, and everything just works: gdb finds your source code, <code>assert</code> prints a
+path you can just open in an editor, etc. &#34;Source path&#34; isn&#39;t even a thing.</p>
+<p>Later on, the system grows, and the build slows down. So someone implements build artifact caching, in one of several
+ways:</p>
+<ul>
+<li>A general-purpose distributed build cache, like Bazel&#39;s</li>
+<li>Something for caching specific kinds of artifacts, like ccache</li>
+<li>An entirely home-grown system - like running the build of user X in a build directory left previously by user Y at the build
+server&#39;s local disk (and hoping that their source code is similar enough, so most object files needn&#39;t be rebuilt<a href="#fn2" id="fnref2" role="doc-noteref"><sup>2</sup></a>)</li>
+</ul>
+<p>In any case, now that you need caching, you also need reproducible builds. Otherwise, you&#39;d cache object files built by
+different users, and you&#39;d get different file paths and other stuff depending on which user built each object file. And we can
+all agree that build caches are important, and pretty much force you to put relative paths into debug information and the value
+of <code>__FILE__</code> (and some meaningless garbage into <code>__TIME__</code>, etc.)</p>
+<p>But we can <em>also</em> agree that the <em>final binaries</em> which users actually run should have full source paths,
+right? I mean, I know there are workarounds for finding the source files. We&#39;ll talk about them later; I&#39;d say they don&#39;t really
+work. Of course, the workarounds would be tolerable if they were inevitable. But they aren&#39;t.</p>
+<p><strong>Why not fix the binary coming out of the build cache, so it points to the absolute path of the source files?</strong>
+(The build system made an effort to detach the binary from the full source path, so that it can be cached. But now that the
+binary has left the cache, we should &#34;refix&#34; it back to the source path of the version where it belongs.)</p>
+<p>We&#39;ll look at 3 ways of refixing the binary to the source path - a thesis, an anti-thesis and a synthesis, as it were.</p>
+<h2 id="thesis-debugedit---civilized-standard-and-format-aware">Thesis: <code>debugedit</code> - civilized, standard and
+format-aware</h2>
+<p>A standard tool for this is <a href="https://sourceware.org/debugedit/">debugedit</a>. The man page example does exactly the
+&#34;refixing&#34; we&#39;re looking for:</p>
+<pre><code>debugedit -b `pwd` -d /usr/lib/debug files...
+    Rewrites path compliled into binary
+    from current directory to /usr/lib/debug.</code></pre>
+<p>Some Linux distributions use <code>debugedit</code> for building source files in some arbitrary location, and then make the
+debug info point to wherever source files are installed when someone downloads them to debug the program.</p>
+<p>If debugedit works for you, problem solved. It works perfectly when it does. However, when I tried it on a 3GB shared object
+compiled from a C++ code base<a href="#fn3" id="fnref3" role="doc-noteref"><sup>3</sup></a>, it ran for 30
+seconds, and then crashed. If you, too find debugedit either slow or buggy for your needs, read on.</p>
+<h2 id="anti-thesis-sed---nasty-brutish-and-short">Anti-thesis: <code>sed</code> - nasty, brutish, and short</h2>
+<p>Why is debugedit&#39;s job hard (slow and bug-prone)? Mainly because it needs to grow or shrink the space reserved for each
+replaced string. When you do such things, you need to move a lot of data (slow), and adjust who-knows-which offset fields in the
+file (bug-prone.)</p>
+<p>But what if the strings had the same length? Then we don&#39;t need to move or adjust anything, and we could, erm, we could
+replace them with <code>sed</code>.</p>
+<p>Here, then, is our nasty, brutish, and short recipe:</p>
+<ul>
+<li>Run <code>gcc</code> with these flags:
+<pre>-fdebug-prefix-map==MAGIC <i># for DWARF</i>
+-ffile-prefix-map==MAGIC  <i># for __FILE__</i>
+</pre></li>
+<li>Make MAGIC long enough for any source path prefix you&#39;re willing to support.</li>
+<li>Why the <code>==</code> in the flag? This invocation assumes that file paths are relative, so it remaps <em>the empty
+string</em> to MAGIC, meaning, <code>dir/file.c</code> becomes <code>MAGICdir/file.c</code>. You can also pass
+<code>=/prefix/to/remap=MAGIC</code>, if your build system uses absolute paths.</li>
+<li>Use <code>sed</code> to replace MAGIC with your actual source path in the binary outputted by the build system.</li>
+<li>If the source path is shorter than the length of MAGIC, pad it with forward slashes: <code>/////home/user/src/</code>. If
+the source path is too long, the post-link step should truncate it, warn, and eventually be changed to outright fail. You don&#39;t
+<em>really</em> need to support giant paths.</li>
+</ul>
+<p>Our post-link step thus becomes:</p>
+<pre><code>sed -i &#39;s/MAGIC/\/\/\/...\/user\/src\//g&#39; binary</code></pre>
+<p>The downside, on top of the source path length limit, is a trace of the brutishness making it into the output file. Namely,
+you&#39;re going to see these extra forward slashes in some situations. We can&#39;t pad a prefix with an invisible character...
+luckily, we can pad it with a character not changing the meaning of the path.</p>
+<p>On the upside, compared to <code>debugedit</code>, the method using <code>sed</code> is:</p>
+<ul>
+<li><strong>More widely applicable</strong> - it, erm, &#34;supports&#34; all executable and debug information formats, as well as
+archives and object files.</li>
+<li><strong>More robust</strong> - not affected by input format complexity</li>
+<li><strong>Faster</strong> - 10 seconds to process the 3GB binary (about the time it takes <code>mold</code> to link that
+binary... yes, it&#39;s that good!)</li>
+</ul>
+<p>Is this fast enough? Depends on your binary sizes. If yours are big and you don&#39;t want to effectively double the link time,
+our next and last method is for you.</p>
+<h2 id="synthesis-refix---nasty-brutish-and-somewhat-format-aware">Synthesis: <code>refix</code> - nasty, brutish, and somewhat
+format-aware</h2>
+<p>Can we go faster than <code>sed</code>? We have two reasons to hope so:</p>
+<ul>
+<li><code>sed</code> is unlikely to be optimized specifically for replacing strings of equal size; it&#39;s not that common a use
+case.</li>
+<li>We don&#39;t actually need to go through the entire file. File paths only appear in some of the sections - <code>.rodata</code>
+where strings are kept, and debug info sections. If we know enough about the file format to find the sections (which takes very
+little knowledge), we can avoid touching most of the bytes in the file.</li>
+</ul>
+<p>But wait, isn&#39;t the giant binary built from C++ mostly giant because of the debug info? <em>Yes</em>, but it turns out that
+most of the debug info sections <em>don&#39;t contain file paths</em>; only <code>.debug_line</code> and <code>.debug_str</code> do
+and these are only about 10% of our giant file.</p>
+<p>So the <code>refix</code> program works as follows:</p>
+<ul>
+<li>It <code>mmap</code>s the file, since it knows it never needs to move the data and can just overwrite the strings in
+place.</li>
+<li>For ELF files, it finds <code>.rodata</code>, <code>.debug_line</code> and <code>.debug_str</code>, and searches &amp;
+replaces only within these. This handles executables, shared libraries (<code>*.so</code>) and object files
+(<code>*.o</code>).</li>
+<li>For <code>ar</code> archives, it finds the ELFs within the archive, then the sections it cares about within each ELF, and
+searches &amp; replaces within these. This handles <code>lib*.a</code>.</li>
+<li>For files which are neither ELFs nor archives of ELFs, <code>refix</code> just replaces everywhere as <code>sed</code>
+would, but still faster because it&#39;s optimized for the same-sized source &amp; destination strings case.</li>
+</ul>
+<p>Thus, <code>refix</code> is:</p>
+<ul>
+<li><strong>Very fast</strong> - 50 ms on the 3GB binary, and 250 ms on the same binary in &#34;sed mode&#34; (meaning, if we remove the
+ELF magic number, so <code>refix</code> is forced to replace everywhere and not just in the relevant sections.)</li>
+<li><strong>Widely applicable</strong> - works on any file format where the file prefix isn&#39;t compressed and is otherwise &#34;laid
+bare&#34;</li>
+<li><strong>Robust</strong> - while it knows a bit about the binary file format, it&#39;s very, very little (enough to find the
+sections it&#39;s interested in); it&#39;s hundreds of lines of code vs <code>debugedit</code>&#39;s thousands. And you can always make it
+run even less code by falling back to &#34;sed mode.&#34;</li>
+</ul>
+<p>...with the sole downside being that, same as with sed, you might occasionally see the leading slashes in pathnames.</p>
+<p>That&#39;s it, right? We&#39;re done? Well, maybe, but it&#39;s not always how it goes. People have questions. So here we go.</p>
+<h2 id="q-a">Q &amp; A</h2>
+<h3 id="why-do-this-we-already-have-a-system-for-finding-the-source-code.">Why do this? We already have a system for finding the
+source code.</h3>
+<p>First of all, it is worth saying that you <em>shouldn&#39;t</em> have any &#34;system&#34; for finding source code, because the tired,
+stressed developer who was sent a core dump to urgently look at is entitled to having at least <em>this</em> part work entirely
+effortlessly<a href="#fn4" id="fnref4" role="doc-noteref"><sup>4</sup></a>.</p>
+<p>But also, whatever system you do have ought to have issues:</p>
+<ul>
+<li>If you do not modify the cacheable, reproducible binaries coming out of the build system, then by definition your way to
+find source code must rely on something inherent to a given source version, independent of who built it and where. Since you&#39;re
+not going to embed the entire source code into the executable, you must rely on some sort of version information. What if the
+program had uncommitted changes, which happens in debugging scenarios (someone built a version to test and someone else sent a
+core dump from this version?)</li>
+<li>&#34;Well you&#39;re not supposed to get core dumps from versions with uncommitted changes, unless it&#39;s your local version that you
+haven&#39;t given to anyone but are testing locally, so you know which version it is. You should only release versions externally
+thru CI&#34; - so giving anything to anyone to test is now considered &#34;releasing externally&#34; and must necessarily go thru CI, and
+having trouble finding the source code is now a punishment for straying from proper procedure? How did this discussion, which
+started at how build caches <em>speed up</em> the build, deteriorate to the point where we&#39;re telling developers to change how
+they work, in ways which will <em>slow them down?</em></li>
+<li>But OK, let&#39;s say I didn&#39;t &#34;release&#34; anything - instead I have 5 local versions I&#39;m working with and they go thru test flows
+and dump core - I&#39;m now supposed to guess which core comes from which version, or develop my own &#34;system&#34; to know? (Some people
+actually assume this won&#39;t happen because you can&#39;t run tests outside CI anyway, so you will submit a merge request in order to
+run them. And they assume that because they use some testing infra intertwined with CI infra and most of their tests technically
+can&#39;t run outside CI. And perhaps they don&#39;t even have machines to run on that aren&#39;t managed by Jenkins or some such to begin
+with. But that is a horror story for another time. Here I&#39;ll just assume that we agree that it&#39;s good to be able to test changes
+locally and debug easily.)</li>
+<li>In the cases where the version info actually enables you to find the right code, the process can be made more tolerable by
+developing a <code>gdb</code> Python extension that automatically tells gdb where the source code is based on the embedded
+version info. Do you have this extension and a team maintaining it together with the build system?</li>
+<li>Do you also have this automated for all the other tools (sanitizers, Valgrind, KCachegrind, VTune, whatever)? Do they all
+even have a way to tell them where to look for source code? Is there a team handling this for all users, for every new tool used
+by developers?</li>
+</ul>
+<p>I realize that these pain points aren&#39;t equally relevant to all organizations, and the extent of their relevance depends a
+lot on the proverbial software lifecycle. (They also aren&#39;t equally relevant to everyone in a given organization. I claim that
+the people suffering the most from this are the people doing the most debugging, and they are quite often very far removed from
+any team that could ameliorate their suffering by improving &#34;the system for finding source code&#34; - so they&#39;re bound to suffer
+for a long time.)</p>
+<p>My main point, however, is that you needn&#39;t have any of these pain points <em>at all</em>. There&#39;s no tradeoff or price to
+pay: your build is still reproducible and fast. Just make it debuggable with this one weird trick!</p>
+<p>(Wow, I&#39;ve been quite composed and civil here. I&#39;m very proud of myself. Not that it&#39;s easy. I have strong <em>feelings</em>
+about this stuff, folks!)</p>
+<h3 id="what-about-non-reproducible-info-other-than-source-path-time-build-host-etc">What about non-reproducible info other than
+source path (time, build host, etc)?</h3>
+<p>I&#39;m glad you asked! You can put all the stuff changing with every build into a separate section, reserved at build time and
+filled after link time. You make the section with:</p>
+<pre><code>char ver[SIZE] __attribute__((section(&#34;.ver&#34;))) = {1};</code></pre>
+<p>This reserves <code>SIZE</code> bytes in a section called <code>.ver</code>. It&#39;s non-<code>const</code> deliberately, since
+if it&#39;s <code>const</code>, the OS will exclude it from core dumps (why save data to disk when it&#39;s guaranteed to be exactly the
+same as the contents of the section in the binary?) But you might actually very much want to look at the content of this section
+in a core dump, perhaps before looking at anything else. <strong>For instance, the content of this section can help you find the
+path of the executable that dumped this core!</strong><a href="#fn5" id="fnref5" role="doc-noteref"><sup>5</sup></a></p>
+<p>(How do you find the section in the core dump without having an executable which the debugger could use to tell you the
+address of <code>ver</code>? Like so: <code>strings core | grep MagicOnlyFoundInVer</code>. Nasty, brutish, and short. The point
+is, having the executable path <em>in the core dump</em> is an additional and often major improvement on top of having full
+source paths <em>in the executable...</em> because you need to find the executable before you can find the source!)</p>
+<p>Additionally, our <code>ver</code> variable is deliberately initialized with one <code>1</code> followed by zeros, since if
+it&#39;s all zeros, then <code>.ver</code> will be a &#34;bss&#34; section, the kind zeroed by the loader and without space reserved for it
+in the binary. So you&#39;d have nowhere to write your actual, &#34;non-reproducible&#34; version info at a post-link step.</p>
+<p>After the linker is done, you can use <code>objcopy</code> to replace the content of <code>.ver</code>. But if you&#39;re using
+<code>refix</code>, which already mmaps the file, you can pass it more arguments to replace ELF sections:</p>
+<pre><code>refix exe old-prefix new-prefix --section .ver file</code></pre>
+<p><code>refix</code> will put the content of <code>file</code> into <code>.ver</code>, or fail if the file doesn&#39;t have the
+right length. (We don&#39;t move stuff around in the ELF, only replace.)</p>
+<h3 id="what-about-compressed-debug-sections">What about compressed debug sections?</h3>
+<p>What about them? I&#39;m not sure why people use them, to be honest. I mean, who has <em>so many</em> executable files which they
+don&#39;t want to compress as a whole (because they need to run them often, I presume), but they do want to compress the debug
+sections to save space? Like, in what scenario <em>this</em> is your way to save enough space to even worry about it?</p>
+<p>But, they could be supported rather nicely, I think, if you really care. You wouldn&#39;t be able to just blithely
+<code>mmap</code> a file and replace inside it without updating any offset field in the file, but I think you could come close,
+or rather stay very far away from doing seriously heavy lifting making this slow and bug-prone. Let&#39;s chat if you&#39;re interested
+in this.</p>
+<p>(I think maybe one problem is that some build caches have a file size limit? Like, something Bazel-related tops out at 2GB
+since it&#39;s the maximal value of the Java int type?.. Let&#39;s talk about something else, this is making me very sad.)</p>
+<h3 id="its-250-ms-on-generic-data.-and-you-still-did-the-elfar-thing-to-get-to-50-ms.-are-you-insane">It&#39;s 250 ms on generic
+data. And you still did the ELF/ar thing to get to 50 ms. Are you insane?</h3>
+<p>Well, it&#39;s 250 ms on a fast machine with a fast SSD. Some people have files on NAS, which can slow down the file access a
+lot. In such cases, accessing 10x less of the <code>mmap</code>ed data will mitigate most of the NAS slowdown. You don&#39;t really
+want to produce linker output on NAS, but it can be very hard to make the build system stop doing that, and I want people stuck
+in this situation to at least have debuggable binaries without waiting even more for the build. So <code>refix</code> is
+optimized for a slow filesystem.</p>
+<p>But also, if it&#39;s not too much work, I like things to be fast. <a href="https://yosefk.com/blog/people-can-read-their-managers-mind.html">Insane or
+not</a>, the people who make fast things are usually the people who like fast things, by themselves and not due to some
+compelling reason, and I&#39;m not sure I&#39;m ashamed of maybe going overboard a bit; better safe than sorry. Like, I don&#39;t parse most
+of the ELF file, which means I don&#39;t use the <code>Elf::parse</code> method from the <code>goblin</code> library, but instead I
+wrote a 30 line function to parse just what I need.</p>
+<p>This saves 300-350 ms, which, is it a lot? - maybe not. Will it become much more than that on a slower file system? I don&#39;t
+know, it takes less time to optimize the problem away than answer this question. Did I think of slow file systems when doing it?
+- not as much as I was just annoyed that my original C++ program, which the Rust program is a &#34;clean room&#34; open source
+implementation of, takes 150 ms and the Rust one takes about 400 ms. Am I happy now that I got it down to 50 ms? Indeed!</p>
+<p>(Why is Rust faster? Not sure; I think, firstly, GNU <code>memmem</code> is slower than <code>memchr::memmem::Finder</code>,
+and secondly, I didn&#39;t use TBB in C++ but did use Rayon in Rust, because the speedup is marginal - you bottleneck on I/O - and I
+don&#39;t want to complicate the build for small gains, but in Rust it&#39;s not complicated - just <code>cargo add rayon</code>.)</p>
+<p>It often takes less time to just do the efficient thing than it takes to argue about the amount it would save relatively to
+the inefficient thing. (But it&#39;s still more time than just going ahead and doing the inefficient thing without arguing. But even
+that is not always the case. But most people who make fast things will usually just go for the efficient thing when they see it
+regardless if it&#39;s the case, I think. IME the people who always argue about whether optimizations are worth it make big and slow
+things in the end.)</p>
+<h3 id="im-as-crazy-as-you-and-i-want-this-speedup-for-non-elf-executable-formats.">I&#39;m as crazy as you, and I want this speedup
+for non-ELF executable formats.</h3>
+<p>Let&#39;s chat. The <code>goblin</code> library probably supports your format - shouldn&#39;t take more than 100-150 LOC to handle
+this in <code>refix</code>.</p>
+<h3 id="which-binaries-should-i-run-this-stuff-on">Which binaries should I run this stuff on?</h3>
+<p>Anything delivered &#34;outside the build system&#34; for the use of people (who run programs / load shared libraries) or other build
+systems (which link code against static libraries / object files.) And nothing &#34;inside the build system&#34;, or it will ruin
+caching.</p>
+<p>I hope for your sake that you have a monolithic build where you build everything from source. But I wouldn&#39;t count on it;
+quite often team A builds libraries for team B, which gets them from Artifactory or something wonderful like that. In that case,
+you might start out with a bug where some libraries are shipped with the MAGIC as their source prefix instead of the real thing.
+This is easy to fix though, and someone might even remind you with &#34;what&#39;s this weird MAGIC stuff?&#34;</p>
+<p>(Somehow nobody used to ask &#34;what&#39;s <code>/local/clone-87fg12eb/src</code>&#34;, when <em>that</em> was the prefix instead of
+MAGIC. Note that even if you have this bug and keep MAGIC in some library files, <em>nobody is worse off</em> than previously
+when it was <code>/local/clone-87fg12eb/src</code>. And once you fix it, they&#39;ll be <em>better</em> off.)</p>
+<h3 id="ci-removes-the-source-after-building-it.-what-should-the-destination-source-prefix-be..">CI removes the source after
+building it. What should the destination source prefix be?..</h3>
+<p>And here I was, thinking that it&#39;s the build cache not liking absolute paths that was the problem... It turns out that we
+have a bigger problems: the source is just nowhere to be found! <code>/local/clone-87fg12eb/src</code> is gone forever!</p>
+<p>But actually, it makes sense for CI to build on the local disk in a temporary directory. In parallel with building, CI can
+export the code to a globally accessible NAS directory. And at the end of the build, CI can refix the binaries to that NAS
+directory. It&#39;s not good to <em>build</em> from NAS (or to NAS) - it&#39;s not only slow, but fails in the worst ways under load -
+which is why a temporary local directory makes sense. But NAS is a great place for <em>debugging tools</em> to get source from -
+widely accessible with no effort for the user.</p>
+<p>Many organizations decide against NAS source exports, because it would be too easy for developers. Instead you&#39;re supposed to
+download the source via HTTP, which is much more scalable than NAS, thus solving an important problem you don&#39;t have; plus, you
+can make yourself some coffee while the entire source code (of which you&#39;ll only need the handful of files you&#39;ll actually open
+in the debugger) is downloaded and decompressed.</p>
+<p>In that case, your destination source prefix should be wherever the user downloads the files to. Decide on any local path
+independent of the user name, and with version information encoded in it, so multiple versions can be downloaded concurrently.
+Have a nice cup of coffee!</p>
+<h3 id="what-should-the-root-path-length-limit-be">What should the root path length limit be?</h3>
+<p>100 bytes.</p>
+<h3 id="our-ci-produces-output-in-filerkubernetesdockergitlabjenkinspre-commitdepartmentteamdeveloperbranch-nametest-suite-namerepo-which-is-110-bytes.">Our
+CI produces output in
+<code>/filer/kubernetes/docker/gitlab/jenkins/pre-commit/department/team/developer/branch-name/test-suite-name/repo/</code>,
+which is 110 bytes.</h3>
+<p>Great! Now you have a reason to ask them to shorten it. I&#39;m sure they&#39;ll get to it in a quarter or two, if you keep
+reminding.</p>
+<h3 id="our-ceos-preschooler-works-as-a-developer-insists-on-a-200-byte-prefix-and-wont-tolerate-the-build-failing.">Our CEO&#39;s
+preschooler works as a developer, insists on a 200 byte prefix, and won&#39;t tolerate the build failing.</h3>
+<p>Then truncate the path without failing the build. He won&#39;t find the source code easily, but he can&#39;t find it <em>already
+today.</em> <strong>If there&#39;s one thing fixing the problem won&#39;t do, it&#39;s making anyone worse off.</strong> It <em>can&#39;t</em>
+make you worse off, since the current situation leaves it nowhere worse to take you. It could only possibly take you from
+<em>never</em> being able to easily find the source to <em>sometimes</em>, if not always, being able to find it.</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>Use <code>refix</code>, <code>sed</code> or <code>debugedit</code> to make your fast, reproducible builds also effortlessly
+debuggable, so that it&#39;s trivial to find the source given an executable - and the executable given a core dump.</p>
+<p>And please don&#39;t tell me it&#39;s OK for developers to roam the Earth looking for source code instead. It hurts my feelings!</p>
+<p><em>Thanks to Dan Luu for reviewing a draft of this post.</em></p>
+</div></div>
+  </body>
+</html>
