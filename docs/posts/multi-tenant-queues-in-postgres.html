@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://docs.hatchet.run/blog/multi-tenant-queues">Original</a>
+    <h1>Multi-tenant queues in Postgres</h1>
+    
+    <div id="readability-page-1" class="page"><article><main><div><p>Blog</p><svg fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg><p>An unfair advantage: multi-tenant queues in Postgres</p></div>
+<div><h5><p>Alexander Belanger</p></h5><p>Published on April 18, 2024</p></div>
+<p><em><strong>TL;DR -</strong> we&#39;ve been implementing fair queueing strategies for Postgres-backed task queues, so processing Bob&#39;s 10,000 files doesn&#39;t crowd out Alice&#39;s 1-page PDF. We&#39;ve solved this in <a href="https://github.com/hatchet-dev/hatchet" target="_blank" rel="noreferrer">Hatchet<span> (opens in a new tab)</span></a> and <a href="https://cloud.onhatchet.run" target="_blank" rel="noreferrer">Hatchet Cloud<span> (opens in a new tab)</span></a> so you don&#39;t have to — here&#39;s a look at how we did it.</em></p>
+<h2>Introduction<a href="#introduction" id="introduction" aria-label="Permalink for this section"></a></h2>
+<p>We set the scene with a simple user request: they&#39;d like to upload and parse a PDF. Or an image, CSV, audio file — it doesn&#39;t really matter. What matters is that the processing of this file can take ages, and scales ≥ linearly with the size of the file.</p>
+<p>Perhaps you&#39;re an astute developer and realized that processing this file might impact the performance of your API — or more likely, the new file upload feature you pushed on Friday has you explaining to your family that nephew Jimmy&#39;s baseball game on Saturday will have to wait.</p>
+<p>In the postmortem, you decide to offload processing this file to somewhere outside of the core web server, asynchronously on a new <em>worker process</em>. The user can now upload a file, the web server quickly sends it off to the worker, and life goes on.</p>
+<p>That is, until Bob decides to upload his entire hard drive — probably also on a Saturday — and your document processing worker now goes down.</p>
+<p>At this point (or ideally before this point), you introduce…the task queue. This allows you to queue each file processing task and only dispatch the amount of tasks each worker can handle at a time.</p>
+
+<p>But while this solves the problem of the worker crashing, it introduces a new problem, because you&#39;ve intentionally bottlenecked the system. Which means that when Bob uploads his second hard drive, a new issue emerges - Alice&#39;s 1-page file upload gets stuck at the back of the queue:</p>
+
+<p>You&#39;re now worried about fairness — specifically, how can you guarantee <em>fair execution time</em> to both Bob and Alice? We&#39;d like to introduce a strategy that&#39;s easy to implement in a Postgres-backed queue — and more difficult in other queueing systems — deterministic round-robin queueing.</p>
+<h2>The setup<a href="#the-setup" id="the-setup" aria-label="Permalink for this section"></a></h2>
+<p>Let&#39;s start with some code! We&#39;re implementing a basic Postgres-backed task queue, where workers poll for events off the queue at some interval. You can find all the code used in these examples — along with some nice helper <code dir="ltr">seed</code> and <code dir="ltr">worker</code> commands — in this repo: <a href="https://github.com/abelanger5/postgres-fair-queue" target="_blank" rel="noreferrer">github.com/abelanger5/postgres-fair-queue<span> (opens in a new tab)</span></a>. Note that I chose <code dir="ltr">sqlc</code> to write these examples, so you might see some <code dir="ltr">sqlc.arg</code> and <code dir="ltr">sqlc.narg</code> in the example queries.</p>
+<p>Our tasks are very simple — they have a <code dir="ltr">created_at</code> time, some input data, and an auto-incremented id:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>-- CreateEnum</span></span>
+<span><span>CREATE</span><span> </span><span>TYPE</span><span> &#34;</span><span>TaskStatus</span><span>&#34; </span><span>AS</span><span> ENUM (</span></span>
+<span><span>    </span><span>&#39;QUEUED&#39;</span><span>,</span></span>
+<span><span>    </span><span>&#39;RUNNING&#39;</span><span>,</span></span>
+<span><span>    </span><span>&#39;SUCCEEDED&#39;</span><span>,</span></span>
+<span><span>    </span><span>&#39;FAILED&#39;</span><span>,</span></span>
+<span><span>    </span><span>&#39;CANCELLED&#39;</span></span>
+<span><span>);</span></span>
+<span> </span>
+<span><span>-- CreateTable</span></span>
+<span><span>CREATE</span><span> </span><span>TABLE</span></span>
+<span><span>    tasks (</span></span>
+<span><span>        id </span><span>BIGSERIAL</span><span> </span><span>NOT NULL</span><span>,</span></span>
+<span><span>        created_at </span><span>timestamp</span><span>,</span></span>
+<span><span>        </span><span>status</span><span> </span><span>&#34;TaskStatus&#34;</span><span> </span><span>NOT NULL</span><span>,</span></span>
+<span><span>        args jsonb,</span></span>
+<span><span>        </span><span>PRIMARY KEY</span><span> (id)</span></span>
+<span><span>    );</span></span></code></pre></div>
+<p>The query which pops tasks off the queue looks like the following:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>-- name: PopTasks :many</span></span>
+<span><span>WITH</span></span>
+<span><span>    eligible_tasks </span><span>AS</span><span> (</span></span>
+<span><span>        </span><span>SELECT</span></span>
+<span><span>            </span><span>*</span></span>
+<span><span>        </span><span>FROM</span></span>
+<span><span>            tasks</span></span>
+<span><span>        </span><span>WHERE</span></span>
+<span><span>            </span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span></span>
+<span><span>        </span><span>ORDER BY</span><span> id </span><span>ASC</span></span>
+<span><span>        </span><span>FOR</span><span> </span><span>UPDATE</span><span> </span><span>SKIP</span><span> LOCKED</span></span>
+<span><span>        </span><span>LIMIT</span></span>
+<span><span>            </span><span>COALESCE</span><span>(sqlc.narg(</span><span>&#39;limit&#39;</span><span>), </span><span>10</span><span>)</span></span>
+<span><span>    )</span></span>
+<span><span>UPDATE</span><span> tasks</span></span>
+<span><span>SET</span></span>
+<span><span>    </span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;RUNNING&#39;</span></span>
+<span><span>FROM</span></span>
+<span><span>    eligible_tasks</span></span>
+<span><span>WHERE</span></span>
+<span><span>    tasks.id </span><span>=</span><span> eligible_tasks.id</span></span>
+<span><span>RETURNING tasks.</span><span>*</span><span>;</span></span></code></pre></div>
+<p>Note the use of <code dir="ltr">FOR UPDATE SKIP LOCKED</code>: this means that workers which concurrently pull tasks off the queue won&#39;t pull duplicate tasks, because they won&#39;t read any rows locked by other worker transactions.</p>
+<p>The polling logic looks something like this:</p>
+<div><pre data-language="go" data-theme="default"><code dir="ltr" data-language="go" data-theme="default"><span><span>type</span><span> </span><span>HandleTask</span><span> </span><span>func</span><span>(ctx context.Context, task </span><span>*</span><span>dbsqlc.Task)</span></span>
+<span> </span>
+<span><span>func</span><span> </span><span>poll</span><span>(ctx context.Context, handleTask HandleTask) {</span></span>
+<span><span>	</span><span>for</span><span> {</span></span>
+<span><span>		</span><span>select</span><span> {</span></span>
+<span><span>		</span><span>case</span><span> </span><span>&lt;-</span><span>ctx.</span><span>Done</span><span>():</span></span>
+<span><span>			</span><span>return</span></span>
+<span><span>		</span><span>case</span><span> </span><span>&lt;-</span><span>time.</span><span>After</span><span>(</span><span>5</span><span> </span><span>*</span><span> time.Second):</span></span>
+<span><span>			tasks, err </span><span>:=</span><span> queries.</span><span>PopTasks</span><span>(ctx, pool, </span><span>10</span><span>)</span></span>
+<span> </span>
+<span><span>			</span><span>if</span><span> err </span><span>!=</span><span> </span><span>nil</span><span> {</span></span>
+<span><span>				log.</span><span>Printf</span><span>(</span><span>&#34;could not pop tasks: </span><span>%v</span><span>&#34;</span><span>, err)</span></span>
+<span><span>				</span><span>continue</span></span>
+<span><span>			}</span></span>
+<span> </span>
+<span><span>			</span><span>for</span><span> _, task </span><span>:=</span><span> </span><span>range</span><span> tasks {</span></span>
+<span><span>				</span><span>handleTask</span><span>(ctx, task)</span></span>
+<span><span>			}</span></span>
+<span><span>		}</span></span>
+<span><span>	}</span></span>
+<span><span>}</span></span></code></pre></div>
+<p>The <code dir="ltr">ORDER BY id</code> statement gives us a default ordering by the auto-incremented index. We&#39;ve now implemented the basic task queue shared above, with long-polling for tasks. We could also add some nice features, like listen/notify to get new tasks immediately, but that&#39;s not the core focus here.</p>
+<h2>Fair queueing<a href="#fair-queueing" id="fair-queueing" aria-label="Permalink for this section"></a></h2>
+<p>We&#39;d now like to guarantee fair execution time to Bob and Alice. A simple way to support this is a round-robin strategy: pop 1 task from Alice, 1 task from Bob, and…Bob&#39;s your uncle? To achieve this, we can imagine separate queues for each group of users -- in this case, &#34;purple,&#34; &#34;orange&#34; and &#34;green&#34;:</p>
+
+<p>Even though we&#39;re essentially creating a set of smaller queues within our larger queue, we don&#39;t want workers to manage their subscriptions across all possible queues. The ugliness of adding a new queue per group should be abstracted from the worker, which should use a single query to pop the next tasks out of the queue.</p>
+<p>To define our groups, let&#39;s modify our implementation above slightly: we&#39;re going to introduce a <code dir="ltr">group_key</code> to each table:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>CREATE</span><span> </span><span>TABLE</span></span>
+<span><span>    tasks (</span></span>
+<span><span>        id </span><span>BIGSERIAL</span><span> </span><span>NOT NULL</span><span>,</span></span>
+<span><span>        created_at </span><span>timestamp</span><span>,</span></span>
+<span><span>        </span><span>status</span><span> </span><span>&#34;TaskStatus&#34;</span><span> </span><span>NOT NULL</span><span>,</span></span>
+<span><span>        args jsonb,</span></span>
+<span><span>        group_key </span><span>text</span><span>,</span></span>
+<span><span>        </span><span>PRIMARY KEY</span><span> (id)</span></span>
+<span><span>    );</span></span></code></pre></div>
+<p>The group key simply identifies which group the task belongs to — for example, is this one of Bob&#39;s or Alice&#39;s tasks? This can refer to individual users, tenants, or even a custom group key based on some combination of other fields.</p>
+<h3>First attempt: <code dir="ltr">PARTITION BY</code><a href="#first-attempt-partition-by" id="first-attempt-partition-by" aria-label="Permalink for this section"></a></h3>
+<p>Let&#39;s try our hand at writing a query to do this. While we have a few options, the most straightforward solution is to use <code dir="ltr">PARTITION BY</code>. Here&#39;s what we&#39;d <em>like</em> the query to look like:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>WITH</span></span>
+<span><span>    eligible_tasks </span><span>AS</span><span> (</span></span>
+<span><span>        </span><span>SELECT</span></span>
+<span><span>            t.id,</span></span>
+<span><span>            t.</span><span>&#34;status&#34;</span><span>,</span></span>
+<span><span>            t.</span><span>&#34;group_key&#34;</span><span>,</span></span>
+<span><span>            </span><span>row_number</span><span>() </span><span>OVER</span><span> (</span><span>PARTITION</span><span> </span><span>BY</span><span> t.</span><span>&#34;group_key&#34;</span><span> </span><span>ORDER BY</span><span> t.</span><span>&#34;id&#34;</span><span> </span><span>ASC</span><span>) </span><span>AS</span><span> rn</span></span>
+<span><span>        </span><span>FROM</span></span>
+<span><span>            tasks t</span></span>
+<span><span>        </span><span>WHERE</span></span>
+<span><span>            </span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span></span>
+<span><span>        </span><span>ORDER BY</span><span> rn, t.id </span><span>ASC</span></span>
+<span><span>        </span><span>LIMIT</span></span>
+<span><span>            </span><span>COALESCE</span><span>(sqlc.narg(</span><span>&#39;limit&#39;</span><span>), </span><span>10</span><span>)</span></span>
+<span><span>        </span><span>FOR</span><span> </span><span>UPDATE</span><span> </span><span>SKIP</span><span> LOCKED</span></span>
+<span><span>    )</span></span>
+<span><span>UPDATE</span><span> tasks</span></span>
+<span><span>SET</span></span>
+<span><span>    </span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;RUNNING&#39;</span></span>
+<span><span>FROM</span></span>
+<span><span>    eligible_tasks</span></span>
+<span><span>WHERE</span></span>
+<span><span>    tasks.id </span><span>=</span><span> eligible_tasks.id </span><span>AND</span></span>
+<span><span>    tasks.</span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span></span>
+<span><span>RETURNING tasks.</span><span>*</span><span>;</span></span></code></pre></div>
+<p>This assigns a row number of <code dir="ltr">1</code> to the first task in each group, a row number of <code dir="ltr">2</code> to the second task in each group, and so on.</p>
+<p>However, if we run this, we&#39;ll get the error: <code dir="ltr">ERROR: FOR UPDATE is not allowed with window functions (SQLSTATE 0A000)</code> . Easy, let&#39;s tweak our query to solve for this - we&#39;ll load up the rows with <code dir="ltr">PARTITION BY</code> and pass them to a new expression which uses <code dir="ltr">SKIP LOCKED</code>:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>WITH</span></span>
+<span><span>    ordered_tasks </span><span>AS</span><span> (</span></span>
+<span><span>        </span><span>SELECT</span></span>
+<span><span>            t.id,</span></span>
+<span><span>            t.</span><span>&#34;status&#34;</span><span>,</span></span>
+<span><span>            t.</span><span>&#34;group_key&#34;</span><span>,</span></span>
+<span><span>            </span><span>row_number</span><span>() </span><span>OVER</span><span> (</span><span>PARTITION</span><span> </span><span>BY</span><span> t.</span><span>&#34;group_key&#34;</span><span> </span><span>ORDER BY</span><span> t.</span><span>&#34;id&#34;</span><span> </span><span>ASC</span><span>) </span><span>AS</span><span> rn</span></span>
+<span><span>        </span><span>FROM</span></span>
+<span><span>            tasks t</span></span>
+<span><span>        </span><span>WHERE</span></span>
+<span><span>            </span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span></span>
+<span><span>        </span><span>ORDER BY</span><span> rn, t.id </span><span>ASC</span></span>
+<span><span>        </span><span>LIMIT</span></span>
+<span><span>            </span><span>COALESCE</span><span>(sqlc.narg(</span><span>&#39;limit&#39;</span><span>), </span><span>10</span><span>)</span></span>
+<span><span>    ),</span></span>
+<span><span>    eligible_tasks </span><span>AS</span><span> (</span></span>
+<span><span>        </span><span>SELECT</span></span>
+<span><span>            t1.id</span></span>
+<span><span>        </span><span>FROM</span></span>
+<span><span>            ordered_tasks t1</span></span>
+<span><span>        </span><span>FOR</span><span> </span><span>UPDATE</span><span> </span><span>SKIP</span><span> LOCKED</span></span>
+<span><span>    )</span></span>
+<span><span>UPDATE</span><span> tasks</span></span>
+<span><span>SET</span></span>
+<span><span>    </span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;RUNNING&#39;</span></span>
+<span><span>FROM</span></span>
+<span><span>    eligible_tasks</span></span>
+<span><span>WHERE</span></span>
+<span><span>    tasks.id </span><span>=</span><span> eligible_tasks.id </span><span>AND</span></span>
+<span><span>    tasks.</span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span></span>
+<span><span>RETURNING tasks.</span><span>*</span><span>;</span></span></code></pre></div>
+<p>…but not so fast. We&#39;ve introduced an issue by adding the first CTE (Common Table Expression - the queries using the <code dir="ltr">WITH</code> clause). If we run 3 workers concurrently and log the number of rows that each worker receives, with a limit of 100 rows per worker, we&#39;ll find only 1 worker is picking up tasks, even if there are more rows to return!</p>
+<div><pre data-language="bash" data-theme="default"><code dir="ltr" data-language="bash" data-theme="default"><span><span>2024/04/05</span><span> </span><span>12</span><span>:52:50</span><span> (worker </span><span>1</span><span>) popped 0 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:50</span><span> (worker </span><span>0</span><span>) popped 0 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:50</span><span> (worker </span><span>2</span><span>) popped 100 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:51</span><span> (worker </span><span>1</span><span>) popped 0 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:51</span><span> (worker </span><span>2</span><span>) popped 0 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:51</span><span> (worker </span><span>0</span><span>) popped 100 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:52</span><span> (worker </span><span>0</span><span>) popped 0 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:52</span><span> (worker </span><span>2</span><span>) popped 0 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:52</span><span> (worker </span><span>1</span><span>) popped 100 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:53</span><span> (worker </span><span>0</span><span>) popped 0 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:53</span><span> (worker </span><span>1</span><span>) popped 0 tasks</span></span>
+<span><span>2024/04/05</span><span> </span><span>12</span><span>:52:53</span><span> (worker </span><span>2</span><span>) popped 100 tasks</span></span></code></pre></div>
+<p>What&#39;s happening here? By introducing the first CTE, we are now selecting locked rows which are excluded by <code dir="ltr">FOR UPDATE SKIP LOCKED</code> in the second CTE - in other words, we might not enqueue any runs on some workers if we&#39;re polling concurrently for new tasks. While we are still guaranteed to enqueue in the manner which we&#39;d like, we may reduce throughput if there&#39;s high contention among workers for the same rows.</p>
+<p>Unfortunately, using <code dir="ltr">PARTITION BY</code> isn&#39;t the right approach here. But before we dive into a better approach, this query does show some interesting properties of queueing systems more generally.</p>
+<h3>Aside: queueing woes<a href="#aside-queueing-woes" id="aside-queueing-woes" aria-label="Permalink for this section"></a></h3>
+<p>A hotfix for the slow polling query would be adding 3 lines of code to our worker setup:</p>
+<div><pre data-language="go" data-theme="default"><code dir="ltr" data-language="go" data-theme="default"><span><span>// sleep for random duration between 0 and polling interval to avoid thundering herd</span></span>
+<span><span>sleepDuration </span><span>:=</span><span> time.</span><span>Duration</span><span>(id) </span><span>*</span><span> interval </span><span>/</span><span> time.</span><span>Duration</span><span>(numWorkers)</span></span>
+<span><span>log.</span><span>Printf</span><span>(</span><span>&#34;(worker </span><span>%d</span><span>) sleeping for </span><span>%v</span><span>\n&#34;</span><span>, id, sleepDuration)</span></span>
+<span><span>time.</span><span>Sleep</span><span>(sleepDuration)</span></span></code></pre></div>
+<p>Which gives us much more promising output:</p>
+<div><pre data-language="go" data-theme="default"><code dir="ltr" data-language="go" data-theme="default"><span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>19</span><span> (worker </span><span>2</span><span>) sleeping </span><span>for</span><span> 666.666666ms</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>19</span><span> (worker </span><span>0</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>19</span><span> (worker </span><span>1</span><span>) sleeping </span><span>for</span><span> 333.333333ms</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>21</span><span> (worker </span><span>0</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>21</span><span> (worker </span><span>1</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>21</span><span> (worker </span><span>2</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>22</span><span> (worker </span><span>0</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>22</span><span> (worker </span><span>1</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>22</span><span> (worker </span><span>2</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>23</span><span> (worker </span><span>0</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>23</span><span> (worker </span><span>1</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>23</span><span> (worker </span><span>2</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>12</span><span>:</span><span>54</span><span>:</span><span>24</span><span> (worker </span><span>0</span><span>) popped </span><span>100</span><span> tasks</span></span></code></pre></div>
+<p>This works — and you can modify this logic to be more distributed by maintaining a lease when a worker starts for a set amount of time — as long as the polling interval is below the query duration time (or more specifically, <code dir="ltr">pollingTime / numWorkers</code> is below the query duration time). But what happens when our queue starts to fill up? Let&#39;s add 10,000 enqueued tasks and run an <code dir="ltr">EXPLAIN ANALYZE</code> for this query to take a look at performance:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>                                                                 QUERY PLAN</span></span>
+<span><span>---------------------------------------------------------------------------------------------------------------------------------------------</span></span>
+<span><span> </span><span>Update</span><span> </span><span>on</span><span> tasks  (cost</span><span>=</span><span>3060</span><span>.</span><span>81</span><span>..</span><span>3602</span><span>.</span><span>70</span><span> </span><span>rows=</span><span>77</span><span> width</span><span>=</span><span>42</span><span>) (actual </span><span>time=</span><span>142</span><span>.</span><span>749</span><span>..</span><span>160</span><span>.</span><span>682</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>   CTE tasks_1</span></span>
+<span><span>     </span><span>-&gt;</span><span>  </span><span>Limit</span><span>  (cost</span><span>=</span><span>2479</span><span>.</span><span>94</span><span>..</span><span>2480</span><span>.</span><span>19</span><span> </span><span>rows=</span><span>100</span><span> width</span><span>=</span><span>36</span><span>) (actual </span><span>time=</span><span>116</span><span>.</span><span>248</span><span>..</span><span>116</span><span>.</span><span>405</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>           </span><span>-&gt;</span><span>  Sort  (cost</span><span>=</span><span>2479</span><span>.</span><span>94</span><span>..</span><span>2517</span><span>.</span><span>65</span><span> </span><span>rows=</span><span>15087</span><span> width</span><span>=</span><span>36</span><span>) (actual </span><span>time=</span><span>116</span><span>.</span><span>128</span><span>..</span><span>116</span><span>.</span><span>203</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>                 Sort </span><span>Key</span><span>: (</span><span>row_number</span><span>() </span><span>OVER</span><span> (?)), (random())</span></span>
+<span><span>                 Sort Method: </span><span>top-</span><span>N heapsort  Memory: 32kB</span></span>
+<span><span>                 </span><span>-&gt;</span><span>  WindowAgg  (cost</span><span>=</span><span>1563</span><span>.</span><span>86</span><span>..</span><span>1903</span><span>.</span><span>32</span><span> </span><span>rows=</span><span>15087</span><span> width</span><span>=</span><span>36</span><span>) (actual </span><span>time=</span><span>70</span><span>.</span><span>788</span><span>..</span><span>105</span><span>.</span><span>097</span><span> </span><span>rows=</span><span>10000</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>                       </span><span>-&gt;</span><span>  Sort  (cost</span><span>=</span><span>1563</span><span>.</span><span>86</span><span>..</span><span>1601</span><span>.</span><span>58</span><span> </span><span>rows=</span><span>15087</span><span> width</span><span>=</span><span>20</span><span>) (actual </span><span>time=</span><span>69</span><span>.</span><span>491</span><span>..</span><span>72</span><span>.</span><span>651</span><span> </span><span>rows=</span><span>10000</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>                             Sort </span><span>Key</span><span>: t.group_key, t.id</span></span>
+<span><span>                             Sort Method: quicksort  Memory: 1010kB</span></span>
+<span><span>                             </span><span>-&gt;</span><span>  Seq Scan </span><span>on</span><span> tasks t  (cost</span><span>=</span><span>0</span><span>.</span><span>00</span><span>..</span><span>516</span><span>.</span><span>75</span><span> </span><span>rows=</span><span>15087</span><span> width</span><span>=</span><span>20</span><span>) (actual </span><span>time=</span><span>0</span><span>.</span><span>587</span><span>..</span><span>12</span><span>.</span><span>837</span><span> </span><span>rows=</span><span>10000</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>                                   </span><span>Filter</span><span>: (</span><span>status</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span><span>::</span><span>&#34;TaskStatus&#34;</span><span>)</span></span>
+<span><span>   CTE eligible_tasks</span></span>
+<span><span>     </span><span>-&gt;</span><span>  LockRows  (cost</span><span>=</span><span>3</span><span>.</span><span>25</span><span>..</span><span>578</span><span>.</span><span>12</span><span> </span><span>rows=</span><span>77</span><span> width</span><span>=</span><span>46</span><span>) (actual </span><span>time=</span><span>119</span><span>.</span><span>137</span><span>..</span><span>133</span><span>.</span><span>640</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>           </span><span>-&gt;</span><span>  </span><span>Hash</span><span> </span><span>Join</span><span>  (cost</span><span>=</span><span>3</span><span>.</span><span>25</span><span>..</span><span>577</span><span>.</span><span>35</span><span> </span><span>rows=</span><span>77</span><span> width</span><span>=</span><span>46</span><span>) (actual </span><span>time=</span><span>118</span><span>.</span><span>408</span><span>..</span><span>132</span><span>.</span><span>472</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>                 </span><span>Hash</span><span> Cond: (t_1.id </span><span>=</span><span> tasks_1.id)</span></span>
+<span><span>                 </span><span>-&gt;</span><span>  Seq Scan </span><span>on</span><span> tasks t_1  (cost</span><span>=</span><span>0</span><span>.</span><span>00</span><span>..</span><span>516</span><span>.</span><span>75</span><span> </span><span>rows=</span><span>15087</span><span> width</span><span>=</span><span>14</span><span>) (actual </span><span>time=</span><span>0</span><span>.</span><span>660</span><span>..</span><span>9</span><span>.</span><span>547</span><span> </span><span>rows=</span><span>10000</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>                       </span><span>Filter</span><span>: (</span><span>status</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span><span>::</span><span>&#34;TaskStatus&#34;</span><span>)</span></span>
+<span><span>                 </span><span>-&gt;</span><span>  </span><span>Hash</span><span>  (cost</span><span>=</span><span>2</span><span>.</span><span>00</span><span>..</span><span>2</span><span>.</span><span>00</span><span> </span><span>rows=</span><span>100</span><span> width</span><span>=</span><span>40</span><span>) (actual </span><span>time=</span><span>117</span><span>.</span><span>536</span><span>..</span><span>117</span><span>.</span><span>569</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>                       Buckets: </span><span>1024</span><span>  </span><span>Batches</span><span>: </span><span>1</span><span>  Memory Usage: 18kB</span></span>
+<span><span>                       </span><span>-&gt;</span><span>  CTE Scan </span><span>on</span><span> tasks_1  (cost</span><span>=</span><span>0</span><span>.</span><span>00</span><span>..</span><span>2</span><span>.</span><span>00</span><span> </span><span>rows=</span><span>100</span><span> width</span><span>=</span><span>40</span><span>) (actual </span><span>time=</span><span>116</span><span>.</span><span>848</span><span>..</span><span>117</span><span>.</span><span>191</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>   </span><span>-&gt;</span><span>  </span><span>Hash</span><span> </span><span>Join</span><span>  (cost</span><span>=</span><span>2</span><span>.</span><span>50</span><span>..</span><span>544</span><span>.</span><span>40</span><span> </span><span>rows=</span><span>77</span><span> width</span><span>=</span><span>42</span><span>) (actual </span><span>time=</span><span>140</span><span>.</span><span>519</span><span>..</span><span>152</span><span>.</span><span>972</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>         </span><span>Hash</span><span> Cond: (tasks.id </span><span>=</span><span> eligible_tasks.id)</span></span>
+<span><span>         </span><span>-&gt;</span><span>  Seq Scan </span><span>on</span><span> tasks  (cost</span><span>=</span><span>0</span><span>.</span><span>00</span><span>..</span><span>468</span><span>.</span><span>00</span><span> </span><span>rows=</span><span>19500</span><span> width</span><span>=</span><span>14</span><span>) (actual </span><span>time=</span><span>5</span><span>.</span><span>947</span><span>..</span><span>13</span><span>.</span><span>352</span><span> </span><span>rows=</span><span>10000</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>         </span><span>-&gt;</span><span>  </span><span>Hash</span><span>  (cost</span><span>=</span><span>1</span><span>.</span><span>54</span><span>..</span><span>1</span><span>.</span><span>54</span><span> </span><span>rows=</span><span>77</span><span> width</span><span>=</span><span>40</span><span>) (actual </span><span>time=</span><span>134</span><span>.</span><span>125</span><span>..</span><span>134</span><span>.</span><span>126</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>               Buckets: </span><span>1024</span><span>  </span><span>Batches</span><span>: </span><span>1</span><span>  Memory Usage: 16kB</span></span>
+<span><span>               </span><span>-&gt;</span><span>  CTE Scan </span><span>on</span><span> eligible_tasks  (cost</span><span>=</span><span>0</span><span>.</span><span>00</span><span>..</span><span>1</span><span>.</span><span>54</span><span> </span><span>rows=</span><span>77</span><span> width</span><span>=</span><span>40</span><span>) (actual </span><span>time=</span><span>119</span><span>.</span><span>320</span><span>..</span><span>134</span><span>.</span><span>017</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span> Planning </span><span>Time</span><span>: </span><span>38</span><span>.</span><span>426</span><span> ms</span></span>
+<span><span> Execution </span><span>Time</span><span>: </span><span>165</span><span>.</span><span>835</span><span> ms</span></span></code></pre></div>
+<p>The important part here is the <code dir="ltr">WindowAgg</code> cost - computing a partition across all rows on the <code dir="ltr">groupKey</code> naturally involves querying every <code dir="ltr">QUEUED</code> row (in this case, <code dir="ltr">10000</code> tasks). We expect this to scale sublinearly with the number of rows in the input - let&#39;s take a guess and look at how our workers do on 25,000 enqueued rows:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>24</span><span> (worker </span><span>2</span><span>) sleeping </span><span>for</span><span> </span><span>666</span><span>.666666ms</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>24</span><span> (worker </span><span>0</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>24</span><span> (worker </span><span>1</span><span>) sleeping </span><span>for</span><span> </span><span>333</span><span>.333333ms</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>26</span><span> (worker </span><span>0</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>26</span><span> (worker </span><span>1</span><span>) popped </span><span>0</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>26</span><span> (worker </span><span>2</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>27</span><span> (worker </span><span>0</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>27</span><span> (worker </span><span>1</span><span>) popped </span><span>0</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>28</span><span> (worker </span><span>2</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>29</span><span> (worker </span><span>0</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>29</span><span> (worker </span><span>1</span><span>) popped </span><span>0</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>05</span><span> </span><span>13</span><span>:</span><span>06</span><span>:</span><span>29</span><span> (worker </span><span>2</span><span>) popped </span><span>100</span><span> tasks</span></span></code></pre></div>
+<p>Sure enough, because we&#39;re seeing execution times greater than <code dir="ltr">333ms</code>, we start losing tasks on <code dir="ltr">worker 1</code>. This is very problematic, because not only is our queue backlog increasing, but the throughput of our workers is decreasing, and this isn&#39;t a problem we can solve by throwing more workers at the queue. This is a general problem in systems that are stable for a long time until some external trigger (for example, workers going down for an hour) causes the system to fail in an unexpected way, leading to the system being <em>unrecoverable</em>.</p>
+<p>A second practical solution to this issue is to create an <code dir="ltr">OVERFLOW</code> status on the task queue, and set an upper bound on the number of enqueued tasks, to ensure worker performance doesn&#39;t drop below a certain threshold. We then can periodically check the overflow queue and place the overflow into the queued status. This is a good idea regardless of the query we write to get new tasks.</p>
+<p>But practical advice aside, let&#39;s take a look at how to write this query to avoid performance degradation at such a small number of enqueued tasks.</p>
+<h2>Improving performance<a href="#improving-performance" id="improving-performance" aria-label="Permalink for this section"></a></h2>
+<h3>Sequencing algorithm<a href="#sequencing-algorithm" id="sequencing-algorithm" aria-label="Permalink for this section"></a></h3>
+<p>The main issue, as we&#39;ve identified, is the window function which is searching across every row that is <code dir="ltr">QUEUED</code>. What we were hoping to accomplish with the partition method was filling up each group&#39;s queue, ordering each group by the task id, and order the tasks by their rank within each group.</p>
+<p>Our goal is to write a query that is constant-time (or as close as possible to constant-time) when reading from the queue, so we can avoid our system being unrecoverable. Even using a <code dir="ltr">JOIN LATERAL</code> instead of <code dir="ltr">PARTITION BY</code> will get slower as the number of partitions (i.e. groups) increases. Also, maintaining each task&#39;s rank after reads (for example, decrementing the task&#39;s rank within the group after read) will also get slower the more tasks we add to a group.</p>
+<p>What if instead of computing the rank within the group via the <code dir="ltr">PARTITION BY</code> method at <em>read time</em>, we wrote a sequence number at <em>write time</em> which guarantees round-robin enqueueing? At first glance, this seems difficult - we don&#39;t know that Alice will need to enqueue 1 task in the future if Bob enqueued 10,000 tasks now.</p>
+<p>We can solve for this by reserving <em>contiguous blocks of IDs</em> for future enqueued runs which belong to groups which don&#39;t exist yet or don&#39;t have a task assigned for that block yet. We&#39;re going to partition <code dir="ltr">BIGINT</code> (max=<code dir="ltr">9,223,372,036,854,775,807</code>) into blocks of <code dir="ltr">blockLength</code>:</p>
+<p><img alt="Blocks" loading="lazy" width="3812" height="2043" decoding="async" data-nimg="1" srcset="/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fmulti-tenant-queues-1.f811f554.png&amp;w=3840&amp;q=75 1x" src="https://docs.hatchet.run/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fmulti-tenant-queues-1.f811f554.png&amp;w=3840&amp;q=75"/></p>
+<p>Next, let&#39;s assign task IDs according to the following algorithm:</p>
+<ol>
+<li>Maintain a unique numerical id <code dir="ltr">i</code> for each distinct group, and maintain a pointer <code dir="ltr">p</code> to the last block that was enqueued for each group - we&#39;ll call this <code dir="ltr">p(i)</code> .</li>
+<li>Maintain a pointer <code dir="ltr">p</code> to the block containing the maximum task ID which doesn&#39;t have a <code dir="ltr">QUEUED</code> status (in other words, the maximum assigned task), call this <code dir="ltr">p_max_assigned</code>. If there are no tasks in the queue, set this to the maximum block across all <code dir="ltr">p(i)</code>. Initialize <code dir="ltr">p_max_assigned</code> at 0.</li>
+<li>When a task is created in group <code dir="ltr">j</code>:<!-- -->
+<ol>
+<li>If this is a new group <code dir="ltr">j</code> is added, initialize <code dir="ltr">p(j)</code> to <code dir="ltr">p_max_assigned</code></li>
+<li>If this is an existing group <code dir="ltr">j</code>, set <code dir="ltr">p(j)</code> to the greater of <code dir="ltr">p_max_assigned</code> or <code dir="ltr">p(j) + 1</code></li>
+<li>Set the id of the task to <code dir="ltr">j + blockLength * p(j)</code></li>
+</ol>
+</li>
+</ol>
+<p><strong>*Note:</strong> we are making a critical assumption that the number of unique group keys will always be below the <code dir="ltr">blockLength</code> , and increasing the blockLength in the future would be a bit involved. A blockLength of ~1 million gives us ~1 billion task executions. To increase the block length, it&#39;s recommended that you add an offset equal to the the maximum task id, and start assigning task ids from there. We will also (in the worst case) cap out at 1 billion executed tasks, though this can be fixed by reassigning IDs when close to this limit.*</p>
+<h3>SQL implemenation<a href="#sql-implemenation" id="sql-implemenation" aria-label="Permalink for this section"></a></h3>
+<p>To actually implement this, let&#39;s add a new set of tables to our queue implementation. We&#39;ll add a table for <code dir="ltr">task_groups</code>, which maintains the pointer <code dir="ltr">p(i)</code> from above, along with a table called <code dir="ltr">task_addr_ptrs</code> which maintains <code dir="ltr">p_max_assigned</code> from above:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>CREATE</span><span> </span><span>TABLE</span></span>
+<span><span>    task_groups (</span></span>
+<span><span>        id </span><span>BIGSERIAL</span><span> </span><span>NOT NULL</span><span>,</span></span>
+<span><span>        group_key </span><span>text</span><span>,</span></span>
+<span><span>        block_addr </span><span>BIGINT</span><span>,</span></span>
+<span><span>        </span><span>PRIMARY KEY</span><span> (id)</span></span>
+<span><span>    );</span></span>
+<span> </span>
+<span><span>ALTER</span><span> </span><span>TABLE</span><span> task_groups </span><span>ADD</span><span> </span><span>CONSTRAINT</span><span> unique_group_key </span><span>UNIQUE</span><span> (group_key);</span></span>
+<span> </span>
+<span><span>ALTER</span><span> </span><span>TABLE</span><span> tasks </span><span>ADD</span><span> </span><span>CONSTRAINT</span><span> fk_tasks_group_key </span><span>FOREIGN KEY</span><span> (group_key) </span><span>REFERENCES</span><span> task_groups (group_key);</span></span>
+<span> </span>
+<span><span>CREATE</span><span> </span><span>TABLE</span></span>
+<span><span>    task_addr_ptrs (</span></span>
+<span><span>        max_assigned_block_addr </span><span>BIGINT</span><span> </span><span>NOT NULL</span><span>,</span></span>
+<span><span>        onerow_id bool </span><span>PRIMARY KEY</span><span> </span><span>DEFAULT</span><span> true,</span></span>
+<span><span>        </span><span>CONSTRAINT</span><span> onerow_uni </span><span>CHECK</span><span> (onerow_id)</span></span>
+<span><span>    );</span></span></code></pre></div>
+<p>Next, we&#39;ll write our <code dir="ltr">CreateTask</code> query using a <code dir="ltr">blockLength</code> of <code dir="ltr">1024*1024</code>:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>WITH</span></span>
+<span><span>    group_key_task </span><span>AS</span><span> (</span></span>
+<span><span>        </span><span>INSERT INTO</span><span> task_groups (</span></span>
+<span><span>            id,</span></span>
+<span><span>            group_key,</span></span>
+<span><span>            block_addr</span></span>
+<span><span>        ) </span><span>VALUES</span><span> (</span></span>
+<span><span>            </span><span>COALESCE</span><span>((</span><span>SELECT</span><span> </span><span>max</span><span>(id) </span><span>FROM</span><span> task_groups), </span><span>-</span><span>1</span><span>) </span><span>+</span><span> </span><span>1</span><span>,</span></span>
+<span><span>            sqlc.arg(</span><span>&#39;group_key&#39;</span><span>)::</span><span>text</span><span>,</span></span>
+<span><span>            (</span><span>SELECT</span><span> max_assigned_block_addr </span><span>FROM</span><span> task_addr_ptrs)</span></span>
+<span><span>        ) </span><span>ON</span><span> CONFLICT (group_key)</span></span>
+<span><span>        DO </span><span>UPDATE</span><span> </span><span>SET</span></span>
+<span><span>            group_key </span><span>=</span><span> EXCLUDED.group_key,</span></span>
+<span><span>            block_addr </span><span>=</span><span> </span><span>GREATEST</span><span>(</span></span>
+<span><span>                task_groups.block_addr </span><span>+</span><span> </span><span>1</span><span>,</span></span>
+<span><span>                (</span><span>SELECT</span><span> max_assigned_block_addr </span><span>FROM</span><span> task_addr_ptrs)</span></span>
+<span><span>            )</span></span>
+<span><span>        RETURNING id, group_key, block_addr</span></span>
+<span><span>    )</span></span>
+<span><span>INSERT INTO</span><span> tasks (</span></span>
+<span><span>    id,</span></span>
+<span><span>    created_at,</span></span>
+<span><span>    </span><span>status</span><span>,</span></span>
+<span><span>    args,</span></span>
+<span><span>    group_key</span></span>
+<span><span>) </span><span>VALUES</span><span> (</span></span>
+<span><span>    (</span><span>SELECT</span><span> id </span><span>FROM</span><span> group_key_task) </span><span>+</span><span> </span><span>1024</span><span> </span><span>*</span><span> </span><span>1024</span><span> </span><span>*</span><span> (</span><span>SELECT</span><span> block_addr </span><span>FROM</span><span> group_key_task),</span></span>
+<span><span>    </span><span>COALESCE</span><span>(sqlc.arg(</span><span>&#39;created_at&#39;</span><span>)::</span><span>timestamp</span><span>, </span><span>now</span><span>()),</span></span>
+<span><span>    </span><span>&#39;QUEUED&#39;</span><span>,</span></span>
+<span><span>    </span><span>COALESCE</span><span>(sqlc.arg(</span><span>&#39;args&#39;</span><span>)::jsonb, </span><span>&#39;{}&#39;</span><span>::jsonb),</span></span>
+<span><span>    sqlc.arg(</span><span>&#39;group_key&#39;</span><span>)::</span><span>text</span></span>
+<span><span>)</span></span>
+<span><span>RETURNING </span><span>*</span><span>;</span></span></code></pre></div>
+<p>The great thing about this is that our <code dir="ltr">PopTasks</code> query doesn&#39;t change, we&#39;ve just changed how we assign IDs. However, we do need to make sure to update <code dir="ltr">task_addr_ptrs</code> in the same transaction that we pop tasks from the queue:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>-- name: UpdateTaskPtrs :one</span></span>
+<span><span>WITH</span></span>
+<span><span>    max_assigned_id </span><span>AS</span><span> (</span></span>
+<span><span>        </span><span>SELECT</span></span>
+<span><span>            id</span></span>
+<span><span>        </span><span>FROM</span></span>
+<span><span>            tasks</span></span>
+<span><span>        </span><span>WHERE</span></span>
+<span><span>            </span><span>&#34;status&#34;</span><span> </span><span>!=</span><span> </span><span>&#39;QUEUED&#39;</span></span>
+<span><span>        </span><span>ORDER BY</span><span> id </span><span>DESC</span></span>
+<span><span>        </span><span>LIMIT</span><span> </span><span>1</span></span>
+<span><span>    )</span></span>
+<span><span>UPDATE</span><span> task_addr_ptrs</span></span>
+<span><span>SET</span></span>
+<span><span>    max_assigned_block_addr </span><span>=</span><span> </span><span>COALESCE</span><span>(</span></span>
+<span><span>        </span><span>FLOOR</span><span>((</span><span>SELECT</span><span> id </span><span>FROM</span><span> max_assigned_id)::</span><span>decimal</span><span> </span><span>/</span><span> </span><span>1024</span><span> </span><span>/</span><span> </span><span>1024</span><span>),</span></span>
+<span><span>        </span><span>COALESCE</span><span>(</span></span>
+<span><span>            (</span><span>SELECT</span><span> </span><span>MAX</span><span>(block_addr) </span><span>FROM</span><span> task_groups),</span></span>
+<span><span>            </span><span>0</span></span>
+<span><span>        )</span></span>
+<span><span>    )</span></span>
+<span><span>FROM</span></span>
+<span><span>    max_assigned_id</span></span>
+<span><span>RETURNING task_addr_ptrs.</span><span>*</span><span>;</span></span></code></pre></div>
+<p>Against 1 million enqueued tasks with 1000 partitions, we still only need to search across 100 rows:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>                                                                        QUERY PLAN</span></span>
+<span><span>-----------------------------------------------------------------------------------------------------------------------------------------------------------</span></span>
+<span><span> Nested </span><span>Loop</span><span>  (cost</span><span>=</span><span>12</span><span>.</span><span>89</span><span>..</span><span>853</span><span>.</span><span>72</span><span> </span><span>rows=</span><span>100</span><span> width</span><span>=</span><span>77</span><span>) (actual </span><span>time=</span><span>17</span><span>.</span><span>521</span><span>..</span><span>20</span><span>.</span><span>227</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>   CTE eligible_tasks</span></span>
+<span><span>     </span><span>-&gt;</span><span>  </span><span>Limit</span><span>  (cost</span><span>=</span><span>0</span><span>.</span><span>42</span><span>..</span><span>10</span><span>.</span><span>21</span><span> </span><span>rows=</span><span>100</span><span> width</span><span>=</span><span>14</span><span>) (actual </span><span>time=</span><span>1</span><span>.</span><span>669</span><span>..</span><span>16</span><span>.</span><span>365</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>           </span><span>-&gt;</span><span>  LockRows  (cost</span><span>=</span><span>0</span><span>.</span><span>42</span><span>..</span><span>97842</span><span>.</span><span>23</span><span> </span><span>rows=</span><span>999484</span><span> width</span><span>=</span><span>14</span><span>) (actual </span><span>time=</span><span>1</span><span>.</span><span>662</span><span>..</span><span>16</span><span>.</span><span>231</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>                 </span><span>-&gt;</span><span>  </span><span>Index</span><span> Scan </span><span>using</span><span> tasks_pkey </span><span>on</span><span> tasks tasks_1  (cost</span><span>=</span><span>0</span><span>.</span><span>42</span><span>..</span><span>87847</span><span>.</span><span>39</span><span> </span><span>rows=</span><span>999484</span><span> width</span><span>=</span><span>14</span><span>) (actual </span><span>time=</span><span>0</span><span>.</span><span>711</span><span>..</span><span>13</span><span>.</span><span>331</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>                       </span><span>Filter</span><span>: (</span><span>status</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span><span>::</span><span>&#34;TaskStatus&#34;</span><span>)</span></span>
+<span><span>   </span><span>-&gt;</span><span>  HashAggregate  (cost</span><span>=</span><span>2</span><span>.</span><span>25</span><span>..</span><span>3</span><span>.</span><span>25</span><span> </span><span>rows=</span><span>100</span><span> width</span><span>=</span><span>8</span><span>) (actual </span><span>time=</span><span>17</span><span>.</span><span>299</span><span>..</span><span>17</span><span>.</span><span>497</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>         Group </span><span>Key</span><span>: eligible_tasks.id</span></span>
+<span><span>         </span><span>Batches</span><span>: </span><span>1</span><span>  Memory Usage: 24kB</span></span>
+<span><span>         </span><span>-&gt;</span><span>  CTE Scan </span><span>on</span><span> eligible_tasks  (cost</span><span>=</span><span>0</span><span>.</span><span>00</span><span>..</span><span>2</span><span>.</span><span>00</span><span> </span><span>rows=</span><span>100</span><span> width</span><span>=</span><span>8</span><span>) (actual </span><span>time=</span><span>1</span><span>.</span><span>720</span><span>..</span><span>16</span><span>.</span><span>959</span><span> </span><span>rows=</span><span>100</span><span> loops</span><span>=</span><span>1</span><span>)</span></span>
+<span><span>   </span><span>-&gt;</span><span>  </span><span>Index</span><span> Scan </span><span>using</span><span> tasks_pkey </span><span>on</span><span> tasks  (cost</span><span>=</span><span>0</span><span>.</span><span>42</span><span>..</span><span>8</span><span>.</span><span>40</span><span> </span><span>rows=</span><span>1</span><span> width</span><span>=</span><span>77</span><span>) (actual </span><span>time=</span><span>0</span><span>.</span><span>022</span><span>..</span><span>0</span><span>.</span><span>022</span><span> </span><span>rows=</span><span>1</span><span> loops</span><span>=</span><span>100</span><span>)</span></span>
+<span><span>         </span><span>Index</span><span> Cond: (id </span><span>=</span><span> eligible_tasks.id)</span></span>
+<span><span> Planning </span><span>Time</span><span>: </span><span>13</span><span>.</span><span>979</span><span> ms</span></span>
+<span><span> Execution </span><span>Time</span><span>: </span><span>21</span><span>.</span><span>433</span><span> ms</span></span></code></pre></div>
+<p>You may also have noticed that because we stopped using the window function, we&#39;ve removed the issue of selecting for previously locked rows. So even if we start 10 workers at the same time, we&#39;re guaranteed to select unique rows again:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>9</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>8</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>4</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>0</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>1</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>2</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>6</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>3</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>5</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>08</span><span> (worker </span><span>7</span><span>) sleeping </span><span>for</span><span> 0s</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>1</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>2</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>7</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>0</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>8</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>9</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>3</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>6</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>5</span><span>) popped </span><span>100</span><span> tasks</span></span>
+<span><span>2024</span><span>/</span><span>04</span><span>/</span><span>08</span><span> </span><span>16</span><span>:</span><span>28</span><span>:</span><span>09</span><span> (worker </span><span>4</span><span>) popped </span><span>100</span><span> tasks</span></span></code></pre></div>
+<p>This doesn&#39;t come without a tradeoff: our writes are slower due to continuously updating the <code dir="ltr">block_addr</code> parameter on the <code dir="ltr">task_group</code>. However, even the writes are constant-time, so the throughput on writes is still on the order of 500 to 1k tasks/second. If you&#39;d prefer a higher write throughput, setting a small limit for placing tasks in the <code dir="ltr">OVERFLOW</code> queue and using the partition method from above may be a better approach.</p>
+<h2>Introducing concurrency limits<a href="#introducing-concurrency-limits" id="introducing-concurrency-limits" aria-label="Permalink for this section"></a></h2>
+<p>In the above implementation, we had a simple <code dir="ltr">LIMIT</code> statement to set an upper bound of the number of tasks a worker should execute. But what if we want to set a concurrency limit for each group of tasks? For example, not only do we want to limit a worker to 100 tasks globally, but we limit each group to 5 concurrent tasks (we&#39;ll refer to this number as <code dir="ltr">concurrency</code> below). This ensures that even if there are slots available on the worker, they are not automatically filled by the same user, which could again crowd out other users in the near future.</p>
+<p>Luckily, this is quite simple with the implementation above. Because of the way we&#39;ve divided task ids across different block addresses, we can simply limit concurrency by searching only from the minimum queued ID <code dir="ltr">min_id</code> to <code dir="ltr">min_id + blockLength * concurrency</code>:</p>
+<div><pre data-language="sql" data-theme="default"><code dir="ltr" data-language="sql" data-theme="default"><span><span>-- name: PopTasksWithConcurrency :many</span></span>
+<span><span>WITH</span></span>
+<span><span>    min_id </span><span>AS</span><span> (</span></span>
+<span><span>        </span><span>SELECT</span></span>
+<span><span>            </span><span>COALESCE</span><span>(</span><span>min</span><span>(id), </span><span>0</span><span>) </span><span>AS</span><span> min_id</span></span>
+<span><span>        </span><span>FROM</span></span>
+<span><span>            tasks</span></span>
+<span><span>        </span><span>WHERE</span></span>
+<span><span>            </span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span></span>
+<span><span>    ),</span></span>
+<span><span>    eligible_tasks </span><span>AS</span><span> (</span></span>
+<span><span>        </span><span>SELECT</span></span>
+<span><span>            tasks.id</span></span>
+<span><span>        </span><span>FROM</span></span>
+<span><span>            tasks</span></span>
+<span><span>        </span><span>WHERE</span></span>
+<span><span>            </span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;QUEUED&#39;</span><span> </span><span>AND</span></span>
+<span><span>            </span><span>&#34;id&#34;</span><span> </span><span>&gt;=</span><span> (</span><span>SELECT</span><span> min_id </span><span>FROM</span><span> min_id) </span><span>AND</span></span>
+<span><span>            </span><span>&#34;id&#34;</span><span> </span><span>&lt;</span><span> (</span><span>SELECT</span><span> min_id </span><span>FROM</span><span> min_id) </span><span>+</span><span> sqlc.arg(</span><span>&#39;concurrency&#39;</span><span>)::</span><span>int</span><span> </span><span>*</span><span> </span><span>1024</span><span> </span><span>*</span><span> </span><span>1024</span></span>
+<span><span>        </span><span>ORDER BY</span><span> id </span><span>ASC</span></span>
+<span><span>        </span><span>FOR</span><span> </span><span>UPDATE</span><span> </span><span>SKIP</span><span> LOCKED</span></span>
+<span><span>        </span><span>LIMIT</span></span>
+<span><span>            </span><span>COALESCE</span><span>(sqlc.narg(</span><span>&#39;limit&#39;</span><span>)::</span><span>int</span><span>, </span><span>10</span><span>)</span></span>
+<span><span>    )</span></span>
+<span><span>UPDATE</span><span> tasks</span></span>
+<span><span>SET</span></span>
+<span><span>    </span><span>&#34;status&#34;</span><span> </span><span>=</span><span> </span><span>&#39;RUNNING&#39;</span></span>
+<span><span>FROM</span></span>
+<span><span>    eligible_tasks</span></span>
+<span><span>WHERE</span></span>
+<span><span>    tasks.id </span><span>=</span><span> eligible_tasks.id</span></span>
+<span><span>RETURNING tasks.</span><span>*</span><span>;</span></span></code></pre></div>
+<p>This guarantees an additional level of fairness which makes it even harder for Bob&#39;s workloads to interfere with Alice&#39;s.</p>
+<h2>Final thoughts<a href="#final-thoughts" id="final-thoughts" aria-label="Permalink for this section"></a></h2>
+<p>We&#39;ve covered deterministic round-robin queueing, but it turns out that many systems just need approximate fairness guarantees (&#34;deterministic&#34; in this case refers to the fact that tasks are processed in a deterministic order on subsequent reads - as opposed to using something like <code dir="ltr">ORDER BY RANDOM()</code>). But there are other approaches which provide approximate fairness, such as <a href="https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/" target="_blank" rel="noreferrer">shuffle sharding<span> (opens in a new tab)</span></a>, which we&#39;ll show how to implement in Postgres in a future post.</p>
+<p>If you have suggestions on making these queries more performant - or perhaps you spotted a bug - I&#39;d love to hear from you in our <a href="https://discord.gg/ZMeUafwH89" target="_blank" rel="noreferrer">Discord<span> (opens in a new tab)</span></a>.</p>
+<p><em><a href="https://cloud.onhatchet.run" target="_blank" rel="noreferrer">Hatchet Cloud<span> (opens in a new tab)</span></a> is our managed Hatchet offering. Give it a spin and let us know what you think!</em></p></main></article></div>
+  </body>
+</html>
