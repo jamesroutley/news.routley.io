@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://simonsafar.com/2020/sbcl/">Original</a>
+    <h1>An Exploration of SBCL Internals (2020)</h1>
+    
+    <div id="readability-page-1" class="page"><article>
+      
+      <p> 2020/07/10 </p>
+      <p>
+        <a href="http://www.sbcl.org">SBCL</a> is a Common Lisp implementation, with a performant compiler and support for a wide range of platforms. It has excellent <a href="http://www.sbcl.org/manual/">documentation</a>, and even a
+        <a href="http://sbcl.org/sbcl-internals/">guide to internals</a> (... this is written towards people who already know a lot about how it works though). <a href="https://research.gold.ac.uk/2336/1/sbcl.pdf">This paper</a> about SBCL&#39;s fairly unique build process is also worth reading.
+      </p>
+
+      <p>
+        The main goal of this article (... it might even turn into a series of articles) is to give a tour of the internals of SBCL (... as an example of how a Lisp system looks like from the inside) while not assuming a lot of implementation-specific knowledge on the reader&#39;s part. It&#39;s also an experiment in &#34;learning in the public&#34;; at the point of starting to write this, I don&#39;t actually know a lot about how SBCL works either. We&#39;re going to figure this out together.
+      </p>
+
+      <p>
+        We&#39;re going to try answering the following questions:
+        </p><ul>
+          <li> How are Lisp objects represented in memory, at runtime? Where we do we store a string&#39;s length? What&#39;s a function object like? How about just a number? Or a Lisp symbol?</li>
+          <li> Where is actual compiled Lisp code? What kind of machine code do we generate? If a function calls another function, how do we resolve what we&#39;re calling into? </li>
+          <li> Where in memory are bindings for special variables? Or thread-locals? </li>
+          <li> Where is the REPL (... the actual loop) implemented? </li>
+          <li> When we evaluate a <b>defun</b>, how do we call the compiler? Can we call into the compiler directly, to turn a Lisp form into machine code? Can we take a machine code blob, turn it into a proper Lisp function by manually creating objects, and then call it?</li>
+          <li> Where is the memory allocator? How do ordinary functions call into it? Where does it call down into the OS? </li>
+          <li> What&#39;s the rough theory behind the GC? How does it track pointers? Does it relocate memory? </li>
+          <li> Lisp systems generally start up by loading entire Lisp &#34;cores&#34;. How do these files look like? Do we map them 1:1 to memory? Can we enumerate all the objects in them?</li>
+          <li> What&#39;s &#34;Genesis&#34; or cold start, often encountered in SBCL source code?</li>
+        </ul>
+      
+
+      <p>
+        To follow along, we&#39;re assuming that you&#39;re reasonably familiar with Lisp, you&#39;re optimally not overly new to x86 assembly, and have SBCL installed (... my setup also includes Emacs and SLIME, but feel free to use whatever fits you best).
+      </p>
+
+      
+      <p>
+        Let&#39;s start with a fairly basic tool: the disassembler. Let&#39;s write a really basic function:
+
+        </p><pre><code>
+(defun testfunc (a b)
+  (+ a b 33))
+        </code></pre>
+
+        <!-- As a reminder, the "#x..." reader syntax lets you use hex numbers, which is really convenient, given how we'll be manipulating hex anyway -->
+
+        Then, we can invoke the disassembler by
+
+        <pre><code>(disassemble &#39;testfunc)</code></pre>
+      
+
+      <p>
+        What we get is along the lines of
+        </p><pre><code>
+; disassembly for TESTFUNC
+; Size: 43 bytes. Origin: #x1002440235
+; 35:       498B4D60         MOV RCX, [R13+96]                ; no-arg-parsing entry point
+                                                              ; thread.binding-stack-pointer
+; 39:       48894DF8         MOV [RBP-8], RCX
+; 3D:       488B55F0         MOV RDX, [RBP-16]
+; 41:       488B7DE8         MOV RDI, [RBP-24]
+; 45:       FF1425A800B021   CALL QWORD PTR [#x21B000A8]      ; GENERIC-+
+; 4C:       BF42000000       MOV EDI, 66
+; 51:       FF1425A800B021   CALL QWORD PTR [#x21B000A8]      ; GENERIC-+
+; 58:       488BE5           MOV RSP, RBP
+; 5B:       F8               CLC
+; 5C:       5D               POP RBP
+; 5D:       C3               RET
+; 5E:       CC0F             BREAK 15                         ; Invalid argument count trap
+NIL
+        </code></pre>
+
+        The interesting part to look for is &#34;MOV EDI, 66&#34;. Apparently, RDX and RDI are the two parameters to &#34;GENERIC-+&#34;, so what is happening is we take the two parameters, add them, we then fill EDI with a third parameter, and add that one, too. For reasons yet unknown to us, we shift that integer to the left by one bit, thus we have 66 instead of 33... but the value is clearly related to the constant we entered.
+      
+
+      <p>
+        So... let&#39;s try hacking this a little bit, to check this assumption. If you look at the actual machine code on the left: &#34;BF420000...&#34;... you might notice that 0x42 is 66 in decimal. (Well, the value has to come from <i>somewhere</i>?) How about adjusting the actual value in the code so that it reads, for example, 0x50? (... which is 80 as a decimal number... so if we call <i>(testfunc 0 0)</i>, we&#39;d expect it to return 40, instead of the current 33.
+      </p>
+
+      <p>
+        So... we need a way of actually writing to memory locations. We even know <i>where</i> we&#39;d want to write: at the top of the code listing, we can see
+        </p><pre><code>; Size: 43 bytes. Origin: #x1002440235</code></pre>
+
+        indicating the origin, with helpful starting points for each instruction. Thus, our &#34;0x42&#34; byte is located at <b>0x100244024d</b> (... since ...4C is the first byte, ...4D is the second). SBCL provides a way for creating pointer values from integers: <a href="http://www.sbcl.org/manual/#Untyped-memory">sb-sys:int-sap</a> does exactly this, which then we can read by invoking
+
+        <pre><code>
+          CL-USER&gt; (sb-sys:sap-ref-8 (sb-sys:int-sap #x100244024d) 0)
+          66
+        </code></pre>
+
+        (the zero value being the offset compared to the memory address). It is exactly what we expected. Then, we can <i>setf</i> the same byte to something we want:
+
+        <pre><code>
+CL-USER&gt; (setf (sb-sys:sap-ref-8 (sb-sys:int-sap #x100244024d) 0) #x50)
+80
+        </code></pre>
+
+        If we disassemble our function now, we can see that the modification was indeed done:
+
+        <pre><code>
+; disassembly for TESTFUNC
+; Size: 43 bytes. Origin: #x1002440235
+; 35:       498B4D60         MOV RCX, [R13+96]                ; no-arg-parsing entry point
+                                                              ; thread.binding-stack-pointer
+; 39:       48894DF8         MOV [RBP-8], RCX
+; 3D:       488B55F0         MOV RDX, [RBP-16]
+; 41:       488B7DE8         MOV RDI, [RBP-24]
+; 45:       FF1425A800B021   CALL QWORD PTR [#x21B000A8]      ; GENERIC-+
+; 4C:       BF50000000       MOV EDI, 80
+; 51:       FF1425A800B021   CALL QWORD PTR [#x21B000A8]      ; GENERIC-+
+; 58:       488BE5           MOV RSP, RBP
+; 5B:       F8               CLC
+; 5C:       5D               POP RBP
+; 5D:       C3               RET
+; 5E:       CC0F             BREAK 15                         ; Invalid argument count trap
+NIL
+        </code></pre>
+
+        ... and indeed, trying out our function again:
+
+        <pre><code>
+CL-USER&gt; (testfunc 0 0)
+40
+        </code></pre>
+
+        Well, Lisp is not magic after all!
+      
+
+      
+
+      <p>
+        Let&#39;s now look at how Lisp objects are laid out in memory! How does, for example, a cons cell look like? How about a symbol? Or a string?
+      </p>
+
+      <p>
+        We can use our trusty tool the disassembler to obtain addresses of things:
+
+        </p><pre><code>
+(defun testfunc2 ()
+  (format t &#34;hello world&#34;))
+        </code></pre>
+
+        ... it can&#39;t get much simpler than this. What we get is...
+
+        <pre><code>
+; disassembly for TESTFUNC2
+; Size: 70 bytes. Origin: #x10060509AC
+; AC:       498B4D60         MOV RCX, [R13+96]                ; no-arg-parsing entry point
+                                                              ; thread.binding-stack-pointer
+; B0:       48894DF8         MOV [RBP-8], RCX
+; B4:       498BBD28020000   MOV RDI, [R13+552]               ; tls: *STANDARD-OUTPUT*
+; BB:       83FF61           CMP EDI, 97
+; BE:       480F443C25D8B54A20 CMOVEQ RDI, [#x204AB5D8]       ; *STANDARD-OUTPUT*
+; C7:       4883EC10         SUB RSP, 16
+; CB:       488B1586FFFFFF   MOV RDX, [RIP-122]               ; &#34;hello world&#34;
+; D2:       B904000000       MOV ECX, 4
+; D7:       48892C24         MOV [RSP], RBP
+; DB:       488BEC           MOV RBP, RSP
+; DE:       B8F8943120       MOV EAX, #x203194F8              ; #<fdefn write-string="">
+; E3:       FFD0             CALL RAX
+; E5:       BA17001020       MOV EDX, #x20100017              ; NIL
+; EA:       488BE5           MOV RSP, RBP
+; ED:       F8               CLC
+; EE:       5D               POP RBP
+; EF:       C3               RET
+; F0:       CC0F             BREAK 15                         ; Invalid argument count trap
+        </fdefn></code></pre>
+
+        So... um... that string &#34;hello world&#34; is supposed to be associated with... [RIP-122]? OK this is confusing. Let&#39;s try something else; we&#39;ll return here again towards the end of this article.
+      
+
+      
+
+      <p>
+        At this point we can also introduce yet another really useful SBCL tool: <b>sb-kernel:get-lisp-obj-address</b>. I have not yet found actual documentation for this (... so I guess it&#39;s subject to change any time); I actually learned about it from <a href="https://stackoverflow.com/a/50613440/391376">a Stack Overflow answer by <i>sds</i></a>, warning <i>against</i> it. I do agree: don&#39;t do this in production. It&#39;s perfectly okay to use it for playing around with things though.
+      </p>
+
+      <p>
+        Yet another tool is to actually dump out memory contents. There <i>might</i> be such a thing around, but it also doesn&#39;t take a lot of time to just write something that can dump out memory contents at a specified address.
+
+        </p><pre><code>
+(defun hexdump-address (address)
+  (let ((ptr (sb-sys:int-sap address)))
+    (dotimes (row 5)
+      (dotimes (col 16)
+        (format t &#34;~2,&#39;0X &#34; (sb-sys:sap-ref-8 ptr (+ (* row 16) col))))
+      (format t &#34;~%&#34;))))
+        </code></pre>
+
+        We just turn the (numeric) address into a System Area Pointer, then iterate over offsets while printing hex numbers, inserting newlines at every 16th one. I&#39;m sure you can come up with more elegant / featureful versions; this was very quick to write though.
+      
+
+      <p>
+        So: let&#39;s construct a string:
+
+        </p><pre><code>
+(defparameter *simple-test-string* &#34;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&#34;)
+        </code></pre>
+
+        and try finding its address:
+
+        <pre><code>
+CL-USER&gt; (sb-kernel:get-lisp-obj-address *simple-test-string*)
+68821502975
+CL-USER&gt; (hexdump-address 68821502975)
+00 61 00 00 00 61 00 00 00 61 00 00 00 61 00 00
+00 61 00 00 00 61 00 00 00 61 00 00 00 61 00 00
+00 61 00 00 00 61 00 00 00 61 00 00 00 61 00 00
+00 61 00 00 00 61 00 00 00 61 00 00 00 61 00 00
+00 61 00 00 00 61 00 00 00 61 00 00 00 61 00 00
+NIL
+CL-USER&gt;
+        </code></pre>
+
+        Well, we&#39;re clearly onto something: 0x61 is the ASCII code for the letter &#34;a&#34;, and this is clearly something repeating, just like the many identical letters in our test string. Also, we seem to be using 4 bytes for each character (... <a href="https://en.wikipedia.org/wiki/UTF-32">UTF-32</a> I guess?) However... just looking at this pointer in hex...
+
+        <pre><code>
+CL-USER&gt; (format t &#34;~X&#34; 68821502975)
+100614CBFF
+        </code></pre>
+
+        ... who in their right mind would allocate a string starting at such a weird address? Sure, x86 (unlike e.g. ARM) is more tolerant to unaligned access, but... it&#39;s just plain ugly! And then what&#39;s up with the nonzero bytes occurring at offsets 1, 5, 9 etc? This is definitely not how 4-byte integers should look like.
+      
+
+      <p>
+        The answer to all of this is that 0x100614CBFF is not really a pointer. It&#39;s not <i>just</i> a pointer. It&#39;s a <i>tagged</i> pointer.
+      </p>
+
+      <p>
+        In C, the compiler knows the type of arguments to functions ahead of time. If parameter 1, coming in a register as per the relevant calling convention, is a 64-bit integer, we can treat it as such; if it&#39;s a pointer to a struct, different code gets generated. However, you could pass in <i>any type of object</i> to a Lisp function; how do we generate code that can decide which one is which and can handle both?
+      </p>
+
+      <p>
+        If speed is not a concern, we can just take the &#34;everything is an object&#34; approach. That is, all our parameters arriving in registers are assumed to be pointers to the Generic Object Type, which has a well-defined layout, stating somewhere what <i>actual</i> type the object has. The code we generate reads this value, and depending on the actual type, can perform different operations on different object types.
+      </p>
+
+      <p>
+        But then... how about <i>numbers</i>? This is where <i>boxing</i> comes in: in order to treat the number 42 as an object, we need to put it into an object that says &#34;this is an object of type &#39;number&#39;, whose value is 42&#34;. This is then stored somewhere on the heap.
+      </p>
+
+      <p>
+        Of course, this is not overly quick: instead of passing around numbers by value, we need a pointer dereference to just figure out what the actual value is... and then pack the return value into a similar box (if it&#39;s a number), allocating memory if needed, and return a pointer to it. Even if we have actual compiled code, this is still a lot slower than Just Returning a Number, the way C does.
+      </p>
+
+      <p>
+        Tagged pointers to the rescue. Instead of using an entire 64-bit register to store a pointer (... which will usually point to a well-aligned memory area, so it&#39;ll end with zero bits anyway), we can use the last few bits to specify what type this <i>value</i> is. For my SBCL here, the tag is 4 bits long, at the end of the value: it&#39;s just a single hex digit. The rest of the pointer is, well, an actual pointer.
+      </p>
+
+      <p>
+        So, if we just zero out that last hex digit on our pointer:
+        </p><pre><code>
+CL-USER&gt; (hexdump-address #x100614CBF0)
+E5 00 00 00 00 00 00 00 46 00 00 00 00 00 00 00
+61 00 00 00 61 00 00 00 61 00 00 00 61 00 00 00
+61 00 00 00 61 00 00 00 61 00 00 00 61 00 00 00
+61 00 00 00 61 00 00 00 61 00 00 00 61 00 00 00
+61 00 00 00 61 00 00 00 61 00 00 00 61 00 00 00
+        </code></pre>
+
+        ... the result now looks a lot more reasonable. This looks like a bunch of well-aligned, smallish integers (remember that we&#39;re on x86 here, which is a big-endian architecture: lower bits at the beginning, <b>bigger</b> bits on the <b>end</b>, so numbers come out backwards if we list memory addresses in increasing order, the way basically every hex dump does). The first byte is... um... something, then yet another thing that is suspiciously like double the length (remember the one-bit shift for numbers from part 1? They&#39;ll be explained soon!)...
+        <pre><code>
+CL-USER&gt; (format t &#34;0x~X&#34; (length *simple-test-string*))
+0x23
+        </code></pre>
+
+        ... and then just a bunch of 0x61s for the &#34;a&#34;-s.
+      
+
+      <p>
+        We can even poke around in the memory area, replacing the first &#34;a&#34; at offset 16 with a &#34;c&#34;:
+        </p><pre><code>
+CL-USER&gt; (setf (sb-sys:sap-ref-8 (sb-sys:int-sap #x100614CBF0) 16) #x63)
+99
+CL-USER&gt; *simple-test-string*
+&#34;caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&#34;
+CL-USER&gt;
+        </code></pre>
+
+        ... or making it shorter by editing the length at offset 8:
+        <pre><code>
+CL-USER&gt; (setf (sb-sys:sap-ref-8 (sb-sys:int-sap #x100614CBF0) 8) #x5)
+5
+CL-USER&gt; *simple-test-string*
+&#34;caa&#34;
+        </code></pre>
+
+        (... with which we might or might have broken the memory allocator if it ever tries to free this, but we do not particularly care at this point.)
+      
+
+      <p>
+        This is the point where having compiled SBCL for yourself becomes fairly useful. (It&#39;s really just a git clone followed by running make.sh, if you already have SBCL installed; it took me 4 minutes to run on a decidedly-not-recent laptop.) Namely, after compilation, let&#39;s look at <b>src/runtime/genesis/constants.h</b> in the SBCL source code. This is a generated piece of code, basically explaining the SBCL runtime (written in C) just about to be built how Lisp objects look like. In case you don&#39;t have it around, here is some of the relevant parts:
+
+        </p><pre><code>
+#define SBCL_GENESIS_CONSTANTS
+#define FIXNUM_TAG_MASK 1 /* 0x1 */
+#define N_FIXNUM_TAG_BITS 1 /* 0x1 */
+#define N_LOWTAG_BITS 4 /* 0x4 */
+#define N_WIDETAG_BITS 8 /* 0x8 */
+#define N_WORD_BYTES 8 /* 0x8 */
+#define LOWTAG_MASK 15 /* 0xF */
+#define N_WORD_BITS 64 /* 0x40 */
+#define WIDETAG_MASK 255 /* 0xFF */
+#define SHORT_HEADER_MAX_WORDS 32767 /* 0x7FFF */
+
+#define EVEN_FIXNUM_LOWTAG 0 /* 0x0 */
+#define OTHER_IMMEDIATE_0_LOWTAG 1 /* 0x1 */
+#define PAD0_LOWTAG 2 /* 0x2 */
+#define INSTANCE_POINTER_LOWTAG 3 /* 0x3 */
+#define PAD1_LOWTAG 4 /* 0x4 */
+#define OTHER_IMMEDIATE_1_LOWTAG 5 /* 0x5 */
+#define PAD2_LOWTAG 6 /* 0x6 */
+#define LIST_POINTER_LOWTAG 7 /* 0x7 */
+#define ODD_FIXNUM_LOWTAG 8 /* 0x8 */
+#define OTHER_IMMEDIATE_2_LOWTAG 9 /* 0x9 */
+#define PAD3_LOWTAG 10 /* 0xA */
+#define FUN_POINTER_LOWTAG 11 /* 0xB */
+#define PAD4_LOWTAG 12 /* 0xC */
+#define OTHER_IMMEDIATE_3_LOWTAG 13 /* 0xD */
+#define PAD5_LOWTAG 14 /* 0xE */
+#define OTHER_POINTER_LOWTAG 15 /* 0xF */
+        </code></pre>
+
+        This describes fairly well what we&#39;ve seen so far. The &#34;lowtag&#34; is those 4 bytes at the end of Lisp objects; also, we&#39;re clearly on a 64-bit architecture here, with N_WORD_BITS being 64, 8 of them reserved for the lowtag. It also details various values for the lowtag, the important one being...
+
+        <pre><code>
+#define OTHER_POINTER_LOWTAG 15 /* 0xF */
+        </code></pre>
+
+        ... which is exactly that 0xF we&#39;ve been seeing at the end of our string pointers. Apparently, a lot of things are &#34;other pointer&#34;-s.
+      
+
+      <p>
+        One exception is function pointers (0xB):
+        </p><pre><code>
+CL-USER&gt; (format t &#34;0x~X&#34; (sb-kernel:get-lisp-obj-address #&#39;testfunc3))
+0x10060508AB
+        </code></pre>
+
+        which, again, matches well with the values in the header. Same for lists (0x7):
+        <pre><code>
+CL-USER&gt; (format t &#34;0x~X&#34; (sb-kernel:get-lisp-obj-address (list &#39;a &#39;b)))
+0x10043CB067
+        </code></pre>
+      
+
+      <p>
+        Also, here comes the explanation for numbers. SBCL stores fixnums in the exact same registers as pointers; to keep the most precision possible, we just interpret anything ending with a 0 bit as a number (... shifting the actual number bits to the left once). Meanwhile, if the last bit is 1, we can look at the rest of the final 4 bits to figure out what kind of pointer we&#39;re dealing with.
+      </p>
+
+      
+
+    </article></div>
+  </body>
+</html>
