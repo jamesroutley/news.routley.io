@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.browserless.io/blog/managing-concurrencies-with-nginx-and-lua">Original</a>
+    <h1>How we manage individual user concurrencies with Nginx and Lua</h1>
+    
+    <div id="readability-page-1" class="page"><div><p><strong>In this article we’ll look at the challenges of managing individual concurrency limits, hosting thousands of browsers for our users.</strong></p><p>‍</p><p>There’s countless articles about straightforward load balancing. Even we have one about using <a href="https://www.browserless.io/blog/horizontally-scaling-chrome">NGINX for scaling Puppeteer</a>.</p><blockquote><em>“It’s the same way you scale anything, containerize it and put a load balancer in front. Boring.”</em> - u/express-set, reddit</blockquote><p>So, I wanted to share details about our complex custom load balancers. This is a behind the scenes info about how we dynamically limit concurrent connections per user. It’s particularly important for us since browsers are notoriously <a href="https://www.browserless.io/blog/advanced-issues-when-managing-chrome-on-aws">messy to host</a>, and our thousands of users can change to plans with different concurrency limits at any time.</p><p>To address this challenge effectively, we must be able to adjust and update connection limits on-the-fly to accommodate different customer plans and usage patterns.</p><h2>First, some context about what we’re load balancing</h2><p>This article is about my work managing concurrencies for Browserless.</p><p>Our service provides a pool of hosted Chrome, Firefox and WebKit browsers. We have thousands of users, each with limits of at least 25 browsers depending on their plan. These are primarily spread between our two main server locations of London and San Francisco.</p><p>These browsers are for using with Puppeteer, Playwright or via one of our APIs. That means they start up, running a script for some amount of seconds or minutes, then close. </p><p>At the extreme end, some of our users will open up a hundred browsers, do a large batch of web scraping, then do nothing for a week. Meanwhile, we have users fairly regularly starting browsers 24/7 for tasks such as generating PDF exports of dashboards.</p><p> So, it’s a rapidly fluctuating environment with a range of usage requirements.</p><h2><strong>Plan of Attack</strong></h2><p>Breaking down the challenge into a few steps went as follows:</p><ol role="list"><li><strong>Identifying the Optimal Location - </strong>Recognizing that all traffic passes through the load balancer, I determined it to be the ideal point for implementing connection limits.</li><li><strong>Limitation of Embedded Nginx Module - </strong>Initial exploration revealed that the embedded <a href="https://nginx.org/en/docs/http/ngx_http_limit_conn_module.html">Nginx module for limiting connections</a> lacked the capability to adjust limits dynamically, prompting us to explore alternative solutions.</li><li><strong>Leveraging OpenResty and Lua Scripting - </strong>I opted to leverage the versatility of OpenResty and Lua scripting to overcome the limitations of the embedded Nginx module. This decision was driven by the flexibility and extensibility offered by Lua scripting.</li><li><strong>Utilizing <code>lua-resty-limit-trafic</code> Library - </strong> I discovered the <a href="https://github.com/openresty/lua-resty-limit-traffic">lua-resty-limit-trafic</a> library during my research, an official solution for limiting traffic. This library offers dedicated modules for controlling both request frequency and concurrent connections, aligning perfectly with our requirements.</li></ol><h2>Implementation</h2><p>I developed a custom limiter module based on the <code>lua-resty-limit-trafic</code> library, comprising three main functions:</p><ol role="list"><li><strong>GetAllowedConcurrency -</strong> This function retrieves the concurrency limit for a given customer token. It fetches the limit either from a database or a local cache. In cases where the limit cannot be retrieved, a default limit is applied.</li><li><strong>LimitRequestsByToken - </strong>Utilizing the lua-resty-limit-trafic library, this function increments the number of connections associated with a specific token. It checks if the limit is exceeded and throws an error accordingly. The limit is dynamically set based on the customer&#39;s concurrency limit.</li><li>‍<strong>LeavingConnection - </strong>Upon the closure of a connection, this function decreases the number of active connections associated with the token.</li></ol><p>The following code snippet showcases the implementation of these functions, demonstrating how the lua-resty-limit-trafic library is utilized to manage connection limits dynamically.</p><div><pre><code>
+local limit_conn = require &#39;resty.limit.conn&#39;
+local limits = {}
+
+local default_limit = 5;
+
+function limits.GetAllowedConcurrency(token)
+    -- Here you can connect your database or a local cache to get limits, 
+    -- in case you can not get limits could be usefull defining a default
+    return default_limit;
+end
+
+function limits.LimitRequestsByToken(token, limitsDictionary)
+    local limit = limits.GetAllowedConcurrency(token)
+    local limitManager, err = limit_conn.new(limitsDictionary, limit, 0, 0.5)
+    if not limitManager then
+        ngx.log(ngx.ERR, &#34;failed to instantiate a resty.limit.conn object: &#34;, err)
+        return ngx.exit(500)
+    end
+
+    local delay, err = limitManager:incoming(token, true)
+    if not delay then
+        if err == &#34;rejected&#34; then
+            return ngx.exit(429)
+        end
+        ngx.log(ngx.ERR, &#34;failed to limit req: &#34;, err)
+        return ngx.exit(500)
+    end
+
+    if limitManager:is_committed() then
+        local ctx = ngx.ctx
+        ctx.limit_conn = limitManager
+        ctx.limit_conn_key = token
+        ctx.limit_conn_delay = delay
+    end
+end
+
+function limits.LeavingConnection()
+    local ctx = ngx.ctx
+    local limitManager = ctx.limit_conn
+    if limitManager then
+        local key = ctx.limit_conn_key
+        assert(key)
+        local conn, err = limitManager:leaving(key)
+        if not conn then
+            ngx.log(ngx.ERR, &#34;failed to record the connection leaving &#34;, &#34;request: &#34;, err)
+            return
+        end
+    end
+end
+
+return limits
+</code>
+</pre></div><p>To integrate the limiter module into the Nginx configuration, we import it into the default.conf file. The module is invoked within the <code>access_by_lua_block</code> and <code>log_by_lua_block</code> directives, leveraging the Authorization header as the identifier for each customer token.</p><p>It&#39;s imperative to create a <code>lua_shared_dict</code> to store the number of existing connections per token.</p><div><pre><code>
+
+lua_shared_dict limit_conn_store 100m;
+server {
+    listen       80;
+    server_name  localhost;
+
+    location / {
+        access_by_lua_block {
+          local limits = require &#34;limiter&#34;
+          local token = ngx.var.http_authorization
+          limits.LimitRequestsByToken(token, &#39;limit_conn_store&#39;)
+        }
+
+        log_by_lua_block {
+          local limits = require &#34;limiter&#34;
+          limits.LeavingConnection()
+        }
+        echo_sleep 5.0;
+        echo &#39;request completed&#39;;
+    }
+
+    error_page   500 502 503 504  /50x.html;
+    location = /50x.html {
+        root   /usr/local/openresty/nginx/html;
+    }
+}
+
+</code>
+</pre></div><p>Additionally, to avoid <code>module not found</code> errors, the <code>lua_package_path</code> directive must be configured in the nginx.conf file to specify the location of the limiter module.</p><div><pre><code>
+
+worker_processes  1;
+events {
+    worker_connections  1024;
+}
+http {
+    lua_package_path &#39;/YOUR_LUA_SCRIPTS_FOLDER/?.lua;;&#39;;
+    include       mime.types;
+    default_type  application/octet-stream;
+    sendfile        on;
+    keepalive_timeout  65;
+    include /etc/nginx/conf.d/*.conf;
+}
+</code>
+</pre></div><p>At this point we are limiting connections as planned. However, prior to implementing this solution, we encountered some challenges that needed to be addressed.</p><h2>Issues Faced</h2><p>When using the limiter, we encountered escalating CPU and memory consumption over time, indicating the presence of a memory leak. This posed a significant challenge as it necessitated periodic service restarts to prevent crashes, prompting an exhaustive investigation to identify and resolve the underlying issue.</p><p>I began troubleshooting by disconnecting non-essential components. First, I removed the database connection, but unfortunately, it didn&#39;t resolve the issue. Next, I removed the local cache, yet the problem persisted.</p><p>As a last resort, I decided to test removing the import <code>local limits = require &#34;limiter&#34;</code> and consolidating all code into a single file. Surprisingly, this resolved the issue.</p><p>I finally identified the problem. Prior to editing the nginx.conf file, I was using the <a href="https://www.lua.org/manual/5.1/manual.html#pdf-package.path">package.path</a> within the Lua script to import my custom Lua folder.</p><div><pre><code>
+package.path = &#34;/usr/local/balancer/lua/?.lua;&#34; .. package.path
+</code>
+</pre></div><p>An important oversight occurred: each time the script ran, the package.path increased because I was concatenating my folder name to the same value in every request. Consequently, after a few requests, inspecting the value of package.path revealed an accumulation of folder names.</p><div><pre><code>
+package.path = &#34;/usr/local/balancer/lua/?.lua;/usr/local/balancer/lua/?.lua;/usr/local/balancer/lua/?.lua;...&#34;
+</code>
+</pre></div><p>Initially, it seemed that concatenating folder names to package.path was the correct approach, as suggested by the Lua official documentation. However, this method caused the mentioned problems in our specific use case. Eventually, I referred to the <a href="https://github.com/openresty/lua-nginx-module#lua_package_path">lua-nginx-module</a> documentation to find the correct way to import modules, and the problem was resolved by adding the <code>lua_package_path</code> directive to the nginx.conf file.</p><p>Below is a graphical representation illustrating the consumption of resources before and after implementing the fix.</p><figure><p><img src="https://assets-global.website-files.com/65e1b80a3a25c950ece0d89d/6602ad4266e6884c792a7a71_Screenshot-2024-02-12-at-9.24.43-AM-1024x855.png" alt=""/></p></figure><p>Additionally, to enhance performance and minimize database queries, we incorporated a local cache with a Time-to-Live (TTL) mechanism to store customer limits. This optimization strategy effectively reduced latency and alleviated the strain on the database.</p><h2><strong>How It Turned Out</strong></h2><p>In the end, the new limiter worked great. It now effectively manages concurrent connections per customer to keep the service healthy and stable, while preventing service abuses and maintaining healthy worker processes.</p><p>If you would like to see it in action, go ahead and grab a <a href="https://www.browserless.io/pricing">Browserless trial</a> and have a play with using the concurrent browsers.</p></div></div>
+  </body>
+</html>
