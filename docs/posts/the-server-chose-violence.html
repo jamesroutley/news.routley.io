@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://cliffle.com/blog/hubris-reply-fault/">Original</a>
+    <h1>The Server Chose Violence</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+            
+<div>
+  <header>
+    
+    <p>Hubris&#39;s oddest syscall</p>
+  </header>
+  
+  <p><span>2024-04-08</span></p><ul>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#a-brief-overview-of-hubris-ipc">A brief overview of Hubris IPC</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#new-and-exciting-failure-modes">New and exciting failure modes</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#none-of-this-happens-in-normal-correct-programs">None of this happens in normal, correct programs</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#the-kernel-is-not-having-any-of-your-nonsense">The kernel is not having any of your nonsense.</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#the-server-isn-t-having-any-of-your-nonsense-either">The server isn’t having any of your nonsense, either.</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#the-joy-of-panicking-other-programs">The joy of panicking other programs</a>
+        
+        </li>
+    
+  </ul>
+  
+  <p>I’m continuing to reflect on the past four years with <a href="https://hubris.oxide.computer/">Hubris</a> — April Fool’s
+Day was, appropriately enough, the fourth anniversary of the first Hubris user
+program, and today is the fourth anniversary of the first kernel code. (I wrote
+the user program first to help me understand what the kernel’s API wanted to
+look like.)</p>
+<p>Of all of Hubris’s design decisions, there’s one that gets a “wait what”
+response more often than any other. It’s also proving to be a critical part of
+the system’s overall robustness. In this post, I’ll take a look at our 13th and
+oddest syscall, <code>REPLY_FAULT</code>.</p>
+<h2 id="a-brief-overview-of-hubris-ipc">A brief overview of Hubris IPC</h2>
+<p>Hubris uses a small, application-independent kernel, and puts most of the code
+— drivers, application logic, network stack, etc. — in separately compiled
+isolated tasks. These tasks can communicate with each other using a cross-task
+messaging system (inter-process communication, or IPC). (This section will do a
+sort of “Hubris in a nutshell” — if you’d like to learn more I recommend the
+<a href="https://hubris.oxide.computer/reference/">Reference Manual</a>.)</p>
+<p>IPC in Hubris consists of three core operations, implemented in the kernel,
+which tasks can request using syscalls:</p>
+<ul>
+<li><code>RECV</code> collects the highest priority incoming message, or blocks until one
+arrives.</li>
+<li><code>SEND</code> stops the caller and transfers a message — and control! — to the
+receiving task. The caller is parked until it gets a response.</li>
+<li><code>REPLY</code> delivers a response to a task that had previously used <code>SEND</code>,
+allowing it to continue.</li>
+</ul>
+<p>The Hubris IPC scheme is deliberately designed to work a lot like a function
+call, at least from the perspective of the client.</p>
+<p>We often talk about “clients” and “servers” in Hubris, and it’s worth noting
+that these are <em>roles tasks play.</em> A client is just a task using <code>SEND</code>, and a
+server is a task using <code>RECV</code> and <code>REPLY</code> – but they’re not mutually exclusive.
+A task may be a server to some other tasks, and simultaneously a client to
+different tasks. For instance, an “LED Blinker” task may call (client) into a
+“GPIO driver” task (server), which itself may call (client) into a supervisory
+task (server).</p>
+<p>To underscore this point, here’s a graph of the IPC flow (green arrows) between
+tasks (rectangles) in Oxide’s production server firmware. Notice that almost all
+tasks have arrows both coming out (client) and coming in (server).</p>
+<p><img src="https://cliffle.com/blog/hubris-reply-fault/gimlet-graph.svg" alt="A directed graph showing layers of tasks in our firmware with edges drawn between them, which is unfortunately difficult to explain entirely in text."/></p>
+<h2 id="new-and-exciting-failure-modes">New and exciting failure modes</h2>
+<p>When writing a function or procedure in almost any programming language, you
+make some assumptions about your callers’ behavior. This creates <em>preconditions</em>
+for calling the function. Depending on the language, some are explicit, and some
+are implicit. In Rust, for instance, if your function takes an argument of
+type <code>String</code>, it’s reasonable to assume your caller passes in a <code>String</code> and
+not a <code>bool</code>.</p>
+<p>Your function has the backing of the compiler here: the caller has to pass a
+compatible type for all arguments, or the compiler won’t let them attempt to
+call the function. It’s possible to subvert this if you work at it, of course,
+but it’s hard to subvert it by accident.</p>
+<p>The compiler and linker conspire behind the scenes to make sure that your
+program calls the function you intended. This ensures that you won’t be
+surprised by code that attempts to call <code>pet_cat</code> and winds up calling
+<code>fire_missiles</code> instead, except in very rare circumstances.</p>
+<p>Because IPC crosses task boundaries, and tasks in Hubris are separately compiled
+programs, you have to be careful making these same assumptions with IPC. If a
+client is compiled against the wrong interface, or confuses one task for
+another, the compiler won’t have any idea, since it sees only a single program
+at a time. In this respect, IPC acts more like communication over a network.</p>
+<p>Every task on Hubris that acts as an IPC server has to deal with the following
+<em>potential</em> errors:</p>
+<ul>
+<li>Getting a message with an operation code that isn’t even appropriate for your
+interface, like “operation number 48” in a two-operation interface.</li>
+<li>Receiving an uninterpretable bag of bytes instead of the message type you were
+expecting — or a message that is much too short or long.</li>
+<li>Not getting the sort of loaned memory you require (e.g. you need it writable
+but you receive it read-only, or don’t receive it at all).</li>
+</ul>
+<p>But I describe those as <em>potential</em> errors because, in practice…</p>
+<h2 id="none-of-this-happens-in-normal-correct-programs">None of this happens in normal, correct programs</h2>
+<p>In a normal Hubris program, none of these things happen.</p>
+<p>Tasks are connected to each other by configuration in the build system, so it’s
+hard to confuse one for the other. Clients use generated Rust code to construct
+and send IPCs to servers, which use different generated Rust code to handle the
+result. This lets us squint and pretend that the type system works across task
+boundaries — it doesn’t, really, but our tools produce a pretty good illusion.</p>
+<p>I always hate to penalize the “good” programs for error cases that they can’t
+actually hit. All of the obvious ways of handling the <em>potential but unlikely</em>
+errors (described above) hurt good programs.</p>
+<p>For example: making all IPC operations return a <code>Result&lt;T, IpcError&gt;</code> where the
+good programs can’t actually hit any case in <code>IpcError</code> means that, in practice,
+they’ll just <code>unwrap()</code> it. That’s a fairly large operation in terms of code
+size — especially when we know the code will never be used! — and costs time
+at runtime to check for errors that won’t happen.</p>
+<p>To keep every client from needing to <code>unwrap()</code> a bazillion errors, we could put
+the <code>unwrap()</code> (or more generally a <code>panic!</code>) into the generated code. This
+might reduce the code size impact (by centralizing the <code>panic!</code> in one location)
+but won’t reduce the cost at runtime.</p>
+<p>There’s also a different kind of cost: a <em>design cost.</em> To be able to return a
+universal error from any operation, and have it be understood by a caller
+attempting any <em>other</em> operation, we have to make rules about the message
+encoding. Every operation must be capable of returning an error, every operation
+must have a way of encoding <em>this particular</em> error, and the encoding of this
+error by all operations must be <em>identical.</em> </p>
+<p>This means you can’t express an operation that <em>can’t</em> fail, which is
+particularly annoying: as we’ve built our firmware infrastructure on Hubris, we
+keep finding operations that really can’t fail. Setting a GPIO pin, for example.</p>
+<p>So we dearly needed an alternative to this “universal error code” approach. I
+drew inspiration from a weird design decision I made in the Hubris kernel API:
+the Hubris kernel is <em>unusually aggressive.</em></p>
+<h2 id="the-kernel-is-not-having-any-of-your-nonsense">The kernel is not having any of your nonsense.</h2>
+<p>In most operating systems, if you violate the preconditions for a system call,
+you get a polite error code back from the kernel — or, at worst, an exception
+handler or signal handler gets triggered. You have an opportunity to recover.</p>
+<p>Take Unix for example. If you call <code>close</code> on a file descriptor you never
+opened, you get an error code back. If you call <code>open</code> and hand it a null
+pointer instead of a pathname? You get an error code back. Both of these are
+violations of a system call’s preconditions, and both are handled through the
+same error mechanism that handles “file not found” and other cases that <em>can</em>
+happen in a correct program.</p>
+<p>On Hubris, if you break a system call’s preconditions, your task is immediately
+destroyed with no opportunity to do anything else.</p>
+
+<p>More specifically, the kernel delivers a <em>synthetic fault.</em> This is very similar
+to the hardware faults that a task receives if it, say, dereferences a null
+pointer, or divides by zero. Those are produced by the CPU for breaking the
+processor architecture’s rules. Synthetic faults, on the other hand, are
+produced by the kernel for breaking the kernel’s rules.</p>
+<p>For example, when a task calls <code>SEND</code>, it passes the kernel the index of the
+intended recipient task, and a pointer to some memory containing the message. If
+the recipient task index is out of range for the application? Synthetic fault.
+If the message pointer points to memory the task doesn’t actually have access
+to? Synthetic fault.</p>
+<p>Early in the system’s design, I decided not to permit recoverable/resumable
+faults. That is, when a program takes a fault — whether it’s hardware or
+synthetic — the task is dead. It can run no further instructions. There is no
+way to “fix” the problem and resume the task. This was a conscious choice to
+avoid some subtle failure modes and simplify reasoning about the system.</p>
+
+<p>But combined with the kernel’s habit of faulting any task that looks at it
+funny, this makes the system’s behavior very unusual compared to most operating
+systems.</p>
+<p>And it’s been <em>great.</em></p>
+<p>Initially I was concerned that I’d made the kernel <em>too</em> aggressive, but in
+practice, this has meant that errors are caught very early in development. A
+fault is hard to miss, and literally cannot be ignored the way an error code
+might be. Humility (our debugger) happily prints a detailed description of any
+fault it finds; in fact, one made an appearance in my <a href="https://cliffle.com/blog/who-killed-the-network-switch/">last Hubris-related
+post</a>, although in that case it was being reported in error:</p>
+<pre><code><span>mem fault (precise: 0x801bffd) in syscall (was: wait: reply from i2c_driver/gen0)
+</span></code></pre>
+<p>This is a synthetic fault that a task receives for handing the kernel a pointer
+to some memory (at address <code>0x801bffd</code> in this case) that the task can’t
+actually access.</p>
+<p>This behavior was <em>so</em> nice to use in practice, in fact, that it suggested a way
+to fix our IPC error reporting woes: generalize the same mechanism.</p>
+<h2 id="the-server-isn-t-having-any-of-your-nonsense-either">The server isn’t having any of your nonsense, either.</h2>
+<p>Once I realized that our unusually strict kernel was actually <em>helping</em>
+developers instead of hindering them, I was inspired to implement Hubris’s 13th
+and oddest syscall: <code>REPLY_FAULT</code>.</p>
+<p>I mentioned <code>REPLY</code> earlier, the mechanism servers use to respond to their
+clients. More specifically,</p>
+<ul>
+<li>
+<p>When a client uses <code>SEND</code> the kernel marks the client’s task as “waiting to
+send” to the recipient task.</p>
+</li>
+<li>
+<p>When the recipient uses <code>RECV</code>, one client task “waiting to send” to it is
+updated to “waiting for reply.” The client task will remain in that state
+until something changes — usually, the server using <code>REPLY</code>.</p>
+</li>
+<li>
+<p><code>REPLY</code> only works on a task marked as “waiting for reply” from the specific
+server task that is attempting to reply. It switches the client task back into
+a “runnable” state.</p>
+</li>
+</ul>
+<p><code>REPLY_FAULT</code> is basically the same thing, except instead of delivering a
+message and making the task runnable, it delivers a fault and makes the task
+dead. With <code>REPLY_FAULT</code>, we can avoid having unnecessary error handling on IPC
+operations, because correct programs will just go on as if the problem can’t
+occur — and incorrect programs won’t get to <em>handle</em> the error at all!</p>
+<p>Like <code>REPLY</code>, a server can only <code>REPLY_FAULT</code> a task that is waiting for its
+reply. You can’t use <code>REPLY_FAULT</code> to kill random tasks, only the set of tasks
+from which you have <code>RECV</code>’d a message and not yet <code>REPLY</code>’d.</p>
+<p>Our system now uses <code>REPLY_FAULT</code> to handle the three cases I mentioned earlier:
+a bogus operation code; or a corrupt, truncated, or otherwise nonsensical
+message; or if the client doesn’t send the right kind of loaned memory.</p>
+<p>But <code>REPLY_FAULT</code> also provides a way to define and implement <em>new</em> kinds of
+errors — application-specific errors — such as access control rules. For
+instance, the Hubris IP stack assigns IP ports to tasks statically. If a task
+tries to mess with another task’s IP port, the IP stack faults them. This gets
+us the same sort of “fail fast” developer experience, with the smaller and
+simpler code that results from not handling “theoretical” errors that can’t
+occur in practice.</p>
+<p>Like the kernel’s aggressive handling of errors in system calls, I was initially
+concerned that <code>REPLY_FAULT</code> would be too extreme. After I had the idea, I
+delayed several months before starting implementation, basically trying to talk
+myself out of it.</p>
+<p>I was being too careful. <code>REPLY_FAULT</code> has been great. A new developer on the
+system recently cited it as one of the more surprising and pleasant parts of
+developing on Hubris, which is what inspired me to write this post.</p>
+<h2 id="the-joy-of-panicking-other-programs">The joy of panicking other programs</h2>
+<p>I mentioned earlier that Hubris IPC was explicitly designed to behave like a
+Rust function call from the perspective of the client.</p>
+<p>Well, if you violate the preconditions on a Rust function call, the function
+will normally respond with a <code>panic!</code>.</p>
+<p><code>REPLY_FAULT</code> essentially provides a way for servers to generate cross-process
+<code>panic!</code> in their clients, without requiring clients to contain code to do it
+— or, perhaps more importantly, without requiring clients to cooperate in the
+process at all.</p>
+<p>Overall, this combines with some other system features to make Hubris
+“aggressively hostile to malicious programs,” as <a href="https://eliza.me/">Eliza Weissman</a> recently
+described it. Since attempts at exploitation often manifest first as errors or
+misuse of APIs, a system that responds to any misbehavior by wiping the state of
+the misbehaving component ought to be harder to exploit. (This hypothesis has
+yet to be tested! Please reach out to me if you’re interested in trying to
+exploit Hubris. I will help!)</p>
+<p>In practice, the only downside I’ve observed from these decisions is that the
+system is <em>really difficult to fuzz test.</em> Because I like <a href="https://en.wikipedia.org/wiki/Chaos_engineering">chaos
+engineering</a>, I’ve implemented a small “chaos” task that generates random
+IPCs and system calls to test other components for bugs, and almost anything it
+does causes it to get immediately reset. To be useful, it has to base all of its
+decisions off the one piece of state that is observably different each time it
+starts: the system uptime counter. (However, <code>REPLY_FAULT</code> <em>does</em> provide a way
+for servers to force chaos upon their clients by randomly killing them, an
+option I haven’t fully evaluated.)</p>
+<p>But normal Hubris tasks don’t dynamically generate IPC messages, particularly
+ones that are deliberately bogus. In practice, they can carry on without
+realizing <code>REPLY_FAULT</code> even exists — because unless they do something <em>really
+unusual,</em> they will never see the business end of it anyway.</p>
+
+  
+    <p><span>
+      
+        <a href="https://cliffle.com/tags/api-design/">#api-design</a>
+      
+        <a href="https://cliffle.com/tags/dayjob/">#dayjob</a>
+      
+        <a href="https://cliffle.com/tags/embedded/">#embedded</a>
+      
+        <a href="https://cliffle.com/tags/rust/">#rust</a>
+      
+        <a href="https://cliffle.com/tags/security/">#security</a>
+      
+    </span>
+  
+</p></div>
+
+        </div></div>
+  </body>
+</html>
