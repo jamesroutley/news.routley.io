@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.highlight.io/blog/lw5-clickhouse-performance-optimization">Original</a>
+    <h1>Optimizing ClickHouse: Tactics that worked for us</h1>
+    
+    <div id="readability-page-1" class="page"><div><div><div><pre><div><div><p>Highlight.io is an <a href="https://github.com/highlight/highlight">open source</a> monitoring distribution. We’re building a suite of tools to monitor your web application, and on this blog, we write about the infra challenges we face along the way. If you’re interested in learning more, get started at <a href="https://app.highlight.io">app.highlight.io</a>.</p></div></div></pre>
+<p>At Highlight.io, we ingest nearly 100 terabytes of observability data from our customers every month. A large chunk of the volume goes to our ClickHouse cluster, handling our client’s Logs, Traces, and Session metadata. Not only do we need to gracefully handle the volume and daily spikes in the traffic patterns, but we also need to ensure that the data is ingested in an efficient format that is performant to query.</p>
+<p>About a year ago,having onboarded several larger customers, we started hitting scaling issues with our Clickhouse setup that necessitated several phases of improvements to our query and ingest systems.</p>
+<p>This post goes through the initial realization and how we tackled it; we went from a largely un-optimized, cpu-heavy clickhouse cluster to a much more efficient, affordable configuration. And more importantly, this yielded a much more “realtime” experience for our customers.</p>
+<h2>The Incident</h2>
+<p>Sometime last year, we onboarded a large customer that sent close to 1 billion spans a day, adding another terabyte to our data ingestion. Beyond the total volume, the real problem with this was in the number of small batches of rows inserted into ClickHouse. Our Kafka queue responsible for buffering data started accruing a backlog, and we quickly noticed that the rate of trace insertion into ClickHouse was significantly lower than the number of new records added to Kafka.</p>
+<p><img src="https://www.highlight.io/images/blog/launch-week/5/clickhouse-backlog.png" alt="ClickHouse Backlog"/></p>
+<p>At that time, all we could spot was that ClickHouse had a significant CPU load utilizing all of the available CPU cores of the ClickHouse Cloud Cluster. This seemed to  cause the INSERT commands to operate slower in synchronous mode as the cluster created backpressure to reduce the overall CPU load. We also observed “too many parts” errors as ClickHouse was unable to merge the data into fewer parts because of the CPU load. While the hotfix was increasing the CPU allocated the cluster, we quickly had to find a long term solution.</p>
+<p><img src="https://www.highlight.io/images/blog/launch-week/5/clickhouse-cpu-wait.png" alt="ClickHouse CPU Wait"/></p>
+<p>Unlike traditional OTLP SQL, the way that data is written to a ClickHouse table affects query performance.
+For instance, if data is written in smaller chunks, ClickHouse ends up creating more “parts” (in other words, files) to
+store it. When querying, ClickHouse has to merge and possibly reorder the results from all relevant parts. Additionally,
+ClickHouse will asynchronously merge data as it is initially ingested to get it into the right format for long term
+storage, but this process consumes CPU on background threads that ultimately may decrease performance of concurrent
+storage. Inserting data with the right configuration helps the merges that ClickHouse has to perform and can speed up
+how much each merge takes.</p>
+<p>Let’s dive into the strategies we used to optimize our ClickHouse cluster and reduce the CPU load.</p>
+<h6>Reducing Merges - Batch Inserts</h6>
+<p>The first step to reducing CPU load on ClickHouse is using larger insert batches. While ClickHouse Cloud offers async
+inserts to perform individual inserts with the cloud cluster handling batching, we chose to use batch <code>INSERT</code> commands
+as
+a way to customize the size of batches on our end. A large batch size was particularly important to our workload as the
+individual rows were on the order of 100KiB each.</p>
+<p>Our first approach used a custom Golang worker that would read messages from Kafka, batch them per our settings, and
+issue a single <code>INSERT</code> command with many values. Though this worked to ensure inserts were large, inserts were not
+atomic
+resulting in duplicate data being inserted during worker reboots.</p>
+<p>We opted to use the ClickHouse Kafka Connect Sink that implements batched writes and exactly-once semantics achieved through ClickHouse Keeper.</p>
+<p>We opted to use the <a href="https://clickhouse.com/docs/en/integrations/kafka/clickhouse-kafka-connect-sink">ClickHouse Kafka Connect Sink</a> that implements batched writes and exactly-once semantics achieved through ClickHouse Keeper.</p>
+<p>To ensure our changes had the right effect, we monitored the Max Parts graph in ClickHouse for the number of parts waiting to be merged. Read more on how this works from ClickHouse <a href="https://clickhouse.com/docs/knowledgebase/maximum_number_of_tables_and_databases">here</a>.</p>
+<p><img src="https://www.highlight.io/images/blog/launch-week/5/clickhouse-1.png" alt="ClickHouse Inserted Rows/sec"/></p>
+<p><img src="https://www.highlight.io/images/blog/launch-week/5/clickhouse-2.png" alt="ClickHouse Max Parts For Partition"/></p>
+<h6>Keeping Data in Wide Parts</h6>
+<p>CPU Usage during merges can also be incurred by the conversion of parts from compact to wide. When data is inserted
+compressed, it must be decompressed into the wide format for it to be merged. If inserting large batch sizes (100k+ rows
+at 10MB+ data), a table level setting that helps is using <code>min_rows_for_wide_part=0</code>, <code>min_bytes_for_wide_part=0</code> to
+make
+sure that ClickHouse will keep inserted data as WIDE to avoid having to convert back and forth between the compact and
+narrow format, since each conversion incurs a CPU cost.</p>
+<h6>Optimizing Order By Granularity</h6>
+<p>If a table is ordered by columns with high granularity, this will result in increased sorting of data when ClickHouse is
+merging parts. For instance, we found that switching our <code>ORDER BY Timestamp</code> to an <code>ORDER BY toStartOfSecond(Timestamp)</code> reduced the CPU load of merging since everything within the same minute would be grouped into the same part
+without having to be sorted. The tradeoff occurs with query performance – a granular <code>ORDER BY</code> means that a <code>SELECT</code>
+will load more parts that must be filtered and sorted, but this is well worth the reduced merging that must happen.</p>
+<p>Another common use case for ordering is using a ID. However, adding the ID to the <code>ORDER BY</code> will require all rows to be
+sorted by a value where each row’s value is unique. A better approach could be to use a truncated version of the ID
+which would use the first N digits of the value to select a smaller range of rows to sort.</p>
+<h6>Checking Merge Levels</h6>
+<p>The performance of merges depends on a number of factors around the type of data and the way that it is inserted.
+Batch insertion often means that bulk merges may be more efficient. Observing the merge <code>level</code> helps understand
+how many times data is re-merged within a part. If insertions are large, full part storage is more efficient since
+the data is already in the right format.</p>
+<p>You can also observe all current merges to understand what tables / partitions are causing the most.</p>
+<pre><div><p><span><code>select merge_type, merge_algorithm, count()
+from clusterAllReplicas(default, system.merges)
+where table = &#39;my_table&#39;
+group by 1, 2
+order by 3 desc;
+</code></span></p><p><span><span><img alt="" aria-hidden="true" src="data:image/svg+xml,%3csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20version=%271.1%27%20width=%2720%27%20height=%2720%27/%3e"/></span><img alt="Copy" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" decoding="async" data-nimg="intrinsic"/></span></p></div></pre>
+<p>If you are inserting in large batches but are still seeing many high-level merges, you may want to
+adjust the <code>min_bytes_for_full_part_storage</code> setting. For instance,<!-- --></p>
+<pre><div><p><span><code>ALTER TABLE my_table MODIFY SETTING min_bytes_for_full_part_storage = 0;
+</code></span></p><p><span><span><img alt="" aria-hidden="true" src="data:image/svg+xml,%3csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20version=%271.1%27%20width=%2720%27%20height=%2720%27/%3e"/></span><img alt="Copy" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" decoding="async" data-nimg="intrinsic"/></span></p></div></pre>
+<h6>Avoiding Use of Projections</h6>
+<p>Projections may be useful to automate switching between multiple views for querying data depending on the primary filter
+arguments. For example, a table may have a primary key of <code>ORDER BY Timestamp</code> allowing for efficient queries within a
+time range. At the same time, you may be interested in querying that table by ID. The typical way to do that would be to
+create a materialized view from the table with a different <code>ORDER BY</code>, and switching the query to select from the
+materialized view when filtering by ID.
+Projections offer an automated approach to choosing the source for the select, creating a materialized view for the data
+but selecting the source automatically. However, with certain queries, the ClickHouse query plan may not select the
+optimal source view for the data, and it limits your ability to further customize the materialized view. We found using
+a materialized view and selecting manually as part of our application logic depending on the query pattern to be more
+reliable.</p>
+<h6>TTL Optimization / Clearing Old Parts</h6>
+<p>It&#39;s important to ensure most writes are coming to a few partitions to limit the number of parts that are being merged.
+Otherwise, ClickHouse will have to merge all parts to keep the data up to date.</p>
+<p>A table&#39;s <code>PARTITION BY</code> clause will dictate how data is partitioned. For example, if a table is partitioned
+by <code>Timestamp</code>,
+data will be written to different parts based on the timestamp. If you have many concurrent writes with vastly different
+timestamps, ClickHouse will have to merge many parts as the different writes will land in different active parts. This,
+in turn, will increase background CPU activity.</p>
+<p>In our application (this will depend on your use case), we ensure that most writes are coming to
+a few partitions, limiting the number of parts that are being merged. We also set a TTL on our tables to clear out old
+data, which helps with parts remaining active. You can always check how many parts are active by running the following
+SQL query:</p>
+<pre><div><p><span><code>select table, count()
+from clusterAllReplicas(default, system.parts)
+where active
+group by 1
+order by 2 desc;
+</code></span></p><p><span><span><img alt="" aria-hidden="true" src="data:image/svg+xml,%3csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20version=%271.1%27%20width=%2720%27%20height=%2720%27/%3e"/></span><img alt="Copy" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" decoding="async" data-nimg="intrinsic"/></span></p></div></pre>
+<p>You can see what parts are active across different partitions to understand where writes are landing.</p>
+<pre><div><p><span><code>select partition, level, count()
+from clusterAllReplicas(default, system.parts)
+where active and table = &#39;my_table&#39;
+group by 1, 2, 3
+order by 1, 2, 3;
+</code></span></p><p><span><span><img alt="" aria-hidden="true" src="data:image/svg+xml,%3csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20version=%271.1%27%20width=%2720%27%20height=%2720%27/%3e"/></span><img alt="Copy" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" decoding="async" data-nimg="intrinsic"/></span></p></div></pre>
+<p>You can also observe all current merges to understand what tables / partitions are causing the most.</p>
+<pre><div><p><span><code>select partition, sum(num_parts)
+from clusterAllReplicas(default, system.merges)
+where table = &#39;my_table&#39;
+group by 1
+order by 2 desc;
+</code></span></p><p><span><span><img alt="" aria-hidden="true" src="data:image/svg+xml,%3csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20version=%271.1%27%20width=%2720%27%20height=%2720%27/%3e"/></span><img alt="Copy" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" decoding="async" data-nimg="intrinsic"/></span></p></div></pre>
+<p>In our case, we encountered parts that were active and well outside our TTL
+but still not being deleted. If there is not enough data for a part to be merged, it may not be deleted by the TTL. To
+the rescue comes
+a <a href="https://clickhouse.com/docs/en/sql-reference/statements/alter/partition#drop-partitionpart">manual command</a> for
+deleting parts or partitions:</p>
+<pre><div><p><span><code>ALTER TABLE my_table
+    DROP PARTITION partition_expr;
+</code></span></p><p><span><span><img alt="" aria-hidden="true" src="data:image/svg+xml,%3csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20version=%271.1%27%20width=%2720%27%20height=%2720%27/%3e"/></span><img alt="Copy" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" decoding="async" data-nimg="intrinsic"/></span></p></div></pre>
+<h6>Conclusion</h6>
+<p>To conclude, from a largely un-optimized, cpu-heavy clickhouse cluster, we now have a much more efficient, affordable configuration. This experience has also yielded a much more “realtime” experience for our customers. We hope that these strategies can help you optimize your ClickHouse cluster as well. If you have any questions or feedback, feel free to reach out to me on <a href="https://twitter.com/vkorolik">Twitter</a> or <a href="https://www.linkedin.com/in/vkorolik/">LinkedIn</a>.</p></div></div></div></div>
+  </body>
+</html>
