@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://depot.dev/blog/faster-ec2-boot-time">Original</a>
+    <h1>Making EC2 boot time 8x faster</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>It is possible to increase the speed at which EC2 instances boot! This can be critical for certain types of workloads, where a fresh EC2 instance is needed to process some request or task. At Depot, we accelerate builds, so the
+EC2 boot time directly equals the lag time for a build to start processing.</p>
+<p>It can seem like EC2&#39;s boot time is fixed, that the time taken to start an instance depends solely on Amazon. However, this turns out not to be the case, there are several ways to speed up the process, especially if you know the workload that will execute on the machine after boot, like a Docker image build or GitHub Actions runner.</p>
+<p>We managed to <strong>reduce EC2 boot time from 40 seconds to 5 seconds</strong> by optimizing each step in the instance launch process.</p>
+<h2 id="what-takes-so-long"><a aria-hidden="true" tabindex="-1" href="#what-takes-so-long"><span></span></a>What takes so long?</h2>
+<p>When a new EC2 instance is requested with <code>RunInstances</code>, AWS performs several different operations to prepare and boot that instance:</p>
+<ul>
+<li>Creating the root EBS volume from the chosen AMI</li>
+<li>Assigning the instance a private IP address</li>
+<li>Choosing a target host for the instance</li>
+<li>Actually booting the machine</li>
+</ul>
+<p>Once the instance hardware is powered on, there&#39;s also a bootloader, kernel, and userspace processes that need to start. Each of those steps happens with each instance that you launch and before your application or service starts on it.</p>
+<h2 id="avoiding-the-problem"><a aria-hidden="true" tabindex="-1" href="#avoiding-the-problem"><span></span></a>Avoiding the problem</h2>
+<p>In the past, we&#39;ve optimized the time to start a build by <a href="https://depot.dev/blog/infrastructure-provisioner-v3">running a pool of standby compute</a>, where incoming build requests are routed to already-running EC2 instances if available. This works well for container builds, where many incoming builds for the same project are routed to the same pool of machines.</p>
+<p>While this hides the EC2 start lag from users, it&#39;s not economically viable for all workloads. For <a href="https://depot.dev/blog/depot-github-actions-runners">managed GitHub Actions runners</a>, each job in a workflow is routed to a dedicated EC2 instance. And with matrix workflows, it&#39;s possible to launch many jobs in parallel. It&#39;s not possible to keep 50 EC2 instances online just to handle one customer&#39;s incoming 50-job matrix workflow.</p>
+<p>But, launching 50 concurrent EC2 instances with a 40-second boot time is also not acceptable either. So, we had to look at ways to reduce the time it takes to boot an EC2 instance.</p>
+<h2 id="faster-boot-times"><a aria-hidden="true" tabindex="-1" href="#faster-boot-times"><span></span></a>Faster boot times</h2>
+<p>One thread became common, <strong>not doing something is always faster than doing something</strong>, if that&#39;s an option for the specific workload.</p>
+<p>We used this theme by systematically optimizing each step of the EC2 instance creation, boot, and application start, to reduce the time to running application from nearly 40 seconds to 5 seconds.</p>
+<p><strong>tl;dr</strong> — boot the instance once, shut the instance down, then boot it again when needed.</p>
+<h3 id="ebs-root-volume-streaming"><a aria-hidden="true" tabindex="-1" href="#ebs-root-volume-streaming"><span></span></a>EBS root volume streaming</h3>
+<p>Preparing the EBS root volume for use is one of the longest and most impactful aspects of EC2 instance boot time and subsequent application performance once the instance has started. When an EBS volume is created from an AMI, the following happens:</p>
+<ul>
+<li>The EBS volume is created, pointing at the AMI snapshot</li>
+<li>When empty blocks are accessed, they receive the full performance of the volume type</li>
+<li>However when data blocks are accessed for the first time, they must be pulled from S3 and written to the volume before they are returned to the instance</li>
+</ul>
+<p>This means that the creating of the EBS root volume is &#34;fast&#34;, because it does not need to actually copy the contents of the AMI into the volume. But it also means that every file operation that accesses a data block for the first time will experience a large performance reduction as that data is lazily loaded from S3 in the background.</p>
+<p>This can especially affect kernel and application start time. Without optimizations, our GitHub Actions runner AMI&#39;s first boot can take 5 seconds for the kernel + 5 seconds just for systemd to <em>load unit files</em>, before any processes actually start. Then on restart, since the files are already loaded from S3, that whole process takes <em>less than 400 ms!</em></p>
+<h4 id="awss-recommended-solution"><a aria-hidden="true" tabindex="-1" href="#awss-recommended-solution"><span></span></a>AWS&#39;s recommended solution</h4>
+<p>AWS <a href="https://docs.aws.amazon.com/ebs/latest/userguide/ebs-initialize.html">documents this behavior</a> and mentions a possible solution: it&#39;s possible to preload all data blocks by forcing each of them to be read once. They recommend using <a href="https://fio.readthedocs.io/en/latest/fio_doc.html"><code>fio</code></a> to access each block in parallel:</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="shell" data-theme="Depot"><code data-language="shell" data-theme="Depot"><span data-line=""><span>#!/bin/bash</span></span>
+<span data-line=""><span>volume</span><span>=</span><span>/dev/xvdf</span></span>
+<span data-line=""><span>sudo</span><span> fio</span><span> --filename=</span><span>$volume</span><span> --rw=read</span><span> --bs=1M</span><span> --iodepth=32</span><span> \</span></span>
+<span data-line=""><span>  --ioengine=libaio</span><span> --direct=1</span><span> --name=volume-initialize</span></span></code></pre></figure>
+<p>This will cause each data block to be accessed and fully streamed from S3 onto the EBS volume. There are however two potential issues with this approach:</p>
+<ol>
+<li>
+<p>It&#39;s slow to access every block - for a 100 GB gp3 volume, which has a default throughput of 125 MB/s, running the <code>fio</code> above would take <em>over 13 minutes</em>! (800 seconds)</p>
+</li>
+<li>
+<p>It&#39;s not possible to launch a new EC2 instance with an existing EBS volume. Instead a new EBS volume is always created with the instance is launched.</p>
+</li>
+</ol>
+<p>However, we can combine this solution with the next approach: booting the instance once before it&#39;s actually needed.</p>
+<h3 id="start-the-instance-once"><a aria-hidden="true" tabindex="-1" href="#start-the-instance-once"><span></span></a>Start the instance once</h3>
+<p>While it&#39;s not possible to launch a new EC2 instance with an existing EBS volume, it is possible to stop an EBS-backed instance and then start it again.</p>
+<p>From a billing perspective, AWS does not charge for the EC2 instance itself when stopped, as there&#39;s no physical hardware being reserved; a stopped instance is just the configuration that will be used when the instance is started next. Note that you do pay for the root EBS volume though, as it&#39;s still consuming storage.</p>
+<p>Therefore, it&#39;s possible to boot an EC2 instance once, let it perform whatever initialization it needs, then stop the EC2 instance, and this creates a &#34;warmed&#34; EBS root volume!</p>
+<p>Besides warming the EBS volume, this also caches two other steps of the boot process:</p>
+<ol>
+<li>The configuration for the instance (tags, launch options, user data, security groups, etc)</li>
+<li>The private IP address assigned to the instance</li>
+</ol>
+<p>This means that when the instance is started again, not only will it start with a pre-warmed EBS root volume, but also with a pre-cached instance and network configuration.</p>
+<p><strong>Booting the EC2 instance is equivalent to an optimized version of <code>fio</code> pre-warming!</strong> The first time the instance starts, it will access just the data blocks that are relevant to booting the instance. Then for the next boot, those data blocks will already be loaded on the volume!</p>
+<p>This makes warming very fast, rather than spending 11 minutes to read <em>every</em> data block, it takes less than 30 seconds to perform the initial boot / warming.</p>
+<h4 id="autoscaling-warm-pools"><a aria-hidden="true" tabindex="-1" href="#autoscaling-warm-pools"><span></span></a>Autoscaling warm pools</h4>
+<p>AWS offers something very similar to this approach called <a href="https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-warm-pools.html">warm pools for EC2 Auto Scaling</a>. This allows you to define a certain number of EC2 instances inside an autoscaling group that are booted once, perform initialization, then shut down, and the autoscaling group will pull from this pool of compute first when scaling up.</p>
+<p>While this sounds like it would serve our needs, autoscaling groups are <em>very slow</em> to react to incoming requests to scale up. From experimentation, it appears that autoscaling groups may have a slow poll loop that checks if new instances are needed, so the delay between requesting a scale up and the instance starting can exceed 60 seconds. For us, this negates the benefit of the warm pool.</p>
+<p>Since we need the best launch performance, we launch EC2 instances directly with the <code>LaunchInstances</code> and <code>StartInstances</code> API calls instead.</p>
+<h3 id="resizing-the-instance"><a aria-hidden="true" tabindex="-1" href="#resizing-the-instance"><span></span></a>Resizing the instance</h3>
+<p>The final boot time optimization involves changing the instance type of a warmed and stopped instance. Since a stopped EC2 instance is &#34;just&#34; an EBS volume + the instance configuration that will be used whenever the instance is started again, it&#39;s possible to <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-resize.html">change that instance&#39;s type</a> with <code>UpdateInstance</code> before starting it again.</p>
+<p>This is important for two reasons:</p>
+<ol>
+<li>
+<p>You can use cheaper instance types to perform the warming and avoid consuming AWS capacity for the warming process - we use <code>t3.large</code> instance types when first launching the instance.</p>
+</li>
+<li>
+<p>When AWS has capacity issues and a particular instance type is unavailable, it&#39;s possible to update the instance type to another one with availability and still use the pre-warmed EBS root volume.</p>
+</li>
+</ol>
+<p>It&#39;s also possible to update the provisioned IOPS and throughput for certain EBS volume types, including gp3, if different performance profiles are needed during the warming or running phases.</p>
+<h2 id="the-whole-flow"><a aria-hidden="true" tabindex="-1" href="#the-whole-flow"><span></span></a>The whole flow</h2>
+<p>For us, that means that our GitHub Actions runner instances go through the following flow:</p>
+<ol>
+<li>Created as a <code>t3.large</code> instance with a root EBS volume</li>
+<li>Assigned a private IP address in the target VPC</li>
+<li>The kernel and userspace processes start once, causing the relevant data blocks to stream from S3 onto the EBS volume</li>
+<li>The instance is stopped</li>
+<li>When a GitHub job request arrives, the instance type is updated to a <code>m7a</code> instance type, depending on how many CPUs were requested, and the instance is started</li>
+<li>If AWS responds that there is no current capacity for <code>m7a</code> instances, the instance is updated to a backup type (like <code>m7i</code>) and started again</li>
+</ol>
+<p>That flow reduces the time the instance for a job <strong>from over 40 seconds to under 5 seconds!</strong></p>
+<h2 id="followup-work"><a aria-hidden="true" tabindex="-1" href="#followup-work"><span></span></a>Followup work</h2>
+<p>Besides the above, it&#39;s possible to further reduce the time from instance start to application running by optimizing what software actually needs to start — for instance, we removed cloud-init from our GitHub Actions AMI as it was unused and contributed heavily to both boot and reboot time. This depends on the specific application and workload though.</p>
+<p>Probably the subject of another post, but we also need to handle specific quirks of the GitHub Actions agent API - while we can boot the Actions runner within 5 seconds of a job starting, it can take GitHub 10+ seconds to actually deliver that job to the runner. We&#39;ve optimized this process already, but there may be further tricks here.</p>
+<p>If any of this is interesting to you, feel free to reach out on <a href="https://twitter.com/jacobwgillespie">Twitter</a> or <a href="https://discord.gg/MMPqYSgDCg">Discord</a> — always happy to share what we&#39;ve learned!</p></div></div>
+  </body>
+</html>
