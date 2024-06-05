@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://androidoffsec.withgoogle.com/posts/attacking-android-binder-analysis-and-exploitation-of-cve-2023-20938/">Original</a>
+    <h1>Attacking Android Binder</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+            <p>At OffensiveCon 2024, the Android Red Team gave a <a href="https://www.youtube.com/watch?v=U-xSM159YLI">presentation</a> (<a href="https://rgoswami.me/posts/attacking-android-binder-analysis-and-exploitation-of-cve-2023-20938/offensivecon_24_binder.pdf">slides</a>) on finding and exploiting CVE-2023-20938, a use-after-free vulnerability in the Android Binder device driver. This post will provide technical details about this vulnerability and how our team used it to achieve root privilege from an untrusted app on a fully up-to-date (at the time of exploitation) Android device. This vulnerability affected all Android devices using GKI kernel versions 5.4 and 5.10.</p>
+<p>This vulnerability is fixed and the patches were released as part of the <a href="https://source.android.com/docs/security/bulletin/2023-02-01">Android Security Bulletin–February 2023</a> and <a href="https://source.android.com/docs/security/bulletin/2023-07-01">July 2023</a> (more details in the remediation section of the blog).</p>
+
+<p>Binder is the primary inter-process communication (IPC) channel on Android. It supports a variety of features such as passing file descriptors and objects containing pointers across process boundaries. It is composed of userspace libraries (<code>libbinder</code> and <code>libhwbinder</code>) provided by the Android platform and a kernel driver in the Android Common Kernel. Therefore, it provides a common IPC interface for Java and native code which can be defined in <a href="https://developer.android.com/guide/components/aidl">AIDL</a>. The term “Binder” is commonly used to refer to many parts of its implementation (there is even a Java class called <a href="https://developer.android.com/reference/android/os/Binder">Binder</a> in Android SDK), but in this post we will use the term “Binder” to refer to the Binder device driver unless otherwise stated.</p>
+
+<h2 id="binder-device-driver-devbinder">
+
+</h2>
+<p>All untrusted apps on Android are sandboxed and inter-process communication mostly occurs through Binder. Meanwhile, Chrome’s renderer process on Android is assigned the <code>isolated_app</code> SELinux context, which is more restrictive than untrusted apps. Despite that, it also has access to Binder and a <a href="https://android.googlesource.com/platform/system/sepolicy/+/3a4c68dd8335c21275ada7a249190aa3d4afc58f/private/isolated_app_all.te#65">limited set</a> of Android services. Therefore, Binder presents a wide attack surface because it is accessible by default to every untrusted and isolated app.</p>
+
+<h3 id="history-of-binder-vulnerabilities">
+
+</h3>
+<p>Here is a list of recent exploits that have exploited vulnerabilities in Binder to achieve root privilege:</p>
+<ul>
+<li>CVE-2019-2025 Waterdrop: <a href="https://conference.hitb.org/hitbsecconf2019ams/materials/D2T2%20-%20Binder%20-%20The%20Bridge%20to%20Root%20-%20Hongli%20Han%20&amp;%20Mingjian%20Zhou.pdf">slides</a>, <a href="https://www.youtube.com/watch?v=l38YQxrk7V8">video</a></li>
+<li>CVE-2019-2215 Bad Binder: <a href="https://googleprojectzero.blogspot.com/2019/11/bad-binder-android-in-wild-exploit.html">blog</a>, <a href="https://www.youtube.com/watch?v=TAwQ4ezgEIo">video</a></li>
+<li>CVE-2020-0041: <a href="https://labs.bluefrostsecurity.de/blog/2020/03/31/cve-2020-0041-part-1-sandbox-escape/">blog</a></li>
+<li>CVE-2020-0423 Typhoon Mangkhut: <a href="https://i.blackhat.com/USA21/Wednesday-Handouts/us-21-Typhoon-Mangkhut-One-Click-Remote-Universal-Root-Formed-With-Two-Vulnerabilities.pdf">slides</a>, <a href="https://www.youtube.com/watch?v=a1vyt6iWmS4">video</a></li>
+<li>CVE-2022-20421 Bad Spin: <a href="https://0xkol.github.io/assets/files/Racing_Against_the_Lock__Exploiting_Spinlock_UAF_in_the_Android_Kernel.pdf">whitepaper</a>, <a href="https://www.youtube.com/watch?v=E3CVDOlcHC4">video</a></li>
+</ul>
+<p>To provide high performance IPC, Binder consists of an extremely complex object lifetime, memory management, and concurrent threading model. To give a sense of this complexity, we counted three different types of concurrency synchronization primitives (5 locks, 6 reference counters, and a few atomic variables) all being used in the same 6.5k line file implementing the driver. The locking in Binder is also extremely fine-grained for performance reasons, further increasing the complexity of the code.</p>
+<p>There have been a number of successful attacks against Binder in recent years by leveraging several security issues, primarily caused by use-after-free bugs. These bugs arise from various root causes, including improper cleanup logic (CVE-2019-2215 and CVE-2022-20421), data races (CVE-2020-0423), and intra-object out-of-bounds access (CVE-2020-0041). This blog provides information on a UAF issue which is a result of improper clean up implementation while processing a Binder transaction which leads to a refcounting error.</p>
+
+<h2 id="making-an-rpc-call-with-binder">
+
+</h2>
+<p>This section will describe how a userspace program interacts with Binder. This section provides a quick overview of what Binder is and how userspace applications interact with it on Android to help illustrate some concepts in Binder. However, if you are already familiar with Binder, feel free to skip this and go to the <a href="#vulnerability">Vulnerability</a> section.</p>
+
+<h3 id="initialize-a-binder-endpoint">
+
+</h3>
+<p>Developing programs to perform IPC via Binder is somewhat different from using other types of sockets (e.g. such as network sockets, etc).</p>
+<p>Every client first <code>open</code> the Binder device and create a memory mapping using the returned file descriptor:</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>int</span> <span>fd</span> <span>=</span> <span>open</span><span>(</span><span>&#34;/dev/binder&#34;</span><span>,</span> <span>O_RDWR</span><span>,</span> <span>0</span><span>);</span>
+</span></span><span><span><span>void</span> <span>*</span><span>map</span> <span>=</span> <span>mmap</span><span>(</span><span>NULL</span><span>,</span> <span>4096</span><span>,</span> <span>PROT_READ</span><span>,</span> <span>MAP_PRIVATE</span><span>,</span> <span>ctx</span><span>-&gt;</span><span>fd</span><span>,</span> <span>0</span><span>);</span>
+</span></span></code></pre></div><p>This memory will be used for the Binder driver’s memory allocator, which is used to store all of the incoming transaction data. This mapping is read-only for the client, but writable by the driver.</p>
+
+<h3 id="send--receive-a-transaction">
+
+</h3>
+<p>Instead of calling the <code>send</code> and <code>recv</code> syscalls, clients perform most IPC interactions by sending the <code>BINDER_WRITE_READ</code> ioctl to the Binder driver. The argument to the ioctl is a <code>struct binder_write_read</code> object:</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>struct</span> <span>binder_write_read</span> <span>bwr</span> <span>=</span> <span>{</span>
+</span></span><span><span>    <span>.</span><span>write_size</span> <span>=</span> <span>...,</span>
+</span></span><span><span>    <span>.</span><span>write_buffer</span> <span>=</span> <span>...,</span>
+</span></span><span><span>    <span>.</span><span>read_size</span> <span>=</span> <span>...,</span>
+</span></span><span><span>    <span>.</span><span>read_buffer</span> <span>=</span> <span>...</span>
+</span></span><span><span><span>};</span>
+</span></span><span><span>
+</span></span><span><span><span>ioctl</span><span>(</span><span>fd</span><span>,</span> <span>BINDER_WRITE_READ</span><span>,</span> <span>&amp;</span><span>bwr</span><span>);</span>
+</span></span></code></pre></div><p>The <code>write_buffer</code> pointer field points to a userspace buffer containing a list of commands from the client to the driver. Meanwhile, the <code>read_buffer</code> pointer field points to a userspace buffer in which the Binder driver will write commands from the driver to the client.</p>
+<blockquote>
+<p>Note: The motivation for this design is that a client can send a transaction and then wait for a response with one ioctl syscall. In contrast, IPC with sockets requires two syscalls, <code>send</code> and <code>recv</code>.</p>
+</blockquote>
+<p>The diagram below shows the data involved when sending a transaction to a client linked to the Ref 0 (<code>target.handle</code>) and the transaction contains a Node object (<code>BINDER_TYPE_BINDER</code>):</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/binder-transaction-layout.png" alt="Binder Transaction Layout"/></p>
+<p>The <code>write_buffer</code> points to a buffer that contains a list of <code>BC_*</code> commands and their associated data. The <code>BC_TRANSACTION</code> command instructs Binder to send a transaction <code>struct_binder_transaction_data</code>. The <code>read_buffer</code> points to an allocated buffer that will be filled by Binder when there are incoming transactions.</p>
+<p>The <code>struct binder_transaction_data</code> contains a target handle and two buffers, <code>buffer</code> and <code>offsets</code>. The <code>target.handle</code> is the Ref ID associated with the recipient, which we will discuss how it is created later. The <code>buffer</code> points to a buffer containing a mix of Binder objects and opaque data. The <code>offsets</code> points to an array of offsets at which every Binder object is located in the <code>buffer</code>. The recipient will receive a copy of this <code>struct binder_transaction_data</code> in the <code>read_buffer</code> after it performs a read with the <code>BINDER_WRITE_READ</code> ioctl.</p>
+<p>Users can send a Node by including a <code>struct flat_binder_object</code> with the <code>type</code> field set to <code>BINDER_TYPE_BINDER</code> in the transaction data. The Node is a type of Binder object, which we will discuss more in the next section.</p>
+
+<h3 id="establish-a-connection-with-another-process">
+
+</h3>
+<p>Binder uses objects such as a Node and a Ref to manage communication channels between processes.</p>
+<p>If a process wants to allow another process to talk to it, it sends a Node to that process. Binder then creates a new Ref in the target process and associates it with the Node, which establishes a connection. Later, the target process can use the Ref to send a transaction to the process that owns the Node associated with the Ref.</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/establish-a-connection.png" alt="Establish a connection"/></p>
+<p>The image above illustrates the steps on how App A establishes a connection for App B with itself, so App B can send transactions to App A to perform RPC calls.</p>
+<p>The steps are as follows:</p>
+<ol>
+<li>App A sends a transaction to App B containing a Node with 0xbeef as ID. The transaction is similar to the one shown above and the Node is represented by the <code>struct flat_binder_object</code> data.</li>
+<li>Binder associates the Node 0xbeef with App A internally and initializes a reference counter to keep track of how many Refs are referencing it. In the actual implementation, there are 4 reference counters in the underlying Node data structure (<code>struct binder_node</code>), which we will cover later.</li>
+<li>Binder creates a Ref 0xbeef that belongs to App B internally and it references App A’s Node 0xbeef. This step <strong>increments</strong> the Node 0xbeef refcount by 1.</li>
+<li>Now, App B can send transactions to App A by using 0xbeef as the <code>target.handle</code> in its <code>struct binder_transaction_data</code> in future. When Binder processes the transaction sent by B, it can find out that the Ref 0xbeef references App A’s Node 0xbeef and send the transaction to App A.</li>
+</ol>
+
+<h3 id="binder-context-manager">
+
+</h3>
+<p>One might ask a question: How does App A send a Node to App B if there is no connection between them in the first place? Firstly, in addition to sending a Node object from one process to another (as shown above) it is also possible to send a Ref object in a similar way. For example, assuming that there exists another App C, then App B can send the Ref (created at step 3 above) to App C. Once App C receives the Ref from App B it can use the Ref to send transactions to App A.</p>
+<p>Secondly, Binder enables a special process to claim itself as the Context Manager with the <code>BINDER_SET_CONTEXT_MGR</code> ioctl and only one single process can hold the role. The Context Manager is a special Binder IPC endpoint always accessible at handle (Ref) 0 which serves as an intermediary to make Binder IPC endpoints discoverable by other processes.</p>
+<p>For instance, a process Client 1 sends a Node (e.g. 0xbeef) to the Context Manager, which in turn receives a Ref (0xbeef). Then, another third process Client 2 initiates a transaction to the Context Manager asking for that Ref (0xbeef). Context Manager responds to the request by returning the Ref (0xbeef). Consequently, this establishes a connection between two processes as Client 2 can now send transactions to Client 1 using the Ref (0xbeef).</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/context-manager.png" alt="Context Manager"/></p>
+<p>On Android, the ServiceManager process claims itself as the Context Manager during startup. System services register their Binder Nodes with the Context Manager to be discoverable by other Apps.</p>
+
+
+<p>A client can include a Binder object (<code>struct binder_object</code>) in a transaction, which can be any of these:</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Enum</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Node</td>
+<td>BINDER_TYPE_BINDER<!-- raw HTML omitted -->BINDER_TYPE_WEAK_BINDER</td>
+<td>A Node</td>
+</tr>
+<tr>
+<td>Ref</td>
+<td>BINDER_TYPE_HANDLE<!-- raw HTML omitted -->BINDER_TYPE_WEAK_HANDLE</td>
+<td>A reference to a Node</td>
+</tr>
+<tr>
+<td>Pointer</td>
+<td>BINDER_TYPE_PTR</td>
+<td>A pointer to a memory buffer used for transferring data</td>
+</tr>
+<tr>
+<td>File Descriptor</td>
+<td>BINDER_TYPE_FD</td>
+<td>A file descriptor</td>
+</tr>
+<tr>
+<td>File Descriptor Array</td>
+<td>BINDER_TYPE_FDA</td>
+<td>An array of file descriptors</td>
+</tr>
+</tbody>
+</table>
+<p>Before sending all Binder objects to the recipient, Binder must translate those objects from the sender’s context into the recipient’s context in the <code>binder_transaction</code> function:</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>void</span> <span>binder_transaction</span><span>(...)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>// Iterate through all Binder objects in the transaction
+</span></span></span><span><span><span></span>  <span>for</span> <span>(</span><span>buffer_offset</span> <span>=</span> <span>off_start_offset</span><span>;</span> <span>buffer_offset</span> <span>&lt;</span> <span>off_end_offset</span><span>;</span>
+</span></span><span><span>      <span>buffer_offset</span> <span>+=</span> <span>sizeof</span><span>(</span><span>binder_size_t</span><span>))</span> <span>{</span>
+</span></span><span><span>    <span>// Process/translate one Binder object
+</span></span></span><span><span><span></span>  <span>}</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>For example, consider a scenario where a client shares a file to another client by sending a file descriptor via Binder. To allow the recipient to access the file, Binder translates the file descriptor by installing a new file descriptor with the shared file in the recipient’s task process.</p>
+<blockquote>
+<p>Note: Some objects are actually translated when the recipient reads the transaction - when <code>BINDER_WRITE_READ</code> ioctl is invoked by the recipient - while others are translated at the moment of sending transaction by the sender - when <code>BINDER_WRITE_READ</code> ioctl is invoked by the sender.</p>
+</blockquote>
+<p>There exists a code path for error handling [1] when processing a transaction with an unaligned <code>offsets_size</code>. Notice that Binder skips the for-loop processing Binder objects, so <code>buffer_offset</code> remains 0 and is then passed to the <code>binder_transaction_buffer_release</code> function call [2] as an argument:</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>void</span> <span>binder_transaction</span><span>(...,</span> <span>struct</span> <span>binder_transaction_data</span> <span>*</span><span>tr</span><span>,</span> <span>...)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>binder_size_t</span> <span>buffer_offset</span> <span>=</span> <span>0</span><span>;</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>if</span> <span>(</span><span>!</span><span>IS_ALIGNED</span><span>(</span><span>tr</span><span>-&gt;</span><span>offsets_size</span><span>,</span> <span>sizeof</span><span>(</span><span>binder_size_t</span><span>)))</span> <span>{</span>        <span>// [1]
+</span></span></span><span><span><span></span>    <span>goto</span> <span>err_bad_offset</span><span>;</span>
+</span></span><span><span>  <span>}</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>// Iterate through all Binder objects in the transaction
+</span></span></span><span><span><span></span>  <span>for</span> <span>(</span><span>buffer_offset</span> <span>=</span> <span>off_start_offset</span><span>;</span> <span>buffer_offset</span> <span>&lt;</span> <span>off_end_offset</span><span>;</span>
+</span></span><span><span>      <span>buffer_offset</span> <span>+=</span> <span>sizeof</span><span>(</span><span>binder_size_t</span><span>))</span> <span>{</span>
+</span></span><span><span>    <span>// Process a Binder object
+</span></span></span><span><span><span></span>  <span>}</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>err_bad_offset</span><span>:</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>    <span>binder_transaction_buffer_release</span><span>(</span><span>target_proc</span><span>,</span> <span>NULL</span><span>,</span> <span>t</span><span>-&gt;</span><span>buffer</span><span>,</span>
+</span></span><span><span>                                      <span>/*failed_at*/</span><span>buffer_offset</span><span>,</span>    <span>// [2]
+</span></span></span><span><span><span></span>                                      <span>/*is_failure*/</span><span>true</span><span>);</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p><code>binder_transaction_buffer_release</code> is a function that undoes every side effect that Binder caused after processing Binder objects in the transaction. For example, closing the opened file descriptor in the recipient process’s task. In error handling cases, Binder must only clean up Binder objects that it has already processed before hitting an error. The <code>failed_at</code> and <code>is_failure</code> parameters in the function determine how many Binder objects Binder has to clean up.</p>
+<p>Back to the error handling path of unaligned <code>offsets_size</code> where <code>failed_at == 0</code> and <code>is_failure == true</code>. In this case, Binder calculates <code>off_end_offset</code> to be the end of the transaction buffer. Therefore, Binder cleans up every Binder object in the transaction. However, Binder did not process any Binder objects in the first place because it hit the error and skipped the for-loop which processes the Binder objects.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>void</span> <span>binder_transaction_buffer_release</span><span>(</span><span>struct</span> <span>binder_proc</span> <span>*</span><span>proc</span><span>,</span>
+</span></span><span><span>                                              <span>struct</span> <span>binder_thread</span> <span>*</span><span>thread</span><span>,</span>
+</span></span><span><span>                                              <span>struct</span> <span>binder_buffer</span> <span>*</span><span>buffer</span><span>,</span>
+</span></span><span><span>                                              <span>binder_size_t</span> <span>failed_at</span><span>/*0*/</span><span>,</span>
+</span></span><span><span>                                              <span>bool</span> <span>is_failure</span><span>/*true*/</span><span>)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>off_start_offset</span> <span>=</span> <span>ALIGN</span><span>(</span><span>buffer</span><span>-&gt;</span><span>data_size</span><span>,</span> <span>sizeof</span><span>(</span><span>void</span> <span>*</span><span>));</span>
+</span></span><span><span>  <span>off_end_offset</span> <span>=</span> <span>is_failure</span> <span>&amp;&amp;</span> <span>failed_at</span> <span>?</span> <span>failed_at</span>
+</span></span><span><span>                                           <span>:</span> <span>off_start_offset</span> <span>+</span> <span>buffer</span><span>-&gt;</span><span>offsets_size</span><span>;</span>
+</span></span><span><span>  <span>for</span> <span>(</span><span>buffer_offset</span> <span>=</span> <span>off_start_offset</span><span>;</span> <span>buffer_offset</span> <span>&lt;</span> <span>off_end_offset</span><span>;</span>
+</span></span><span><span>       <span>buffer_offset</span> <span>+=</span> <span>sizeof</span><span>(</span><span>size_t</span><span>))</span> <span>{</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>  <span>}</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>The reason for this logic is that the meaning of <code>failed_at</code> is overloaded: there are other parts of the code that use this logic to clean up the entire buffer. However, in this case we’ve hit this code path without processing any objects, which will introduce inconsistency in reference counting. In the following section we will demonstrate how to leverage this vulnerability to achieve a use-after-free of a Binder Node object and turn it into a privilege escalation PoC.</p>
+
+
+<p>In a <a href="https://labs.bluefrostsecurity.de/blog/2020/03/31/cve-2020-0041-part-1-sandbox-escape/">previously published exploit</a> for CVE-2020-004, Blue Frost Security exploited the same cleanup process to achieve root privilege. However, they exploited a vulnerability that modifies the Binder objects within the transaction after Binder had processed it. They published a PoC to demonstrate their <a href="https://labs.bluefrostsecurity.de/blog/2020/04/08/cve-2020-0041-part-2-escalating-to-root/">root privilege escalation</a> on a Pixel 3 running kernel version 4.9.</p>
+<p>We took inspiration from this past exploit to first achieve the same leak and unlink primitives in Binder. Because of some changes in the SLUB allocator’s caches in newer kernel versions, we used a different approach to perform use-after-free on the victim objects. We will explain those changes and how we overcame them in a later section.</p>
+
+<h2 id="uaf-of-a-binder_node">
+
+</h2>
+<p>A Node (<code>struct binder_node</code>) is a Binder object (<code>struct flat_binder_object</code>) in a transaction with the header type <code>BINDER_TYPE_BINDER</code> or <code>BINDER_TYPE_WEAK_BINDER</code>. Binder creates a Node internally when a client sends a Node to another client. Binder also manages several reference counters in the Node to determine its lifetime. In this section, we demonstrate how to leverage the vulnerability described above to introduce inconsistency in one of the reference counters of a Node object, which leads to freeing this object while having a dangling pointer to it and, thus, resulting in a use-after-free.</p>
+<p>When the <code>binder_transaction_buffer_release</code> function iterates through all Binder objects in the buffer and encounters a Node with the header type <code>BINDER_TYPE_BINDER</code> or <code>BINDER_TYPE_WEAK_BINDER</code>, it calls the <code>binder_get_node</code> function to retrieve the <code>binder_node</code> that belongs to the recipient process’s context (<code>proc</code>) and has the Node ID equal to <code>fp-&gt;binder</code> ([1] in the listing below).</p>
+<p>Then, it calls the <code>binder_dec_node</code> function to decrement one of its reference counters ([2] in the listing below). Suppose we have a Node in the transaction with the header type <code>BINDER_TYPE_BINDER</code>, then Binder calls <code>binder_dec_node</code> function with passing expressions <code>strong == 1</code> and <code>internal == 0</code> as function arguments.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>void</span> <span>binder_transaction_buffer_release</span><span>(...)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>for</span> <span>(</span><span>buffer_offset</span> <span>=</span> <span>off_start_offset</span><span>;</span> <span>buffer_offset</span> <span>&lt;</span> <span>off_end_offset</span><span>;</span>
+</span></span><span><span>       <span>buffer_offset</span> <span>+=</span> <span>sizeof</span><span>(</span><span>size_t</span><span>))</span> <span>{</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>    <span>case</span> <span>BINDER_TYPE_BINDER</span><span>:</span>
+</span></span><span><span>    <span>case</span> <span>BINDER_TYPE_WEAK_BINDER</span><span>:</span> <span>{</span>
+</span></span><span><span>      <span>...</span>
+</span></span><span><span>      <span>// [1]
+</span></span></span><span><span><span></span>      <span>node</span> <span>=</span> <span>binder_get_node</span><span>(</span><span>proc</span><span>,</span> <span>fp</span><span>-&gt;</span><span>binder</span><span>);</span>
+</span></span><span><span>      <span>...</span>
+</span></span><span><span>      <span>// [2]
+</span></span></span><span><span><span></span>      <span>binder_dec_node</span><span>(</span><span>node</span><span>,</span> <span>/*strong*/</span> <span>hdr</span><span>-&gt;</span><span>type</span> <span>==</span> <span>BINDER_TYPE_BINDER</span><span>,</span> <span>/*internal*/</span> <span>0</span><span>);</span>
+</span></span><span><span>      <span>...</span>
+</span></span><span><span>    <span>}</span> <span>break</span><span>;</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>  <span>}</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><blockquote>
+<p>Note: The terms Node and <code>binder_node</code> are interchangeable, but the term <code>binder_node</code> usually refers to the underlying Node data structure in Binder. The term Node is also used to refer to a <code>struct flat_binder_object</code> in a transaction that has the header type <code>BINDER_TYPE_BINDER</code> and <code>BINDER_TYPE_WEAK_BINDER</code>.</p>
+</blockquote>
+<p>The <code>binder_dec_node</code> function calls <code>binder_dec_node_nilocked</code> to decrement one of the reference counters ([1] in listing below) of the <code>binder_node</code>. If <code>binder_dec_node_nilocked</code> returns true, the function will call <code>binder_free_node</code> to free the <code>binder_node</code> ([2] in listing below). That’s exactly the branch we want to be taken in order to achieve UAF.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>void</span> <span>binder_dec_node</span><span>(</span><span>struct</span> <span>binder_node</span> <span>*</span><span>node</span><span>,</span> <span>int</span> <span>strong</span> <span>/*1*/</span><span>,</span> <span>int</span> <span>internal</span> <span>/*0*/</span><span>)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>bool</span> <span>free_node</span><span>;</span>
+</span></span><span><span>
+</span></span><span><span>  <span>binder_node_inner_lock</span><span>(</span><span>node</span><span>);</span>
+</span></span><span><span>  <span>free_node</span> <span>=</span> <span>binder_dec_node_nilocked</span><span>(</span><span>node</span><span>,</span> <span>strong</span><span>,</span> <span>internal</span><span>);</span> <span>// [1]
+</span></span></span><span><span><span></span>  <span>binder_node_inner_unlock</span><span>(</span><span>node</span><span>);</span>
+</span></span><span><span>  <span>if</span> <span>(</span><span>free_node</span><span>)</span>
+</span></span><span><span>    <span>binder_free_node</span><span>(</span><span>node</span><span>);</span> <span>// [2]
+</span></span></span><span><span><span></span><span>}</span>
+</span></span></code></pre></div><blockquote>
+<p>Note: There are many functions in Binder that has a suffix *locked which expects that the caller has acquired necessary locks before calling them. More details about all the suffixes can be found at the top of /drivers/android/binder.c code.</p>
+</blockquote>
+<p>In the <code>binder_dec_node_nilocked</code> function, if <code>strong == 1</code> and <code>internal == 0</code>, it decrements the <code>local_strong_refs</code> field in <code>binder_node</code>.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>bool</span> <span>binder_dec_node_nilocked</span><span>(</span><span>struct</span> <span>binder_node</span> <span>*</span><span>node</span><span>,</span>
+</span></span><span><span>                                     <span>int</span> <span>strong</span> <span>/*1*/</span><span>,</span> <span>int</span> <span>internal</span> <span>/*0*/</span><span>)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>if</span> <span>(</span><span>strong</span><span>)</span> <span>{</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>internal</span><span>)</span>
+</span></span><span><span>      <span>...</span>
+</span></span><span><span>    <span>else</span>
+</span></span><span><span>      <span>node</span><span>-&gt;</span><span>local_strong_refs</span><span>--</span><span>;</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>  <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>  <span>}</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>Thus, to trigger the vulnerability we can send a transaction with a Node object with the header type set to <code>BINDER_TYPE_BINDER</code> and the <code>binder</code> field set to the ID of the Node (<code>struct binder_node</code>) we want to decrement the value of its <code>local_strong_refs</code> reference counter. The diagram below shows a malicious transaction that exploits the vulnerability to decrement a reference counter in the Node <code>0xbeef</code> of the recipient client two times. The transaction contains two Nodes (<code>struct flat_binder_object</code>) and an unaligned <code>offsets_size</code>.</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/transaction-with-unaligned-offsets-size.png" alt="Transaction with unaligned offsets size"/></p>
+<p>The unaligned <code>offsets_size</code> cause Binder to take the vulnerable error-handling path in the <code>binder_transaction</code> function, which skips processing the two Nodes in the transaction. This exploits the <code>binder_transaction_buffer_release</code> function to clean up those two Nodes, which decrements the Node 0xbeef’s <code>local_strong_refs</code> twice – once for each of the 2 <code>struct flat_binder_ojbect</code> objects in the transaction.</p>
+<p>Now, let’s analyze which conditions <code>struct binder_node</code> needs to satisfy to be freed in the <code>binder_dec_node</code> function (i.e. under what conditions <code>binder_dec_node_nilocked</code> returns <code>true</code> forcing <code>binder_dec_node</code> to free the <code>binder_node</code>). Based on the code fragment below, the <code>binder_dec_node_nilocked</code> returns true based on the values of several fields in the <code>struct binder_node</code>.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>bool</span> <span>binder_dec_node_nilocked</span><span>(</span><span>struct</span> <span>binder_node</span> <span>*</span><span>node</span><span>,</span>
+</span></span><span><span>                                     <span>int</span> <span>strong</span> <span>/*1*/</span><span>,</span> <span>int</span> <span>internal</span> <span>/*0*/</span><span>)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>if</span> <span>(</span><span>strong</span><span>)</span> <span>{</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>internal</span><span>)</span>
+</span></span><span><span>      <span>...</span>
+</span></span><span><span>    <span>else</span>
+</span></span><span><span>      <span>node</span><span>-&gt;</span><span>local_strong_refs</span><span>--</span><span>;</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>node</span><span>-&gt;</span><span>local_strong_refs</span> <span>||</span> <span>node</span><span>-&gt;</span><span>internal_strong_refs</span><span>)</span>
+</span></span><span><span>      <span>return</span> <span>false</span><span>;</span>
+</span></span><span><span>  <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>  <span>}</span>
+</span></span><span><span>
+</span></span><span><span>  <span>if</span> <span>(</span><span>proc</span> <span>&amp;&amp;</span> <span>(</span><span>node</span><span>-&gt;</span><span>has_strong_ref</span> <span>||</span> <span>node</span><span>-&gt;</span><span>has_weak_ref</span><span>))</span> <span>{</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>  <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>hlist_empty</span><span>(</span><span>&amp;</span><span>node</span><span>-&gt;</span><span>refs</span><span>)</span> <span>&amp;&amp;</span> <span>!</span><span>node</span><span>-&gt;</span><span>local_strong_refs</span> <span>&amp;&amp;</span>
+</span></span><span><span>        <span>!</span><span>node</span><span>-&gt;</span><span>local_weak_refs</span> <span>&amp;&amp;</span> <span>!</span><span>node</span><span>-&gt;</span><span>tmp_refs</span><span>)</span> <span>{</span>
+</span></span><span><span>      <span>...</span>
+</span></span><span><span>      <span>return</span> <span>true</span><span>;</span>
+</span></span><span><span>    <span>}</span>
+</span></span><span><span>  <span>}</span>
+</span></span><span><span>  <span>return</span> <span>false</span><span>;</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>To ensure that <code>binder_dec_node_nilocked</code> returns <code>true</code> after decrementing <code>local_strong_refs</code>, we have to pass a <code>node</code> that meets the following conditions:</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>// Reference counters in struct binder_node
+</span></span></span><span><span><span></span><span>local_strong_refs</span>        <span>==</span> <span>1</span> <span>// before `binder_dec_node_nilocked` decrements it
+</span></span></span><span><span><span></span><span>local_weak_refs</span>          <span>==</span> <span>0</span>
+</span></span><span><span><span>internal_strong_refs</span>     <span>==</span> <span>0</span>
+</span></span><span><span><span>tmp_refs</span>                 <span>==</span> <span>0</span>
+</span></span><span><span>
+</span></span><span><span><span>has_strong_ref</span>           <span>==</span> <span>0</span>
+</span></span><span><span><span>has_weak_ref</span>             <span>==</span> <span>0</span>
+</span></span><span><span><span>hlist_empty</span><span>(</span><span>&amp;</span><span>node</span><span>-&gt;</span><span>refs</span><span>)</span> <span>==</span> <span>true</span>
+</span></span></code></pre></div><p>Thus, to free a <code>binder_node</code> object in the <code>binder_dec_node</code> function we must set up a <code>binder_node</code> that does not have any Refs referencing it and all reference counters are equal to zero except the <code>local_strong_refs</code>. Then, we can exploit the vulnerability to decrement the <code>local_strong_refs</code> and cause it to be freed by <code>binder_free_node</code>.</p>
+<p>A simple way to set up a <code>binder_node</code> as such is as follows:</p>
+<ol>
+<li>Client A and Client B establish a connection between each other with the Node 0xbeef and Ref 0xbeef (refer to previous diagrams). The Node begins with <code>local_strong_refs</code> equal to 1 because only the Ref object is referencing the Node.</li>
+<li>Client B sends a transaction with the <code>target.handle</code> set to <code>0xbeef</code>. Binder processes it, allocates a <code>binder_buffer</code> on the Client A’s side and copies the transaction data into the allocated buffer. At this moment, the Node’s <code>local_strong_refs</code> is equal to 2 because the Ref object and the transaction are referencing the Node.</li>
+<li>Client B closes the Binder file descriptor, which releases the Ref object and decrements the <code>local_strong_refs</code> by 1. Now, the Node’s <code>local_strong_ref</code> goes back to 1 because only the transaction is referencing the Node.</li>
+</ol>
+<p>The diagram below illustrates the setup of a <code>binder_node</code> before and after exploiting the vulnerability to free it:</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/dangling-pointer.png" alt="Dangling Pointer"/></p>
+<p>After freeing the <code>binder_node</code> by exploiting the vulnerability, this leaves a dangling pointer in the <code>target_node</code> of the <code>binder_buffer</code>. In the following sections we utilize this use-after-free multiple times to obtain the necessary primitives for our exploit to root an Android device.</p>
+<p>First we obtain a limited leak primitive enabling us to leak 16 bytes (2 8-byte values) from the kernel heap. We built on top of this primitive to get next-stage unlink primitive enabling us to overwrite kernel memory with the attacker controlled data. Next, we leverage both leak and unlink primitives to obtain arbitrary kernel memory read primitive which we use to identify addresses of kernel structures we want to overwrite to finally get root privileges on the devices.</p>
+
+<h2 id="leak-primitive">
+
+</h2>
+<p>First, we exploit the vulnerability in the use-after-free read of a freed <code>binder_node</code> object in the <code>binder_thread_read</code> function. When a client performs a <code>BINDER_WRITE_READ</code> ioctl to read incoming transactions from Binder, Binder calls the <code>binder_thread_read</code> function to copy incoming transactions back to the userspace. This function copies two fields from the <code>binder_node</code> (<code>ptr</code> and <code>cookie</code>) into a transaction ([1] and [2]). Then, Binder copies the transaction back to userspace [3]. Therefore, we can cause an use-after-read to leak two values from the kernel heap memory.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>int</span> <span>binder_thread_read</span><span>(...)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span>    <span>struct</span> <span>binder_transaction_data_secctx</span> <span>tr</span><span>;</span>
+</span></span><span><span>    <span>struct</span> <span>binder_transaction_data</span> <span>*</span><span>trd</span> <span>=</span> <span>&amp;</span><span>tr</span><span>.</span><span>transaction_data</span><span>;</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span>    <span>struct</span> <span>binder_transaction</span> <span>*</span><span>t</span> <span>=</span> <span>NULL</span><span>;</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span>            <span>t</span> <span>=</span> <span>container_of</span><span>(</span><span>w</span><span>,</span> <span>struct</span> <span>binder_transaction</span><span>,</span> <span>work</span><span>);</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span>        <span>if</span> <span>(</span><span>t</span><span>-&gt;</span><span>buffer</span><span>-&gt;</span><span>target_node</span><span>)</span> <span>{</span>
+</span></span><span><span>            <span>struct</span> <span>binder_node</span> <span>*</span><span>target_node</span> <span>=</span> <span>t</span><span>-&gt;</span><span>buffer</span><span>-&gt;</span><span>target_node</span><span>;</span>
+</span></span><span><span>
+</span></span><span><span>            <span>trd</span><span>-&gt;</span><span>target</span><span>.</span><span>ptr</span> <span>=</span> <span>target_node</span><span>-&gt;</span><span>ptr</span><span>;</span> <span>// [1]
+</span></span></span><span><span><span></span>            <span>trd</span><span>-&gt;</span><span>cookie</span> <span>=</span> <span>target_node</span><span>-&gt;</span><span>cookie</span><span>;</span> <span>// [2]
+</span></span></span><span><span><span></span><span>...</span>
+</span></span><span><span>    <span>}</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span>        <span>if</span> <span>(</span><span>copy_to_user</span><span>(</span><span>ptr</span><span>,</span> <span>&amp;</span><span>tr</span><span>,</span> <span>trsize</span><span>))</span> <span>{</span> <span>// [3]
+</span></span></span><span><span><span></span><span>...</span>
+</span></span><span><span>    <span>}</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>The <code>binder_node</code> object is allocated from the kmalloc-128 SLAB cache and the two 8-bytes leaks are at offsets 88 and 96.</p>
+<div><pre tabindex="0"><code data-lang="plaintext"><span><span>gdb&gt; ptype /o struct binder_node
+</span></span><span><span>/* offset      |    size */  type = struct binder_node {
+</span></span><span><span>...
+</span></span><span><span>/*     88      |       8 */    binder_uintptr_t ptr;
+</span></span><span><span>/*     96      |       8 */    binder_uintptr_t cookie;
+</span></span></code></pre></div>
+<h2 id="unlink-primitive">
+
+</h2>
+<p>There can be an use-after-free in an unlink operation in the <code>binder_dec_node_nilocked</code> function [1]. However, there are also multiple checks before reaching the unlink operation.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>bool</span> <span>binder_dec_node_nilocked</span><span>(</span><span>struct</span> <span>binder_node</span> <span>*</span><span>node</span><span>,</span>
+</span></span><span><span>                                             <span>int</span> <span>strong</span><span>,</span> <span>int</span> <span>internal</span><span>)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>struct</span> <span>binder_proc</span> <span>*</span><span>proc</span> <span>=</span> <span>node</span><span>-&gt;</span><span>proc</span><span>;</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>if</span> <span>(</span><span>strong</span><span>)</span> <span>{</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>node</span><span>-&gt;</span><span>local_strong_refs</span> <span>||</span> <span>node</span><span>-&gt;</span><span>internal_strong_refs</span><span>)</span>
+</span></span><span><span>      <span>return</span> <span>false</span><span>;</span>
+</span></span><span><span>  <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>  <span>}</span>
+</span></span><span><span>
+</span></span><span><span>  <span>if</span> <span>(</span><span>proc</span> <span>&amp;&amp;</span> <span>(</span><span>node</span><span>-&gt;</span><span>has_strong_ref</span> <span>||</span> <span>node</span><span>-&gt;</span><span>has_weak_ref</span><span>))</span> <span>{</span>
+</span></span><span><span>    <span>...</span>
+</span></span><span><span>  <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>hlist_empty</span><span>(</span><span>&amp;</span><span>node</span><span>-&gt;</span><span>refs</span><span>)</span> <span>&amp;&amp;</span> <span>!</span><span>node</span><span>-&gt;</span><span>local_strong_refs</span> <span>&amp;&amp;</span>
+</span></span><span><span>        <span>!</span><span>node</span><span>-&gt;</span><span>local_weak_refs</span> <span>&amp;&amp;</span> <span>!</span><span>node</span><span>-&gt;</span><span>tmp_refs</span><span>)</span> <span>{</span>
+</span></span><span><span>      <span>if</span> <span>(</span><span>proc</span><span>)</span> <span>{</span>
+</span></span><span><span>        <span>...</span>
+</span></span><span><span>      <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>        <span>BUG_ON</span><span>(</span><span>!</span><span>list_empty</span><span>(</span><span>&amp;</span><span>node</span><span>-&gt;</span><span>work</span><span>.</span><span>entry</span><span>));</span>
+</span></span><span><span>        <span>...</span>
+</span></span><span><span>        <span>if</span> <span>(</span><span>node</span><span>-&gt;</span><span>tmp_refs</span><span>)</span> <span>{</span>
+</span></span><span><span>          <span>...</span>
+</span></span><span><span>          <span>return</span> <span>false</span><span>;</span>
+</span></span><span><span>        <span>}</span>
+</span></span><span><span>        <span>hlist_del</span><span>(</span><span>&amp;</span><span>node</span><span>-&gt;</span><span>dead_node</span><span>);</span> <span>// [1]
+</span></span></span><span><span><span></span>        <span>...</span>
+</span></span><span><span>      <span>}</span>
+</span></span><span><span>      <span>return</span> <span>true</span><span>;</span>
+</span></span><span><span>    <span>}</span>
+</span></span><span><span>  <span>}</span>
+</span></span><span><span>  <span>return</span> <span>false</span><span>;</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>The unlink operation implemented in <code>__hlist_del</code> function basically modifies two kernel pointers to point to each other.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>inline</span> <span>void</span> <span>__hlist_del</span><span>(</span><span>struct</span> <span>hlist_node</span> <span>*</span><span>n</span><span>)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>    <span>struct</span> <span>hlist_node</span> <span>*</span><span>next</span> <span>=</span> <span>n</span><span>-&gt;</span><span>next</span><span>;</span>
+</span></span><span><span>    <span>struct</span> <span>hlist_node</span> <span>**</span><span>pprev</span> <span>=</span> <span>n</span><span>-&gt;</span><span>pprev</span><span>;</span>
+</span></span><span><span>
+</span></span><span><span>    <span>WRITE_ONCE</span><span>(</span><span>*</span><span>pprev</span><span>,</span> <span>next</span><span>);</span>
+</span></span><span><span>    <span>if</span> <span>(</span><span>next</span><span>)</span>
+</span></span><span><span>        <span>WRITE_ONCE</span><span>(</span><span>next</span><span>-&gt;</span><span>pprev</span><span>,</span> <span>pprev</span><span>);</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>Without loss of generality it can be summarized as:</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>*</span><span>pprev</span> <span>=</span> <span>next</span>
+</span></span><span><span><span>*</span><span>(</span><span>next</span> <span>+</span> <span>8</span><span>)</span> <span>=</span> <span>pprev</span>
+</span></span></code></pre></div><p>To reach the unlink operation, we must reallocate the freed <code>binder_node</code> object with a fake <code>binder_node</code> object whose data we control. For that we can use a well-known <code>sendmsg</code> heap spray technique to allocate an object with arbitrary data on top of the freed <code>binder_node</code>.</p>
+<p>Because there are multiple checks before the unlink operation, we must fill the fake <code>binder_node</code> with the right data to pass them. We must create a fake <code>binder_node</code> object with the following conditions:</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>node</span><span>-&gt;</span><span>proc</span> <span>==</span> <span>0</span>
+</span></span><span><span><span>node</span><span>-&gt;</span><span>has_strong_ref</span> <span>==</span> <span>0</span>
+</span></span><span><span><span>node</span><span>-&gt;</span><span>has_weak_ref</span> <span>==</span> <span>0</span>
+</span></span><span><span><span>node</span><span>-&gt;</span><span>local_strong_refs</span> <span>==</span> <span>0</span>
+</span></span><span><span><span>node</span><span>-&gt;</span><span>local_weak_refs</span> <span>==</span> <span>0</span>
+</span></span><span><span><span>node</span><span>-&gt;</span><span>tmp_refs</span> <span>==</span> <span>0</span>
+</span></span><span><span><span>node</span><span>-&gt;</span><span>refs</span> <span>==</span> <span>0</span> <span>// hlist_empty(node-&gt;refs)
+</span></span></span><span><span><span></span><span>node</span><span>-&gt;</span><span>work</span><span>.</span><span>entry</span> <span>=</span> <span>&amp;</span><span>node</span><span>-&gt;</span><span>work</span><span>.</span><span>entry</span> <span>// list_empty(&amp;node-&gt;work.entry)
+</span></span></span></code></pre></div><p>The last condition is tricky to satisfy because we must already know the address of the freed <code>binder_node</code> to calculate the correct <code>&amp;node-&gt;work.entry</code>. Fortunately, we can use our leak primitive to leak a <code>binder_node</code> address before exploiting the vulnerability to free it. Here is how we can accomplish this.</p>
+
+<h3 id="leak-a-binder_node-address">
+
+</h3>
+<p>A <code>binder_ref</code> object is allocated from the <code>kmalloc-128</code> SLAB cache and contains a pointer to the corresponding <code>binder_node</code> object exactly at offset 88 (as you remember our leak primitive discussed above leaks two 8-byte values at offsets 88 and 96 during use-after-free read).</p>
+<div><pre tabindex="0"><code data-lang="plaintext"><span><span>gdb&gt; ptype /o struct binder_ref
+</span></span><span><span>/* offset      |    size */  type = struct binder_ref {
+</span></span><span><span>...
+</span></span><span><span>/*     88      |       8 */    struct binder_node *node;
+</span></span><span><span>/*     96      |       8 */    struct binder_ref_death *death;
+</span></span></code></pre></div><p>Therefore, we can leak an address to a <code>binder_node</code> with the following steps:</p>
+<ol>
+<li>Exploit the vulnerability to free a <code>binder_node</code>.</li>
+<li>Allocate a <code>binder_ref</code> on top of the freed <code>binder_node</code>.</li>
+<li>Use the leak primitive to leak an address to a <code>binder_node</code> from the <code>binder_ref</code>.</li>
+</ol>
+<p>Once we leak the address of the freed <code>binder_node </code>object we have all the necessary data to set up our unlink primitive. After reallocating our fake <code>binder_node</code> with <code>sendmsg</code>, we send a <code>BC_FREE_BUFFER</code> binder command to free the transaction containing the dangling <code>binder_node</code> to trigger the unlink operation. At this point, we achieve a limited arbitrary write primitive – due to the implementation details of <code>__hlist_del</code> function we overwrite kernel memory either with a valid kernel pointer or with NULL.</p>
+
+<h2 id="arbitrary-read-primitive">
+
+</h2>
+<p>The exploit for CVE-2020-0041 utilized the <code>FIGETBSZ</code> ioctl to obtain arbitrary read primitive. The <code>FIGETBSZ</code> ioctl copies 4 bytes of data corresponding to the <code>s_blocksize</code> member of <code>struct super_block</code>  from the kernel back to the userspace as shown in the listing below at [1].</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>static</span> <span>int</span> <span>do_vfs_ioctl</span><span>(</span><span>struct</span> <span>file</span> <span>*</span><span>filp</span><span>,</span> <span>...)</span> <span>{</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span>  <span>struct</span> <span>inode</span> <span>*</span><span>inode</span> <span>=</span> <span>file_inode</span><span>(</span><span>filp</span><span>);</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span>    <span>case</span> <span>FIGETBSZ</span><span>:</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span>      <span>return</span> <span>put_user</span><span>(</span><span>inode</span><span>-&gt;</span><span>i_sb</span><span>-&gt;</span><span>s_blocksize</span><span>,</span> <span>(</span><span>int</span> <span>__user</span> <span>*</span><span>)</span><span>argp</span><span>);</span> <span>// [1]
+</span></span></span><span><span><span></span><span>...</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><div><pre tabindex="0"><code data-lang="c"><span><span><span>ioctl</span><span>(</span><span>fd</span><span>,</span> <span>FIGETBSZ</span><span>,</span> <span>&amp;</span><span>value</span><span>);</span> <span>// &amp;value == argp
+</span></span></span></code></pre></div><p>The diagram below shows the location of the <code>s_blocksize</code> field as referenced by <code>struct file</code> and <code>struct inode </code>structures.</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/FIGETBSZ.png" alt="FIGETBSZ"/></p>
+<p>We can perform an unlink write to modify the <code>inode</code> pointer to point to a <code>struct epitem</code> that we know the address of. As we can directly control the <code>event.data</code> field (located at the offset of 40 bytes from the beginning of the structure) in the <code>struct epitem</code> with <code>epoll_ctl</code> to point it to anywhere in kernel address space, then we can easily modify the <code>i_sb</code> field (also located at the offset 40) shown above with any arbitrary value.</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/arbitrary-read.png" alt="Arbitrary Read"/></p>
+<p>Then, we can use the <code>FIGETBSZ</code> ioctl and <code>epoll_ctl</code> as our arbitrary read primitive to read a 4-byte value from anywhere in the kernel address space. BUT, we must first know the kernel addresses of a <code>struct file</code> and a <code>struct epitem</code> objects.</p>
+
+<h3 id="leak-struct-file-address">
+
+</h3>
+<p>The <code>struct epitem</code> contains two kernel pointers (<code>next</code> and <code>prev</code>) at offsets 88 and 96 correspondingly.</p>
+<div><pre tabindex="0"><code data-lang="plaintext"><span><span>gdb&gt; ptype /o struct epitem
+</span></span><span><span>/* offset      |    size */  type = struct epitem {
+</span></span><span><span>...
+</span></span><span><span>/*     88      |      16 */    struct list_head {
+</span></span><span><span>/*     88      |       8 */        struct list_head *next
+</span></span><span><span>/*     96      |       8 */        struct list_head *prev;
+</span></span><span><span>                               } fllink;
+</span></span></code></pre></div><p>These two kernel pointers (<code>next</code> and <code>prev</code>) form a linked list of <code>struct epitem</code> objects. The head of the linked list is located at <code>struct file.f_ep_links</code>. When we use the leak primitive to leak those kernel pointers back to the userspace, one of those pointers will point to a <code>struct file </code>object.</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/file-epitem-list.png" alt="struct file and struct epitem List"/></p>
+<p>Allocating a <code>struct epitem</code> on top of the freed <code>binder_node</code> was straightforward in the previous exploit for CVE-2020-0041 targeting kernel version 4.9. Both <code>struct epitem</code> and <code>binder_node</code> are allocated from the same <code>kmalloc-128</code> SLAB cache due to cache aliasing and the <code>kmalloc-128</code> SLAB cache works in a FIFO manner. Therefore, after freeing the <code>binder_node</code>, we could allocate a <code>struct epitem</code> from the same memory location where the <code>binder_node</code> was.</p>
+<p>Cache aliasing is a kernel feature which merges multiple SLAB caches into one single SLAB cache for efficiency purposes. This happens when those SLAB caches hold similar size objects and share similar attributes. More details on cache aliasing can be found in <a href="https://duasynt.com/blog/linux-kernel-heap-feng-shui-2022">Linux kernel heap feng shui in 2022</a> blog.</p>
+<p>In kernel version 5.10, a <a href="https://android.googlesource.com/kernel/common/+/2ae928a9441a3b5f13952e1e8a97d03cb23ea603">commit</a> added the <code>SLAB_ACCOUNT</code> flag to the <code>eventpoll_epi</code> SLAB cache, so the <code>eventpoll_epi</code> and <code>kmalloc-128</code> no longer share the same SLAB cache. In other words, a <code>struct epitem</code> is no longer allocated from the <code>kmalloc-128</code> SLAB cache, which prevents us from allocating it on top of the freed <code>binder_node</code> immediately.</p>
+
+<h3 id="cross-cache-attack">
+
+</h3>
+<p>Cross-cache attack is a technique to allocate an object on top of another object that is allocated from a different cache. This is possible because there are multiple levels of memory allocators in the kernel and caches from the same level share the same memory allocator higher in their hierarchy. Caches in the SLUB allocator (<code>kmem_cache</code>) acquire a page from the page allocator and use them as a slab. If a <code>kmem_cache</code> releases a page back to the page allocator, another <code>kmem_cache</code> that requires additional memory during allocation will acquire it.</p>
+<blockquote>
+<p>Notes: The page allocator is a buddy allocator which has caches for different orders of contiguous free pages. Different <code>kmem_cache</code>s use different numbers of contiguous pages as its slab. Fortunately, both <code>kmalloc-128</code> and <code>eventpoll_epi</code> <code>kmem_cache</code>s use order-0 (2^0 = 1) page as a slab. Therefore, we do not have to groom the page allocator when performing a cross-cache attack and we can safely assume that the page allocator acts in a FIFO manner for every page allocated from and released to it.</p>
+</blockquote>
+<p>The diagram below shows how a <code>struct epitem</code> can be allocated from the same memory region that was used by a previously freed <code>binder_node</code>.</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/cross-cache-attack.png" alt="Cross-cache attack"/></p>
+<p>To perform a cross-cache attack, we must release a slab (a 4K page) from the <code>kmalloc-128</code> back to the page allocator’s per-cpu page cache, so it can be allocated to <code>eventpoll_epi</code>. Each slab in the <code>kmalloc-128</code> and <code>eventpoll_epi</code> is a 4K page and can hold 32 kernel objects (4096 / 128).</p>
+<p>To have control over one whole slab, we must allocate 32 <code>binder_object</code>s. Then, we exploit the vulnerability to release all <code>binder_node</code>s at once and leave dangling pointers pointing to them. However, SLUB allocator does not immediately release the page of the empty slab back to the page allocator, but puts it on the <code>kmalloc-128</code> cache’s <strong>partial list</strong> and makes it frozen (by setting <code>struct page.frozen</code> field).</p>
+<blockquote>
+<p>Notes: SLUB allocator uses the <code>struct page</code> of the slab to store metadata, such as the number of in-use objects, the next page in the partial list and etc..</p>
+</blockquote>
+<p>Every <code>kmem_cache</code> holds a number of slabs in the partial list, which can be empty or partially-empty, before releasing the empty slabs back to the page allocator. The SLUB allocator tracks the number of free slots in the partial list in the page of the first slab on the list (<code>struct page.pobjects</code>). When the value of <code>pobjects</code> field is larger than the value of <code>kmem_cache.cpu_partial</code> field, the SLUB allocator unfreezes and releases every empty slab back to the page allocator. The <code>set_cpu_partial</code> function determines the value of <code>kmem_cache.cpu_partial</code> and it is 30 for the <code>kmalloc_128</code>.</p>
+<p>However, as it turned out it’s not sufficient to have 30 empty slots in the partial list to get our empty slabs be released back to the page allocator. At the moment of working on PoC there was an <a href="https://lore.kernel.org/linux-mm/CAG48ez2Qx5K1Cab-m8BdSibp6wLTip6ro4=-umR7BLsEgjEYzA@mail.gmail.com/">accounting bug</a> in the SLUB allocator that causes the <code>pobjects</code> to keep track of the number of slabs on the partial list instead of empty slots. Therefore, the SLUB allocator starts releasing empty slabs back to the page allocator when the <code>kmalloc-128</code> has more than 30 slabs in the partial list.</p>
+<p>In our exploits, we allocate 36 * 32 (number of slabs * number of objects in a slab) <code>binder_node</code>s and release them all at once. Then, we allocate more than 32 <code>struct epitem</code>s to use up all the empty slots on the <code>eventpoll_epi</code>’s partial lists, so <code>eventpoll_epi</code> will allocate new pages from the page allocator.</p>
+<p>Finally, we use the leak primitive on all dangling nodes to read the values of those two fields at offset 88 and 96. If we have successfully allocated a <code>struct epitem</code> on top of an already freed <code>binder_node</code>, we will find kernel addresses in those fields and one of them is the kernel address of a <code>struct file</code>.</p>
+
+<h4 id="binder-buffer-allocator">
+
+</h4>
+<p>We want to fill the whole <code>kmalloc-128</code> slab with <code>binder_node</code>s, so we can create dangling pointers to every object in the slab by exploiting the vulnerability, but there is a challenge.</p>
+<div><pre tabindex="0"><code data-lang="plaintext"><span><span>      slab
+</span></span><span><span>+---------------+
+</span></span><span><span>| *binder_node* |&lt;---- dangling pointer
+</span></span><span><span>+---------------+
+</span></span><span><span>| *binder_node* |&lt;---- dangling pointer
+</span></span><span><span>+---------------+
+</span></span><span><span>|      ...      |
+</span></span><span><span>+---------------+
+</span></span></code></pre></div><p>When we send a transaction, Binder also allocates other kernel objects from the <code>kmalloc-128</code> cache, such as the <code>struct binder_buffer</code> object. The <code>binder_buffer</code> object holds information about the transaction buffer and a pointer to a <code>binder_node</code> owned by the recipient client’s <code>binder_proc</code>. Exploiting the vulnerability turns that pointer to a dangling pointer to the freed <code>binder_node</code>.</p>
+<div><pre tabindex="0"><code data-lang="plaintext"><span><span>      slab
+</span></span><span><span>+---------------+
+</span></span><span><span>|      ...      |
+</span></span><span><span>+---------------+
+</span></span><span><span>| binder_buffer |----+
+</span></span><span><span>+---------------+    | dangling pointer
+</span></span><span><span>| *binder_node* |&lt;---+
+</span></span><span><span>+---------------+
+</span></span><span><span>|      ...      |
+</span></span><span><span>+---------------+
+</span></span></code></pre></div><p>However, we cannot free this <code>binder_buffer</code> yet because we need it to trigger the use-after-free for the leak and unlink primitives. Therefore, we must ensure the <code>binder_buffer</code> cannot be allocated from the same <code>kmalloc-128</code> slab as the <code>binder_node</code>s.</p>
+<p>Binder implements its own memory allocator to allocate memory for every incoming transaction and map them to the recipient’s mapped memory map. The memory allocator employs the best-fit allocation strategy and uses the <code>binder_buffer</code> object to keep track of all allocated and free memory regions. When allocating a new transaction buffer, it searches for a free <code>binder_buffer</code> of the same size to reuse. If none is available, it splits a larger free <code>binder_buffer</code> into two: one with the requested size and another with the remaining size.</p>
+<p>To prevent Binder from allocating a new <code>binder_buffer</code> for every transaction, we can allocate many free <code>binder_buffer</code>s in advance by causing memory fragmentation. We can achieve that by sending multiple transactions of varying sizes and selectively releasing some of them. Consequently, this process creates gaps within the memory allocator, which results many free <code>binder_buffer</code> available for reuse in future transactions.</p>
+<div><pre tabindex="0"><code data-lang="plaintext"><span><span>Binder buffer allocator
+</span></span><span><span>+-----------------+----------+-----------------+----------+---------+
+</span></span><span><span>|    free (24)    | used (8) |    free (24)    | used (8) |   ...   |
+</span></span><span><span>+-----------------+----------+-----------------+----------+---------+
+</span></span></code></pre></div><p>Here is a video demonstrating the cross-cache attack:</p>
+
+
+    
+    <p>
+      <iframe allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen="allowfullscreen" loading="eager" referrerpolicy="strict-origin-when-cross-origin" src="https://www.youtube.com/embed/VJWEUsTDtuc?autoplay=0&amp;controls=1&amp;end=0&amp;loop=0&amp;mute=0&amp;start=0" title="YouTube video"></iframe>
+    </p>
+
+
+<h2 id="root">
+
+</h2>
+<p>To obtain root privileges, we perform the following steps:</p>
+<ol>
+<li>Use the arbitrary read primitive to find our process’s <code>task_struct</code> and <code>cred</code> structures.</li>
+</ol>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>struct</span> <span>binder_node</span> <span>*</span><span>node</span><span>;</span>
+</span></span><span><span><span>struct</span> <span>binder_proc</span> <span>*</span><span>proc</span> <span>=</span> <span>node</span><span>-&gt;</span><span>proc</span><span>;</span>
+</span></span><span><span><span>struct</span> <span>task_struct</span> <span>*</span><span>task</span> <span>=</span> <span>proc</span><span>-&gt;</span><span>tsk</span><span>;</span>
+</span></span><span><span><span>struct</span> <span>task_struct</span> <span>*</span><span>cred</span> <span>=</span> <span>task</span><span>-&gt;</span><span>cred</span><span>;</span>
+</span></span></code></pre></div><ol start="2">
+<li>Overwrite all the ID fields in the <code>struct cred</code> object with 0 (the UID for root).</li>
+<li>Disable SELinux by overwriting <code>selinux.enforcing</code> field with 0.</li>
+<li>Enable <code>TIF_SECCOMP</code> in the current task flag and overwrite the seccomp’s mask with 0 to bypass seccomp.</li>
+</ol>
+
+<h2 id="demo">
+
+</h2>
+
+
+    
+    <p>
+      <iframe allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen="allowfullscreen" loading="eager" referrerpolicy="strict-origin-when-cross-origin" src="https://www.youtube.com/embed/7qFb6RUHnnU?autoplay=0&amp;controls=1&amp;end=0&amp;loop=0&amp;mute=0&amp;start=0" title="YouTube video"></iframe>
+    </p>
+
+
+<h2 id="bonus-arbitrary-write-primitive">
+
+</h2>
+<p>Although we do not need an arbitrary write primitive to achieve root privilege in our PoC, we would like to provide information on how to obtain write-what-where primite for the reference.</p>
+<p>Our unlink primitive can write at any arbitrary address writeable in the kernel, but it can only write 0 or a value which is valid (i.e. writeable) kernel address. To achieve a more powerful arbitrary write (write-what-where), we chose to exploit the pointer field <code>buf</code> in the <code>struct seq_file</code> object based on the technique presented in Typhoon Mangkhut exploit chain by 360 Alpha Lab (<a href="https://i.blackhat.com/USA21/Wednesday-Handouts/us-21-Typhoon-Mangkhut-One-Click-Remote-Universal-Root-Formed-With-Two-Vulnerabilities.pdf">slides</a>).</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>struct</span> <span>seq_file</span> <span>{</span>
+</span></span><span><span>  <span>char</span> <span>*</span><span>buf</span><span>;</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span><span>};</span>
+</span></span></code></pre></div><p>The <code>struct seq_file</code> is used by files implemented with the Linux’s <code>seq_file</code> interface, for example <code>/proc/self/comm</code>. When opening the <code>/proc/self/comm</code> file, the kernel creates a <code>struct seq_file</code> and calls the <code>comm_open</code> function. The <code>comm_open</code> passes the <code>comm_show</code> function to the <code>single_open</code> function to define what string to show when the file is read.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>// fs/proc/base.c
+</span></span></span><span><span><span></span><span>static</span> <span>int</span> <span>comm_open</span><span>(</span><span>struct</span> <span>inode</span> <span>*</span><span>inode</span><span>,</span> <span>struct</span> <span>file</span> <span>*</span><span>filp</span><span>)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>return</span> <span>single_open</span><span>(</span><span>filp</span><span>,</span> <span>comm_show</span><span>,</span> <span>inode</span><span>);</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>The <code>comm_show</code> copies the current task name into the <code>seq_file-&gt;buf</code> buffer ([1] in the listing below).</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>// fs/proc/base.c
+</span></span></span><span><span><span></span><span>static</span> <span>int</span> <span>comm_show</span><span>(</span><span>struct</span> <span>seq_file</span> <span>*</span><span>m</span><span>,</span> <span>void</span> <span>*</span><span>v</span><span>)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span>  <span>proc_task_name</span><span>(</span><span>m</span><span>,</span> <span>p</span><span>,</span> <span>false</span><span>);</span>
+</span></span><span><span><span>...</span>
+</span></span><span><span><span>}</span>
+</span></span><span><span>
+</span></span><span><span><span>// fs/proc/array.c
+</span></span></span><span><span><span></span><span>void</span> <span>proc_task_name</span><span>(</span><span>struct</span> <span>seq_file</span> <span>*</span><span>m</span><span>,</span> <span>struct</span> <span>task_struct</span> <span>*</span><span>p</span><span>,</span> <span>bool</span> <span>escape</span><span>)</span>
+</span></span><span><span><span>{</span>
+</span></span><span><span>  <span>char</span> <span>*</span><span>buf</span><span>;</span>
+</span></span><span><span>  <span>size_t</span> <span>size</span><span>;</span>
+</span></span><span><span>  <span>char</span> <span>tcomm</span><span>[</span><span>64</span><span>];</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>// `tcomm` is filled with the current task name
+</span></span></span><span><span><span></span>  <span>...</span>
+</span></span><span><span>  <span>size</span> <span>=</span> <span>seq_get_buf</span><span>(</span><span>m</span><span>,</span> <span>&amp;</span><span>buf</span><span>);</span> <span>// buf = m-&gt;buf
+</span></span></span><span><span><span></span>  <span>if</span> <span>(</span><span>escape</span><span>)</span> <span>{</span>
+</span></span><span><span>  <span>...</span>
+</span></span><span><span>  <span>}</span> <span>else</span> <span>{</span>
+</span></span><span><span>    <span>ret</span> <span>=</span> <span>strscpy</span><span>(</span><span>buf</span><span>,</span> <span>tcomm</span><span>,</span> <span>size</span><span>);</span> <span>// [1]
+</span></span></span><span><span><span></span>  <span>}</span>
+</span></span><span><span><span>}</span>
+</span></span></code></pre></div><p>We can open the <code>/proc/self/comm</code> file two times to allocate two instances <code>struct seq_file</code> in the kernel. Then, we use the unlink primitive to overwrite <code>struct seq_file-&gt;buf</code> field in the first instance to point to the address of <code>struct seq_file-&gt;buf</code> field in the second instance.</p>
+<p>As a result, this enables us to overwrite the <code>struct seq_file-&gt;buf</code> field in the second instance to point to any arbitrary kernel address by changing the current task name to the 8-byte value of the target address and calling <code>lseek</code> on the first <code>seq_file</code>’s file descriptor ([2] in the listing below). Calling <code>lseek</code> on the file descriptor will trigger the <code>comm_show</code> function leading to overwriting <code>struct seq_file-&gt;buf</code> field in the second instance of the structure with the target address.</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>// [2] Point `seq_file-&gt;buf` to arbitrary kernel address
+</span></span></span><span><span><span></span><span>prctl</span><span>(</span><span>PR_SET_NAME</span><span>,</span><span>&#34;</span><span>\xef\xbe\xad\xde\xff\xff\xff\xff\0</span><span>&#34;</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>,</span> <span>0</span><span>);</span>
+</span></span><span><span><span>lseek</span><span>(</span><span>comm_fd1</span><span>,</span> <span>1</span><span>,</span> <span>SEEK_SET</span><span>);</span> <span>// comm_fd1 = First seq_file&#39;s file descriptor
+</span></span></span></code></pre></div><p>The diagram below shows the layout of the instances of <code>struct seq_file</code> with <code>struct seq_file-&gt;buf</code> field pointing at the attacker-chosen address.</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/arbitrary-write.png" alt="Arbitrary Write"/></p>
+<p>Then, we can perform similar actions on the second <code>seq_file</code>’s file descriptor to write with data we control by setting the current task name. As a result, this gives us a more powerful arbitrary write (write-what-where) primitive in kernel memory.</p>
+
+<h2 id="bonus-binder-node-reference-counting-explained">
+
+</h2>
+<p>Let’s examine the 4 reference counters of a <code>struct binder_node</code>.</p>
+<p>The <code>local_strong_refs</code> and <code>local_weak_refs</code> keep track of the number of Nodes in all transactions that reference the Node. Remember the Node in a transaction (<code>struct flat_binder_object</code>) has a different data structure from the Node (<code>struct binder_node</code>) that Binder creates internally for bookkeeping. Binder ensures that every <code>binder_node</code> does not go away when there are Nodes in transactions that have references to it.</p>
+<p>After opening a Binder device file, we call <code>mmap</code> to provide a shared memory map that Binder uses to store data for incoming transactions. Binder implements a buffer allocator to manage that shared memory map, which allocates a <code>struct binder_buffer</code> to occupy a part of the memory map to store an incoming transaction data. The <code>target_node</code> field in the <code>struct binder_buffer</code> references the <code>binder_node</code> that belongs to the receiving client, which increments that <code>binder_node</code>’s <code>local_strong_refs</code> refcount.</p>
+<p>The <code>internal_strong_refs</code> keep tracks of how many Refs other clients have that are referencing the Node.</p>
+<p>The diagram below illustrates a scenario where Client A has an incoming transaction that contains two Nodes and Client B has a Ref 0xbeef (<code>binder_ref</code>) that references Client A’s Node 0xbeef (<code>binder_node</code>). Most importantly, it highlights how those data structures increment the reference counters of Node 0xbeef.</p>
+<p><img src="https://rgoswami.me/posts/lowering-resource-usage-foot-systemd/binder-refcounts.png" alt="Binder Node Reference Count"/></p>
+<p>When Binder assigns a variable to a pointer to a <code>binder_node</code>, it uses the <code>tmp_refs</code> to keep the <code>binder_node</code> alive as long as the pointer is used within its scope. The code below shows a basic example:</p>
+<div><pre tabindex="0"><code data-lang="c"><span><span><span>struct</span> <span>binder_node</span> <span>*</span><span>node</span> <span>=</span> <span>...;</span>
+</span></span><span><span><span>binder_inc_node_tmpref</span><span>(</span><span>node</span><span>);</span>
+</span></span><span><span>
+</span></span><span><span><span>// Access `node` safely
+</span></span></span><span><span><span></span>
+</span></span><span><span><span>binder_dec_node_tmpref</span><span>(</span><span>node</span><span>);</span> <span>// `node` can no longer be used after this.
+</span></span></span><span><span><span></span>                                 <span>Otherwise</span><span>,</span> <span>there</span> <span>can</span> <span>be</span> <span>race</span> <span>conditions</span><span>.</span>
+</span></span></code></pre></div><p>Binder also sets the <code>has_strong_ref</code> and <code>has_weak_ref</code> flags when there is at least one Ref that references the <code>binder_node</code>.</p>
+<p>The <code>binder_node-&gt;refs</code> points to the head of a list of Refs.</p>
+
+
+<p>The issue described in this blog has been remediated in two Android Security Bulletins:</p>
+<ul>
+<li>CVE-2023-20938 in <a href="https://source.android.com/docs/security/bulletin/2023-02-01#kernel">2023-02-01</a></li>
+<li>CVE-2023-21255 in <a href="https://source.android.com/docs/security/bulletin/2023-07-01#kernel">2023-07-01</a></li>
+</ul>
+<p>CVE-2023-20938 was initially addressed in the February 2023 Android Security Bulletin by back-porting <a href="https://github.com/torvalds/linux/commit/6d98eb95b450a75adb4516a1d33652dc78d2b20c">a patch</a> to the vulnerable kernels. However, further analysis reveals that the patch did not fully mitigate the underlying root cause and it was still possible to reach the bug, although, through a different path. As a result, a new CVE-2023-21255 was assigned and the root cause was <a href="https://android.googlesource.com/kernel/common/+/1ca1130ec62d">fully mitigated</a> in the July 2023 Android Security Bulletin.</p>
+
+
+<p>Special thanks to Carlos Llamas, Jann Horn, Seth Jenkins, Octavian Purdila, Xingyu Jin, Farzan Karimi, for their support with technical questions and for reviewing this post.</p>
+        </div></div>
+  </body>
+</html>
