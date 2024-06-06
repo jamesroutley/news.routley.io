@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://mattweidner.com/2024/06/04/server-architectures.html">Original</a>
+    <h1>Architectures for Central Server Collaboration</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+  <div>
+
+    
+
+    <p><i>
+    Matthew Weidner |
+    
+    Jun 4th, 2024
+    
+    </i></p>
+
+    <p>This blog post records some thoughts on how to architect a real-time collaborative app when you <em>do</em> have a central server.</p>
+
+<p>It is on the speculative side, since my own experience centers on server-optional collaborative apps using <a href="https://crdt.tech/">CRDTs</a>. Nonetheless, I hope that this post can provide a useful overview of different architectures, while also giving perspective on where classic CRDT/<a href="https://en.wikipedia.org/wiki/Operational_transformation">OT</a> approaches are useful and where they might be overkill.</p>
+
+<p>The architectural techniques below come from a variety of collaborative apps and devtools, summarized in the <a href="#classification-table">Classification Table</a> at the end. Additionally, the following sources serve as theoretical inspiration:</p>
+
+<ul>
+  <li><a href="https://vlcn.io/blog/crdt-substrate">A Framework for Convergence</a>, Matt Wonlaw (2023).</li>
+  <li><a href="https://marijnhaverbeke.nl/blog/collaborative-editing.html">Collaborative Editing in ProseMirror</a>, Marijn Haverbeke (2015).</li>
+  <li><a href="https://alarmingdevelopment.org/?p=1716">Operational Version Control</a>, Jonathan Edwards (2024).</li>
+</ul>
+
+<ul id="toc"></ul>
+<!-- Filled in by script at end. -->
+
+
+
+<p>Here is a simple abstract model that describes many apps with a central server and multiple users:</p>
+
+<ul>
+  <li>The server stores some <strong>state</strong> that changes over time. (User status, task list, multiplayer game world, etc.).</li>
+  <li>User interact with the state by submitting <strong>operations</strong> to the server. (“set status”, “mark task as completed”, “pick up loot”, etc.) Each time the server receives an operation, it uses app-specific business logic to validate the operation and possibly update the state.</li>
+  <li>Occasionally, the server sends the latest state to users, so that they can update their local views.</li>
+</ul>
+
+<p><img src="https://mattweidner.com/assets/img/server-architectures/server_model.png" alt="See caption"/></p>
+<p><i>Bob submits a &#34;set status&#34; operation to the server using a form. The server processes it, updates its state, and sends the new state to Bob and Alice.</i></p>
+
+<p>In early web apps, updating the user’s local view of the state required refreshing the page. This was true even for the user’s own operations: to perform an operation, the user’s browser would submit a form and display the returned HTML. Later, AJAX let users submit operations and receive updates without reloading the whole page, but they often still needed to wait for a response from the server before seeing the effects of their own operations.</p>
+
+<p><em>Real-time collaborative apps</em> like Google Docs, Figma, and many multiplayer games instead let users see their own operations immediately, without waiting for a response from the server. These instant local updates are merely <em>optimistic</em>—the operation might be rejected by the server, or modified by concurrent user actions—but they nevertheless improve the user experience, by reducing user-perceived latency. Real-time collaborative apps can even choose to allow offline work, by storing operations for later submission while still updating the local state immediately.</p>
+
+
+
+<p>Even before adding real-time collaboration, our simple abstract model hides an important challenge: What should the server do in situations like Figure 1, where Bob submits an operation that arrives after a <em>concurrent</em> operation from Alice?</p>
+
+<p><a id="figure-1"></a>
+<img src="https://mattweidner.com/assets/img/server-architectures/server_side_rebasing.png" alt="See caption"/></p>
+<p><i><b>Figure 1.</b> Starting in state <code>S</code>, Bob submits operation <code>B</code> to the server. But before it arrives, the server processes Alice&#39;s concurrent operation <code>A</code>, changing the state to <code>S + A</code>.</i></p>
+
+<p>The issue here is that Bob expected his operation <code>B</code> to apply to some state <code>S</code>, but it was instead applied to the state <code>S + A</code>. I call this <strong>server-side rebasing</strong>, by analogy with <a href="https://git-scm.com/book/en/v2/Git-Branching-Rebasing">git rebasing</a>. Depending on the details of the specific situation, the original operation <code>B</code> might no longer make sense in state <code>S + A</code>:</p>
+
+<ul>
+  <li>Suppose Alice and Bob both “like” a social media post. If the post started with 5 likes, Alice and Bob could each send the operation “set like count to 6”. But when Bob’s operation arrives, the count is already 6; his rebased operation should instead increase it to 7.
+ <img src="https://mattweidner.com/assets/img/server-architectures/like_count_rebasing.png" alt="Specialization of Figure 1 to the like-count example. State S: &#34;Like count: 5&#34;. Operation A: &#34;set like count to 6&#34;. Operation B: &#34;set like count to 6&#34;. State S+A: &#34;Like count: 6&#34;. State after B: &#34;Like count: ~6~ 7&#34;."/></li>
+  <li>In a multiplayer game, suppose there is some loot on the ground and Alice and Bob each try to pick it up. If you phrase their operations as “add loot to my inventory; delete loot from ground”, then they will both end up with the loot in their inventory, duplicating it.</li>
+  <li>In a word document, if Bob’s edit is phrased as “set document state to <code>&#34;xyz...&#34;</code>”, then his change will overwrite Alice’s concurrent edits. This might be okay for individual paragraphs (e.g., <a href="https://www.notion.so/blog/data-model-behind-notion">Notion blocks</a>), but for a large document with Alice and Bob editing different places simultaneously, Alice would prefer that Bob’s rebased operation preserves her concurrent edits (like Google Docs).</li>
+</ul>
+
+<p>Here are three common solutions to the server-side rebasing challenge.</p>
+
+<h2 id="1-serialization">1. Serialization</h2>
+
+<p>In situations like <a href="#figure-1">Figure 1</a>, the server rejects Bob’s operation. His client must download the new state <code>S + A</code> and then retry with an updated operation <code>B&#39;</code>.</p>
+
+<p>Examples:</p>
+
+<ul>
+  <li>In the like-count example above, Bob’s client could read the new like count (6) and retry with an updated operation “set like count to 7”.</li>
+  <li>The ProseMirror rich-text editor’s <a href="https://prosemirror.net/docs/guide/#collab">built-in collaborative editing system</a> rejects operations like <code>B</code>. Upon learning of this rejection, Bob’s client will compute a rebased operation <code>B&#39;</code> that “does the same thing” to the new document state, using ProseMirror’s built-in rebasing function, then submit <code>B&#39;</code> to the server.</li>
+  <li>In git, if you <code>git push</code> to a remote branch that has more commits (= operations) than your local branch, the remote branch will reject your push. You can then use <code>git pull --rebase &amp;&amp; git push</code> to download the new state, rebase your local commits, and retry. Note that unlike in most real-time collaborative apps, this might require human input.</li>
+</ul>
+
+<p>I call this approach “Serialization” by analogy with SQL’s <a href="https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE">serializable isolation level</a>.</p>
+
+<p>Note that serialization does not actually solve the rebasing problem; it just defers it to clients, who must rebase the operations themselves. Also, in apps with many active users, frequent rejections can lead to performance issues and even lock out users—see <a href="https://stepwisehq.com/blog/2023-07-25-prosemirror-collab-performance/">StepWise’s ProseMirror blog post</a>.</p>
+
+<h2 id="2-crdt-ish">2. CRDT-ish</h2>
+
+<p>Operations are designed to “make sense” as-is, even when applied to a slightly newer state. That is, in situations like <a href="#figure-1">Figure 1</a>, the server applies operation <code>B</code> directly to the state <code>S + A</code> and hopes that the result looks reasonable to users.</p>
+
+<p>Examples:</p>
+
+<ul>
+  <li>In the like-count example above, Alice and Bob can rephrase their operations as “add 1 to the like count” (or “add my user ID to the has-liked set”).</li>
+  <li>In the multiplayer game example above, the server can treat a “pick up loot” action as “if the loot is on the ground, add it to the player’s inventory, else do nothing”. That way, if Bob tries to pick up a loot item but Alice picks it up first, Bob’s operation is ignored—the item is not added to his inventory. The server can likewise ignore any subsequent attempts by Bob to use that item, since it isn’t in his inventory.</li>
+  <li>In a todo-list app, if operation <code>A</code> marks a task as completed while operation <code>B</code> changes the task’s content, the server can choose to process both operations as-is. This is simple to implement if you treat the two operations as acting on independent states—the “done” checkmark and the text content—instead of overwriting a whole object <code>{ done: boolean; content: string }</code>. On the other hand, maybe your business logic doesn’t allow edits to completed tasks, in which case the server can do something else.</li>
+</ul>
+
+<p>I call this approach “CRDT-ish” because <a href="https://crdt.tech/">CRDTs</a> also use operations that can be applied as-is to newer states. Thus studying <a href="https://mattweidner.com/2023/09/26/crdt-survey-2.html">CRDT techniques</a> can help you design operations that “make sense” like in the examples above.</p>
+
+<p>Note that you don’t need to use literal CRDTs, which are often overkill in a central server app. In particular, your operations don’t need to satisfy CRDTs’ strict algebraic requirements (commutativity / lattice axioms). Whether operations “make sense” in new states is instead a fuzzy, app-specific question: it depends on your app’s business logic and what users expect to happen, and it’s okay to be imperfect.</p>
+
+<p>I personally find designing CRDT-ish operations a lot of fun, though it can require a special way of thinking. From the server’s perspective, it just needs to apply operations to its state in serial order, which is dead simple.</p>
+
+<p>Performance-wise, literal CRDTs were historically criticized for storing lots of metadata. This is less of a problem with modern implementations, and the central server can help if needed.</p>
+
+<h2 id="3-ot-ish">3. OT-ish</h2>
+
+<p>In situations like <a href="#figure-1">Figure 1</a>, the server <em>transforms</em> <code>B</code> against <code>A</code>, computing a new operation <code>B&#39;</code> that is actually applied to the state. More generally, the server applies a <em>transformation function</em> <code>T</code> to each intervening concurrent operation in order:</p>
+
+<p><img src="https://mattweidner.com/assets/img/server-architectures/ot_ish.png" alt="Bob submits operation B. Concurrently, other users submit operations A1, A2, ..., An, which arrive at the server first (in that order). The server transforms B against each intervening concurrent operation in order: B&#39; = T(B, A1), B&#39;&#39; = T(B&#39;, A2), ..., B^(n) = T(B^(n-1), An). It then applies the transformed B^(n) to the state."/></p>
+
+<p>Examples:</p>
+
+<ul>
+  <li>In the like-count example above, a reasonable transformation function is <code>T(set(n), set(_)) = set(n+1)</code>. That way, Bob’s operation <code>set(6)</code> transforms against Alice’s intervening concurrent operation to yield <code>set(7)</code>.</li>
+  <li>In the multiplayer game example above, a reasonable transformation function is:
+    <div><div><pre><code>  T(pickUp(userB, Y), pickUp(userA, X)) = 
+    if X = Y return noop()
+    else return pickUp(userB, Y)
+</code></pre></div>    </div>
+    <p>That way, if Alice and Bob both try to pick up the same item, the second operation (Bob’s) is transformed into a no-op.</p>
+  </li>
+</ul>
+
+<p>I call this approach “OT-ish” because <a href="https://en.wikipedia.org/wiki/Operational_transformation">Operational Transformation (OT)</a> systems also transform each operation against intervening concurrent operations. As in the previous section, literal OT algorithms are probably overkill. In particular, your transformation function doesn’t need to satisfy OT’s strict algebraic requirements (the Transformation Properties).</p>
+
+<p>OT-ish systems are well established in practice. In particular, Google Docs is a literal OT system. However, most published info about OT focuses on text editing, which is difficult but only a small part of many apps.</p>
+
+<p>Performance-wise, OT-ish systems can struggle in the face of many simultaneous active users: the server ends up doing <code>O(# active users)</code> transformations per operation, hence <code>O((# active users)^2)</code> transformations per second. Also, the server needs to store a log of past operations for transformations, not just the current state. You can garbage collect this log, but then you lose the ability to process delayed operations (e.g., users’ offline edits).</p>
+
+<h2 id="challenge-text-and-lists">Challenge: Text and Lists</h2>
+
+<p>There is one case where server-side rebasing is especially tricky, no matter which of the three above solutions you use: editing text and lists. (Extensions to text, like <a href="https://www.inkandswitch.com/peritext/">rich text</a> and <a href="https://inria.hal.science/hal-01404024">wiki pages</a>, are likewise hard.)</p>
+
+<p>Figure 2 illustrates the challenge:</p>
+
+<p><a id="figure-2"></a>
+<img src="https://mattweidner.com/assets/img/server-architectures/index_rebasing.png" alt="See caption"/></p>
+<p><i><b>Figure 2.</b> Bob submits the operation &#34;insert ‘ the’ at index 17&#34; to the central server. But before his edit arrives, the server applies Alice&#39;s concurrent operation &#34;insert ‘ gray’ at index 3&#34;. So it no longer makes sense to apply Bob&#39;s operation at index 17; the server must &#34;rebase&#34; it to index 22.</i></p>
+
+<p>This “index rebasing” challenge is best known for real-time collaborative apps like Google Docs, but technically, it can also affect non-real-time apps—e.g., a web form that inserts items into a list. The problem can even appear in single-threaded local apps, which need to transform text/list indices for features like <a href="https://docs.google.com/presentation/d/10C2ra_dna63Fjrhf6zzIKXYUpmcBzXVEDTVEiuQpvvM/edit#slide=id.g2bdb934aad2_0_49">annotations and edit histories</a>.</p>
+
+<p>Solutions to the index-rebasing problem fall into two camps:</p>
+<ul>
+  <li>
+    <p><strong>Immutable Positions (CRDT-ish).</strong> Assign each character / list element an immutable ID that is ordered and moves around together with the character. I call these <em>positions</em>.</p>
+
+    <p><a href="https://www.figma.com/blog/realtime-editing-of-ordered-sequences/#fractional-indexing">Fractional indexing</a> is a simple example: assign each character a real number like 0.5, 0.75, 0.8, …; to insert a character between those at 0.5 and 0.75, use an operation like “add character <code>&#39;x&#39;</code> at position 0.625”, which will end up in the right place even if the array index changes. Text/list CRDTs implement advanced versions of fractional indexing that avoid its main issues.</p>
+
+    <p>Immutable positions are a good fit for CRDT-ish server-side rebasing, because the positions “make sense” as-is in newer states: you can always ask “what array index corresponds to this position right now?”.</p>
+  </li>
+  <li>
+    <p><strong>Index Transformations (OT-ish).</strong> Directly transform index 17 to 22 in situations like <a href="#figure-2">Figure 2</a>, by noticing that a concurrent operation inserted 5 characters in front of it. This is normal OT-ish server-side rebasing, but it is hard because there are a lot of edge cases—e.g., how do you transform an insert operation against a delete operation at the same index?</p>
+  </li>
+</ul>
+
+<p>Typically, solutions to the index-rebasing problem are implemented as literal CRDT/OT algorithms inside of a full-stack CRDT/OT collaboration system. This can be quite restrictive, if you need the algorithms for text editing but otherwise want to make your own collaboration system (for custom server-side business logic, more control over the network and storage subsystems, etc.).</p>
+
+<p>To alleviate these restrictions, I’m interested in tools that solve the index-rebasing problem using <em>local</em> data structures, independent of a specific collaboration system:</p>
+<ul>
+  <li>For CRDT-ish systems, I created the <a href="https://github.com/mweidner037/list-positions">list-positions</a> library.</li>
+  <li>For OT-ish systems, <a href="https://prosemirror.net/docs/guide/#transform.rebasing">ProseMirror’s built-in rebasing function</a> is a good example. ProseMirror’s author provides some perspective on why literal OT is overkill <a href="https://marijnhaverbeke.nl/blog/collaborative-editing.html">here</a>.</li>
+</ul>
+
+
+
+<p>We now want to add real-time collaboration to our central server app. Recall that this means that users can see the effects of their own operations immediately, without waiting for a response from the server: their clients are allowed to perform <strong>optimistic local updates</strong>.</p>
+
+<p>To incorporate optimistic local updates into our earlier <a href="#modeling-central-server-apps">abstract model</a>, let us assume that each client has access to a <strong>reducer function</strong> à la <a href="https://redux.js.org/">Redux</a>. It inputs a state and an operation, outputting the new state. This reducer function should emulate the server’s business logic, though it need not match exactly (e.g., it likely omits interactions with external systems).</p>
+
+<p>Now we can define what we mean by “users can see the effects of their own operations immediately”. At any time, a user’s optimistic local state is given by:</p>
+<ol>
+  <li>Start with the latest state received from the server.</li>
+  <li>Apply the reducer function to all <strong>pending local operations</strong>—operations that were performed locally but not yet acknowledged by the server.</li>
+</ol>
+
+<p>In other words, the optimistic local state is what the client thinks the server’s state will be once the server processes its local operations, assuming that there are no intervening concurrent operations, authorization issues, etc.</p>
+
+<p>Processing local operations is easy; the client just needs to apply the reducer function. The interesting part is processing <em>remote</em> operations—state updates received from the server—in the presence of pending local operations:</p>
+
+<p><a id="figure-3"></a>
+<img src="https://mattweidner.com/assets/img/server-architectures/optimistic_local_updates.png" alt="See caption"/></p>
+<p><i><b>Figure 3.</b> Bob&#39;s client optimistically renders the state <code>S+L1+L2+L3</code>, where <code>S</code> is the last state received from the server and <code>L1, L2, L3</code> are pending local operations. After receiving a remote operation <code>R</code> from the server, his client must render the new optimistic state <code>(S+R)+L1+L2+L3</code>.</i></p>
+
+<p>The three techniques below are different ways to update the client’s state in situations like Figure 3. Note that the correct answer is already specified by the abstract model above—the three techniques are merely different ways to compute it.</p>
+
+<h2 id="1-server-reconciliation">1. Server Reconciliation</h2>
+
+<p>One implementation technique is to take the abstract model literally: when a client receives a batch of remote operations from the server,</p>
+
+<ol>
+  <li>Undo all pending local operations. This rewinds the state to the client’s previous view of the server’s state.</li>
+  <li>Apply the remote operations. This brings the client up-to-date with the server’s state.</li>
+  <li>Redo any pending local operations that are still pending, i.e., they were not acknowledged as part of the remote batch.</li>
+</ol>
+
+<p><img src="https://mattweidner.com/assets/img/server-architectures/server_reconciliation.png" alt="Starting in optimistic local state S+L1+L2+L3, Step 1 leads to state S, Step 2 leads to state S+R, and Step 3 leads to state S+R+L1+L2+L3."/></p>
+<p><i>The Server Reconciliation way to process a remote operation <code>R</code> in the presence of pending local operations <code>L1, L2, L3</code>.</i></p>
+
+<p>Step 1 could involve literal undo commands, using a local stack that records how to undo each pending local mutation. Or, you could store the app state as a persistent data structure and directly restore the state before the first pending local mutation. Or, the server could tell you the exact new state to use (= its own latest state), which you use directly as the result of step 2.</p>
+
+<blockquote>
+  <p>If you use OT-ish server-side rebasing—the server transforms operations received after concurrent operations—then you must apply an equivalent transformation to the pending local operations in step 3. Basically, ensure that the new log of pending local operations matches what the server would apply to its own state, if it received the <em>original</em> operations next.</p>
+</blockquote>
+
+
+
+
+<p>You do need special support from your local data structures to implement step 1—e.g., “undoable” or persistent data structures—but these are easier to implement than CRDT or OT data structures. Indeed, their special properties are purely local, so your data structures don’t need to reason about concurrency or eventual consistency. (Instead, “reasoning about concurrency” takes place during server-side rebasing.)</p>
+
+<p>Because of its simplicity and flexibility, server reconciliation is where I’ve focused my own recent research efforts. However, undoing and redoing pending local operations does increase the cost of remote updates, which could cause performance issues. Let us now discuss two techniques that avoid this cost by applying remote operations to the state “directly”: literal CRDT and OT.</p>
+
+<h2 id="2-crdt">2. CRDT</h2>
+
+<p>The CRDT way to process a remote operation is: just process it directly, as if there were no pending local operations. This works because a new remote operation is always concurrent to all pending local operations, and (op-based) CRDTs guarantee that concurrent operations commute:</p>
+
+<p><img src="https://mattweidner.com/assets/img/server-architectures/crdt.png" alt="Starting in optimistic local state S+L1+L2+L3, go to state S+L1+L2+L3+R, which is equivalent to S+R+L1+L2+L3."/></p>
+<p><i>The CRDT way to process a remote operation <code>R</code> in the presence of pending local operations <code>L1, L2, L3</code>. The reordered operations are equivalent (same final states) because concurrent operations commute by assumption.</i></p>
+
+<p>In some cases, clients can process a remote operation “directly” without using a literal CRDT. The example I have in mind is a key-value store with operations <code>set(key, value)</code> (used by <a href="https://www.figma.com/blog/how-figmas-multiplayer-technology-works/#syncing-object-properties">Figma object properties</a>):</p>
+<ul>
+  <li>When a user performs a pending local operation, mark its key as “pending” on that user’s device. Unmark it once the operation is acknowledged by the server.</li>
+  <li>To process a remote operation <code>set(key, value)</code>, first check if <code>key</code> is marked pending. If so, do nothing; otherwise, set <code>key</code> to <code>value</code> normally. This is equivalent to re-applying pending local operations “on top” of the remote operation, as required by <a href="#figure-3">Figure 3</a>.</li>
+</ul>
+
+<p>CRDTs can be made quite efficient. For rich-text editing, which is a hard case, Yjs and Collabs can each support <a href="https://arxiv.org/abs/2212.02618">~100 simultaneously active users</a> with a modest server and clients, vs &lt;32 for Google Docs (an OT system).</p>
+
+<p>The downside is that you must restrict yourself to commuting concurrent operations, which are hard to come by. In practice, this means that apps often only use CRDTs provided by an expert-made library—though my <a href="https://mattweidner.com/">blog</a> tries to change that.</p>
+
+<h2 id="3-ot">3. OT</h2>
+
+<p>The OT way to process a remote operation is: <em>transform</em> it into a new operation that has the same effect as server reconciliation, then apply the transformed operation to the optimistic local state.</p>
+
+<p><img src="https://mattweidner.com/assets/img/server-architectures/ot.png" alt="Starting in optimistic local state S+L1+L2+L3, go to state S+L1+L2+L3+R&#39;&#39;&#39;, which is equivalent to S+R+L1+L2+L3. Here R&#39;&#39;&#39; is computed as: R&#39;=T(R, L1), R&#39;&#39;=T(R&#39;, L2), R&#39;&#39;&#39;=T(R&#39;&#39;, L3)."/></p>
+<p><i>The OT way to process a remote operation <code>R</code> in the presence of pending local operations <code>L1, L2, L3</code>. The reordered operations are equivalent (same final states) by a property of <code>T</code>.</i></p>
+
+<p>The downside is again that you must restrict yourself to specific operations: those possessing a transformation <code>T</code> that satisfies the algebraic rule <a href="https://en.wikipedia.org/wiki/Operational_transformation#Transformation_properties">Transformation Property 1 (TP1)</a>. I don’t know how difficult it is to find such functions in practice, but be warned that the number of transformation cases increases as <code>O((# op types)^2)</code>. TP1 is at least easier to satisfy than Transformation Property 2 (TP2)—something that many text algorithms <a href="https://doi.org/10.1016/j.tcs.2005.09.066">get wrong</a> but that is only necessary for decentralized collaboration.</p>
+
+<h2 id="discussion">Discussion</h2>
+
+<p>Much work has gone into designing CRDT and OT algorithms, which are challenging because they must satisfy algebraic rules. I and others have also spent a lot of time thinking about how to structure apps so that they can tolerate CRDTs’ limited room for custom business logic.</p>
+
+<p>Thus it is ironic to see that, <em>in the centralized model used by this blog post, CRDTs and OT are merely <strong>optimizations</strong> over server reconciliation</em>, which is straightforward and completely flexible. Moreover, CRDT/OTs’ usage by clients is unrelated to the app’s core collaboration logic, which instead takes place during server-side rebasing—a setting with no strict algebraic rules.</p>
+
+<p>That said, the difficult parts of CRDTs/OT are still useful for <em>decentralized</em> collaboration (though see other options in the <a href="#appendix-from-centralized-to-decentralized">Appendix</a>), and for making sense of collaborative <a href="#challenge-text-and-lists">text and list operations</a>.</p>
+
+
+
+<p>The previous two sections each described an architectural challenge and options for how to address it. Before showing the choices made by existing apps and devtools, I want to introduce one more axis of variation:</p>
+
+<p><strong>Form of Operations.</strong> What is the form of the operations sent from clients to the server, and vice-versa? Are they high-level and app-specific (“pick up loot”), or low-level state changes (“set key K to value V”)?</p>
+
+<h2 id="1-mutations">1. Mutations</h2>
+
+<p>Most of my example operations so far have been high-level and app-specific: “pick up loot”, “mark task as completed”, “increment like count”, etc. I call these <strong>mutations</strong>, following <a href="https://replicache.dev/">Replicache</a>.</p>
+
+<p>Mutations give you maximum control over the behavior of server-side rebasing, allowing you to accommodate app-specific business logic and user intent. On the other hand, this also gives you the freedom to make mistakes, e.g., defining mutations that rebase weirdly or are expensive to process.</p>
+
+<h2 id="2-state-changes">2. State Changes</h2>
+
+<p>Alternatively, operations can be low-level <strong>state changes</strong> sent between clients and the server. This is especially common with replicated databases (<a href="https://firebase.google.com/docs/database">Firebase RTDB</a>, <a href="https://electric-sql.com/">ElectricSQL</a>, <a href="https://www.triplit.dev/">Triplit</a>, etc.): clients translate user actions into local database changes, and the database replicates those changes without knowing about the original user action.</p>
+
+<p>Because state changes are often simple and reusable, they can be implemented by off-the-shelf tools and highly optimized. However, they hide information about the original user action from the server, making it harder for server-side rebasing to respect app-specific business logic and user intent.</p>
+
+<h2 id="discussion-1">Discussion</h2>
+
+<p>It’s possible to send <em>mutations</em> from the client to the server, but <em>state changes</em> from the server back to clients. Many multiplayer games work this way: clients send high-level user actions to the server (“walk-forward key is pressed”), which the server processes (applying collision detection etc.) and then translates into low-level world updates (“entity E moved to coordinates (x, y, z)”).</p>
+
+<p>The dividing line between mutations and state changes is somewhat arbitrary. For example, operations on collaborative XML are high level (“format text”, “split node”), but they ignore specific apps’ schemas and user actions. Below, I place devtools in the “mutations” category only if apps can customize the contents of operations sent over the network.</p>
+
+
+
+<p>We now have three high-level architectural choices when implementing this post’s abstract model of central server collaboration:</p>
+
+<ul>
+  <li><strong>Server-Side Rebasing.</strong> How the server makes sense of operations that arrive after concurrent operations.</li>
+  <li><strong>Optimistic Local Updates.</strong> How clients process remote operations when they have pending local operations.</li>
+  <li><strong>Form of Operations.</strong> The level and specificity of operations sent from clients → server and server → clients.</li>
+</ul>
+
+<blockquote>
+  <p>These are not the only architectural choices—e.g., there are various ways to filter redundant operations after a client reconnects to the server—but I consider these the main high-level choices. They generalize the well-known “CRDT vs OT” choice.</p>
+</blockquote>
+
+
+
+
+
+
+<table>
+<tbody><tr>
+    <td colspan="3"></td>
+    <th colspan="6">Server-Side Rebasing</th>
+    <td rowspan="9"></td>
+</tr>
+<tr>
+    <td colspan="2"></td>
+    <td>Clients → Server</td>
+    <td colspan="3">Mutations</td>
+    <td colspan="3">State Changes</td>
+</tr>
+<tr>
+    <td></td>
+    <td>Server → Clients</td>
+    <td></td>
+    <th>Serializable</th>
+    <th>CRDT-ish</th>
+    <th>OT-ish</th>
+    <th>Serializable</th>
+    <th>CRDT-ish</th>
+    <th>OT-ish</th>
+</tr>
+<tr>
+    <th rowspan="6"><span>Optimistic Local Updates</span></th>
+    <td rowspan="3">Mutations</td>
+    <th>Server Reconciliation</th>
+    <td><a href="https://marijnhaverbeke.nl/blog/collaborative-editing.html">ProseMirror-collab</a></td>
+    <td><a href="https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.ECOOP.2023.15">Actyx</a>*, <a href="https://discuss.prosemirror.net/t/crdt-inspired-adaptation-of-prosemirror-collab/6383">ProseMirror-log</a></td>
+    <td><a href="https://stepwisehq.com/blog/2023-07-25-prosemirror-collab-performance/">ProseMirror-collab-commit</a></td>
+    <td colspan="3" rowspan="3"></td>
+</tr>
+<tr>
+    <th>CRDT</th>
+    <td></td>
+    <td></td>
+    <td></td>
+</tr>
+<tr>
+    <th>OT</th>
+    <td></td>
+    <td></td>
+    <td>Google Docs</td>
+</tr>
+<tr>
+    <td rowspan="3">State Changes</td>
+    <th>Server Reconciliation</th>
+    <td></td>
+    <td><a href="https://developer.valvesoftware.com/wiki/Latency_Compensating_Methods_in_Client/Server_In-game_Protocol_Design_and_Optimization">Half-Life engine</a>, <a href="https://replicache.dev/">Replicache</a></td>
+    <td></td>
+    <td></td>
+    <td><a href="https://automerge.org/">Automerge</a>*, <a href="https://fluidframework.com/">Fluid Framework</a></td>
+    <td></td>
+</tr>
+<tr>
+    <th>CRDT</th>
+    <td></td>
+    <td></td>
+    <td></td>
+    <td></td>
+    <td><a href="https://firebase.google.com/docs/database">Firebase RTDB</a>, <a href="https://docs.yjs.dev/">Yjs</a>*, <a href="https://www.triplit.dev/">Triplit</a>, ...</td>
+    <td></td>
+</tr>
+<tr>
+    <th>OT</th>
+    <td></td>
+    <td></td>
+    <td></td>
+    <td></td>
+    <td></td>
+    <td><a href="https://share.github.io/sharedb/">ShareDB</a></td>
+</tr>
+</tbody></table>
+
+<p>Notes:</p>
+<ol>
+  <li>Tools marked with * also work in the absence of a central server.</li>
+  <li>The <span>red-shaded</span> quadrant is ruled out, since if you send low-level state changes from clients to the server, it cannot convert them back into high-level mutations for sending to clients.</li>
+  <li>The <span>yellow-shaded</span> cells seem impractical to me: once you’ve implemented CRDTs/OT for optimistic local updates, you might as well use them for server-side rebasing, too.</li>
+</ol>
+
+
+
+<p>CRDT and OT algorithms are the classic approaches to real-time collaboration (in practice, mostly OT). When it comes to collaborative text and lists, this is understandable, since you will need some way to solve the <a href="#challenge-text-and-lists">index rebasing challenge</a>. However, we’ve seen that literal CRDT/OT architectures are not the only option, and in fact they are likely overkill for a central server app:</p>
+
+<ul>
+  <li><a href="#server-side-rebasing">Server-side rebasing</a> can be “CRDT-ish” or “OT-ish” instead of literal CRDT/OT. The real requirements are to respect your app’s business logic, and to attempt to match user expectations. (For text and lists, you can call out to <em>local</em> data structures that solve the index rebasing challenge.)</li>
+  <li><a href="#optimistic-local-updates">Optimistic local updates</a> must implement a specific abstract model (client state = server’s latest state + pending local operations), but this can be done for arbitrary operations and business logic using <a href="#1-server-reconciliation">server reconciliation</a>. Literal CRDT/OT algorithms allow for a more direct implementation but don’t change the user-visible behavior.</li>
+</ul>
+
+<p>Going forward, I am interested in exploring the classification table’s Mutations/Mutations, CRDT-ish, Server Reconciliation cell. This architecture is related to <a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing">event sourcing</a> and has similar trade-offs. It fits my longstanding goal of taking CRDT (-ish) ideas and making them as flexible as possible: server reconciliation frees you from CRDTs’ algebraic rules, and mutations free you from the need to express state and operations in a particular form (e.g., as database changes). The architecture also seems well-suited for apps that want to support edit histories and perhaps even decentralized version control, as described in the appendix.</p>
+
+<h2 id="acknowledgements">Acknowledgements</h2>
+
+<p>I thank AJ Nandi and Matt Wonlaw for feedback on a draft of this post, and James Addison and Matthew Linkous for insightful discussions.</p>
+
+
+
+<p>Our abstract model above assumed a central server. The server had two main tasks:</p>
+
+<ul>
+  <li>Assign a total order to operations—namely, the order that the server receives them.</li>
+  <li>Update the state in response to operations, using the app’s business logic.</li>
+</ul>
+
+<p>Clients can already do the second task themselves, using the same <a href="#optimistic-local-updates">reducer function</a> as for optimistic local updates. (Techically, this gets tricky when your app’s business logic is nondeterministic or involves interactions with external systems, but let’s assume that your app does not have those issues.)</p>
+
+<p>Then in principle, to create a <em>decentralized</em> version of your app, all you need is either:</p>
+<ol>
+  <li>Clients that don’t care about the total order of operations</li>
+  <li>Or, a decentralized way for clients to (eventually) agree on a total order of operations.</li>
+</ol>
+
+<p>Literal CRDT/OT algorithms follow approach 1: they guarantee that all users will end up in the same state, regardless of the order in which they process operations. As noted already, though, this requires strict algebraic rules that are tricky to satisfy. (For decentralized OT, you must satisfy both <a href="https://en.wikipedia.org/wiki/Operational_transformation#Transformation_properties">TP1 and TP2</a>.)</p>
+
+<p>Approach 2 instead lets you use the more flexible <a href="#1-server-reconciliation">server reconciliation</a> technique (but without the server!). Note that for sanity, the total order on operations should be an extension of the <a href="https://mattweidner.com/2023/09/26/crdt-survey-2.html#causal-order">causal order</a>. There are a number of ways to eventually agree on a total order that extends the causal order:</p>
+
+<ul>
+  <li>Assign each operation a <a href="https://mattweidner.com/2023/09/26/crdt-survey-3.html#lww-lamport-timestamps">logical timestamp</a> when it is created and sort by those. (Ex: <a href="https://automerge.org/">Automerge</a>, <a href="https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.ECOOP.2023.15">Actyx</a>)</li>
+  <li>Use an arbitrary topological sort of the causal order. (Ex: <a href="https://vlcn.io/blog/crdt-substrate">Wonlaw 2023</a>)</li>
+  <li>Append operations to a list CRDT and use its list order. Often, this amounts to an over-engineered implementation of the previous idea.</li>
+  <li>Use a topological sort informed by business logic, e.g., authorization rules. (Ex: <a href="https://doi.org/10.1145/3381991.3395399">Matrix</a>)</li>
+</ul>
+
+<blockquote>
+  <p>With all of these techniques, it is technically possible for a client to receive an old operation that belongs arbitrarily far back in the log. So to permit server reconciliation, clients need to store the entire operation log indefinitely—not just the current state. You can mitigate this cost by using <a href="https://automerge.org/automerge-binary-format-spec/">fancy compression</a> and/or by putting the log in cold storage (disk/network).</p>
+</blockquote>
+
+
+
+
+
+
+
+        
+    <!-- Footer -->
+    <p>
+    ⭐️ I&#39;m on the market for a software engineering job.
+    </p><hr/>
+    <p>
+    <a href="https://mattweidner.com/">Home</a>
+    • Matthew Weidner
+    • PhD student at CMU CSD
+    • mweidner037@gmail.com
+    • <a href="https://twitter.com/MatthewWeidner3">@MatthewWeidner3</a>
+    • <a href="https://www.linkedin.com/in/matthew-weidner-99715412a">LinkedIn</a>
+    • <a href="https://github.com/mweidner037/">GitHub</a>
+    </p>
+  </div>
+</div></div>
+  </body>
+</html>
