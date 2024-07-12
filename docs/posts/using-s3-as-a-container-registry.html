@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://ochagavia.nl/blog/using-s3-as-a-container-registry/">Original</a>
+    <h1>Using S3 as a Container Registry</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+  <p>For the last four months I’ve been developing a custom container image builder, collaborating with Outerbounds<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup>. The technical details of the builder itself might be the topic of a future article, but there’s something surprising I wanted to share already: you can use <a href="https://en.wikipedia.org/wiki/Amazon_S3">S3</a> as a container registry! You heard it right. All it takes is to expose an S3 bucket through HTTP and to upload the image’s files to specific paths. With that in place, you can actually <code>docker pull</code> from it. Isn’t that neat?</p>
+<p>In the rest of this post I’ll explain how it all works, but let’s start with a demo for the impatient among us. I created a container image that runs <a href="https://en.wikipedia.org/wiki/Cowsay">cowsay</a> and mirrored it to a bucket. Here’s what happens when you pull and run it from the bucket’s url:</p>
+<pre tabindex="0"><code>$ docker run --rm pub-40af5d7df1e0402d9a92b982a6599860.r2.dev/cowsay
+
+ _________________________
+&lt; This is seriously cool! &gt;
+ -------------------------
+        \   ^__^
+         \  (oo)\_______
+            (__)\       )\/\
+                ||----w |
+                ||     ||
+</code></pre><p>Don’t you agree with the cow? Note that, for this demo, I’m using <a href="https://www.cloudflare.com/developer-platform/r2/">R2</a> instead of S3 (because it has free egress 😎). Fortunately, it doesn’t matter whether you use R2 or S3, since they are API-compatible. As a matter of fact, I used the AWS SDK to push my image to R2.</p>
+<h3 id="but-why">But why?</h3>
+<p>Using S3 is not the traditional approach for hosting container images. You’d normally use a container registry, such as <a href="https://hub.docker.com/">DockerHub</a>, <a href="https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry">GitHub Container Registry</a>, <a href="https://aws.amazon.com/ecr/">ECR</a>, etc. What benefits does S3 bring, then, to make deviating from the trodden, <a href="https://boringtechnology.club/">boring</a>, path worthwhile?</p>
+<p>Let’s take a step back. We are developing a custom image builder (or bakery, as we affectionately call it) because of speed. We want to go from requirements to a ready-to-pull image in a few seconds. The easiest container registry to use in our case is ECR, because we are on AWS. However, it turns out there’s a substantial performance difference between S3 and ECR when it comes to upload speed!</p>
+<p>I discovered the performance gap somewhat by accident. Since speed is important for us, and the first rule of performance optimization is to measure, I instrumented the code to generate <a href="https://medium.com/jaegertracing/jaeger-tracing-a-friendly-guide-for-beginners-7b53a4a568ca">traces</a>. Having that, I went hunting for optimization opportunities and came across something unexpected: the traces showed that pushing layers to the container registry accounted for a significant amount of time! That felt off, so I decided to run a small benchmark: to upload a 198 MiB layer to ECR and to S3, and observe the difference in duration.</p>
+<p>Here’s the outcome:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Minimum observed speed</strong></th>
+<th><strong>Maximum observed speed</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>ECR</strong></td>
+<td>24 MiB/s (8.2 s)</td>
+<td>28 MiB/s (7.0 s)</td>
+</tr>
+<tr>
+<td><strong>S3</strong></td>
+<td>115 MiB/s (1.7 s)</td>
+<td>190 MiB/s (1.0 s)</td>
+</tr>
+</tbody>
+</table>
+<p>The table shows that S3 is up to 8x faster than ECR, which is almost an order of magnitude<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup>! Of course, there are <a href="#caveats">caveats</a>, but “raw” S3 container registries are nevertheless a promising avenue of optimization.</p>
+<h3 id="what-makes-s3-faster-than-ecr">What makes S3 faster than ECR?</h3>
+<p>The big difference between pushing to ECR and uploading objects to S3 is that the latter allows uploading a single layer’s chunks in parallel. Given enough bandwidth, this yields a massive increase in throughput. In fact, parallel chunked uploads are recommended in the <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-guidelines.html#optimizing-performance-guidelines-scale">AWS docs</a> to maximize bandwidth usage<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup>.</p>
+<p>Why can’t ECR support this kind of parallel uploads? The “problem” is that it implements the <a href="https://github.com/opencontainers/distribution-spec/blob/2291163927cae6f5105a07d32c675c00ff39244c/spec.md">OCI Distribution Spec</a>, which is the standard for container registries (i.e. the reason why you can <code>docker pull</code> and <code>docker push</code> to different registry implementations). According to the specification, a layer push must happen sequentially: even if you upload the layer in chunks, each chunk needs to finish uploading before you can move on to the next one. Needless to say, having a single active connection per layer leaves a significant amount of bandwidth unused!</p>
+<p><em>Aside: we also tested the performance of sequential uploads to S3. The result? Throughput went down to ECR-like levels!</em></p>
+<h3 id="but-s3-is-not-a-container-registry">But S3 is not a container registry!</h3>
+<p>Indeed, S3 is not a container registry in the strict sense of the word. You can’t <code>docker push</code> to it, and the fact that you can <code>docker pull</code> is mostly a happy coincidence. So how does it work?</p>
+<p>The answer to our question is revealed by looking at the inner workings of <code>docker pull</code>. Spoiler: it’s HTTP requests all the way down. More specifically, I logged<sup id="fnref:4"><a href="#fn:4" role="doc-noteref">4</a></sup> the requests issued by <code>docker pull</code> and saw that they are “just” a bunch of <code>HEAD</code> and <code>GET</code> requests. As an example, see the log of a <code>docker pull my-image:latest</code> at my self-hosted registry (lines starting with <code>#</code> are comments):</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span><span># Check whether the image&#39;s manifest is present in the registry</span>
+</span></span><span><span>HEAD /v2/my-image/manifests/latest
+</span></span><span><span><span># Download the image&#39;s manifest</span>
+</span></span><span><span>GET /v2/my-image/manifests/latest
+</span></span><span><span><span># Re-download the image&#39;s manifest, now addressed using the manifest&#39;s hash</span>
+</span></span><span><span><span># (I think this is a sanity check by docker)</span>
+</span></span><span><span>GET /v2/my-image/manifests/sha256:dabf91b69c191a1a0a1628fd6bdd029c0c4018041c7f052870bb13c5a222ae76
+</span></span><span><span><span># Download one of the image&#39;s blobs (which happens to be the image&#39;s metadata)</span>
+</span></span><span><span>GET /v2/my-image/blobs/sha256:a606584aa9aa875552092ec9e1d62cb98d486f51f389609914039aabd9414687
+</span></span><span><span><span># Download the remaining image&#39;s blob (which happens to be its only layer)</span>
+</span></span><span><span>GET /v2/my-image/blobs/sha256:ec99f8b99825a742d50fb3ce173d291378a46ab54b8ef7dd75e5654e2a296e99
+</span></span></code></pre></div><p>That’s it! A <code>docker pull</code> is merely downloading files through HTTP! Which means… You can pull containers from <em>any</em> static file server, as long as it has the necessary files at the expected paths and sets the right <code>Content-Type</code> header for each request. Since a S3 bucket is capable of both, a carefully crafted bucket can become a container registry!</p>
+<p><em>Aside: if you want to know more about “manifests”, “blobs”, and such, check out my article on <a href="https://ochagavia.nl/blog/crafting-container-images-without-dockerfiles/">Crafting container images without dockerfiles</a> and the <a href="https://github.com/opencontainers/image-spec/blob/036563a4a268d7c08b51a08f05a02a0fe74c7268/spec.md">OCI Image Format Specification</a>.</em></p>
+<h3 id="caveats">Caveats</h3>
+<p>In case it’s not already clear: this is all very experimental. I’m waiting to do more research before making any serious claims. Will it end up in production? Or will you, my dear reader, send me an email explaining how my approach is utterly flawed?</p>
+<p>Note that, while I haven’t made a survey of the container registry offerings out there, it’s obvious they come with features that make them more attractive than dumping files on a bucket. For instance: you can trust the images you upload are actually valid (because the registry uses the standard push method); you can run automated security scans against your layers and receive warnings if there’s anything fishy; you can natively specify who has access to private repositories; etc.</p>
+<p>Don’t let these caveats discourage you, though. If it all works as well as I’m hoping, maybe we’ll see a new trend of hosting public container images in Cloudflare’s R2! What would you say to free egress?</p>
+<h5 id="ps-what-about-the-whale">PS. What about the whale?</h5>
+<p>It’s a pun… <a href="https://www.google.com/search?q=docker+logo&amp;hl=en">go have a look</a> at the docker logo 😉</p>
+
+
+
+</div></div>
+  </body>
+</html>
