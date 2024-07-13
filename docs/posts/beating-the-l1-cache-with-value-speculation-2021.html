@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://mazzo.li/posts/value-speculation.html">Original</a>
+    <h1>Beating the L1 cache with value speculation (2021)</h1>
+    
+    <div id="readability-page-1" class="page"><div id="wrapper">
+
+
+
+<p>If we have a heuristic to guess some value cheaply, we can remove a data dependency in a tight loop using the branch predictor. This allows the CPU to run more instructions in parallel, increasing performance. If this explanation does not make much sense to you, keep reading to learn about some of the magic making your CPU fast!</p>
+<hr/>
+<p><a href="https://twitter.com/pervognsen">Per Vognsen</a>’s twitter feed is full of neat low-level curiosities, usually leveraging CPU features for some performance benefit.</p>
+<p><a href="https://twitter.com/pervognsen/status/1412611878140874757">Recently</a> he tweeted about a trick that I had never heard of – value speculation.<a href="#fn1" id="fnref1" role="doc-noteref"><sup>1</sup></a> The trick exploits the branch predictor to guess values, enabling more instruction parallelism and therefore removing a bottleneck on the L1 cache. Note that the bottleneck is <em>not</em> due to L1 cache misses, but on L1 cache <em>hits</em> introducing unwanted data dependencies.</p>
+
+<p>In this post I explain the machinery involved, including a primer on branch prediction and CPU caches, so that anybody with a passing knowledge of C and how code is executed on CPUs should be able to follow.</p>
+<p>The code for the post is available <a href="https://gist.github.com/bitonic/78887f5d3238bab5e31f3c5a41d404b2">here</a>. All the numbers are from a Xeon E5-1650 v3, an Intel Haswell processor with L1 / L2 / L3 cache of 32kB, 256kB, and 15MB respectively. The code was compiled with <code>clang -O3</code>, and not with <code>gcc</code>, for reasons explained <a href="#compiling">later</a>.</p>
+<p>Before starting, I’d like to stress that L1 cache <em>hits</em> are almost certainly <em>not</em> the bottleneck of your application! This is just a very neat trick that illuminates some CPU features, not a guide on how to improve the performance of your average piece of C code.</p>
+<h2 id="the-setup-summing-linked-lists">The setup – summing linked lists <a href="#the-setup-summing-linked-lists">#</a></h2>
+<p>We have a simple linked list data type, and a function summing all the elements of a given linked list:</p>
+<div id="cb1"><pre><code><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span>typedef</span> <span>struct</span> Node <span>{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span>uint64_t</span> value<span>;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span>struct</span> Node <span>*</span>next<span>;</span> <span>// NULL for the last node</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span>}</span> Node<span>;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span>uint64_t</span> sum1<span>(</span>Node<span>*</span> node<span>)</span> <span>{</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>  <span>uint64_t</span> value <span>=</span> <span>0</span><span>;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  <span>while</span> <span>(</span>node<span>)</span> <span>{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    value <span>+=</span> node<span>-&gt;</span>value<span>;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    node <span>=</span> node<span>-&gt;</span>next<span>;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>  <span>return</span> value<span>;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>So far so good. Our test case works as follows: build a linked list where the nodes live sequentially in contiguous memory, then see how long it takes to sum them all up:</p>
+<div id="cb2"><pre><code><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span>// Allocate 5MB of linked list nodes, and link them sequentially, with</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span>// random data in the `value`s.</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span>uint64_t</span> n <span>=</span> <span>312500</span><span>llu</span><span>;</span> <span>// 312500 * sizeof(Node) = 312500 * 16 bytes = 5000000 bytes</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>Node <span>*</span>nodes <span>=</span> malloc<span>(</span>n <span>*</span> <span>sizeof</span><span>(</span>Node<span>));</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span>for</span> <span>(</span><span>uint64_t</span> i <span>=</span> <span>0</span><span>;</span> i <span>&lt;</span> n <span>-</span> <span>1</span><span>;</span> i<span>++)</span> <span>{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>  nodes<span>[</span>i<span>].</span>value <span>=</span> random_uint64<span>();</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>  nodes<span>[</span>i<span>].</span>next <span>=</span> <span>&amp;</span>nodes<span>[</span>i<span>+</span><span>1</span><span>];</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span>}</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>nodes<span>[</span>n<span>-</span><span>1</span><span>].</span>value <span>=</span> random_uint64<span>();</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>nodes<span>[</span>n<span>-</span><span>1</span><span>].</span>next <span>=</span> NULL<span>;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span>// Now sum.</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>sum1<span>(&amp;</span>nodes<span>[</span><span>0</span><span>]);</span></span></code></pre></div>
+<p>On a server with a relatively old Xeon E5-1650 v3, running <code>sum1</code> with the sample data takes 0.36 milliseconds, which means that we’re processing our linked list at roughly 14GB/s. In the rest of the post will will identify the bottleneck and get around it with value speculation, bringing the throughput for this dataset to 30GB/s.</p>
+<p>The impact of the fix varies depending on the size of the dataset. If it is already entirely in the CPU cache, the improvement is much more pronounced, since otherwise we are quickly constrained by how fast we can read data from RAM. This graph shows the performance improvement over differently sized datasets (higher is better):</p>
+<div>
+<figure>
+<img src="https://mazzo.li/assets/images/value-speculation-chart.svg" alt="Chart showing the performance of various versions of sum, including sum1 as described above. Multiple iterations of the same functions are run, to ensure the data is already in the cache if possible."/>
+<figcaption aria-hidden="true"><small>Chart showing the performance of various versions of <code>sum</code>, including <code>sum1</code> as described above. Multiple iterations of the same functions are run, to ensure the data is already in the cache if possible.</small></figcaption>
+</figure>
+</div>
+<p>The chart shows the performance of <code>sum1</code> together with the performance of two improved functions, <code>sum2</code> and <code>sum3</code>. We go from a throughput of 14GB/s in <code>sum1</code> to more than 45GB/s in <code>sum3</code> if the data fits entirely in the L1 cache (the 16kB dataset), with the performance decreasing slightly for datasets fitting in the L2 and L3 cache (128kB and 5MB datasets). If the dataset does not fit entirely in any CPU cache (~4GB dataset) we go from 10GB/s to 15GB/s, which is as fast as the RAM allows.<a href="#fn2" id="fnref2" role="doc-noteref"><sup>2</sup></a></p>
+
+<h2 id="instruction-parallelism-and-branch-prediction">Instruction parallelism and branch prediction <a href="#instruction-parallelism-and-branch-prediction">#</a></h2>
+<div>
+
+<p>Modern CPUs do not process instructions serially, but rather handle many at the same time. They read many instructions at once, break them down in stages, and then try to fill all the computation units they have with as many tasks from as many instructions as possible.<a href="#fn3" id="fnref3" role="doc-noteref"><sup>3</sup></a> For instance, modern Intel processors are designed for a throughput of 4 instructions per clock cycle, and AMD Zen processors for up to 5 or 6.<a href="#fn4" id="fnref4" role="doc-noteref"><sup>4</sup></a></p>
+<p>However, branches pose a challenge when wanting to execute instructions in parallel. Let’s go back to our function <code>sum1</code>:</p>
+</div>
+
+<div id="cb3"><pre><code><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span>uint64_t</span> sum1<span>(</span>Node<span>*</span> node<span>)</span> <span>{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span>uint64_t</span> value <span>=</span> <span>0</span><span>;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span>while</span> <span>(</span>node<span>)</span> <span>{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    value <span>+=</span> node<span>-&gt;</span>value<span>;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    node <span>=</span> node<span>-&gt;</span>next<span>;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span>return</span> value<span>;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>and its very readable assembly version:</p>
+<div id="cb4"><pre><code><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span>; rdi = node and rax = value.</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span>; rax is the return value register (we&#39;re returning value)</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span>sum1:</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span>xor</span>     <span>rax</span><span>,</span> <span>rax</span>                 <span>; value = 0</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span>test</span>    <span>rdi</span><span>,</span> <span>rdi</span>                 <span>; if node is NULL, exit, otherwise start loop</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span>je</span>      end</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span>loop:</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span>add</span>     <span>rax</span><span>,</span> <span>qword</span> <span>ptr</span> <span>[</span><span>rdi</span><span>]</span>     <span>; value += node-&gt;value</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  <span>mov</span>     <span>rdi</span><span>,</span> <span>qword</span> <span>ptr</span> <span>[</span><span>rdi</span> <span>+</span> <span>8</span><span>]</span> <span>; node = node-&gt;next</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>  <span>test</span>    <span>rdi</span><span>,</span> <span>rdi</span>                 <span>; if node is not NULL, repeat loop,</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>  <span>jne</span>     loop                     <span>; otherwise exit</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span>end:</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>  <span>ret</span></span></code></pre></div>
+<p>The loop body is made out of 4 instructions, the last of which a jump. Without special measures, every instruction up to the <code>jne</code> must be executed before proceeding to the next instruction, since we need to know if we’ll go to the beginning of the loop or continue. In other words the conditional jump would introduce a barrier in the instruction level parallelism internal to the CPU.</p>
+<p>However, executing many instructions at once is so important that dedicated hardware – the <em>branch predictor</em> – is present in all modern CPUs to make an educated guess on which way we’ll go at every conditional jump. The details of how this works are beyond the scope of this blog post, but conceptually your CPU observes your program as it runs and tries to predict which branch will be taken by remembering what happened in the past.<a href="#fn5" id="fnref5" role="doc-noteref"><sup>5</sup></a></p>
+
+<p>Even without knowing much about the branch prediction, we expect the predictor to do a great job for our test case – we always go back to the beginning of the loop apart from when we stop consuming the list. On Linux, we can verify that this is the case with <code>perf stat</code>:</p>
+<pre><code>$ perf stat ./value-speculation-linux
+...
+         2,507,580      branch-misses             #    0.04% of all branches</code></pre>
+<p>The branch predictor gets it right 99.96% of the time. So the CPU can parallelize our instructions with abandon, right? …right?</p>
+<h2 id="data-dependencies-tripping-us-up">Data dependencies tripping us up <a href="#data-dependencies-tripping-us-up">#</a></h2>
+<p>Let’s focus on the loop body of <code>sum1</code>:</p>
+<div id="cb6"><pre><code><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span>; rdi = node and rax = value.</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span>loop:</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span>add</span>     <span>rax</span><span>,</span> <span>qword</span> <span>ptr</span> <span>[</span><span>rdi</span><span>]</span>     <span>; value += node-&gt;value</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span>mov</span>     <span>rdi</span><span>,</span> <span>qword</span> <span>ptr</span> <span>[</span><span>rdi</span> <span>+</span> <span>8</span><span>]</span> <span>; node = node-&gt;next</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>  <span>test</span>    <span>rdi</span><span>,</span> <span>rdi</span>                 <span>; if node is not NULL, repeat loop,</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span>jne</span>     loop                     <span>; otherwise exit</span></span></code></pre></div>
+<p>To increment <code>value</code> (<code>rax</code>), we need to know the value of <code>node</code> (<code>rdi</code>), which depends on the <code>mov</code> in the previous iteration of the loop. The same is true for the <code>mov</code> itself – it is also dependent on the result of the previous <code>mov</code> to operate. So there’s a <em>data dependency</em> between each iteration of the loop: we must have finished reading <code>node-&gt;next</code> (<code>[rdi + 8]</code>) at iteration <span>n</span> before we can start executing the <code>add</code> and <code>mov</code> at iteration <span>n+1</span>.</p>
+<p>Moreover, reading the <code>node-&gt;next</code> (<code>[rdi + 8]</code>) is slower than you might think.</p>
+<div>
+<figure>
+<img src="https://mazzo.li/assets/images/lstopo-ram256g-1.svg" alt="Diagram showing the CPU caches for the processor used in this post. Generated with lstopo."/>
+<figcaption aria-hidden="true"><small>Diagram showing the CPU caches for the processor used in this post. Generated with <code>lstopo</code>.</small></figcaption>
+</figure>
+</div>
+<div>
+
+<p>Modern CPUs are a lot better at adding numbers than reading from memory. For this reason, a series of fast caches exist between the CPU and main memory. All reading and writing from main memory normally goes through the cache – if the data we are interested in is not already present, the CPU will load a chunk of memory (a “cache line”, 64 bytes on x86) which contains our desired data into the cache.<a href="#fn6" id="fnref6" role="doc-noteref"><sup>6</sup></a> The fastest cache is usually called L1 (successive caching layers being predictably called L2, L3, …).</p>
+<p>Our setup is the best-case scenario when it comes to CPU caches – we read a bunch of memory sequentially, utilizing every byte along the way. However, even if the L1 cache is very fast, it is not free: it takes around 4 CPU cycles to read from it. This will make our <code>mov</code> and <code>add</code> take at least 4 cycles to complete. The other two instructions, <code>je</code> and <code>test</code>, will take only one cycle.<a href="#fn7" id="fnref7" role="doc-noteref"><sup>7</sup></a></p>
+<p>So the number of cycles needed to go through a single loop iteration is bounded by the 4 cycles it takes to read from L1 cache. The data I get from the Xeon I tested the program with is roughly consistent with this:</p>
+</div>
+
+<pre><code>16kB, 10000 iterations
+  sum1:  8465052097154389858,  1.12us,  14.25GB/s,  3.91 cycles/elem,  1.03 instrs/cycle,  3.48GHz,  4.01 instrs/elem
+128kB, 10000 iterations
+  sum1:  6947699366156898439,  9.06us,  14.13GB/s,  3.95 cycles/elem,  1.01 instrs/cycle,  3.49GHz,  4.00 instrs/elem
+5000kB, 100 iterations
+  sum1:  2134986631019855758,  0.36ms,  14.07GB/s,  3.96 cycles/elem,  1.01 instrs/cycle,  3.48GHz,  4.00 instrs/elem
+4294MB, 1 iterations
+  sum1: 15446485409674718527,  0.43 s,   9.94GB/s,  5.60 cycles/elem,  0.71 instrs/cycle,  3.48GHz,  4.00 instrs/elem</code></pre>
+<p>The important numbers are <code>cycles/elem</code> and <code>instrs/cycle</code>. We spend roughly 4 cycles per list element (that is to say, per loop iteration), corresponding to a throughput of roughly 1 instruction per cycle. Given that the CPU in question is designed for a throughput of 4 instructions per cycle, we’re wasting a lot of the CPU magic at our disposal, because we’re stuck waiting on the L1 cache.</p>
+<h2 id="value-speculation-bailing-us-out">Value speculation bailing us out <a href="#value-speculation-bailing-us-out">#</a></h2>
+<p>We finally get to the trick. As discussed, we are stuck waiting on reading what the next node address is. However, in our setup we allocate the list in a contiguous block of memory, and therefore the nodes are always next to each other.</p>
+<p>So here’s the key idea: try to guess the next node by just bumping the previous value. If the guess is wrong, set the node to the “real” next value. In C, this is how it would look like:</p>
+<div id="cb8"><pre><code><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span>uint64_t</span> faster_sum<span>(</span>Node<span>*</span> node<span>)</span> <span>{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span>uint64_t</span> value <span>=</span> <span>0</span><span>;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  Node<span>*</span> next <span>=</span> NULL<span>;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>  <span>while</span> <span>(</span>node<span>)</span> <span>{</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    value <span>+=</span> node<span>-&gt;</span>value<span>;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    next <span>=</span> node<span>-&gt;</span>next<span>;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span>// Guess the next value</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    node<span>++;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span>// But fix it up if we guessed wrong (in case the nodes are not</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span>// next to each other).</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span>if</span> <span>(</span>node <span>!=</span> next<span>)</span> <span>{</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>      node <span>=</span> next<span>;</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    <span>}</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>  <span>return</span> value<span>;</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>This looks quite bizarre. We are still reading <code>node-&gt;next</code> in the comparison <code>node != next</code> to make sure our guess is right. So at first glance this might not seem like an improvement.</p>
+<p>This is where the branch predictor comes in. In the case of lists where most nodes <em>are</em> next to each other (as is the case in our test code), the branch predictor will guess that the <code>if (node != next) { ... }</code> branch is not taken, and therefore we’ll go through loop iterations without having to wait for the L1 read.</p>
+<p>Note that when the branch predictor <em>is</em> wrong (for example when the list ends, or if we have non-contiguous nodes) the CPU will need to backtrack and re-run from the failed branch prediction, which is costly (15 to 20 cycles on our processor<a href="#fn8" id="fnref8" role="doc-noteref"><sup>8</sup></a>). However, if the list is mostly contiguous, the trick works and makes our function 50-200% faster.</p>
+
+<p>However there is one last challenge remaining to reach the final code and show you numbers – convincing compilers that our code is worth compiling.</p>
+<h2 id="compiling">Getting compilers to emit the right code <a href="#compiling">#</a></h2>
+<p>Let’s go back to the code we showed for value speculation in C:</p>
+<div id="cb9"><pre><code><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span>uint64_t</span> faster_sum<span>(</span>Node<span>*</span> node<span>)</span> <span>{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>  <span>uint64_t</span> value <span>=</span> <span>0</span><span>;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>  Node<span>*</span> next <span>=</span> NULL<span>;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>  <span>while</span> <span>(</span>node<span>)</span> <span>{</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    value <span>+=</span> node<span>-&gt;</span>value<span>;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    next <span>=</span> node<span>-&gt;</span>next<span>;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    node<span>++;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span>if</span> <span>(</span>node <span>!=</span> next<span>)</span> <span>{</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>      node <span>=</span> next<span>;</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    <span>}</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>  <span>return</span> value<span>;</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>Both <code>gcc</code> and <code>clang</code> easily deduce that the guessing is semantically pointless, and compile our trick away, making the compiled version of <code>faster_sum</code> the same as <code>sum1</code>. This is an instance where the compiler smartness undoes human knowledge about the underlying platform we’re compiling for.</p>
+<p>Per Vognsen’s gist uses the following trick to get compilers to behave – this is the first improvement to our <code>sum1</code>, <code>sum2</code>:</p>
+<div id="cb10"><pre><code><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span>static</span> <span>uint64_t</span> sum2<span>(</span>Node <span>*</span>node<span>)</span> <span>{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  <span>uint64_t</span> value <span>=</span> <span>0</span><span>;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span>while</span> <span>(</span>node<span>)</span> <span>{</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    value <span>+=</span> node<span>-&gt;</span>value<span>;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    Node <span>*</span>predicted_next <span>=</span> node <span>+</span> <span>1</span><span>;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    Node <span>*</span>next <span>=</span> node<span>-&gt;</span>next<span>;</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span>if</span> <span>(</span>next <span>==</span> predicted_next<span>)</span> <span>{</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>      <span>// Prevent compilers optimizing this apparently meaningless branch away</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>      <span>// by making them think we&#39;re changing predicted_next here.</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>      <span>//</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>      <span>// This trick, however, does not work with GCC, only with clang. GCC here</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>      <span>// derives that `next` and `predicted_next` are the same, and therefore</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>      <span>// merges them into the same variable, which re-introduces the data</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>      <span>// dependency we wanted to get rid of.</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>      asm<span>(</span><span>&#34;&#34;</span> <span>:</span> <span>&#34;+r&#34;</span><span>(</span>predicted_next<span>));</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>      node <span>=</span> predicted_next<span>;</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>    <span>}</span> <span>else</span> <span>{</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>      node <span>=</span> next<span>;</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>    <span>}</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>  <span>return</span> value<span>;</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>However <code>gcc</code> still doesn’t fully fall for it, as explained in the comment.<a href="#fn9" id="fnref9" role="doc-noteref"><sup>9</sup></a> Moreover, <code>clang</code>’s generated loop is not as tight as it could, taking 10 instructions per element. So I resorted to manually writing out a better loop, which we’ll call <code>sum3</code>:<a href="#fn10" id="fnref10" role="doc-noteref"><sup>10</sup></a></p>
+
+<div id="cb11"><pre><code><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span>; rax = value, rcx = next, rdi = node</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span>; Note that rax is the return value register (we are returning the value)</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span>sum3:</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>  <span>xor</span>     <span>rax</span><span>,</span> <span>rax</span>                   <span>; value = 0</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>  <span>xor</span>     <span>rcx</span><span>,</span> <span>rcx</span>                   <span>; next = NULL</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>  <span>test</span>    <span>rdi</span><span>,</span> <span>rdi</span>                   <span>; if node is null, go to the end,</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>  <span>je</span>      end                        <span>; otherwise start loop</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span>loop_body:</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>  <span>add</span>     <span>rax</span><span>,</span> <span>qword</span> <span>ptr</span> <span>[</span><span>rdi</span><span>]</span>       <span>; value += node-&gt;value</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>  <span>mov</span>     <span>rcx</span><span>,</span> <span>qword</span> <span>ptr</span> <span>[</span><span>rdi</span> <span>+</span> <span>8</span><span>]</span>   <span>; next = node-&gt;next</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>  <span>add</span>     <span>rdi</span><span>,</span> <span>16</span>                    <span>; node++</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>  <span>cmp</span>     <span>rcx</span><span>,</span> <span>rdi</span>                   <span>; if node is equal to next,</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>  <span>je</span>      loop_body                  <span>; restart loop, otherwise fix up node</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>  <span>mov</span>     <span>rdi</span><span>,</span> <span>rcx</span>                   <span>; node = next</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>  <span>test</span>    <span>rdi</span><span>,</span> <span>rdi</span>                   <span>; if node is not NULL restart the loop,</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>  <span>jne</span>     loop_body                  <span>; otherwise exit.</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span>end:</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>  <span>ret</span></span></code></pre></div>
+<p>The code relies on the fact that <code>node</code> can’t be <code>NULL</code> after we increment it if it is equal to <code>next</code>, avoiding an additional test, and taking only 5 instructions per element (from <code>loop_body</code> to <code>je loop_body</code> in the happy path).<a href="#fn11" id="fnref11" role="doc-noteref"><sup>11</sup></a></p>
+
+<h2 id="results">Results <a href="#results">#</a></h2>
+<p>These are the final numbers for our four functions:</p>
+<pre><code>16kB, 10000 iterations
+  sum1:  8465052097154389858,  1.12us,  14.25GB/s,  3.91 cycles/elem,  1.03 instrs/cycle,  3.48GHz,  4.01 instrs/elem
+  sum2:  8465052097154389858,  0.57us,  27.97GB/s,  1.99 cycles/elem,  5.02 instrs/cycle,  3.48GHz, 10.01 instrs/elem
+  sum3:  8465052097154389858,  0.36us,  44.96GB/s,  1.24 cycles/elem,  4.05 instrs/cycle,  3.48GHz,  5.01 instrs/elem
+128kB, 10000 iterations
+  sum1:  6947699366156898439,  9.05us,  14.14GB/s,  3.95 cycles/elem,  1.01 instrs/cycle,  3.49GHz,  4.00 instrs/elem
+  sum2:  6947699366156898439,  4.51us,  28.38GB/s,  1.97 cycles/elem,  5.09 instrs/cycle,  3.49GHz, 10.00 instrs/elem
+  sum3:  6947699366156898439,  3.79us,  33.80GB/s,  1.65 cycles/elem,  3.03 instrs/cycle,  3.49GHz,  5.00 instrs/elem
+5000kB, 100 iterations
+  sum1:  2134986631019855758,  0.35ms,  14.09GB/s,  3.95 cycles/elem,  1.01 instrs/cycle,  3.48GHz,  4.00 instrs/elem
+  sum2:  2134986631019855758,  0.19ms,  26.27GB/s,  2.12 cycles/elem,  4.72 instrs/cycle,  3.48GHz, 10.00 instrs/elem
+  sum3:  2134986631019855758,  0.17ms,  28.93GB/s,  1.93 cycles/elem,  2.60 instrs/cycle,  3.48GHz,  5.00 instrs/elem
+4294MB, 1 iterations
+  sum1: 15446485409674718527,  0.44 s,   9.66GB/s,  5.76 cycles/elem,  0.69 instrs/cycle,  3.48GHz,  4.00 instrs/elem
+  sum2: 15446485409674718527,  0.33 s,  13.19GB/s,  4.22 cycles/elem,  2.37 instrs/cycle,  3.48GHz, 10.00 instrs/elem
+  sum3: 15446485409674718527,  0.30 s,  14.20GB/s,  3.91 cycles/elem,  1.28 instrs/cycle,  3.47GHz,  5.00 instrs/elem</code></pre>
+<p><img src="https://mazzo.li/assets/images/value-speculation-chart.svg"/></p>
+<p>The numbers are provided <a href="https://gist.github.com/bitonic/78887f5d3238bab5e31f3c5a41d404b2#file-value-speculation-linux-c-L262">by the Linux <code>perf_event_open</code> syscall</a>.</p>
+<p>The first three datasets are meant to fit in the L1 / L2 / L3 cache. In those cases, the improvements are very pronounced, and <code>sum3</code> is crunching the data at around 4 instructions per cycle, which should be close to the limit on the processor I tested the code on. When the data does not fit in the cache, the bottleneck becomes filling it, and we process the data at roughly 15 GB/s.</p>
+<p>I believe that this is as fast as one can go with “simple” single-threaded reading from RAM,
+and it’s consistent with data from <code>sysbench</code>:</p>
+<pre><code>$ sysbench memory --memory-block-size=1G --memory-oper=read --threads=1 run
+...
+102400.00 MiB transferred (15089.75 MiB/sec)
+...</code></pre>
+<p>The RAM-reading speed could probably be improved using SIMD streaming instructions or by reading from multiple threads, although the implementation would be significantly more complicated.</p>
+<p>And so we complete our journey into this low-level trick! If you want more of this, I can’t reccomend <a href="https://twitter.com/pervognsen">Per’s account</a> enough – figuring out how his tricks works has been very educational.</p>
+<p>Thanks to <a href="https://scvalex.net/">Alexandru Scvortov</a>, <a href="https://nh2.me/">Niklas Hambüchen</a>, Alex Appetiti, and <a href="https://twitter.com/cartazio">Carter T Schonwald</a> for reading drafts of this post. Niklas also clarified some details regarding RAM speeds, and suggested <code>sysbench</code> to measure single threaded RAM reading speed in particular. Also thanks to Per Vognsen and Jason Rohem for spotting a few typos, and to <a href="https://twitter.com/RhialtoTheM">Rihalto</a> for pointing out a better <code>sum3</code> and some misleading wording.</p>
+<h2 id="bonus-track-a-compiler-friendly-c-version">Bonus track – a compiler friendly C version <a href="#bonus-track-a-compiler-friendly-c-version">#</a></h2>
+<p><a href="https://twitter.com/_monoid/status/1418663360871141376">Alexander Monakov suggested</a> a more robust C function which works well with both <code>gcc</code> and <code>clang</code>, performs as well as <code>sum3</code>, and does not resort to any assembly:</p>
+<div id="cb14"><pre><code><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span>uint64_t</span> sum5<span>(</span>Node <span>*</span>node<span>)</span> <span>{</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>  <span>uint64_t</span> value <span>=</span> <span>0</span><span>;</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>  Node <span>*</span>next <span>=</span> NULL<span>;</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>  <span>for</span> <span>(;</span> node<span>;</span> node <span>=</span> node<span>-&gt;</span>next<span>)</span> <span>{</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    <span>for</span> <span>(;;)</span> <span>{</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>      value <span>+=</span> node<span>-&gt;</span>value<span>;</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>      <span>if</span> <span>(</span>node <span>+</span> <span>1</span> <span>!=</span> node<span>-&gt;</span>next<span>)</span> <span>{</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>        <span>break</span><span>;</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>      <span>}</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>      node<span>++;</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>    <span>}</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>  <span>return</span> value<span>;</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+
+
+
+
+
+
+</div></div>
+  </body>
+</html>
