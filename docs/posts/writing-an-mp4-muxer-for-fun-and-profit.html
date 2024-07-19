@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://obsproject.com/blog/obs-studio-hybrid-mp4">Original</a>
+    <h1>Writing an MP4 Muxer for Fun and Profit</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        <h5><center>(Except there is no profit, only pain)</center></h5>
+<p>In OBS 30.2 I introduced the new &#34;Hybrid MP4&#34; output format which solves a number of complaints our users have had for pretty much all of OBS&#39;s existence; It&#39;s resilient against data loss like MKV, but widely compatible like regular MP4.</p>
+<p>Getting here was quite a journey, and involved fixing several other bugs in OBS that were only apparent once diving this deep into how the audio and video data is stored.</p>
+<p>In this post I&#39;ll try to explain how MP4 works, what the drawbacks were to regular/fragmented MP4, and how I tried to solve them with a hybrid approach.</p>
+<h2>QTFF, BMFF, WTF</h2>
+<p>The MP4 file format we all know and love today is based on Apple&#39;s <a href="https://en.wikipedia.org/wiki/QuickTime_File_Format">&#34;QuickTime File Format&#34; (QTFF)</a> - mostly just known as &#34;MOV&#34; - which was originally created in the 90s. It was adapted by the International Organization for Standardization (ISO) to create the <a href="https://en.wikipedia.org/wiki/MP4_file_format">MP4 File Format</a> in 2001, then later split up into the more generic <a href="https://en.wikipedia.org/wiki/ISO_base_media_file_format">&#34;Base Media File Format&#34; (ISO BMFF)</a> and an MP4 extension containing MPEG-specific features.</p>
+<p>Since then, MP4 has undergone numerous updates and extensions over the years to support new codecs and more specialised use cases. The extensible nature of the base format also means that various users of MP4, such as Apple, have added extensions to support various other features such as DRM, 3D video and more.</p>
+<h2>The Trouble with <del>Tribbles</del> MP4</h2>
+<p>While MP4 is very widespread and supported by almost anything under the sun, there are some issues specific to the use case of recording live video to disk. To explain those, let&#39;s first go over the basic structure of an MP4 file, as that will help make sense of what was required to make Hybrid MP4 work.</p>
+<p>At its core an MP4 file is made up of objects known as &#34;Boxes&#34; in ISO, or &#34;Atoms&#34; in Apple terminology. Each box consists of a header containing its size and a four-letter name/type, followed by its data. Most boxes contain data structures defined in ISO/Apple specifications, but some are containers for other boxes. This allows for a hierarchical structure of the file and makes it easy to extend the format by introducing new boxes containing additional information without breaking backwards compatibility with existing software. For the purposes of this blog post, however, we&#39;ll only be looking at what are known as &#34;top-level boxes&#34;, i.e. boxes that are written directly into the file and are not contained within other boxes.</p>
+<figure><img alt="MP4 Diagram" src="https://obsproject.com/media/pages/blog/obs-studio-hybrid-mp4/4e708fd0e3-1721156355/blog_mp4_transparent_fixed.png"/></figure>
+<p>A typical MP4 file produced by OBS or FFmpeg will contain four top-level boxes:</p>
+<ul>
+<li><code>ftyp</code> - File Type Box: Contains information about the the standard version(s) used in the file</li>
+<li><code>free</code> - Free Space Box: Placeholder that should be ignored/skipped over</li>
+<li><code>mdat</code> - Media Data Box: Contains data for media tracks (audio, video, etc.)</li>
+<li><code>moov</code> - Movie Box: Contains other boxes with metadata for the file and media tracks</li>
+</ul>
+<p>There are two things here that create the main problem we have with MP4: The <code>moov</code> sits at the end and is written when finalising the file, and it is required to be able to make sense of the data contained in the <code>mdat</code> box. This means that if the writing of the file gets interrupted for any reason (BSOD, disk full, power loss, etc.) and the <code>moov</code> box is not written, the file is extremely difficult - if not impossible - to recover. This is obviously very bad™ if you just recorded your best ever clutch in Counter-Strike but then your disk space ran out and now you don&#39;t have any proof of it ever happening!</p>
+<p><em><strong>Note about the <code>free</code> box since it will become important later:</strong> The size field in the box header is limited to 4 GiB. In order to have an <code>mdat</code> box larger than that, an extended size field needs to be used, which increases the size of the header. FFmpeg and OBS will write the placeholder so that it can be overwritten to writer a longer <code>mdat</code> header should it become necessary.</em></p>
+<p>This leads us into the next part, which details the first attempt at solving this problem...</p>
+<h2>Fragmented Frustration</h2>
+<p>Some time ago the ISO format was extended with support for splitting media data into &#34;Fragments&#34;, this is commonly referred to as &#34;Fragmented MP4&#34;. These fragments can be split out into separate files as well, which is mainly used when streaming video over the internet, whether live on Twitch<sup id="fnref1:1"><a href="#fn:1">1</a></sup> or films on Netflix. The details of that are beyond the scope of this post, but you can learn more about why this is done and its advantages for streaming use cases by reading more about <a href="https://en.wikipedia.org/wiki/HTTP_Live_Streaming">HLS</a> and <a href="https://en.wikipedia.org/wiki/Dynamic_Adaptive_Streaming_over_HTTP">DASH</a>.</p>
+<p>What&#39;s relevant for us is that a fragmented file has an &#34;incomplete&#34; <code>moov</code> that only contains the basic information necessary for decoding each track, with the information about specific samples (video frames, audio segments) contained in a fragment being stored in the <code>moof</code> (Movie Fragment Box) at the start of each fragment.</p>
+<figure><img alt="Fragmented MP4 Diagram" src="https://obsproject.com/media/pages/blog/obs-studio-hybrid-mp4/be0b883d12-1720813902/blog_fmp4_transparent.png"/></figure>
+<p>This is useful for the OBS recording use case because it means that a file no longer relies on a single <code>moov</code> containing all the information about the media data in the file. Each fragment only needs it&#39;s own <code>moof</code> box + the incomplete <code>moov</code> at the beginning to be played back correctly. This means that if the writing of the file is interrupted (e.g. due to a power failure), everything up to the last fragment will still be readable, solving the data loss problem of regular MP4 files.</p>
+<p>Sounds too good to be true, doesn&#39;t it? Well, there are some significant downsides that ultimately caused us to stop using fragmented MP4 as the default pretty quickly:</p>
+<ol>
+<li>Fragmented files are still not well supported in various applications, including editors and players</li>
+<li>They are slow to access on HDD or network drives, as each fragment&#39;s header needs to be read to get the complete metadata of the file and start playback</li>
+<li>File browsers such as the Windows explorer do not show the file duration due to 2.</li>
+<li>Some players (e.g. the default Windows Media Player) do not allow seeking in the file due to 2. and will instead play it back like a livestream</li>
+</ol>
+<p>Of course this can be fixed by remuxing the file, but that just brings us right back to where we started with MKV. There has to be a better way...</p>
+<h2>Hybrid Harmony</h2>
+<p>Quite a while ago I had a simple though: What if we just &#34;finalise&#34; a fragmented file with a full <code>moov</code> so that it behaves like a regular MP4? Then finally a few months ago I started to actually explore this idea which evolved into what we now know as &#34;Hybrid MP4&#34;.</p>
+<p>While the recording is running, a hybrid file is really just a fragmented MP4, retaining the resilience against data loss, but when the recording stops, it is quickly modified to appear like a normal MP4. I called this process a &#34;soft remux&#34; because it only needs to overwrite a small part of the file to achieve similar results to fully remuxing a file.</p>
+<p>To do this, a full <code>moov</code> is written at the very end of the file that indexes the media data exactly like a normal MP4 would, and the placeholder <code>free</code> box at the start is overwritten with an <code>mdat</code> header that turns the entire file up to the newly written <code>moov</code> box into one giant Media Data box, thus effectively hiding the fragments from a reading application. This means we&#39;re now left with a file that <em>appears</em> to be a regular MP4, when it&#39;s actually fragmented inside!</p>
+<figure><img alt="Hybrid MP4 Diagram" src="https://obsproject.com/media/pages/blog/obs-studio-hybrid-mp4/9d3498e6ea-1720813902/blog_hybrid_transparent.png"/></figure>
+<p>The hybrid approach ultimately addresses all the problems we had by combining the best of both worlds. If a file is not finalised you still have a valid fragmented MP4 that can be remuxed if necessary, and if it is finalised, well, for all intents and purposes it&#39;s just a regular old MP4.</p>
+<p>And that&#39;s pretty much it. This idea went through a few rounds of iteration and improvement, this post only details the final version that has shipped in OBS. It kind of hurts that several days of work and research can be summed up in a couple paragraphs, but that&#39;s what the &#34;pain&#34; part in the subtitle is for.</p>
+<h2><a href="https://en.wikipedia.org/wiki/Big_Buck_Bunny#Legacy">Big Buck Bunny</a> Holes</h2>
+<p>The process of building this implementation took me down quite a few rabbit holes, as it required me to learn a lot of low-level details about how audio and video data is stored in files, and sometimes left me wondering why my results were different from the references I was using. This section contains some fun and some not so fun examples of things I encountered while working on the Hybrid MP4 output.</p>
+<h3>Chapter Markers</h3>
+<p>Markers are one of the headline features that Hybrid MP4 adds over the existing FFmpeg-based output. Don&#39;t get me wrong, FFmpeg <em>does</em> support these as well, but we never implemented it. But while I was doing this I figured this might be a good time to get it done, and will give users a nice incentive to actually use and test it.</p>
+<p>The MP4 standard itself actually does not define anything for chapter markers, they are entirely based on Apple&#39;s QuickTime specification, and even then it seems to be only <em>mostly</em> documented. The implementation in OBS is directly adapted from FFmpeg, and should work in all the same software that it does like video players and some editing suites such as DaVinci Resolve. Sadly this does not include Adobe Premiere or Final Cut Pro, but there may be tools coming to make it a bit easier for those users!</p>
+<h3>Additional Metadata</h3>
+<p>While I was at it I figured I can add some additional metadata to each media track and the file itself, such as the encoder configuration<sup id="fnref1:2"><a href="#fn:2">2</a></sup>, so I did! This is particularly useful when you&#39;re testing different settings and want to compare them later, but don&#39;t want to have to rename the file after every test. Files now also contain a correct creation/encoding date so even if you rename them you can still track when a file was originally recorded.</p>
+<h3>Multi-Track Video</h3>
+<p>The new MP4 output now also supports multiple video tracks alongside multiple audio tracks, this is great for debugging features such as Twitch&#39;s <a href="https://help.twitch.tv/s/article/multiple-encodes">Enhanced Broadcasting</a> by having a single file with all the video streams that can be easily switched between in players such as MPC-HC.</p>
+<p>So it&#39;s not super useful for the average user <em>yet</em>, but hopefully we can make use of it in the future for things such as ISO recording (well, if we can also convince video editors to support it...).</p>
+<h3>Audio Encoder Delay and why your audio might&#39;ve been out of sync for the last few years</h3>
+<p>AAC and Opus audio both have something called &#34;priming&#34; samples, this is a few milliseconds of silence at the start of an audio stream used to &#34;warm up&#34; the encoder, which should be skipped when playing back the file. Audio packets containing priming samples have a negative timestamp, indicating (part of) the audio they contain should be skipped during playback. There were two separate issues in OBS related to this:</p>
+<ol>
+<li>Audio packets with timestamp &lt; 0 would be discarded until the one with a closest timestamp &lt;= 0 is found, which would then have its timestamp &#34;corrected&#34; so that the stream always starts at 0, thus including the delay in the output and causing it to be slightly out of sync</li>
+<li>The CoreAudio AAC encoder implementation did not subtract the delay from timestamps at all, thus audio always being delayed by 40-44 ms (at 48/44.1 kHz)</li>
+</ol>
+<p>Issue 1. happened to <strong>not</strong> affect the default audio encoder (FFmpeg AAC), as it uses a delay equivalent to packet duration, meaning the first packet with actual audio already starts at 0. Opus on the other hand would produce a first packet with a timestamp of -312 with the next one being 648, OBS would then &#34;correct&#34; the packets to 0 and 960 respectively and would result in the 312 samples of silence being included and the audio being ~6.5 ms late.</p>
+<h2>Coincidental Collaboration</h2>
+<p>Just a few days after we merged the Hybrid MP4 feature into OBS the FFmpeg maintainer Martin <a href="https://ffmpeg.org/pipermail/ffmpeg-devel/2024-May/328600.html">submitted a patch</a> that adds a similar feature to FFmpeg&#39;s MOV/MP4 muxer. This was entirely coincidental, and includes a note that Apple apparently did something like this already, which just proves that great minds do indeed think alike 😛.</p>
+<p>This has now also been merged into FFmpeg as well, meaning it&#39;s already available in git builds and will hopefully soon make it&#39;s way into a stable release!</p>
+<p><em>Note: The FFmpeg implementation is slightly different, and the OBS version has a few more safety nets just in case. It&#39;s still great to have though!</em></p>
+<h2>MOV-ing Forward</h2>
+<p>While MP4 is great for many things, it lacks some of the features and codec support available in it&#39;s ancestor QTFF (or MOV). Adding a &#34;Hybrid MOV&#34; mode is the next step to truly making it the new default in OBS. This primarily requires dealing with some of the differences between MOV and MP4 with things like PCM audio, differently implemented metadata structures, and also support for the ProRes codec. I&#39;m hoping this can be done in time for OBS 31.0 if everything goes well!</p>
+<p>A few other things that I&#39;d like to work on for future improvements:</p>
+<ol>
+<li>Better accuracy for chapter marker timestamps (needs OBS backend updates)</li>
+<li>Support for writing a timecode (<code>tmcd</code>) track (requires the same backend updates as 1.)</li>
+<li>Support for configurable fragment duration, rather than always fragmenting on keyframes (particularly important for intra-only codecs such as ProRes)</li>
+<li><em>(Maybe)</em> Built-in utility for exporting chapter markers in different formats for easier use in Premiere, etc.</li>
+<li><strong>(Big Maybe)</strong> Support for embedded <a href="https://en.wikipedia.org/wiki/Extensible_Metadata_Platform">XMP</a> metadata for markers in Premiere</li>
+</ol>
+<h2>Thanks &amp; Acknowledgements</h2>
+<ul>
+<li>FFmpeg and its contributors for documenting the undocumented</li>
+<li>GPAC for mp4box.js, which has been invaluable for debugging my muxer and inspecting its output</li>
+<li>Apple&#39;s old QTFF documentation for actually being really good and having great explanations for concepts such as priming samples</li>
+<li><strong>NOT</strong> the ISO for paywalling these specs and making it a god damn paperchase where every time you get one document it references three others that are also paywalled</li>
+</ul>
+      </div></div>
+  </body>
+</html>
