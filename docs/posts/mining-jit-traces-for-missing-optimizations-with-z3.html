@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://pypy.org/posts/2024/07/mining-jit-traces-missing-optimizations-z3.html">Original</a>
+    <h1>Mining JIT traces for missing optimizations with Z3</h1>
+    
+    <div id="readability-page-1" class="page"><div itemprop="articleBody text">
+      <p>In my last post I&#39;ve described <a href="https://pypy.org/posts/2024/07/finding-simple-rewrite-rules-jit-z3.html">how to use Z3 to find simple local peephole
+optimization patterns</a>
+for the integer operations in PyPy&#39;s JIT. An example is <code>int_and(x, 0) -&gt;
+0</code>. In this post I want to scale up the problem of identifying possible
+optimizations to much bigger instruction sequences, also using Z3. For that, I
+am starting with the JIT traces of <strong>real benchmarks</strong>, after they have been
+optimized by the optimizer of PyPy&#39;s JIT. Then we can ask Z3 to find
+inefficient integer operations in those traces.</p>
+<p>Starting from the optimized traces of real programs has some big
+advantages over the &#34;classical&#34; superoptimization approach of generating and
+then trying all possible sequences of instructions. It avoids the
+combinatorical explosion that happens with the latter approach. Also, starting
+from the traces of benchmarks or (even better) actual programs makes sure that
+we actually care about the missing optimizations
+that are found in this way. And because the traces are analyzed after they have
+been optimized by PyPy&#39;s optimizer, we only get reports for <em>missing</em>
+optimizations, that the JIT isn&#39;t able to do (yet).</p>
+<p>The techniques and experiments I describe in this post are again the result of
+a bunch of discussions with John Regehr at a conference a few weeks ago, as
+well as reading his blog posts and papers. Thanks John! Also thanks to <a href="https://bernsteinbear.com/">Max
+Bernstein</a> for super helpful feedback on the drafts
+of this blog post (and for poking me to write things in general).</p>
+<h3 id="high-level-approach">High-Level Approach<a href="#high-level-approach" title="Permalink to this heading">¶</a></h3>
+<p>The approach that I took works as follows:</p>
+<ul>
+<li>Run benchmarks or other interesting programs and then dump the IR of the JIT
+  traces into a file. The traces have at that point been already optimized by
+  the PyPy JIT&#39;s optimizer.</li>
+<li>For every trace, ignore all the operations on non-integer variables.</li>
+<li>Translate every integer operation into a Z3 formula.</li>
+<li>For every operation, use Z3 to find out whether the operation is redundant
+  (how that is done is described below).</li>
+<li>If the operation is redundant, the trace is less efficient than it could have
+  been, because the optimizer could also have removed the operation. Report the
+  inefficiency.</li>
+<li>Minimize the inefficient programs by removing as many operations as possible
+  to make the problem easier to understand.</li>
+</ul>
+<p>In the post I will describe the details and show some pseudocode of the
+approach. I&#39;ll also make the proper code public eventually (but it needs a
+healthy dose of cleanups first).</p>
+<h3 id="dumping-pypy-traces">Dumping PyPy Traces<a href="#dumping-pypy-traces" title="Permalink to this heading">¶</a></h3>
+<p>PyPy will write its JIT traces into the file <code>out</code> if the environment variable
+<a href="https://doc.pypy.org/en/latest/man/pypy.1.html"><code>PYPYLOG</code></a> is set as follows:</p>
+<div><pre>PYPYLOG=jit-log-opt:out pypy &lt;program.py&gt;
+</pre></div>
+
+<p>This environment variable works for PyPy, but also for other virtual machines
+built with RPython.</p>
+<p>(This is really a side point for the rest of the blog post, but since the
+question came up I wanted to clarify it: Operations on integers in the Python
+program that the JIT is running don&#39;t all correspond 1-to-1 with the <code>int_...</code>
+operations in the traces. The <code>int_...</code> trace operations always operate on
+machine words. The Python <code>int</code> type supports arbitrarily large integers. PyPy
+will optimistically try to lower the operations on Python integers into machine
+word operations, but adds the necessary guards into the trace to make sure that
+overflow outside of the range of machine words is caught. In case one of these
+guards fails the interpreter switches to a big integer heap-allocated
+representation.)</p>
+<h3 id="encoding-traces-as-z3-formulas">Encoding Traces as Z3 formulas<a href="#encoding-traces-as-z3-formulas" title="Permalink to this heading">¶</a></h3>
+<p>The last blog post already contained the code to encode the results of
+individual trace operations into Z3 formulas, so we don&#39;t need to repeat that
+here. To encode traces of operations we introduce a Z3 variable for every
+operation in the trace and then call the <code>z3_expression</code> function for every
+single one of the operations in the trace.</p>
+<p>For example, for the following trace:</p>
+<div><pre><span>[i1]</span>
+<span>i2</span><span> </span><span>=</span><span> </span><span>uint_rshift(i1, 32)</span>
+<span>i3</span><span> </span><span>=</span><span> </span><span>int_and(i2, 65535)</span>
+<span>i4</span><span> </span><span>=</span><span> </span><span>uint_rshift(i1, 48)</span>
+<span>i5</span><span> </span><span>=</span><span> </span><span>int_lshift(i4, 16)</span>
+<span>i6</span><span> </span><span>=</span><span> </span><span>int_or(i5, i3)</span>
+<span>jump(i6, i2) # equal</span>
+</pre></div>
+
+<p>We would get the Z3 formula:</p>
+<div><pre>z3.And(i2 == LShR(i1, 32),
+       i3 == i2 &amp; 65535,
+       i4 == LShR(i1, 48),
+       i5 == i4 &lt;&lt; 16)
+</pre></div>
+
+<p>Usually we won&#39;t ask for the formula of the whole trace at once. Instead we go
+through the trace operation by operation and try to find inefficiencies in the
+current one we are looking at. Roughly like this (pseudo-)code:</p>
+<div><pre><span>def</span> <span>newvar</span><span>(</span><span>name</span><span>):</span>
+    <span>return</span> <span>z3</span><span>.</span><span>BitVec</span><span>(</span><span>name</span><span>,</span> <span>INTEGER_WIDTH</span><span>)</span>
+
+<span>def</span> <span>find_inefficiencies</span><span>(</span><span>trace</span><span>):</span>
+    <span>solver</span> <span>=</span> <span>z3</span><span>.</span><span>Solver</span><span>()</span>
+    <span>var_to_z3var</span> <span>=</span> <span>{}</span>
+    <span>for</span> <span>input_argument</span> <span>in</span> <span>trace</span><span>.</span><span>inputargs</span><span>:</span>
+        <span>var_to_z3var</span><span>[</span><span>input_argument</span><span>]</span> <span>=</span> <span>newz3var</span><span>(</span><span>input_argument</span><span>)</span>
+    <span>for</span> <span>op</span> <span>in</span> <span>trace</span><span>:</span>
+        <span>var_to_z3var</span><span>[</span><span>op</span><span>]</span> <span>=</span> <span>z3resultvar</span> <span>=</span> <span>newz3var</span><span>(</span><span>op</span><span>.</span><span>resultvarname</span><span>)</span>
+        <span>arg0</span> <span>=</span> <span>op</span><span>.</span><span>args</span><span>[</span><span>0</span><span>]</span>
+        <span>z3arg0</span> <span>=</span> <span>var_to_z3var</span><span>[</span><span>arg0</span><span>]</span>
+        <span>if</span> <span>len</span><span>(</span><span>op</span><span>.</span><span>args</span><span>)</span> <span>==</span> <span>2</span><span>:</span>
+            <span>arg1</span> <span>=</span> <span>op</span><span>.</span><span>args</span><span>[</span><span>1</span><span>]</span>
+            <span>z3arg1</span> <span>=</span> <span>var_to_z3var</span><span>[</span><span>arg1</span><span>]</span>
+        <span>else</span><span>:</span>
+            <span>z3arg1</span> <span>=</span> <span>None</span>
+        <span>res</span><span>,</span> <span>valid_if</span> <span>=</span> <span>z3_expression</span><span>(</span><span>op</span><span>.</span><span>name</span><span>,</span> <span>z3arg0</span><span>,</span> <span>z3arg1</span><span>)</span>
+        <span># checking for inefficiencies, see the next sections</span>
+        <span>...</span>
+        <span>if</span> <span>...</span><span>:</span>
+            <span>return</span> <span>&#34;inefficient&#34;</span><span>,</span> <span>op</span>
+
+        <span># not inefficient, assert op into the solver and continue with the next op</span>
+        <span>solver</span><span>.</span><span>add</span><span>(</span><span>z3resultvar</span> <span>==</span> <span>res</span><span>)</span>
+    <span>return</span> <span>None</span> <span># no inefficiency found</span>
+</pre></div>
+
+<h3 id="identifying-constant-booleans-with-z3">Identifying constant booleans with Z3<a href="#identifying-constant-booleans-with-z3" title="Permalink to this heading">¶</a></h3>
+<p>To get started finding inefficiencies in a trace, we can
+first focus on boolean variables. For every operation in the trace that
+returns a bool we can ask Z3 to prove that this variable must be always True or
+always False. Most of the time, neither of these proofs will succeed. But if Z3
+manages to prove one of them, we know have found an ineffiency: instead of
+computing the boolean result (eg by executing a comparison) the JIT&#39;s optimizer
+could have replaced the operation with the corresponding boolean constant.</p>
+<p>Here&#39;s an example of an inefficiency found that way: if <code>x &lt; y</code> and <code>y &lt; z</code> are
+both true, PyPy&#39;s JIT could conclude that <code>x &lt; z</code> must also
+be true. However, currently the JIT cannot make that conclusion because it
+only reasons about the concrete ranges (lower and upper bounds) for every
+integer variable, but it has no way to remember anything about relationships
+between different variables. This kind of reasoning would quite often be useful
+to remove list/string bounds checks. Here&#39;s a <a href="https://www.youtube.com/watch?app=desktop&amp;v=1hm5ZVmBEvo">talk about how LLVM does
+this</a> (but it might be
+too heavyweight for a JIT setting).</p>
+<p>Here are some more examples found that way:</p>
+<ul>
+<li>
+<code>x - 1 == x</code> is always False</li>
+<li>
+<code>x - (x == -1) == -1</code> is always False. The pattern <code>x - (x == -1)</code> happens a
+  lot in PyPy&#39;s hash computations: To be compatible with the CPython hashes we
+  need to make sure that no object&#39;s hash is -1 (CPython uses -1 as an error
+  value on the C level).</li>
+</ul>
+<p>Here&#39;s pseudo-code for how to implement checking boolean operations for
+inefficiencies:</p>
+<div><pre><span>def</span> <span>find_inefficiencies</span><span>(</span><span>trace</span><span>):</span>
+    <span>...</span>
+    <span>for</span> <span>op</span> <span>in</span> <span>trace</span><span>:</span>
+        <span>...</span>
+        <span>res</span><span>,</span> <span>valid_if</span> <span>=</span> <span>z3_expression</span><span>(</span><span>op</span><span>.</span><span>name</span><span>,</span> <span>z3arg0</span><span>,</span> <span>z3arg1</span><span>)</span>
+        <span># check for boolean constant result</span>
+        <span>if</span> <span>op</span><span>.</span><span>has_boolean_result</span><span>():</span>
+            <span>if</span> <span>prove</span><span>(</span><span>solver</span><span>,</span> <span>res</span> <span>==</span> <span>0</span><span>):</span>
+                <span>return</span> <span>&#34;inefficient&#34;</span><span>,</span> <span>op</span><span>,</span> <span>0</span>
+            <span>if</span> <span>prove</span><span>(</span><span>solver</span><span>,</span> <span>res</span> <span>==</span> <span>1</span><span>):</span>
+                <span>return</span> <span>&#34;inefficient&#34;</span><span>,</span> <span>op</span><span>,</span> <span>1</span>
+        <span># checking for other inefficiencies, see the next sections</span>
+        <span>...</span>
+
+        <span># not inefficient, add op to the solver and continue with the next op</span>
+        <span>solver</span><span>.</span><span>add</span><span>(</span><span>z3resultvar</span> <span>==</span> <span>res</span><span>)</span>
+    <span>return</span> <span>None</span> <span># no inefficiency found</span>
+</pre></div>
+
+<h3 id="identifying-redundant-operations">Identifying redundant operations<a href="#identifying-redundant-operations" title="Permalink to this heading">¶</a></h3>
+<p>A more interesting class of redundancy is to try to find two operations in a
+trace that compute the same result. We can do that by asking Z3 to prove for
+each pair of different operations in the trace to prove that the result is
+always the same. If a previous operation returns the same result, the JIT could
+have re-used that result instead of re-computing it, saving time. Doing this
+search for equivalent operations with Z3 is quadratic in the number of
+operations, but since traces have a maximum length it is not too bad in
+practice.</p>
+<p>This is the real workhorse of my script so far, it&#39;s what finds most of the
+inefficiencies. Here&#39;s a few examples:</p>
+<ul>
+<li>The very first and super useful example the script found is <code>int_eq(b, 1) ==
+  b</code> if <code>b</code> is known to be a boolean (ie and integer 0 or 1). I have already
+  implemented this optimization in the JIT.</li>
+<li>Similarly, <code>int_and(b, 1) == b</code> for booleans.</li>
+<li><code>(x &lt;&lt; 4) &amp; -0xf == x &lt;&lt; 4</code></li>
+<li>
+<code>((x &gt;&gt; 63) &lt;&lt; 1) &lt;&lt; 2) &gt;&gt; 3 == x &gt;&gt; 63</code>. In general the JIT is quite bad at
+  optimizing repeated shifts (the infrastructure for doing better with that is
+  already in place, so this will be a relatively easy fix).</li>
+<li>
+<code>(x &amp; 0xffffffff) | ((x &gt;&gt; 32) &lt;&lt; 32) == x</code>. Having the JIT optimize this
+  would maybe require first recognizing that <code>(x &gt;&gt; 32) &lt;&lt; 32</code> can be expressed
+  as a mask: <code>(x &amp; 0xffffffff00000000)</code>, and then using <code>(x &amp; c1) | (x &amp; c1) ==
+  x &amp; (c1 | c2)</code>
+</li>
+<li>A commonly occurring pattern is variations of this one:
+  <code>((x &amp; 1345) ^ 2048) - 2048 == x &amp; 1345</code> (with different constants, of
+  course). xor is add without carry, and <code>x &amp; 1345</code> does not have the bit
+  <code>2048</code> set. Therefore the <code>^ 2048</code> is equivalent to <code>+ 2048</code>, which the <code>-
+  2048</code> cancels. More generally, if <code>a &amp; b == 0</code>, then <code>a + b == a | b == a ^ b</code>.
+  I don&#39;t understand at all why this appears so often in the traces, but I
+  see variations of it a lot. LLVM can optimize this, but <a href="https://gcc.gnu.org/bugzilla/show_bug.cgi?id=115829">GCC
+  can&#39;t</a>, thanks to
+  <a href="https://hachyderm.io/@pinskia/112752641328799157">Andrew Pinski for filing the
+  bug</a>!</li>
+</ul>
+<p>And here&#39;s some implementation pseudo-code again:</p>
+<div><pre><span>def</span> <span>find_inefficiencies</span><span>(</span><span>trace</span><span>):</span>
+    <span>...</span>
+    <span>for</span> <span>op</span> <span>in</span> <span>trace</span><span>:</span>
+        <span>...</span>
+        <span>res</span><span>,</span> <span>valid_if</span> <span>=</span> <span>z3_expression</span><span>(</span><span>op</span><span>.</span><span>name</span><span>,</span> <span>z3arg0</span><span>,</span> <span>z3arg1</span><span>)</span>
+        <span># check for boolean constant result</span>
+        <span>...</span>
+        <span># searching for redundant operations</span>
+        <span>for</span> <span>previous_op</span> <span>in</span> <span>trace</span><span>:</span>
+            <span>if</span> <span>previous_op</span> <span>is</span> <span>op</span><span>:</span>
+                <span>break</span> <span># done, reached the current op</span>
+            <span>previous_op_z3var</span> <span>=</span> <span>var_to_z3var</span><span>[</span><span>previous_op</span><span>]</span>
+            <span>if</span> <span>prove</span><span>(</span><span>solver</span><span>,</span> <span>previous_op_z3var</span> <span>==</span> <span>res</span><span>):</span>
+                <span>return</span> <span>&#34;inefficient&#34;</span><span>,</span> <span>op</span><span>,</span> <span>previous_op</span>
+        <span>...</span>
+        <span># more code here later</span>
+        <span>...</span>
+
+        <span># not inefficient, add op to the solver and continue with the next op</span>
+        <span>solver</span><span>.</span><span>add</span><span>(</span><span>z3resultvar</span> <span>==</span> <span>res</span><span>)</span>
+    <span>return</span> <span>None</span> <span># no inefficiency found</span>
+</pre></div>
+
+<h3 id="synthesizing-more-complicated-constants-with-exists-forall">Synthesizing more complicated constants with exists-forall<a href="#synthesizing-more-complicated-constants-with-exists-forall" title="Permalink to this heading">¶</a></h3>
+<p>To find out whether some integer operations always return a constant result, we
+can&#39;t simply use the same trick as for those operations that return boolean
+results, because enumerating 2⁶⁴ possible constants and checking them all
+would take too long. Like in the last post, we can use <code>z3.ForAll</code> to find out
+whether Z3 can synthesize a constant for the result of an operation for us.
+If such a constant exists, the JIT could have removed the operation,
+and replaced it with the constant that Z3 provides.</p>
+<p>Here a few examples of inefficiencies found this way:</p>
+<ul>
+<li>
+<code>(x ^ 1) ^ x == 1</code> (or, more generally: <code>(x ^ y) ^ x == y</code>)</li>
+<li>if <code>x | y == 0</code>, it follows that <code>x == 0</code> and <code>y == 0</code>
+</li>
+<li>if <code>x != MAXINT</code>, then <code>x + 1 &gt; x</code>
+</li>
+</ul>
+<p>Implementing this is actually slightly annoying. The <code>solver.add</code> calls for
+non-inefficient ops add assertions to the solver, which are now confusing the
+<code>z3.ForAll</code> query. We could remove all assertion from the solver, then do the
+<code>ForAll</code> query, then add the assertions back. What I ended doing instead was
+instantiating a second solver object that I&#39;m using for the <code>ForAll</code> queries,
+that remains empty the whole time.</p>
+<div><pre><span>def</span> <span>find_inefficiencies</span><span>(</span><span>trace</span><span>):</span>
+    <span>solver</span> <span>=</span> <span>z3</span><span>.</span><span>Solver</span><span>()</span>
+    <span>empty_solver</span> <span>=</span> <span>z3</span><span>.</span><span>Solver</span><span>()</span>
+    <span>var_to_z3var</span> <span>=</span> <span>{}</span>
+    <span>...</span>
+    <span>for</span> <span>op</span> <span>in</span> <span>trace</span><span>:</span>
+        <span>...</span>
+        <span>res</span><span>,</span> <span>valid_if</span> <span>=</span> <span>z3_expression</span><span>(</span><span>op</span><span>.</span><span>name</span><span>,</span> <span>z3arg0</span><span>,</span> <span>z3arg1</span><span>)</span>
+        <span># check for boolean constant result</span>
+        <span>...</span>
+        <span># searching for redundant operations</span>
+        <span>...</span>
+        <span># checking for constant results</span>
+        <span>constvar</span> <span>=</span> <span>z3</span><span>.</span><span>BitVec</span><span>(</span><span>&#39;find_const&#39;</span><span>,</span> <span>INTEGER_WIDTH</span><span>)</span>
+        <span>condition</span> <span>=</span> <span>z3</span><span>.</span><span>ForAll</span><span>(</span>
+            <span>var_to_z3var</span><span>.</span><span>values</span><span>(),</span>
+            <span>z3</span><span>.</span><span>Implies</span><span>(</span>
+                <span>*</span><span>solver</span><span>.</span><span>assertions</span><span>(),</span>
+                <span>expr</span> <span>==</span> <span>constvar</span>
+            <span>)</span>
+        <span>)</span>
+        <span>if</span> <span>empty_solver</span><span>.</span><span>check</span><span>(</span><span>condition</span><span>)</span> <span>==</span> <span>z3</span><span>.</span><span>sat</span><span>:</span>
+            <span>model</span> <span>=</span> <span>empty_solver</span><span>.</span><span>model</span><span>()</span>
+            <span>const</span> <span>=</span> <span>model</span><span>[</span><span>constvar</span><span>]</span><span>.</span><span>as_signed_long</span><span>()</span>
+            <span>return</span> <span>&#34;inefficient&#34;</span><span>,</span> <span>op</span><span>,</span> <span>const</span>
+
+        <span># not inefficient, add op to the solver and continue with the next op</span>
+        <span>solver</span><span>.</span><span>add</span><span>(</span><span>z3resultvar</span> <span>==</span> <span>res</span><span>)</span>
+    <span>return</span> <span>None</span> <span># no inefficiency found</span>
+</pre></div>
+
+<h3 id="minimization">Minimization<a href="#minimization" title="Permalink to this heading">¶</a></h3>
+<p>Analyzing an inefficiency by hand in the context of a larger trace is quite
+tedious. Therefore I&#39;ve implemented a (super inefficient) script to try to make
+the examples smaller. Here&#39;s how that works:</p>
+<ul>
+<li>First throw out all the operations that occur <em>after</em> the inefficient operation
+  in the trace.</li>
+<li>Then we remove all &#34;dead&#34; operations, ie operations that don&#39;t have their
+  results used (all the operations that we can analyze with Z3 are without side
+  effects).</li>
+<li>Now we try to remove every guard in the trace one by one and check
+  afterwards, whether the resulting trace still has an inefficiency.</li>
+<li>We also try to replace every single operation with a new argument to the
+  trace, to see whether the inefficiency is still present.</li>
+</ul>
+<p>The minimization process is sort of inefficient and I should probably be using
+ <a href="https://github.com/DRMacIver/shrinkray">shrinkray</a> or
+ <a href="https://github.com/csmith-project/creduce">C-Reduce</a> instead. However, it
+ seems to work well in practice and the runtime isn&#39;t too bad.</p>
+<h3 id="results">Results<a href="#results" title="Permalink to this heading">¶</a></h3>
+<p>So far I am using the JIT traces of three programs: 1) Booting Linux on the
+<a href="https://docs.pydrofoil.org">Pydrofoil</a> RISC-V emulator, 2) booting Linux on the Pydrofoil ARM emulator, and 3)
+running the PyPy bootstrap process on top of PyPy.</p>
+<p>I picked these programs because most Python programs don&#39;t contain interesting
+amounts of integer operations, and the traces of the emulators
+contain a lot of them. I also used the bootstrap process because I still wanted
+to try a big Python program and personally care about the runtime of this
+program a lot.</p>
+<p>The script identifies 94
+inefficiencies in the traces, a lot of them come from repeating
+patterns. My next steps will be to manually inspect them all, categorize them, and
+implement easy optimizations identified that way. I also want a way to sort the
+examples by execution count in the benchmarks, to get a feeling for which of
+them are most important.</p>
+<p>I didn&#39;t investigate the full set of <a href="https://speed.pypy.org">Python
+benchmarks</a> that PyPy uses yet, because I don&#39;t expect
+them to contain interesting amounts of integer operations, but maybe I am wrong
+about that? Will have to try eventually.</p>
+<h3 id="conclusion">Conclusion<a href="#conclusion" title="Permalink to this heading">¶</a></h3>
+<p>This was again much easier to do than I would have expected! Given that I had
+the translation of trace ops to Z3 already in place, it was a matter of about a
+day&#39;s of programming to use this infrastructure to find the first problems and
+minimizing them.</p>
+<p>Reusing the results of existing operations or replacing operations by constants
+can be seen as &#34;zero-instruction superoptimization&#34;. I&#39;ll probably be rather
+busy for a while to add the missing optimizations identified by my simple
+script. But later extensions to actually synthesize one or several operations
+in the attempt to optimize the traces more and find more opportunities should
+be possible.</p>
+<p>Finding inefficiencies in traces with Z3 is significantly less
+annoying and also less error-prone than just manually inspecting traces and
+trying to spot optimization opportunities.</p>
+<h3 id="random-notes-and-sources">Random Notes and Sources<a href="#random-notes-and-sources" title="Permalink to this heading">¶</a></h3>
+<p>Again, John&#39;s blog posts:</p>
+<ul>
+<li><a href="https://blog.regehr.org/archives/1109">Let’s Work on an LLVM Superoptimizer</a></li>
+<li><a href="https://blog.regehr.org/archives/1146">Early Superoptimizer Results</a></li>
+<li><a href="https://blog.regehr.org/archives/1252">A Few Synthesizing Superoptimizer Results</a></li>
+<li><a href="https://blog.regehr.org/archives/1636">Synthesizing Constants</a></li>
+</ul>
+<p>and papers:</p>
+<ul>
+<li><a href="https://arxiv.org/pdf/1711.04422">A Synthesizing Superoptimizer</a></li>
+<li><a href="https://dl.acm.org/doi/pdf/10.1145/3649837">Hydra: Generalizing Peephole Optimizations with Program Synthesis</a></li>
+</ul>
+<p>I remembered recently that I had seen the approach of optimizing the traces of
+a tracing JIT with Z3 a long time ago, as part of the (now long dead, I think)
+<a href="https://web.archive.org/web/20160304055149/http://research.microsoft.com/en-us/projects/spur/">SPUR
+project</a>.
+There&#39;s a <a href="https://web.archive.org/web/20161029162737/http://csl.stanford.edu/~christos/pldi2010.fit/tillmann.provers4jit.pdf">workshop
+paper</a>
+from 2010 about this. SPUR was trying to use Z3 built into the actual JIT (as
+opposed to using Z3 only to find places where the regular optimizers could be
+improved). In addition to bitvectors, SPUR also used the Z3 support for arrays
+to model the C# heap and remove redundant stores. This is still another future
+extension for all the Z3 work I&#39;ve been doing in the context of the PyPy JIT.</p>
+      </div></div>
+  </body>
+</html>
