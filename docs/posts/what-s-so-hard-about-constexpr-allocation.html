@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://brevzin.github.io/c&#43;&#43;/2024/07/24/constexpr-alloc/">Original</a>
+    <h1>What&#39;s so hard about constexpr allocation?</h1>
+    
+    <div id="readability-page-1" class="page"><div><h2 id="setting-the-stage"><span>Setting the Stage</span><a href="#setting-the-stage"><i></i></a></h2><p>Before C++20, we couldn’t have any allocation during constant evaluation at all. Any attempt to do so would fail the evaluation — it would no longer be constant.</p><p>In C++20, as a result of <a href="https://wg21.link/p0784">P0784R7</a>, that changed. Finally we could do allocation during constant evaluation. However, this evaluation was extremely limited. Specifically, any allocation that happens must be deallocated during <em>that</em> constant evaluation.</p><p>This opened the door to a wide range of operations that weren’t possible before. We can now have local <code>std::string</code>s and <code>std::vector&lt;T&gt;</code>s! Those just work!</p><p>But we still cannot just declare a <code>constexpr std::vector</code>:</p><pre><code>#include &lt;vector&gt;
+
+constexpr std::vector&lt;int&gt; v = {1, 2, 3}; // error
+</code></pre><p>And we cannot even declare a local <code>constexpr std::vector</code> in a <code>consteval</code> function:</p><pre><code>#include &lt;vector&gt;
+
+consteval auto f() -&gt; int {
+    constexpr std::vector&lt;int&gt; v = {4, 5, 6}; // still error
+    return v.size();
+}
+</code></pre><p>This limitation still remains in C++23 and could very well still remain in C++26. The goal of this blog post is to explain why we haven’t just solved this problem already.</p><h2 id="the-two-problems"><span>The Two Problems</span><a href="#the-two-problems"><i></i></a></h2><p>There are actually two problems here to solve, not just one, although we frequently talk about this as the <code>constexpr</code> allocation problem.</p><p>The problems are:</p><ol><li>How do we know that we can allow an allocation to persist?</li><li>How do we know when we can use the contents of an allocation as a <em>constant-expression</em>?</li></ol><p>Put differently, these are the constant destruction problem and the constant access problem. Let’s go through each in turn.</p><h2 id="the-constant-destruction-problem"><span>The Constant Destruction Problem</span><a href="#the-constant-destruction-problem"><i></i></a></h2><p>Let’s start with the first problem, and use a simplified version of <code>std::unique_ptr&lt;T&gt;</code> to explain the issue:</p><pre><code>template &lt;typename T&gt;
+class unique_ptr {
+    T* ptr = nullptr;
+
+public:
+    constexpr unique_ptr() = default;
+    constexpr unique_ptr(T* p) : ptr(p) { }
+    constexpr unique_ptr(unique_ptr&amp;&amp; rhs) noexcept
+        : ptr(rhs.ptr)
+    {
+        rhs.ptr = nullptr;
+    }
+    constexpr ~unique_ptr() { delete ptr; }
+
+    constexpr auto operator=(unique_ptr&amp;&amp; rhs) noexcept
+        -&gt; unique_ptr&amp;
+    {
+        reset(rhs.release());
+        return *this;
+    }
+
+    constexpr auto get() const -&gt; T* {
+        return ptr;
+    }
+
+    constexpr auto operator*() const -&gt; T&amp; {
+        return *ptr;
+    }
+
+    constexpr auto reset(T* p) -&gt; void {
+        T* old = ptr;
+        ptr = p;
+        delete old;
+    }
+
+    constexpr auto release() -&gt; T* {
+        T* old = ptr;
+        ptr = nullptr;
+        return old;
+    }
+};
+</code></pre><p>Now, consider this extremely simple program:</p><pre><code>constexpr auto p = unique_ptr&lt;int&gt;(new int(42));
+
+auto main() -&gt; int { }
+</code></pre><p>Today, this is ill-formed, because the allocation persists past the constant evaluation that is the initialization of the global variable <code>p</code>. But we want to change that. So what happens?</p><p>Well, eventually (at the end of the program) <code>p</code> is going to be destroyed, which means its destructor is going to be run. This happens at runtime. Now, whatever the compiler actually did to initialize <code>p</code>, it did <em>not</em> allocate memory at runtime. The intent is that this behaves more like this:</p><pre><code>int __storage = 42;
+constexpr auto p = unique_ptr&lt;int&gt;{.ptr = &amp;__storage};
+
+auto main() -&gt; int { }
+</code></pre><blockquote><p>We need <code>p</code> to be constant-initialized, and a runtime allocator is just not going to be able to cut it. Having static storage allows everything to be compiled into the binary.</p></blockquote><p>And since we didn’t <em>allocate</em> this memory at runtime, we definitely cannot <em>deallocate</em> the memory at runtime. Attempting to evaluate <code>p.ptr</code>, when that simply points to the static storage duration variable <code>__storage</code>, is going to crash (or worse). Even though this happens <em>after</em> we return from <code>main</code>, that’s still not acceptable. We can’t just crash our way to progress.</p><p>What we really need to do is <em>not</em> run <code>p</code>’s destructor at the end of the program. Or rather, check (during constant evaluation time) to make sure that <code>p</code>’s destructor cleans up any allocation. If it doesn’t, fail the initialization. If it does, then go ahead and allow it to persist — but simply omit the call to <code>p</code>’s destructor at runtime.</p><p>Does that work?</p><p>Consider:</p><pre><code>constexpr auto ppi = unique_ptr&lt;unique_ptr&lt;int&gt;&gt;(
+    new unique_ptr&lt;int&gt;(new int(42))
+);
+
+auto main() -&gt; int {
+    // NB: mutable
+    unique_ptr&lt;int&gt;&amp; pi = *ppi;
+
+    // boom
+    pi.reset(new int(43));
+}
+</code></pre><p>With just <code>unique_ptr&lt;int&gt;</code>, we can’t really do much interesting. But add another layer of indirection, and we start to see some problems.</p><p><code>unique_ptr&lt;T&gt;</code> is shallow-<code>const</code>, so even though <code>ppi</code> is a <code>constexpr</code> variable, dereferencing it gives us a <em>mutable</em> <code>unique_ptr&lt;int&gt;</code>. Nothing in the type system prevents us from declaring <code>pi</code> there or invoking <code>reset</code>. But that <code>reset</code> call breaks in the same way that our original destructor broke: we’re calling <code>delete</code> at runtime on a pointer that was allocated during compile time. That can’t work.</p><p>Visually, our structure looks like (here, green indicates <code>const</code> and red indicates mutable):</p><pre><code>%%{init: {&#39;fontFamily&#39;:&#39;Consolas, Monaco&#39;}}%%
+graph LR
+    subgraph outer
+        A[&#34;unique_ptr&amp;lt;int&amp;gt;*&#34; const p]
+    end
+
+    subgraph inner
+        B[&#34;int* p&#34;]
+    end
+
+    C[42]
+
+    A --&gt; inner
+    B --&gt; C
+
+    classDef green stroke:#99ff99,stroke-width:4px;
+    classDef red stroke:#ff9999,stroke-width:4px;
+    class A green
+    class B,C red
+</code></pre><p>The outer <code>unique_ptr</code>’s member (<code>ppi.p</code>) is effectively a <code>unique_ptr&lt;int&gt;* const</code> — it is a const pointer to mutable <code>unique_ptr&lt;int&gt;</code> — by virtue of it being a <code>constexpr</code> object. But the inner <code>unique_ptr</code> is mutable, which means its member pointer (i.e. <code>ppi.p-&gt;p</code>) is effectively just an <code>int*</code> — a mutable pointer to mutable <code>int</code>.</p><p>We checked to see that <code>ppi</code>’s destructor completely cleans up all the allocation (recursively into its subobjects), and it does so. But the problem is that this allocation is <em>mutable</em> — in the example above we were able to swap out one allocation for another at runtime. If an allocation is mutable, then checking at compile time that it’s cleaned up in the destructor is kind of meaningless. How do you know that the runtime destructor actually does the same thing that the compile-time destructor did, if you’re allowed to change values at runtime?</p><p>Now, we <em>cannot</em> make the call <code>reset</code> there ill-formed. If we get that far in the program, there is nothing in the type system that will stop us. So what do we do?</p><p>There are two easy ways out.</p><p>One easy way out is to simply prevent multi-layered allocation. If you only allow one layer of allocation, there’s no problem. However, this seems awfully limiting and I really am only throwing this idea out for completeness. It is an <em>easy</em> way out, but not a good one.</p><p>The other easy way out is to simply call this undefined behavior. That’s actually not as horrible as it might seem at first glance. There will definitely be some bar, somewhere, at which point we will have to introduce new undefined behavior. This is simply because <code>const_cast</code> exists. The only question is where that bar ends up being. Although admittedly it’d be nice to be able to reject as many questionable cases up front.</p><p>Even in this example, by simply adding <code>const</code> in a key place — having a <code>unique_ptr&lt;unique_ptr&lt;int&gt; const&gt;</code> instead of a <code>unique_ptr&lt;unique_ptr&lt;int&gt;&gt;</code> is sufficient. That would change our structure to be:</p><pre><code>%%{init: {&#39;fontFamily&#39;:&#39;Consolas, Monaco&#39;}}%%
+graph LR
+    subgraph outer
+        A[&#34;unique_ptr&amp;lt;int&amp;gt;*&#34; const p]
+    end
+
+    subgraph inner
+        B[&#34;int* const p&#34;]
+    end
+
+    C[42]
+
+    A --&gt; inner
+    B --&gt; C
+
+    classDef green stroke:#99ff99,stroke-width:4px;
+    classDef red stroke:#ff9999,stroke-width:4px;
+
+    class A,B green
+    class C red
+</code></pre><p>The inner-most pointer is still a pointer to <em>mutable</em> <code>int</code>, but that doesn’t affect the ability to perform constant destruction. We don’t read the value <code>42</code> during destruction, so it doesn’t matter. This structure would be safe to allow to persist to runtime.</p><p>The question then is: how can we reject the first construct (having a <code>constexpr unique_ptr&lt;unique_ptr&lt;int&gt;&gt;</code>) but allow the second (having a <code>constexpr unique_ptr&lt;unique_ptr&lt;int&gt; const&gt;</code>)? It’s a tough question!</p><p>Before I answer that, consider real quick that <code>vector&lt;T&gt;</code> and <code>unique_ptr&lt;T&gt;</code> are not that different in terms of the actual members. Sure, <code>vector&lt;T&gt;</code> is deep-<code>const</code> while <code>unique_ptr&lt;T&gt;</code> is shallow-<code>const</code>, but as far as the language is concerned that is simply convention. A <code>vector&lt;vector&lt;int&gt;&gt;</code> has exactly the same problem as a <code>unique_ptr&lt;unique_ptr&lt;int&gt;&gt;</code>:</p><pre><code>%%{init: {&#39;fontFamily&#39;:&#39;Consolas, Monaco&#39;}}%%
+graph LR
+    subgraph outer
+        A[&#34;vector&amp;lt;int&amp;gt;*&#34; const begin]
+        A2[&#34;vector&amp;lt;int&amp;gt;*&#34; const end]
+        A3[&#34;vector&amp;lt;int&amp;gt;*&#34; const capacity]
+    end
+
+    subgraph inner
+        B[&#34;int* begin&#34;]
+        B2[&#34;int* end&#34;]
+        B3[&#34;int* capacity&#34;]
+    end
+
+    C[&#34;{1, 2, 3}&#34;]
+
+    A --&gt; inner
+    B --&gt; C
+
+    classDef green stroke:#99ff99,stroke-width:4px;
+    classDef red stroke:#ff9999,stroke-width:4px;
+
+    class A,A2,A3 green
+    class B,B2,B3,C red
+</code></pre><p>I already said I don’t want to reject multi-layered allocation. And probably the most common use of a multi-layered allocation is going to be something like a <code>vector&lt;vector&lt;T&gt;&gt;</code> (or a <code>vector&lt;string&gt;</code> which is morally equivalent). So if whatever rule we come up with to reject the bad <code>unique_ptr&lt;unique_&lt;int&gt;&gt;</code> case also rejects the good <code>vector&lt;vector&lt;int&gt;&gt;</code> case, that’s not a particularly useful rule.</p><blockquote><p>To the language, the two cases are the same. But the fact that <code>unique_ptr</code> is shallow-<code>const</code> and <code>vector</code> is deep-<code>const</code> do matter to the usability. The fact that the former directly exposes an inner <code>reset</code> but the latter does not means that you have to explicitly try to do the wrong thing with <code>vector</code>.</p></blockquote><p>To summarize, the constant destruction problem is trying to figure under what conditions it is safe to persist a constexpr allocation to runtime. We need, at a minimum, that the destructor frees all memory. But we also would like some way to guard against, at the least, the easy and unintentional mutations of the allocation itself during runtime — by rejecting shallow-const nested allocations.</p><h2 id="the-constant-access-problem"><span>The Constant Access Problem</span><a href="#the-constant-access-problem"><i></i></a></h2><p>It is arguably pointless to pursue allowing persistent <code>constexpr</code> allocation if the allocation itself cannot be used as a <em>constant-expression</em>. Meaning:</p><pre><code>// if we allow this
+constexpr auto v = vector&lt;int&gt;{1, 2, 3};
+
+// ... then we really should also allow this
+static_assert(v[0] == 1);
+static_assert(v[1] == 2);
+static_assert(v[2] == 3);
+static_assert(v.size() == 3);
+</code></pre><p>The question is: how can we determine when we can use the contents of such an allocation as a constant?</p><p>Right away we can see with the <code>unique_ptr&lt;int&gt;</code> example that the answer clearly isn’t: always. Jeff Snyder gave me this great example a few months ago:</p><pre><code>constexpr auto p = unique_ptr&lt;int&gt;(new int(42));
+
+auto foo() -&gt; void {
+    array&lt;int, *p&gt; xs;                 // #1
+    for (auto i = 0; i &lt; *p; ++i) {    // #2
+        xs[i] = i;
+    }
+}
+
+auto main() -&gt; int {
+    *p = 47;                           // #3
+    foo();
+}
+</code></pre><p>If <code>p</code> is an allowed declaration, then the mutation at <code>#3</code> is valid (<code>p</code> is a const pointer to a mutable <code>int</code>, so that <code>int</code> is allowed to be mutated). But then we have to ask what the value of <code>*p</code> is at lines <code>#1</code> and <code>#2</code>? This isn’t much of a question though — at <code>#1</code> the value can only be <code>42</code> and at <code>#2</code> the value can only be <code>47</code>. So here we have code that on two consecutive lines is accessing the same seemingly-<code>const</code> expression and giving different answers? In a way that overruns the array, despite looking correct? Unacceptable.</p><p>This code must either:</p><ol><li>be ill-formed at the point of the declaration of <code>p</code>, or</li><li>be ill-formed at the use of <code>*p</code> in <code>#1</code></li></ol><p>The first option means disallowing any constant allocation to persist if its value is reachable as mutable.</p><blockquote><p>This isn’t quite the same rule as what I laid out in the previous section. For the constant destruction problem, we need the allocation (i.e. the pointer) to not be <em>read</em> as mutable — and it is not in this example. Here, we additionally need the <em>contents</em> of the allocation (i.e. the pointee) to not be <em>reachable</em> as mutable, which is a stronger requirement.</p></blockquote><p>The second option means disallowing the use of <code>*p</code> as a constant if it is reachable as mutable. Declaring and using <code>p</code> is fine — and the value of <code>p.p</code> is constant, it’s simply that the value of <code>*p.p</code> is not constant.</p><p>Both cases require actually being able to tell if the contents are reachable as mutable — it’s just a question what we do about the case where the rule is violated: disallow use as a constant, or completely disallow?</p><h2 id="another-layer"><span>Another Layer</span><a href="#another-layer"><i></i></a></h2><p>Alright so far I’ve laid out the two problems we have to figure out how to address: constant destruction and constant access. But actually there’s one more layer to this problem. Or at least, there <em>could</em> be one more layer to this problem — if we so choose.</p><p>Up until now, we’ve been talking about having a constexpr allocation persist to runtime. It turns out, there aren’t just two kinds of constant allocations — there are three.</p><ol><li>A <code>constexpr</code> allocation is <em>transient</em> if it does not last past the constant evaluation that it was allocated in. This was the kind of allocation that was introduced in C++20, and is currently the only kind of allowed <code>constexpr</code> allocation.</li><li>A <code>constexpr</code> allocation is <em>non-transient</em> if it persists past the constant evaluation that it was allocated in, but not all the way to runtime.</li><li>A <code>constexpr</code> allocation is <em>persistent</em> if it was allocated during constant evaluation time but is usable at runtime.</li></ol><p>The interesting thing about what I’m calling non-transient (but non-persistent) allocations is that we actually have more options available to us to address them, if we so choose. To make it clear what I’m talking about:</p><pre><code>// this would be a persistent allocation
+constexpr auto a = unique_ptr&lt;int&gt;(new int(1));
+
+constexpr auto f() -&gt; int {
+    // this is a transient allocation
+    auto p = unique_ptr&lt;int&gt;(new int(2));
+    return *p;
+}
+
+consteval auto g() -&gt; int {
+    // this is a non-transient allocation
+    // the declaration of c begins a new constant evaluation,
+    // but c isn&#39;t destroyed until the end of g().
+    // Nevertheless, because g is consteval, the allocation
+    // does not leak to runtime.
+    constexpr auto c = unique_ptr&lt;int&gt;(new int(3));
+    return *c;
+}
+</code></pre><p>The two variables <code>a</code> and <code>c</code> are both <code>constexpr</code> variables whose type is <code>unique_ptr&lt;int&gt;</code>. But <code>a</code> is usable at runtime (or, rather, potentially usable — depending on what rules we choose to adopt), whereas <code>c</code> is definitely not. The consequence of this is that all behavior that affects <code>c</code> can be controlled by the compiler.</p><p>We could simply say, by fiat, that all mutation of allocation that is owned by a <code>constexpr</code> variable during constant evaluation is <em>not allowed</em>.</p><p>That means that while <code>*a</code> can never be usable as a constant expression, <code>*c</code> could be — because we can enforce that <code>*c</code> is always the value <code>3</code>. The appeal here is that it opens the door to supporting non-transient <code>constexpr</code> allocation without yet supporting persistent <code>constexpr</code> allocation by solving a simpler problem. We can address the questions of constant destruction and constant access by disallowing all mutation during constant evaluation time, which means that everything… just works?</p><blockquote><p>Obviously, we cannot just disallow mutation during runtime. If we could, we probably would’ve just shipped that in C++20.</p></blockquote><p>This was so appealing to me that I proposed that we do precisely that as part of <a href="https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2024/p3032r2.html">P3032R2</a>. It’s an easy enough rule to understand and it permits a lot of functionality that we want to permit. What’s not to like?</p><p>Well…</p><p>It does have the unfortunate consequence of making the same code behave differently depending on context:</p><pre><code>constexpr auto a = unique_ptr&lt;int&gt;(new int(1));
+static_assert(*a == 1); // must be ill-formed, *a isn&#39;t constant
+
+constexpr auto f() -&gt; void {
+    constexpr auto b = unique_ptr&lt;int&gt;(new int(2));
+    static_assert(*b == 2); // must be ill-formed, *b isn&#39;t constant
+}
+
+consteval auto g() -&gt; void {
+    constexpr auto c = unique_ptr&lt;int&gt;(new int(3));
+    static_assert(*c == 3); // OK
+}
+</code></pre><p>That’s a less than thrilling outcome, and kind of puts the brakes on the whole claim that it’s an “easy enough rule to understand.” It also doesn’t help in establishing a path forward for persistent allocation, which would be even more valuable than simply allowing non-transient allocation.</p><p>It’s always good to be able to make incremental progress, but it’s not clear that the incrementalism actually helps here. It may very well be better to <em>not</em> think of non-transient and persistent allocation as separate layers.</p><h2 id="proposed-solutions"><span>Proposed Solutions</span><a href="#proposed-solutions"><i></i></a></h2><p>There are a few solutions on the table to getting persistent <code>constexpr</code> allocation to work (as separate from the P3032R2 suggestion to allow non-transient allocation specifically by rejecting mutation). I think they can be divided into two categories: attempt to come up with as coherent and safe a solution as possible within the confines of the C++ type system, or trust the programmer.</p><h3 id="propconst"><span><code>propconst</code></span><a href="#propconst"><i></i></a></h3><p>Both <code>unique_ptr&lt;int&gt;</code> and <code>vector&lt;int&gt;</code> are types that have an <code>int*</code> member, but we recognize that these aren’t the same kind of type. <code>unique_ptr&lt;int&gt;</code> runs into mutation problems both when dealing with destruction and constant access — because it is shallow <code>const</code>. <code>vector&lt;int&gt;</code> doesn’t run into either problem because it is deep <code>const</code>. Is there a way that we can lift this notion of deep <code>const</code> into the type system? Doing so would allow us to differentiate between these types at the type system level — which would allow us to allow uses of <code>vector</code> that we would have to disallow for <code>unique_ptr</code>.</p><p>This was the intent of the <code>propconst</code> proposal: <a href="https://wg21.link/p1974r0">P1974R0</a>.</p><blockquote><p>As of this blog post in July 2024, r0 is the latest revision.</p></blockquote><p>Jeff Snyder’s proposal was to introduce a new <em>cv</em>-qualifier named <code>propconst</code> that would propagate <code>const</code> as a language feature. At its simplest:</p><pre><code>struct X {
+    int propconst* p;
+};
+
+auto test(X&amp; x) -&gt; void {
+    // a is an int&amp;
+    // x.p behaves like an int*
+    auto&amp;&amp; a = *x.p;
+
+    // b is an int const&amp;
+    // as_const(x).p behaves like an int const* const
+    auto&amp;&amp; b = *std::as_const(x).p;
+}
+</code></pre><p>This feature would lead to changes in <code>std::vector&lt;T&gt;</code> to have members of type <code>T propconst*</code> instead of <code>T*</code>, but would <em>not</em> lead to changes in <code>std::unique_ptr&lt;T&gt;</code>. It would let us adopt and enforce strict rules for destruction and constant access by way of readability and reachability as mutable. What’s not to like?</p><p>One issue may be that having a <code>propconst</code> qualifier (in the same spot as <code>const</code> and <code>volatile</code>) may be a bit too much. On the plus side, it opens the door to a <code>const</code>-propagating tuple simply by doing <code>std::tuple&lt;int propconst&amp;&gt;</code>. Oh the other hand, the word “simply” is doing a lot of work there — this requires other library (and possibly language) changes that are discussed in the proposal. That leads to an increase in complexity to handle things that aren’t strictly related to the <code>constexpr</code> allocation problem.</p><p>To that end, Matt Calabrese had suggested a refinement of the proposal: rather than have it as a <em>qualifier</em> (and thus appear in any context a type appears — and need to think about what that actually means in every case), what if <code>propconst</code> were a <em>specifier</em> that could be used in the same context as <code>mutable</code> today? That wouldn’t give us a const-propagating <code>std::tuple</code> and it appears to be a simpler proposal. I wrote this up on <a href="https://wg21.link/p2670r1">P2670R1</a>.</p><blockquote><p>A <code>propconst</code> specifier can appear in far fewer places than a <code>propconst</code> qualifier and doesn’t lead to more language rules. But it’s not as much simpler as one would hope — in particular it ends up being tricky to figure out what <code>propconst int** p;</code> <a href="https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2023/p2670r1.html#a-propconst-specifier">should actually mean</a>.</p></blockquote><p>Either approach to <code>propconst</code> does have the question of enforcement. We would require two kinds of checking:</p><ol><li>for constant destruction: ensure when running the destructor that no allocation is read as mutable.</li><li>for constant access: ensure the allocation is not reachable as mutable in any path.</li></ol><p>The first doesn’t seem complicated — you evaluate the destructor and see what variables are read. The second is more obviously problematic. Consider:</p><pre><code>struct bad_vector {
+    int propconst* begin;
+    int          * end;      // oops, not propconst
+    int          * capacity; // oops, not propconst
+};
+</code></pre><p>Given a <code>constexpr bad_vector v</code>, you cannot mutate through <code>begin</code> — but you can mutate through <code>end</code>. Which means that constant access would have to be prohibited. Basically, every pointer into an allocation (anywhere into an allocation) must propagate const.</p><p>One way to think about the <code>propconst</code> approach is that it’s a proof system. We make the constant evaluation engine <em>prove</em> that we correctly implemented a deep <code>const</code> type. Expanding on the example:</p><pre><code>struct bad_vector {
+    int propconst* begin_;
+    int* end_;
+    int* capacity_;
+
+    // these do the right/expected thing
+    constexpr bad_vector(std::initializer_list&lt;int&gt; xs);
+    constexpr ~bad_vector();
+    constexpr auto operator[](size_t)       -&gt; int&amp;;
+    constexpr auto operator[](size_t) const -&gt; int const&amp;;
+
+    // these... almost do
+    constexpr auto begin()       -&gt; int*       { return begin_; }
+    constexpr auto begin() const -&gt; int const* { return begin_; }
+    constexpr auto end()         -&gt; int* { return end_; }
+    constexpr auto end()   const -&gt; int* { return end_; }
+}
+</code></pre><p>Here, we accidentally forgot to make <code>end_</code> and <code>capacity_</code> propconst, and then <code>end() const</code> accidentally returns an <code>int*</code> instead of an <code>int const*</code>. This will compile just fine. It’ll probably pass most tests that you write, since <code>int*</code> is usable as a constant iterator just fine as long as you don’t try to mutate through it. All the comparisons work, etc.</p><p>Except that, of course, you still end up with a mutable iterator that otherwise satisfies all the language rules.</p><p>With <code>propconst</code> though, just one test is sufficient:</p><pre><code>constexpr auto v = bad_vector{1, 2, 3};
+
+// error: cannot use v[0] as a constant expression
+// because the allocation is reachable as mutable
+// through v.end_ and v.capacity_
+static_assert(v[0] == 1);
+</code></pre><p>The missing <code>propconst</code> can fool most tests, but it won’t fool the constant evaluator.</p><h3 id="trust-dont-verify"><span>Trust, Don’t Verify</span><a href="#trust-dont-verify"><i></i></a></h3><p>Alternatively, we can ask the question: how much does such verification buy us in practice? The verification that a <code>propconst</code> needs to do in order to achieve sound-ness is quite thorough: for every pointer and reference member (recursively), we need to ensure that for destruction there is no mutable path to an allocation.</p><p>It turns out it isn’t enough to simply verify that the variables read during the destructor aren’t mutable — we would really have to track every member. Consider:</p><pre><code>struct C {
+    propconst int* alloc; // regardless of which design
+    int** internal;
+
+    constexpr C() {
+        alloc = new int(42);
+        internal = &amp;alloc;
+    }
+
+    constexpr ~C() {
+        delete alloc;
+    }
+};
+
+constexpr C c;
+static_assert(*c.alloc == 42);
+
+auto main() -&gt; int {
+    delete *c.internal;
+    *c.internal = new int(43);
+}
+</code></pre><p>Here, we have an internal pointer of type <code>int**</code> that points to our local member <code>alloc</code>. In our destructor, we do not read any variable that is reachable as mutable — <code>alloc</code> is declared <code>propconst</code>, which was supposed to solve this problem for us. However, <code>internal</code> is a mutable pointer into that allocation and we can interact with it without any trouble from the type system.</p><p>Basically, while either of the <code>propconst</code> designs give us some guarantees of sound-ness — those guarantees are expensive to provide. And even then, there are some operations that we would have to declare as being undefined behavior anyway. For instance:</p><pre><code>auto main() -&gt; int {
+    auto p = unique_ptr&lt;int const&gt;(new int(5));
+    *const_cast&lt;int*&gt;(p.get()) = 6;
+    static_assert(*p == 5);
+}
+</code></pre><p>That mutation actually isn’t undefined behavior today — the <code>int</code> object wasn’t created as <code>const</code>, so it’s simply allowed to be mutated. But I’m not super worried about this case, because it requires an explicit <code>const_cast</code>.</p><p>That said — there is an alternative design to <code>propconst</code> that doesn’t require expensive tracking of all members of a type: we provide a magic library function that the library author can use to mark their allocation as immutable and just trust that they use it correctly. In the original design, this function was called <code>std::mark_immutable_if_constexpr()</code>.</p><blockquote><p>This function appeared in <a href="https://wg21.link/p0784r5">P0784R5</a>, but that revision is extremely light on details about how this function is intended to be used or even what it does. That revision also did not touch on the constant access problem at all, it solely dealt with the constant destruction problem.</p></blockquote><p>This design is quite simple: an allocation is allowed to persist if it has been marked immutable. The contents of an allocation are usable as a constant expression if has been marked immutable. Effectively, we combine the constant destruction and access problems into a single problem and treat them uniformly. It would be up to the library author to know when and how to use this function.</p><p>For instance:</p><pre><code>template &lt;typename T&gt;
+class unique_ptr {
+    T* ptr = nullptr;
+
+public:
+    constexpr unique_ptr(T* p)
+        : ptr(p)
+    {
++       if constexpr (std::is_const_v&lt;T&gt;) {
++           std::mark_immutable_if_constexpr(ptr);
++       }
+    }
+};
+
+template &lt;typename T&gt;
+class vector {
+    T* begin_;
+    T* end_;
+    T* capacity_;
+
+public:
+    constexpr vector(std::initializer_list&lt;T&gt; elems) {
+        begin_ = std::allocator&lt;T&gt;{}.allocate(elems.size());
+        end_ = capacity_ = std::uninitialized_copy(
+            elems.begin(), elems.end(), begin_);
++       std::mark_immutable_if_constexpr(begin_);
+    }
+};
+</code></pre><p>Basically, <code>unique_ptr&lt;T&gt;</code> is only immutable if <code>T</code> is <code>const</code>, but <code>vector&lt;T&gt;</code> is always immutable. And these would be marked at the end of initialization. Constant evaluation would reject any mutation into an allocation marked immutable.</p><p>The result is that while the <code>propconst</code> design would have allowed for a <code>constexpr unique_ptr&lt;int&gt;</code>, the mark immutable design does not. Is that a big loss in functionality? Unlikely. I have, on many, many, many occasions, had a need for persistent constexpr allocation that used a <code>vector</code> or a <code>string</code> or a <code>map</code>. I cannot recall an instance in which I really needed a persistent constexpr mutable <code>unique_ptr</code>. I cannot say with certainly that such a thing is completely useless (it almost certainly has some use), but the overwhelming value of persistent constant allocation would come from constant access — so it’s not unreasonable to group these problems together.</p><p>Of course, the section title here isn’t “Trust, But Verify” — it’s “Trust, Don’t Verify.” There is nothing to stop the user from writing a shallow const type (like <code>unique_ptr&lt;T&gt;</code>) and marking its allocation immutable unconditionally. The type system will allow it just fine, and this could lead to either nonsensical behavior (mutating a “constant” at runtime) or crashes or worse (deallocating a constexpr allocation that wasn’t actually a runtime allocation). It would be up to the library author to only mark an allocation immutable if they are sure there is no mutable access into it.</p><p>But I’m not actually sure that’s such an egregious problem. These containers already exist and are deep const.</p><p>There is a more conservative option here too. Rather than providing a magic library function to users to mark their allocations immutable, we could just say, by fiat, that standard-library-provided specializations of <code>std::basic_string</code> and <code>std::vector</code> <em>just work</em>. We’re not going to say <em>how</em> they work, just that such allocations are allowed to persist and are usable in constant expressions. Just full stop, without specifying any details of how such a thing might work. It’s the Standard Library. They’re allowed to do whatever they want.</p><p>There is clearly some appeal to this approach. <code>std::basic_string</code> and <code>std::vector</code> are probably a significant percentage of the total benefit of this approach. And we don’t have to worry about potential harms — these two containers are already, definitely, correctly written and <code>const</code>-propagating. But it’s also obviously unsatisfying — those are hardly the only two containers that exist in the universe of C++ code!</p><h3 id="quick-comparison"><span>Quick Comparison</span><a href="#quick-comparison"><i></i></a></h3><p>Both approaches presented here would require code changes in the various containers to support persistent allocation that is usable as a <em>constant-expression</em>: whether by somehow marking the allocation in the constructor or by somehow marking the members.</p><p>A <code>propconst</code>-based approach promises more sound-ness by catching more potential errors at compile-time, at the cost of having to do all the checking necessary to catch those errors and a more complicated model. A <code>propconst</code>-based approach would also allow for a <code>constexpr unique_ptr&lt;int&gt;</code> — such that the allocation is constant but the contents thereof are mutable.</p><p>A trust-based approach is a far simpler model. It supports fewer possibilities by using a single tool to solve both the constant access and destruction problems — as a result it would not support <code>constexpr unique_ptr&lt;int&gt;</code>. It could lead to unsafe allocations if library authors do not use the tool carefully. However, it does mean that almost nothing needs to be done at compile-time to verify that persistent allocation and constexpr access is possible.</p><h2 id="where-do-we-go-from-here"><span>Where do we go from here?</span><a href="#where-do-we-go-from-here"><i></i></a></h2><p>At the moment, we’re at something of an impasse. We discussed this problem a bit at the St. Louis meeting and took a few directional polls.</p><p>One for whether we wanted to allow non-transient but not persistent allocation (as discussed <a href="#another-layer">here</a>, which would allow the different behavior of <code>unique_ptr</code>):</p><p>And one for whether we wanted to just by fiat support persisting allocations from <code>std::basic_string</code> and <code>std::vector</code> and not worry about any other allocation:</p><p>It’s not an easy problem, and it lacks a silver bullet — at least one that I’m aware of. Personally, I’ve changed my mind many times about this problem over the years. At this point I think my favorite design is actually the <code>std::mark_immutable_if_constexpr()</code> one. It doesn’t give us protection, but it’s also the simplest to understand and reason about, and also doesn’t require extensive tracking by the implementation to provide the guarantees that we would require of <code>propconst</code>.</p><blockquote><p>Calling it my favorite might be the wrong term. More like my least disliked?</p></blockquote><p>I am not super concerned about not having the protection <code>propconst</code> gives us for a few reasons. First, most uses of <code>constexpr</code> allocation are going to come from existing container types suitably annotated. Those should already properly propagate <code>const</code>, and if they don’t, that’s a separate problem. Second, if there is any doubt about someone’s ability to write a <code>const</code>-propagating type and if they wish they could lean on <code>propconst</code> to ensure correctness here, there is always a library solution for that. The Library Fundamentals TS had a <a href="https://en.cppreference.com/w/cpp/experimental/propagate_const">type</a> called <code>std::propagate_const&lt;T&gt;</code> (for pointer-like types <code>T</code>, like <code>int*</code> or <code>std::unique_ptr&lt;int&gt;</code>) that would simply behave like a <code>const</code>-propagating pointer. <code>std::propagate_const&lt;int*&gt;</code> behaves like <code>propconst int*</code>, except that you can implement it today without any language changes. When in doubt, this could give you the type system protections that <code>propconst</code> would give you (although not the full-blown all-paths analysis). If that’s desired, we have the tools to build it.</p><p>Regardless, I do think it’s important to at least provide support for persistent <code>std::string</code> and <code>std::vector</code> in the C++26 time-frame though, especially with Reflection on the way. Given that there’s clear support for solving the problem <em>somehow</em>, I’m hoping that we can all coalesce on <em>some</em> solution — whatever it may be.</p></div></div>
+  </body>
+</html>
