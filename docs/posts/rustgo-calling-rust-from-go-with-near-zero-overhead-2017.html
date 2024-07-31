@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://words.filippo.io/rustgo/">Original</a>
+    <h1>Rustgo: Calling Rust from Go with near-zero overhead (2017)</h1>
+    
+    <div id="readability-page-1" class="page"><section>
+            <!--kg-card-begin: markdown--><p>
+[<a href="https://habrahabr.ru/post/337348/?ref=words.filippo.io">русский</a><!-- — 日本語]-->]
+</p>
+<p>Go has good support for calling into assembly, and a lot of the fast cryptographic code in the stdlib is carefully optimized assembly, bringing speedups of over 20 times.</p>
+<p>However, writing assembly code is hard, reviewing it is possibly harder, and <a href="https://groups.google.com/forum/?ref=words.filippo.io#!topic/golang-announce/B5ww0iFt1_Q">cryptography is unforgiving</a>. Wouldn&#39;t it be nice if we could write these hot functions in a higher level language?</p>
+<p>This post is the story of a slightly-less-than-sane experiment to call Rust code from Go fast enough to replace assembly. No need to know Rust, or compiler internals, but knowing what a linker is would help.</p>
+<h2 id="whyrust">Why Rust</h2>
+<p>I&#39;ll be upfront: I don&#39;t know Rust, and don&#39;t feel compelled to do my day-to-day programming in it. However, I know Rust is a very tweakable and optimizable language, while still more readable than assembly. (After all, everything is more readable than assembly!)</p>
+<p>Go strives to find defaults that are good for its core use cases, and only accepts features that are fast enough to be enabled by default, in a constant and successful fight against knobs. I love it for that. But for what we are doing today we need a language that won&#39;t flinch when asked to generate stack-only functions with manually hinted away safety checks.</p>
+<p>So if there&#39;s a language that we might be able to constrain enough to behave like assembly, and to optimize enough to be as useful as assembly, it might be Rust.</p>
+<p>Finally, Rust is safe, actively developed, and not least, there&#39;s already a good ecosystem of high-performance Rust cryptography code to tap into.</p>
+<h2 id="whynotcgo">Why not cgo</h2>
+<p>Go has a <a href="https://en.wikipedia.org/wiki/Foreign_function_interface?ref=words.filippo.io">Foreign Function Interface</a>, <em>cgo</em>. <a href="https://golang.org/cmd/cgo/?ref=words.filippo.io">cgo</a> allows Go programs to call C functions in the most natural way possible—which is unfortunately not very natural at all. (I know <a href="https://speakerdeck.com/filosottile/from-cgo-back-to-go-gophercon-2016?ref=words.filippo.io">more than I&#39;d like to about cgo</a>, and I can tell you <a href="https://dave.cheney.net/2016/01/18/cgo-is-not-go?ref=words.filippo.io">it&#39;s not fun</a>.)</p>
+<p>By using the C <a href="https://en.wikipedia.org/wiki/Application_binary_interface?ref=words.filippo.io">ABI</a> as <a href="https://en.wikipedia.org/wiki/Lingua_franca?ref=words.filippo.io">lingua franca</a> of FFIs, we can call anything from anything: Rust can compile into a library exposing the C ABI, and cgo can use that. It&#39;s awkward, but it works.</p>
+<p>We can even use reverse-cgo to build Go into a C library and call it from random languages, like <a href="https://blog.filippo.io/building-python-modules-with-go-1-5/?ref=words.filippo.io">I did with Python as a stunt</a>. (It was a stunt folks, stop taking me seriously.)</p>
+<p>But cgo does a lot of things to enable that bit of Go naturalness it provides: it will setup a whole stack for C to live in, it makes defer calls to prepare for a panic in a Go callback... this <s>could be</s> will be a whole post of its own.</p>
+<p>As a result, the performance cost of each cgo call is way too high for the use case we are thinking about—<em>small hot functions</em>.</p>
+<h2 id="linkingittogether">Linking it together</h2>
+<p>So here&#39;s the idea: if we have Rust code that is as constrained as assembly, we should be able to use it <strong>just like assembly</strong>, and call straight into it. Maybe with a thin layer of glue.</p>
+<p>We don&#39;t have to work at the <a href="https://idea.popcount.org/2013-07-24-ir-is-better-than-assembly/?ref=words.filippo.io">IR</a> level: the Go compiler converts both code and high-level assembly into machine code before linking <a href="https://talks.golang.org/2016/asm.slide?ref=words.filippo.io">since Go 1.3</a>.</p>
+<p>This is confirmed by the existence of &#34;<a href="https://docs.google.com/document/d/1nr-TQHw_er6GOQRsF6T43GGhFDelrAP0NqSS_00RgZQ/preview?ref=words.filippo.io">external linking</a>&#34;, where the system linker is used to put together a Go program. It&#39;s how cgo works, too: it compiles C with the C compiler, Go with the Go compiler, and links it all together with <code>clang</code> or <code>gcc</code>. We can even pass flags to the linker with <code>CGO_LDFLAGS</code>.</p>
+<p>Underneath all the safety features of cgo, we surely find a cross-language function call, after all.</p>
+<p>It would be nice if we could figure out how to do this without patching the compiler, though. First, let&#39;s figure out how to link a Go program with a Rust archive.</p>
+<p>I could not find a decent way to link against a foreign blob with <code>go build</code> (why should there be one?) except using <code>#cgo</code> directives. However, invoking cgo <a href="https://github.com/golang/go/issues/19448?ref=words.filippo.io">makes <code>.s</code> files go to the C compiler instead of the Go one</a>, and my friends, we <em>will</em> need Go assembly.</p>
+<p>Thankfully <a href="https://golang.org/pkg/go/build/?ref=words.filippo.io">go/build</a> is nothing but a frontend! Go offers a set of low level tools to <a href="https://golang.org/cmd/compile/?ref=words.filippo.io">compile</a> and <a href="https://golang.org/cmd/link/?ref=words.filippo.io">link</a> programs, <code>go build</code> just collects files and invokes those tools. We can follow what it does by using the <code>-x</code> flag.</p>
+<p>I built this small Makefile by following a <code>-x -ldflags &#34;-v -linkmode=external &#39;-extldflags=-v&#39;&#34;</code> invocation of a cgo build.</p>
+<pre><code>rustgo: rustgo.a
+        go tool link -o rustgo -extld clang -buildmode exe -buildid b01dca11ab1e -linkmode external -v rustgo.a
+
+rustgo.a: hello.go hello.o
+        go tool compile -o rustgo.a -p main -buildid b01dca11ab1e -pack hello.go
+        go tool pack r rustgo.a hello.o
+
+hello.o: hello.s
+        go tool asm -I &#34;$(shell go env GOROOT)/pkg/include&#34; -D GOOS_darwin -D GOARCH_amd64 -o hello.o hello.s
+</code></pre>
+<p>This compiles a simple main package composed of a Go file (<code>hello.go</code>) and a Go assembly file (<code>hello.s</code>).</p>
+<p>Now, if we want to link in a Rust object we first build it as a static library...</p>
+<pre><code>libhello.a: hello.rs
+        rustc -g -O --crate-type staticlib hello.rs
+</code></pre>
+<p>... and then just tell the external linker to link it together.</p>
+<pre><code>rustgo: rustgo.a libhello.a
+        go tool link -o rustgo -extld clang -buildmode exe -buildid b01dca11ab1e -linkmode external -v -extldflags=&#39;-lhello -L&#34;$(CURDIR)&#34;&#39; rustgo.a
+</code></pre>
+<pre><code>$ make
+go tool asm -I &#34;/usr/local/Cellar/go/1.8.1_1/libexec/pkg/include&#34; -D GOOS_darwin -D GOARCH_amd64 -o hello.o hello.s
+go tool compile -o rustgo.a -p main -buildid b01dca11ab1e -pack hello.go
+go tool pack r rustgo.a hello.o
+rustc --crate-type staticlib hello.rs
+note: link against the following native artifacts when linking against this static library
+
+note: the order and any duplication can be significant on some platforms, and so may need to be preserved
+
+note: library: System
+
+note: library: c
+
+note: library: m
+
+go tool link -o rustgo -extld clang -buildmode exe -buildid b01dca11ab1e -linkmode external -v -extldflags=&#34;-lhello -L/Users/filippo/code/misc/rustgo&#34; rustgo.a
+HEADER = -H1 -T0x1001000 -D0x0 -R0x1000
+searching for runtime.a in /usr/local/Cellar/go/1.8.1_1/libexec/pkg/darwin_amd64/runtime.a
+searching for runtime/cgo.a in /usr/local/Cellar/go/1.8.1_1/libexec/pkg/darwin_amd64/runtime/cgo.a
+ 0.00 deadcode
+ 0.00 pclntab=166785 bytes, funcdata total 17079 bytes
+ 0.01 dodata
+ 0.01 symsize = 0
+ 0.01 symsize = 0
+ 0.01 reloc
+ 0.01 dwarf
+ 0.02 symsize = 0
+ 0.02 reloc
+ 0.02 asmb
+ 0.02 codeblk
+ 0.03 datblk
+ 0.03 sym
+ 0.03 headr
+ 0.06 host link: &#34;clang&#34; &#34;-m64&#34; &#34;-gdwarf-2&#34; &#34;-Wl,-headerpad,1144&#34; &#34;-Wl,-no_pie&#34; &#34;-Wl,-pagezero_size,4000000&#34; &#34;-o&#34; &#34;rustgo&#34; &#34;-Qunused-arguments&#34; &#34;/var/folders/ry/v14gg02d0y9cb2w9809hf6ch0000gn/T/go-link-412633279/go.o&#34; &#34;/var/folders/ry/v14gg02d0y9cb2w9809hf6ch0000gn/T/go-link-412633279/000000.o&#34; &#34;-g&#34; &#34;-O2&#34; &#34;-lpthread&#34; &#34;-lhello&#34; &#34;-L/Users/filippo/code/misc/rustgo&#34;
+ 0.34 cpu time
+12641 symbols
+5764 liveness data
+</code></pre>
+<h2 id="jumpingintorust">Jumping into Rust</h2>
+<p>Alright, so we linked it, but the symbols are not going to do anything just by sitting next to each other. We need to somehow call the Rust function from our Go code.</p>
+<p>We know how to call a Go function from Go. In assembly the same call looks like <code>CALL hello(SB)</code>, where SB is a virtual register all global symbols are relative to.</p>
+<p>If we want to call an assembly function from Go we make the compiler aware of its existence like a C header, by writing <code>func hello()</code> without a function body.</p>
+<p>I tried all combinations of the above to call an external (Rust) function, but they all complained that they couldn&#39;t find either the symbol name, or the function body.</p>
+<p>But cgo, which at the end of the day is just a giant code generator, somehow manages to eventually invoke that foreign function! How?</p>
+<p>I stumbled upon <a href="https://github.com/golang/go/blob/c3c2e453c968c7b450c59a47dc9502bd44257164/src/cmd/cgo/out.go?ref=words.filippo.io#L1475-L1478">the answer</a> a couple days later.</p>
+<pre><code>//go:cgo_import_static _cgoPREFIX_Cfunc__Cmalloc
+//go:linkname __cgofn__cgoPREFIX_Cfunc__Cmalloc _cgoPREFIX_Cfunc__Cmalloc
+var __cgofn__cgoPREFIX_Cfunc__Cmalloc byte
+var _cgoPREFIX_Cfunc__Cmalloc = unsafe.Pointer(&amp;__cgofn__cgoPREFIX_Cfunc__Cmalloc)
+</code></pre>
+<p>That looks like an interesting pragma! <code>//go:linkname</code> just creates a symbol alias in the local scope (which <a href="https://sitano.github.io/2016/04/28/golang-private/?ref=words.filippo.io">can be used to call private functions</a>!), and I&#39;m pretty sure the <code>byte</code> trick is only cleverness to have something to take the address of, but <code>//go:cgo_import_static</code>... this imports an external symbol!</p>
+<p>Armed with this new tool and the Makefile above, we have a chance to invoke this Rust function (<code>hello.rs</code>)</p>
+<pre><code>#[no_mangle]
+pub extern fn hello() {
+    println!(&#34;Hello, Rust!&#34;);
+}
+</code></pre>
+<p>(The no-mangle-pub-extern incantation is from <a href="https://doc.rust-lang.org/1.5.0/book/rust-inside-other-languages.html?ref=words.filippo.io">this tutorial</a>.)</p>
+<p>from this Go program (<code>hello.go</code>)</p>
+<pre><code>package main
+
+//go:cgo_import_static hello
+
+func trampoline()
+
+func main() {
+    println(&#34;Hello, Go!&#34;)
+    trampoline()
+}
+</code></pre>
+<p>with the help of this assembly snippet. (<code>hello.s</code>)</p>
+<pre><code>TEXT ·trampoline(SB), 0, $2048
+    JMP hello(SB)
+    RET
+</code></pre>
+<p><code>CALL</code> was a bit too smart to work, but using a simple <code>JMP</code>...</p>
+<pre><code>Hello, Go!
+Hello, Rust!
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x0]
+</code></pre>
+<p>💥</p>
+<p>Well, it crashes when it tries to return. Also that <code>$2048</code> value is the whole stack size Rust is allowed (if it&#39;s even putting the stack in the right place), and don&#39;t ask me what happens if Rust tries to touch a heap... but hell, I&#39;m surprised it works at all!</p>
+<h2 id="callingconventions">Calling conventions</h2>
+<p>Now, to make it return cleanly, and take some arguments, we need to look more closely at the Go and Rust calling conventions. A <a href="https://en.wikipedia.org/wiki/Calling_convention?ref=words.filippo.io">calling convention</a> defines where arguments and return values sit across function calls.</p>
+<p>The Go calling convention is described <a href="https://github.com/golang/go/files/447163/GoFunctionsInAssembly.pdf?ref=words.filippo.io">here</a> and <a href="https://golang.org/doc/asm?ref=words.filippo.io">here</a>. For Rust we&#39;ll look at the <a href="https://doc.rust-lang.org/beta/book/first-edition/ffi.html?ref=words.filippo.io#calling-rust-code-from-c">default for FFI</a>, which is the standard C calling convention.</p>
+<p>To keep going we&#39;re going to need a debugger. (LLDB supports Go, but <a href="https://github.com/golang/go/issues/20568?ref=words.filippo.io">breakpoints are somehow broken on macOS</a>, so I had to play inside a privileged Docker container.)</p>
+
+<p>
+![Zelda dangerous to go alone](/content/images/2017/08/zelda-2.png)
+</p>
+<h3 id="thegocallingconvention">The Go calling convention</h3>
+<p><img src="https://words.filippo.io/content/images/2017/08/Go-stack-layout-3.png" alt="Go calling convention diagram" loading="lazy"/></p>
+<p>The Go calling convention is mostly <a href="https://github.com/golang/go/issues/16922?ref=words.filippo.io">undocumented</a>, but we&#39;ll need to understand it to proceed, so here is what we can learn from a disassembly (amd64 specific). Let&#39;s look at a very simple function.</p>
+<pre><code>// func foo(x, y uint64) uint64
+TEXT ·foo(SB), 0, $256-24
+    MOVQ x+0(FP), DX
+    MOVQ DX, ret+16(FP)
+    RET
+</code></pre>
+<p><code>foo</code> has 256 (0x100) bytes of local frame, 16 bytes of arguments, 8 bytes of return value, and it returns its first argument.</p>
+<pre><code>func main() {
+    foo(0xf0f0f0f0f0f0f0f0, 0x5555555555555555)
+</code></pre>
+<pre><code>rustgo[0x49d785]:  movabsq $-0xf0f0f0f0f0f0f10, %rax
+rustgo[0x49d78f]:  movq   %rax, (%rsp)
+rustgo[0x49d793]:  movabsq $0x5555555555555555, %rax
+rustgo[0x49d79d]:  movq   %rax, 0x8(%rsp)
+rustgo[0x49d7a2]:  callq  0x49d8a0                  ; main.foo at hello.s:14
+</code></pre>
+<p>The caller, seen above, does very little: it places the arguments on the stack in reverse order, at the bottom of its own frame (<code>rsp</code> to <code>16(rsp)</code>, remember that the stack grows down) and executes <code>CALL</code>. The <code>CALL</code> will push the return pointer to the stack and jump. There&#39;s no caller cleanup, just a plain <code>RET</code>.</p>
+<p>Notice that <code>rsp</code> is fixed, and we have <code>movq</code>s, not <code>push</code>s.</p>
+<pre><code>rustgo`main.foo at hello.s:14:
+rustgo[0x49d8a0]:  movq   %fs:-0x8, %rcx
+rustgo[0x49d8a9]:  leaq   -0x88(%rsp), %rax
+rustgo[0x49d8b1]:  cmpq   0x10(%rcx), %rax
+rustgo[0x49d8b5]:  jbe    0x49d8ee                  ; main.foo + 78 at hello.s:14
+                   [...]
+rustgo[0x49d8ee]:  callq  0x495d10                  ; runtime.morestack_noctxt at asm_amd64.s:405
+rustgo[0x49d8f3]:  jmp    0x49d8a0                  ; main.foo at hello.s:14
+</code></pre>
+<p>The first 4 and last 2 instructions of the function are checking if there is enough space for the stack, and if not calling <code>runtime.morestack</code>. They are probably skipped for <code>NOSPLIT</code> functions.</p>
+<pre><code>rustgo[0x49d8b7]:  subq   $0x108, %rsp
+                   [...]
+rustgo[0x49d8e6]:  addq   $0x108, %rsp
+rustgo[0x49d8ed]:  retq
+</code></pre>
+<p>Then there&#39;s the <code>rsp</code> management, which subtracts 0x108, making space for the entire 0x100 bytes of frame in one go, and the 8 bytes of frame pointer. So <code>rsp</code> points to the bottom (the end) of the function frame, and is callee managed. Before returning, <code>rsp</code> is returned to where it was (just past the return pointer).</p>
+<pre><code>rustgo[0x49d8be]:  movq   %rbp, 0x100(%rsp)
+rustgo[0x49d8c6]:  leaq   0x100(%rsp), %rbp
+                   [...]
+rustgo[0x49d8de]:  movq   0x100(%rsp), %rbp
+</code></pre>
+<p>Finally the <a href="https://stackoverflow.com/questions/579262/what-is-the-purpose-of-the-ebp-frame-pointer-register?ref=words.filippo.io">frame pointer</a>, which is effectively pushed to the stack just after the return pointer, and updated at <code>rbp</code>. So <code>rbp</code> is also callee saved, and should be updated to point at where the caller&#39;s <code>rbp</code> is stored to enable stack trace unrolling.</p>
+<pre><code>rustgo[0x49d8ce]:  movq   0x110(%rsp), %rdx
+rustgo[0x49d8d6]:  movq   %rdx, 0x120(%rsp)
+</code></pre>
+<p>Finally, from the body itself we learn that return values go just above the arguments.</p>
+<h4 id="virtualregisters">Virtual registers</h4>
+<p>The Go docs say that <code>SP</code> and <code>FP</code> are virtual registers, not just aliases of <code>rsp</code> and <code>rbp</code>.</p>
+<p>Indeed, when accessing <code>SP</code> from Go assembly, the offsets are adjusted relative to the real <code>rsp</code> so that <code>SP</code> points to the top, not the bottom, of the frame. That&#39;s convenient because it means not having to change all offsets when changing the frame size, but it&#39;s just syntactic sugar. Naked access to the register (like <code>MOVQ SP, DX</code>) accesses <code>rsp</code> directly.</p>
+<p>The <code>FP</code> virtual register is simply an adjusted offset over <code>rsp</code>, too. It points to the bottom of the caller frame, where arguments are, and there&#39;s no direct access.</p>
+<p>Note: Go maintains <code>rbp</code> and frame pointers to help debugging, but then uses a fixed <code>rsp</code> and <code>omit-stack-pointer</code>-style <code>rsp</code> offsets for the virtual <code>FP</code>. You can learn more about frame pointers and not using them from <a href="https://www.imperialviolet.org/2017/01/18/cfi.html?ref=words.filippo.io">this Adam Langley blog post</a>.</p>
+<h3 id="theccallingconvention">The C calling convention</h3>
+<p>&#34;<a href="https://en.wikipedia.org/wiki/X86_calling_conventions?ref=words.filippo.io#System_V_AMD64_ABI">sysv64</a>&#34;, the default C calling convention on x86-64, is quite different:</p>
+<ul>
+<li>The arguments are passed via registers: RDI, RSI, RDX, RCX, R8, and R9.</li>
+<li>The return value goes to RAX.</li>
+<li>Some registers are callee-saved: RBP, RBX, and R12–R15.
+<ul>
+<li>We care little about this, since in Go all registers are caller-saved.</li>
+</ul>
+</li>
+<li>The stack must be aligned to 16-bytes.
+<ul>
+<li>(I think this is why <code>JMP</code> worked and <code>CALL</code> didn&#39;t, we failed to align the stack!)</li>
+</ul>
+</li>
+</ul>
+<p>Frame pointers work the same way (and are generated by <code>rustc</code> with <code>-g</code>).</p>
+<h3 id="gluingthemtogether">Gluing them together</h3>
+<p>Building a simple trampoline between the two conventions won&#39;t be hard. We can also look at <a href="https://github.com/golang/go/blob/57bf6aca711a53aa7fea877b98896cd0445c6ad0/src/runtime/asm_amd64.s?ref=words.filippo.io#L585"><code>asmcgocall</code></a> for inspiration, since it does approximately the same job, but for cgo.</p>
+<p>We need to remember that we want the Rust function to use the stack space of our assembly function, since Go ensured for us that it&#39;s present. To do that, we have to rollback <code>rsp</code> from the end of the stack.</p>
+<pre><code>package main
+
+//go:cgo_import_static increment
+func trampoline(arg uint64) uint64
+
+func main() {
+    println(trampoline(41))
+}
+</code></pre>
+<center>⬇</center>
+<pre><code>TEXT ·trampoline(SB), 0, $2048-16
+    MOVQ arg+0(FP), DI // Load the argument before messing with SP
+    MOVQ SP, BX        // Save SP in a callee-saved registry
+    ADDQ $2048, SP     // Rollback SP to reuse this function&#39;s frame
+    ANDQ $~15, SP      // Align the stack to 16-bytes
+    CALL increment(SB)
+    MOVQ BX, SP        // Restore SP
+    MOVQ AX, ret+8(FP) // Place the return value on the stack
+    RET
+</code></pre>
+<center>⬇</center>
+<pre><code>#[no_mangle]
+pub extern fn increment(a: u64) -&gt; u64 {
+    return a + 1;
+}
+</code></pre>
+<h3 id="callonmacos">CALL on macOS</h3>
+<p><code>CALL</code> didn&#39;t quite work on macOS. For some reason, there the function call was replaced with an intermediate call to <code>_cgo_thread_start</code>, which is not that incredible considering we are using something called <code>cgo_import_static</code> and that <code>CALL</code> is virtual in Go assembly.</p>
+<pre><code>callq  0x40a27cd                 ; x_cgo_thread_start + 29
+</code></pre>
+<p>We can bypass that &#34;helper&#34; by using the full <code>//go:linkname</code> incantation we found in the standard library to take a pointer to the function, and then calling the function pointer, like this.</p>
+<pre><code>import _ &#34;unsafe&#34;
+
+//go:cgo_import_static increment
+//go:linkname increment increment
+var increment uintptr
+var _increment = &amp;increment
+</code></pre>
+<pre><code>    MOVQ ·_increment(SB), AX
+    CALL AX
+</code></pre>
+<h2 id="isitfast">Is it fast?</h2>
+<p>The point of this whole exercise is to be able to call Rust instead of assembly for cryptographic operations (and to have fun). So a rustgo call will have to be almost <a href="https://speakerdeck.com/gtank/i-wanna-go-fast?ref=words.filippo.io">as fast as an assembly call</a> to be useful.</p>
+<p>Benchmark time!</p>
+<p>We&#39;ll compare incrementing a uint64 inline, with a <code>//go:noinline</code> function, with the rustgo call above, and with a cgo call to the exact same Rust function.</p>
+<p>Rust was compiled with <code>-g -O</code>, and the benchmarks were run on macOS on a 2.9GHz Intel Core i5.</p>
+<pre><code>name                 time/op
+CallOverhead/Inline  1.72ns ± 3%
+CallOverhead/Go      4.60ns ± 2%
+CallOverhead/rustgo  5.11ns ± 4%
+CallOverhead/cgo     73.6ns ± 0%
+</code></pre>
+<p>rustgo is 11% slower than a Go function call, and almost 15 times faster than cgo!</p>
+<p>The performance is even better when run on Linux without the function pointer workaround, with only a 2% overhead.</p>
+<pre><code>name                 time/op
+CallOverhead/Inline  1.67ns ± 2%
+CallOverhead/Go      4.49ns ± 3%
+CallOverhead/rustgo  4.58ns ± 3%
+CallOverhead/cgo     69.4ns ± 0%
+</code></pre>
+<h2 id="arealexample">A real example</h2>
+<p>For a real-world demo, I picked the excellent curve25519-dalek library, and specifically the task of multiplying the curve basepoint by a scalar and returning its Edwards representation.</p>
+<p>The Cargo benchmarks swing widely between executions because of <a href="https://wiki.debian.org/HowTo/CpuFrequencyScaling?ref=words.filippo.io">CPU frequency scaling</a>, but they suggest the operation will take 22.9µs ± 17%.</p>
+<pre><code>test curve::bench::basepoint_mult    ... bench:      17,276 ns/iter (+/- 3,057)
+test curve::bench::edwards_compress  ... bench:       5,633 ns/iter (+/- 858)
+</code></pre>
+<p>On the Go side, we&#39;ll expose a simple API.</p>
+<pre><code>func ScalarBaseMult(dst, in *[32]byte)
+</code></pre>
+<p>On the Rust side, it&#39;s not different from building <a href="https://doc.rust-lang.org/beta/book/first-edition/ffi.html?ref=words.filippo.io#calling-rust-code-from-c">an interface for normal FFI</a>.</p>
+<p>I&#39;ll be honest, it took me forever to figure out enough Rust to make this work.</p>
+<pre><code>#![no_std]
+
+extern crate curve25519_dalek;
+use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::constants;
+
+#[no_mangle]
+pub extern fn scalar_base_mult(dst: &amp;mut [u8; 32], k: &amp;[u8; 32]) {
+    let res = &amp;constants::ED25519_BASEPOINT_TABLE * &amp;Scalar(*k);
+    dst.clone_from(res.compress_edwards().as_bytes());
+}
+</code></pre>
+<p>To build the <code>.a</code> we use <code>cargo build --release</code> with a <code>Cargo.toml</code> that defines the dependencies, enables frame pointers, and configures curve25519-dalek to use its most efficient math and no standard library.</p>
+<pre><code>[package]
+name = &#34;ed25519-dalek-rustgo&#34;
+version = &#34;0.0.0&#34;
+
+[lib]
+crate-type = [&#34;staticlib&#34;]
+
+[dependencies.curve25519-dalek]
+version = &#34;^0.9&#34;
+default-features = false
+features = [&#34;nightly&#34;]
+
+[profile.release]
+debug = true
+</code></pre>
+<p>Finally, we need to adjust the trampoline to take two arguments and return no value.</p>
+<pre><code>TEXT ·ScalarBaseMult(SB), 0, $16384-16
+    MOVQ dst+0(FP), DI
+    MOVQ in+8(FP), SI
+
+    MOVQ SP, BX
+    ADDQ $16384, SP
+    ANDQ $~15, SP
+
+    MOVQ ·_scalar_base_mult(SB), AX
+    CALL AX
+
+    MOVQ BX, SP
+    RET
+</code></pre>
+<p>The result is a transparent Go call with performance that closely resembles the pure Rust benchmark, and is almost 6% faster than cgo!</p>
+<pre><code>name            old time/op  new time/op  delta
+RustScalarBaseMult  23.7µs ± 1%  22.3µs ± 4%  -5.88%  (p=0.003 n=5+7)
+</code></pre>
+<p>For comparison, similar functionality is provided by github.com/agl/ed25519/edwards25519, and that pure-Go library takes almost 3 times as long.</p>
+<pre><code>h := &amp;edwards25519.ExtendedGroupElement{}
+edwards25519.GeScalarMultBase(h, &amp;k)
+h.ToBytes(&amp;dst)
+</code></pre>
+<pre><code>name            time/op
+GoScalarBaseMult  66.1µs ± 2%
+</code></pre>
+<h2 id="packagingup">Packaging up</h2>
+<p>Now we know it actually works, that&#39;s exciting! But to be usable it will have to be an importable package, not forced into <code>package main</code> by a weird build process.</p>
+<p>This is where <a href="https://github.com/golang/proposal/blob/master/design/2775-binary-only-packages.md?ref=words.filippo.io"><code>//go:binary-only-package</code></a> comes in! That annotation allows us to tell the compiler to ignore the source of the package, and to only use the pre-built <code>.a</code> library file in <code>$GOPATH/pkg</code>.</p>
+<p>If we can manage to build a <code>.a</code> file that works with Go&#39;s native linker (<a href="https://godoc.org/cmd/link?ref=words.filippo.io">cmd/link</a>, referred to also as the <em>internal</em> linker), <strong>we can redistribute that and it will let our users import the package as if it was a native one</strong>, including cross-compiling (provided we included a <code>.a</code> for that platform)!</p>
+<p>The Go side is easy, and pairs with the assembly and Rust we already have. We can even include docs for <code>go doc</code>&#39;s benefit.</p>
+<pre><code>//go:binary-only-package
+
+// Package edwards25519 implements operations on an Edwards curve that is
+// isomorphic to curve25519.
+//
+// Crypto operations are implemented by calling directly into the Rust
+// library curve25519-dalek, without cgo.
+//
+// You should not actually be using this.
+package edwards25519
+
+import _ &#34;unsafe&#34;
+
+//go:cgo_import_static scalar_base_mult
+//go:linkname scalar_base_mult scalar_base_mult
+var scalar_base_mult uintptr
+var _scalar_base_mult = &amp;scalar_base_mult
+
+// ScalarBaseMult multiplies the scalar in by the curve basepoint, and writes
+// the compressed Edwards representation of the resulting point to dst.
+func ScalarBaseMult(dst, in *[32]byte)
+</code></pre>
+<p>The Makefile will have to change quite a bit—since we aren&#39;t building a binary anymore we don&#39;t get to keep using <code>go tool link</code>.</p>
+<p>A <code>.a</code> archive is just a pack of <code>.o</code> object files in <a href="https://en.wikipedia.org/wiki/Ar_(Unix)?ref=words.filippo.io">an ancient format with a symbol table</a>. If we could get the symbols from the Rust <code>libed25519_dalek_rustgo.a</code> library into the <code>edwards25519.a</code> archive that <code>go tool compile</code> made, we <em>should</em> be golden.</p>
+<p><code>.a</code> archives are managed by the <code>ar</code> UNIX tool, or by its Go internal counterpart, <a href="https://godoc.org/cmd/pack?ref=words.filippo.io">cmd/pack</a> (as in <code>go tool pack</code>). The two formats are ever-so-subtly different, of course. We&#39;ll need to use the platform <code>ar</code> for <code>libed25519_dalek_rustgo.a</code> and the Go cmd/pack for <code>edwards25519.a</code>.</p>
+<p>(For example, the platform <code>ar</code> on my macOS uses <a href="https://en.wikipedia.org/wiki/Ar_(Unix)?ref=words.filippo.io#BSD_variant">the BSD convention</a> of calling files <code>#1/LEN</code> and then embedding the filename of length LEN at the beginning of the file, to exceed the 16 bytes max file length. That was confusing.)</p>
+<p>To bundle the two libraries I tried doing the simplest (read: hackish) thing: extract <code>libed25519_dalek_rustgo.a</code> into a temporary folder, and then pack the objects back into <code>edwards25519.a</code>.</p>
+<pre><code>edwards25519/edwards25519.a: edwards25519/rustgo.go edwards25519/rustgo.o target/release/libed25519_dalek_rustgo.a
+               go tool compile -N -l -o $@ -p main -pack edwards25519/rustgo.go
+               go tool pack r $@ edwards25519/rustgo.o # from edwards25519/rustgo.s
+               mkdir -p target/release/libed25519_dalek_rustgo &amp;&amp; cd target/release/libed25519_dalek_rustgo &amp;&amp; \
+                       rm -f *.o &amp;&amp; ar xv &#34;$(CURDIR)/target/release/libed25519_dalek_rustgo.a&#34;
+               go tool pack r $@ target/release/libed25519_dalek_rustgo/*.o
+
+.PHONY: install
+install: edwards25519/edwards25519.a
+               mkdir -p &#34;$(shell go env GOPATH)/pkg/darwin_amd64/$(IMPORT_PATH)/&#34;
+               cp edwards25519/edwards25519.a &#34;$(shell go env GOPATH)/pkg/darwin_amd64/$(IMPORT_PATH)/&#34;
+</code></pre>
+<p>Imagine my surprise when it worked!</p>
+<p>With the <code>.a</code> in place it&#39;s just a matter of making a simple program using the package.</p>
+<pre><code>package main
+
+import (
+	&#34;bytes&#34;
+	&#34;encoding/hex&#34;
+	&#34;fmt&#34;
+	&#34;testing&#34;
+
+	&#34;github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519&#34;
+)
+
+func main() {
+	input, _ := hex.DecodeString(&#34;39129b3f7bbd7e17a39679b940018a737fc3bf430fcbc827029e67360aab3707&#34;)
+	expected, _ := hex.DecodeString(&#34;1cc4789ed5ea69f84ad460941ba0491ff532c1af1fa126733d6c7b62f7ebcbcf&#34;)
+
+	var dst, k [32]byte
+	copy(k[:], input)
+
+	edwards25519.ScalarBaseMult(&amp;dst, &amp;k)
+	if !bytes.Equal(dst[:], expected) {
+		fmt.Println(&#34;rustgo produces a wrong result!&#34;)
+	}
+
+	fmt.Printf(&#34;BenchmarkScalarBaseMult\t%v\n&#34;, testing.Benchmark(func(b *testing.B) {
+		for i := 0; i &lt; b.N; i++ {
+			edwards25519.ScalarBaseMult(&amp;dst, &amp;k)
+		}
+	}))
+}
+</code></pre>
+<p>And running <code>go build</code>!</p>
+<pre><code>$ go build -ldflags &#39;-linkmode external -extldflags -lresolv&#39;
+$ ./ed25519-dalek-rustgo
+BenchmarkScalarBaseMult	  100000	     19914 ns/op
+</code></pre>
+<p>Well, it almost worked. We cheated. The binary would not compile unless we linked it to <code>libresolv</code>. To be fair, the Rust compiler tried to tell us. (But who listens to everything the Rust compiler tells you anyway?)</p>
+<pre><code>note: link against the following native artifacts when linking against this static library
+
+note: the order and any duplication can be significant on some platforms, and so may need to be preserved
+
+note: library: System
+
+note: library: resolv
+
+note: library: c
+
+note: library: m
+</code></pre>
+<p>Now, linking against system libraries would be a problem, because it will never happen with internal linking and cross-compilation...</p>
+<p>But hold on a minute, <em>libresolv</em>?! Why does our <code>no_std</code>, &#34;should be like assembly&#34;, stack only Rust library want to <em>resolve DNS names</em>?</p>
+<h3 id="ireallymeantno_std">I really meant <code>no_std</code></h3>
+<p>The problem is that the library is not actually <code>no_std</code>. Look at all that stuff in there! We want nothing to do with allocators!</p>
+<pre><code>$ ar t target/release/libed25519_dalek_rustgo.a
+__.SYMDEF
+ed25519_dalek_rustgo-742a1d9f1c101d86.0.o
+ed25519_dalek_rustgo-742a1d9f1c101d86.crate.allocator.o
+curve25519_dalek-03e3ca0f6d904d88.0.o
+subtle-cd04b61500f6e56a.0.o
+std-72653eb2361f5909.0.o
+panic_unwind-d0b88496572d35a9.0.o
+unwind-da13b913698118f9.0.o
+arrayref-2be0c0ff08ae2c7d.0.o
+digest-f1373d68da35ca45.0.o
+generic_array-95ca86a62dc11ddc.0.o
+nodrop-7df18ca19bb4fc21.0.o
+odds-3bc0ea0bdf8209aa.0.o
+typenum-a61a9024d805e64e.0.o
+rand-e0d585156faee9eb.0.o
+alloc_system-c942637a1f049140.0.o
+libc-e038d130d15e5dae.0.o
+alloc-0e789b712308019f.0.o
+std_unicode-9735142be30abc63.0.o
+compiler_builtins-8a5da980a34153c7.0.o
+absvdi2.o
+absvsi2.o
+absvti2.o
+[... snip ...]
+truncsfhf2.o
+ucmpdi2.o
+ucmpti2.o
+core-9077840c2cc91cbf.0.o
+</code></pre>
+<p>So how do we actually make it <code>no_std</code>? This turned out to be <a href="https://twitter.com/FiloSottile/status/894663496410988544?ref=words.filippo.io">an entire side-quest</a>, but I&#39;ll give you a recap.</p>
+<ul>
+<li>If any dependency is not <code>no_std</code>, your <code>no_std</code> flag is nullified. One of the <code>curve25519-dalek</code> dependencies had this problem, <code>cargo update</code> fixed that.</li>
+<li>Actually making a <code>no_std</code> <em>staticlib</em> (that is, an library for external use, as opposed to for inclusion in a Rust program) is more like making a <code>no_std</code> <em>executable</em>, which is much harder as it must be self-contained.</li>
+<li>The docs on how to make a <code>no_std</code> <em>executable</em> are sparse. I mostly used <a href="https://doc.rust-lang.org/1.5.0/book/no-stdlib.html?ref=words.filippo.io">an old version of the Rust book</a> and eventually found <a href="https://doc.rust-lang.org/beta/unstable-book/language-features/lang-items.html?ref=words.filippo.io#writing-an-executable-without-stdlib">this section in the lang_items chapter</a>. <a href="https://os.phil-opp.com/set-up-rust/?ref=words.filippo.io">This blog post</a> was useful.</li>
+<li>For starters, you need to define &#34;lang_items&#34; functions to handle functionality that is normally in the stdlib, like <code>panic_fmt</code>.</li>
+<li>Then you are without the Rust equivalents of <code>compiler-rt</code>, so you have to import the crate compiler_builtins. (<a href="https://github.com/rust-lang/rust/issues/43264?ref=words.filippo.io">rust-lang/rust#43264</a>)</li>
+<li>Then there&#39;s a problem with <code>rust_begin_unwind</code> being unexported, which don&#39;t ask me why but is solved by marking <code>panic_fmt</code> as <code>no_mangle</code>, which the linter is not happy about. (<a href="https://github.com/rust-lang/rust/issues/38281?ref=words.filippo.io">rust-lang/rust#38281</a>)</li>
+<li>Then you are without <code>memcpy</code>, but thankfully there&#39;s a native Rust reimplementation in the <a href="https://github.com/alexcrichton/rlibc?ref=words.filippo.io">rlibc</a> crate. Super useful <a href="https://github.com/rust-lang-nursery/compiler-builtins/issues/182?ref=words.filippo.io">learning</a> that <code>nm -u</code> will tell you what symbols are missing from an object.</li>
+</ul>
+<p>This all boils down to a bunch of arcane lines at the top of our <code>lib.rs</code>.</p>
+<pre><code>#![no_std]
+#![feature(lang_items, compiler_builtins_lib, core_intrinsics)]
+use core::intrinsics;
+#[allow(private_no_mangle_fns)] #[no_mangle] // rust-lang/rust#38281
+#[lang = &#34;panic_fmt&#34;] fn panic_fmt() -&gt; ! { unsafe { intrinsics::abort() } }
+#[lang = &#34;eh_personality&#34;] extern fn eh_personality() {}
+extern crate compiler_builtins; // rust-lang/rust#43264
+extern crate rlibc;
+</code></pre>
+<p>And with that, <code>go build</code> works (!!!) on macOS.</p>
+<h3 id="linux">Linux</h3>
+<p>On Linux nothing works.</p>
+<p>External linking complains about <code>fmax</code> and other symbols missing, and it seems to be right.</p>
+<pre><code>$ ld -r -o linux.o target/release/libed25519_dalek_rustgo/*.o
+$ nm -u linux.o
+                 U _GLOBAL_OFFSET_TABLE_
+                 U abort
+                 U fmax
+                 U fmaxf
+                 U fmaxl
+                 U logb
+                 U logbf
+                 U logbl
+                 U scalbn
+                 U scalbnf
+                 U scalbnl
+</code></pre>
+<p>A friend thankfully suggested making sure that I was using <code>--gc-sections</code> to strip dead code, which might reference things I don&#39;t actually need. And sure enough, this worked. (That&#39;s three layers of flag-passing right there.)</p>
+<pre><code>$ go build -ldflags &#39;-extld clang -linkmode external -extldflags -Wl,--gc-sections&#39;
+</code></pre>
+<p>But umh, in the Makefile we aren&#39;t using a linker at all, so where do we put <code>--gc-sections</code>? The answer is to stop hacking <code>.a</code>s together and actually reading the <a href="https://linux.die.net/man/1/ld?ref=words.filippo.io">linker man page</a>.</p>
+<p>We can build a <code>.o</code> containing a given symbol and all the symbols it references with <code>ld -r --gc-sections -u $SYMBOL</code>. <code>-r</code> makes the object reusable for a later link, and <code>-u</code> marks a symbol as needed, or everything would end up garbage collected. <code>$SYMBOL</code> is <code>scalar_base_mult</code> in our case.</p>
+<p>Why wasn&#39;t this a problem on macOS? It would have been if we linked manually, but the macOS compiler apparently does dead symbol stripping by default.</p>
+<pre><code>$ ld -e _scalar_base_mult target/release/libed25519_dalek_rustgo/*.o
+Undefined symbols for architecture x86_64:
+  &#34;___assert_rtn&#34;, referenced from:
+      _compilerrt_abort_impl in int_util.o
+  &#34;_copysign&#34;, referenced from:
+      ___divdc3 in divdc3.o
+      ___muldc3 in muldc3.o
+  &#34;_copysignf&#34;, referenced from:
+      ___divsc3 in divsc3.o
+      ___mulsc3 in mulsc3.o
+  &#34;_copysignl&#34;, referenced from:
+      ___divxc3 in divxc3.o
+      ___mulxc3 in mulxc3.o
+  &#34;_fmax&#34;, referenced from:
+      ___divdc3 in divdc3.o
+  &#34;_fmaxf&#34;, referenced from:
+      ___divsc3 in divsc3.o
+  &#34;_fmaxl&#34;, referenced from:
+      ___divxc3 in divxc3.o
+  &#34;_logb&#34;, referenced from:
+      ___divdc3 in divdc3.o
+  &#34;_logbf&#34;, referenced from:
+      ___divsc3 in divsc3.o
+  &#34;_logbl&#34;, referenced from:
+      ___divxc3 in divxc3.o
+  &#34;_scalbn&#34;, referenced from:
+      ___divdc3 in divdc3.o
+  &#34;_scalbnf&#34;, referenced from:
+      ___divsc3 in divsc3.o
+  &#34;_scalbnl&#34;, referenced from:
+      ___divxc3 in divxc3.o
+ld: symbol(s) not found for inferred architecture x86_64
+$ ld -e _scalar_base_mult -dead_strip target/release/libed25519_dalek_rustgo/*.o
+</code></pre>
+<p>This is also the part where <a href="https://github.com/rust-lang/rust/issues/35052?ref=words.filippo.io">we learn painfully that the macOS platform prepends a <code>_</code> to all symbol names</a>, because reasons.</p>
+<p>So here&#39;s the Makefile portion that will work with external linking out of the box.</p>
+<pre><code>edwards25519/edwards25519.a: edwards25519/rustgo.go edwards25519/rustgo.o edwards25519/libed25519_dalek_rustgo.o
+		go tool compile -N -l -o $@ -p main -pack edwards25519/rustgo.go
+		go tool pack r $@ edwards25519/rustgo.o edwards25519/libed25519_dalek_rustgo.o
+
+edwards25519/libed25519_dalek_rustgo.o: target/$(TARGET)/release/libed25519_dalek_rustgo.a
+ifeq ($(shell go env GOOS),darwin)
+		$(LD) -r -o $@ -arch x86_64 -u &#34;_$(SYMBOL)&#34; $^
+else
+		$(LD) -r -o $@ --gc-sections -u &#34;$(SYMBOL)&#34; $^
+endif
+</code></pre>
+<p>The last missing piece is internal linking on Linux. In short, <a href="https://gist.github.com/FiloSottile/0d938bc4e8a7f3eab1fa4f672c334842?ref=words.filippo.io#file-internal-linking-issue-diff">it was not linking the Rust code</a>, even if the compilation seemed to succeed. The relocations were not happening and the <code>CALL</code> instructions in our Rust function left pointing at meaningless addresses.</p>
+<p>At that point I felt like it had to be a silent linker bug, the final boss in implementing rustgo, and reached out to people much smarter than me. One of them was guiding me in <a href="https://gist.github.com/FiloSottile/0d938bc4e8a7f3eab1fa4f672c334842?ref=words.filippo.io#file-relocations-txt">debugging cmd/link</a> (which was fascinating!) when Ian Lance Taylor, the author of cgo, helpfully pointed out that <code>//cgo:cgo_import_static</code> is not enough for internal linking, and that I also wanted <code>//cgo:cgo_import_dynamic</code>.</p>
+<pre><code>//go:cgo_import_static scalar_base_mult
+//go:cgo_import_dynamic scalar_base_mult
+</code></pre>
+<p>I still have no idea <em>why</em> leaving it out would result in that issue, but adding it finally made our rustgo package compile both with external and internal linking, on Linux and macOS, out of the box.</p>
+<h3 id="redistributable">Redistributable</h3>
+<p>Now that we can build a <code>.a</code>, we can take the suggestion in the <a href="https://github.com/golang/proposal/blob/master/design/2775-binary-only-packages.md?ref=words.filippo.io"><code>//go:binary-only-package</code></a> spec, and build a tarball with <code>.a</code>s for <code>linux_amd64</code>/<code>darwin_amd64</code> and the package source, to untar into a GOPATH to install.</p>
+<pre><code>$ tar tf ed25519-dalek-rustgo_go1.8.3.tar.gz
+src/github.com/FiloSottile/ed25519-dalek-rustgo/
+src/github.com/FiloSottile/ed25519-dalek-rustgo/.gitignore
+src/github.com/FiloSottile/ed25519-dalek-rustgo/Cargo.lock
+src/github.com/FiloSottile/ed25519-dalek-rustgo/Cargo.toml
+src/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519/
+src/github.com/FiloSottile/ed25519-dalek-rustgo/main.go
+src/github.com/FiloSottile/ed25519-dalek-rustgo/Makefile
+src/github.com/FiloSottile/ed25519-dalek-rustgo/release.sh
+src/github.com/FiloSottile/ed25519-dalek-rustgo/src/
+src/github.com/FiloSottile/ed25519-dalek-rustgo/target.go
+src/github.com/FiloSottile/ed25519-dalek-rustgo/src/lib.rs
+src/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519/rustgo.go
+src/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519/rustgo.s
+pkg/linux_amd64/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519.a
+pkg/darwin_amd64/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519.a
+</code></pre>
+<p>Once installed like that, the package will be usable just like a native one, cross-compilation included (as long as we packaged a <code>.a</code> for the target)!</p>
+<p>The only thing we have to worry about is that if we build Rust with <code>-Ctarget-cpu=native</code> it might not run on older CPUs. Thankfully benchmarks (<a href="https://twitter.com/isislovecruft/status/887787163072507904?ref=words.filippo.io">and the curve25519-dalek authors</a>) tell us that the only real difference is between post and pre-Haswell processors, so we only have to make a universal build and a Haswell one.</p>
+<pre><code>$ benchstat bench-none.txt bench-haswell.txt
+name                   old time/op  new time/op  delta
+ScalarBaseMult/rustgo  22.0µs ± 3%  20.2µs ± 2%  -8.41%  (p=0.001 n=7+6)
+$ benchstat bench-haswell.txt bench-native.txt
+name                   old time/op  new time/op  delta
+ScalarBaseMult/rustgo  20.2µs ± 2%  20.1µs ± 2%   ~     (p=0.945 n=6+7)
+</code></pre>
+<p>As the cherry on top, I made the Makefile obey GOOS/GOARCH, converting them as needed into Rust target triples, so if you have Rust set up for cross-compilation you can even cross-compile the <code>.a</code> itself.</p>
+<p>Here&#39;s the result: <a href="https://github.com/FiloSottile/ed25519-dalek-rustgo?ref=words.filippo.io">github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519</a>. It&#39;s even on <a href="https://godoc.org/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519?ref=words.filippo.io">godoc</a>.</p>
+<h2 id="turningitintoarealthing">Turning it into a real thing</h2>
+<p>Well, this was fun.</p>
+<p>But to be clear, rustgo is not a real thing that you should use <s>in production</s>. For example, I suspect I should be saving <code>g</code> before the jump, the stack size is completely arbitrary, and shrinking the trampoline frame like that will probably confuse the hell out of debuggers. Also, a panic in Rust might get weird.</p>
+<p>To make it a real thing I&#39;d start by calling <code>morestack</code> manually from a <code>NOSPLIT</code> assembly function to ensure we have enough goroutine stack space (instead of rolling back <code>rsp</code>) with a size obtained maybe from static analysis of the Rust function (instead of, well, made up).</p>
+<p>It could all be analyzed, generated and built by some &#34;rustgo&#34; tool, instead of hardcoded in Makefiles and assembly files. cgo itself is little more than a code-generation tool after all. It might make sense as a <code>go:generate</code> thing, but I know someone who wants to make it a cargo command. (Finally some Rust-vs-Go fighting!) Also, a Rust-side collection of FFI types like, say, <code>GoSlice</code> would be nice.</p>
+<pre><code>#[repr(C)]
+struct GoSlice {
+    array: *mut u8,
+    len: i32,
+    cap: i32,
+}
+</code></pre>
+<p>Or maybe a Go or Rust adult will come and tell us to stop before we get hurt.</p>
+<p>In the meantime, you might want to <a href="https://twitter.com/FiloSottile?ref=words.filippo.io">follow me on Twitter</a>.</p>
+<p>EDIT: It was pointed out to me that if we simply named the Rust object file <code>libed25519_dalek_rustgo.syso</code>, we could skip all the <code>go tool</code> invocations and simply use <code>go build</code> which automatically links <code>.syso</code> files found in the package. But what&#39;s the fun in that.</p>
+<blockquote>
+<p>Thanks (in no particular order) to David, Ian, Henry, Isis, Manish, Zaki, Anna, George, Kaylyn, Bill, David, Jess, Tony and Daniel for making this possible. Don&#39;t blame them for the mistakes and horrors, those are mine.</p>
+</blockquote>
+<center>
+<blockquote data-cards="hidden" data-lang="en-gb"><p lang="en" dir="ltr">Calling Rust from Go without cgo.</p>— Filippo Valsorda (@FiloSottile) <a href="https://twitter.com/FiloSottile/status/897434109613674496?ref=words.filippo.io">15 August 2017</a></blockquote>
+
+</center>
+<p>P.S. Before anyone tries to compare this to cgo (which has many more safety features) or pure Go, it&#39;s not meant to replace either. It&#39;s meant to replace manually written assembly with something much safer and more readable, with comparable performance. Or better yet, it was meant to be a fun experiment.</p>
+<!--kg-card-end: markdown-->
+        </section></div>
+  </body>
+</html>
