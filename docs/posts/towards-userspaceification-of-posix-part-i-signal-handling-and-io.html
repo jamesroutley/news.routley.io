@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.redox-os.org/news/kernel-11/">Original</a>
+    <h1>Towards userspaceification of POSIX – part I: signal handling and IO</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+  
+    
+  
+  
+    <h5>By Jacob Lorentzon (4lDO2)
+      
+        on <time datetime="2024-07-09 00:22:00 +0200 +0200">Tuesday, July 9, 2024</time>
+      
+    </h5>
+  
+  
+<p>I’m very exited to announce that Redox has been selected as <a href="https://nlnet.nl/news/2024/20240618-Call-announcement.html">one of the 45
+projects receiving new NGI Zero
+grants</a>, with me as
+primary developer for <a href="https://nlnet.nl/project/RedoxOS-Signals/">Redox’s POSIX signals
+project</a>! The goal of this project
+it to implement proper POSIX signal handling and process management, and to do
+this in userspace to the largest reasonable extent. This grant is obviously
+highly beneficial for Redox, and will allow me to dedicate significantly more
+time to work on the Redox kernel and related components for one year.</p>
+<p>As this announcement came roughly a week after RSoC started, I spent the
+first week preparing the kernel for new IPC changes, by investing some time
+into changing the scheme packet format, improving both performance and the
+possible set of IPC messages.</p>
+<p>Since then, I’ve been working on replacing the current signal implementation
+with a mostly userspace-based one, initially keeping the same level of support
+without adding new features. This has almost been merged.</p>
+<h2 id="improved-userspace-scheme-protocol-and-stateless-io">Improved userspace scheme protocol, and stateless IO</h2>
+<p>TL;DR <strong>As announced in the June report, an improved scheme packet format and
+two new syscalls have improved RedoxFS copy performance by 63%!</strong></p>
+<p>The Redox kernel implements IO syscalls, such as SYS_READ, by mapping affected
+memory ranges directly into the handler process, and by queueing <code>Packet</code>s
+containing metadata of those scheme calls. The <code>Packet</code> struct has existed, and
+had zero changes to the format, since <a href="https://gitlab.redox-os.org/redox-os/syscall/-/commit/0e7fec4adf35c9092b8c26c684bcb67ef5145a46">this commit from
+2016</a>. It is defined as follows:</p>
+<div><pre tabindex="0"><code data-lang="rust"><span>#[repr(packed)]</span>
+<span>struct</span> <span>Packet</span> {
+    id: <span>u64</span>, <span>// unique (among in-flight reqs) tag
+</span><span></span>    pid: <span>usize</span>, <span>// caller context id
+</span><span></span>    uid: <span>u32</span>, <span>// caller effective uid
+</span><span></span>    gid: <span>u32</span>, <span>// caller effective gid
+</span><span></span>    a: <span>usize</span>, <span>// SYS_READ
+</span><span></span>    b: <span>usize</span>, <span>// fd
+</span><span></span>    c: <span>usize</span>, <span>// buf.as_mut_ptr()
+</span><span></span>    d: <span>usize</span>, <span>// buf.len()
+</span><span></span>    <span>// 56 bytes on 64-bit platforms
+</span><span></span>}
+</code></pre></div><p>While this struct is sufficient for implementing most syscalls, the obvious
+limitation of at most 3 arguments has resulted in accumulated technical debt
+among many different Redox components. For example, since <code>pread</code> requires at
+least 4 args, almost all schemes previously implemented boilerplate roughly of the
+form</p>
+<div><pre tabindex="0"><code data-lang="rust"><span>fn</span> <span>seek</span>(<span>&amp;</span><span>mut</span> self, fd: <span>usize</span>, pos: <span>isize</span>, whence: <span>usize</span>) -&gt; Result<span>&lt;</span><span>isize</span><span>&gt;</span> {
+    <span>let</span> handle <span>=</span> self.handles.get_mut(<span>&amp;</span>fd).ok_or(Error::new(EBADF))<span>?</span>;
+    <span>let</span> file <span>=</span> self
+        .filesystem
+        .files
+        .get_mut(<span>&amp;</span>handle.inode)
+        .ok_or(Error::new(EBADFD))<span>?</span>;
+
+    <span>let</span> old <span>=</span> handle.offset;
+    handle.offset <span>=</span> <span>match</span> whence {
+        SEEK_SET <span>=&gt;</span> cmp::max(<span>0</span>, pos),
+        SEEK_CUR <span>=&gt;</span> cmp::max(
+            <span>0</span>,
+            pos <span>+</span> <span>isize</span>::try_from(handle.offset).or(Err(Error::new(EOVERFLOW)))<span>?</span>,
+        ),
+        SEEK_END <span>=&gt;</span> cmp::max(
+            <span>0</span>,
+            pos <span>+</span> <span>isize</span>::try_from(file.data.size()).or(Err(Error::new(EOVERFLOW)))<span>?</span>,
+        ),
+        _ <span>=&gt;</span> <span>return</span> Err(Error::new(EINVAL)),
+    } <span>as</span> <span>usize</span>;
+    Ok(handle.offset <span>as</span> <span>isize</span>) <span>// why isize???
+</span><span></span>}
+</code></pre></div><p>as well as requiring all schemes to store the file cursor for all handles
+(which on GNU Hurd similarly is considered a ‘questionable design choice’ in
+<a href="http://walfield.org/papers/200707-walfield-critique-of-the-GNU-Hurd.pdf">the
+critique</a>).
+This cursor unfortunately cannot be stored in userspace without complex
+coordination, since POSIX allows file descriptors to be shared by an arbitrary
+number of processes, after e.g. forks or SCM_RIGHTS transfers (even though this
+use case is most likely very rare, so it’s not entirely impossible for this
+state to be moved to userspace).</p>
+<p>The new format, similar to <a href="https://kernel.dk/io_uring.pdf">io_uring</a>, is now
+defined as:</p>
+<div><pre tabindex="0"><code data-lang="rust"><span>#[repr(C)]</span>
+<span>struct</span> <span>Sqe</span> {
+    opcode: <span>u8</span>,
+    sqe_flags: <span>SqeFlags</span>,
+    _rsvd: <span>u16</span>, <span>// TODO: priority
+</span><span></span>    tag: <span>u32</span>,
+    args: [<span>u64</span>; <span>6</span>],
+    caller: <span>u64</span>,
+}
+<span>#[repr(C)]</span>
+<span>struct</span> <span>Cqe</span> {
+    flags: <span>u8</span>, <span>// bits 3:0 are CqeOpcode
+</span><span></span>    extra_raw: [<span>u8</span>; <span>3</span>],
+    tag: <span>u32</span>,
+    result: <span>u64</span>,
+}
+</code></pre></div><p>SQEs and CQEs are the Submission/Completion Queue entries, where schemes read
+and process SQEs, and respond to the kernel by sending corresponding CQEs.
+These new types both nicely fit into 1, and 1/4th of a cache line,
+respectively, and some unnecessarily large fields have been shortened.
+<code>SYS_PREAD2</code> and <code>SYS_PWRITE2</code> have been added to the scheme API, that now
+allow passing both offsets and per-syscall flags (like <code>RWF_NONBLOCK</code>). The
+<code>args</code> member is opcode-dependent, and for <code>SYS_PREAD2</code> for example, is
+populated as follows:</p>
+<div><pre tabindex="0"><code data-lang="rust"><span>// { ... }
+</span><span></span><span>let</span> inner <span>=</span> self.inner.upgrade().ok_or(Error::new(ENODEV))<span>?</span>;
+<span>let</span> address <span>=</span> inner.capture_user(buf)<span>?</span>;
+<span>let</span> result <span>=</span> inner.call(Opcode::Read, [file <span>as</span> <span>u64</span>, address.base() <span>as</span> <span>u64</span>, address.len() <span>as</span> <span>u64</span>, offset, <span>u64</span>::from(call_flags)]);
+address.release()<span>?</span>;
+<span>// { ... }
+</span></code></pre></div><p>The last <code>args</code> element currently contains the UID and GID of the caller, but
+this will eventually be replaced by a cleaner interface. The kernel currently
+emulates these new syscalls as using <code>lseek</code> and then regular <code>read</code>/<code>write</code>
+for legacy scheme, but for new schemes <code>lseek</code> can be ignored if the
+application uses more modern APIs. For instance, in <code>redoxfs</code>:</p>
+<div><pre tabindex="0"><code data-lang="diff">// This is the disk interface, which groups bytes into logical 4096-blocks.
+// The interface doesn&#39;t support byte-granular IO size and offset, since the underlying disk drivers don&#39;t.
+
+unsafe fn read_at(&amp;mut self, block: u64, buffer: &amp;mut [u8]) -&gt; Result&lt;usize&gt; {
+<span>--  try_disk!(self.file.seek(SeekFrom::Start(block * BLOCK_SIZE)));
+</span><span>--  let count = try_disk!(self.file.read(buffer));
+</span><span>--  Ok(count)
+</span><span></span><span>++  self.file.read_at(buffer, block * BLOCK_SIZE).or_eio()
+</span><span></span>}
+
+unsafe fn write_at(&amp;mut self, block: u64, buffer: &amp;[u8]) -&gt; Result&lt;usize&gt; {
+<span>--  try_disk!(self.file.seek(SeekFrom::Start(block * BLOCK_SIZE)));
+</span><span>--  let count = try_disk!(self.file.write(buffer));
+</span><span>--  Ok(count)
+</span><span></span><span>++  self.file.write_at(buffer, block * BLOCK_SIZE).or_eio()
+</span><span></span>}
+</code></pre></div><p>Jeremy Soller previously used the file copy utility <code>dd</code> as a benchmark when tuning the most efficient block size,
+taking into account both context switch and virtual memory overhead. The
+throughput for reading a 277 MiB file using <code>dd</code> with a <code>4 MiB</code> buffer size,
+was thus increased from <a href="https://www.redox-os.org/news/this-month-240229">170 MiB/s</a>, for the previous optimizations, to 277 MiB/s with the new interface,
+roughly a 63% improvement. There is obviously a lot more nuance in how this
+would affect performance depending on parameters, but this (low-hanging)
+optimization is indeed noticeable!</p>
+<p>For comparison, running the same command on Linux, with the same virtual machine configuration,
+gives a throughput of roughly 2 GiB/s, which is obviously a significant
+difference. Both RedoxFS (which is currently fully sequential) and raw context
+switch performance will need to be improved. (Copying disks directly is done at
+2 GiB/s on Linux and 0.8 GiB/s on Redox).</p>
+<h3 id="todo">TODO</h3>
+<ul>
+<li>There are still many schemes currently using the old packet format. They will need to be converted, allowing the kernel to remove the overhead of supporting the old format.</li>
+<li>The <code>Event</code> struct can similarly be improved.</li>
+<li>Both scheme SQEs and events should be accessible to handlers from a ring buffer (like io_uring), rather than the current mechanism where they are read as messages using SYS_READ. And syscall overhead, although strictly faster than context switching, is still noticeable, which is also why io_uring exists in the first place on Linux.</li>
+</ul>
+
+<p>The internal kernel signal implementation improved <a href="https://gitlab.redox-os.org/redox-os/kernel/-/merge_requests/283">earlier in
+March</a>, to
+address the earlier <a href="https://gitlab.redox-os.org/redox-os/kernel/-/issues/117">quite serious
+shortcomings</a>.
+However, even after the changes, signal support was still very limited, e.g. lacking support
+for sigprocmask, sigaltstack, and most of sigaction.</p>
+<h2 id="the-problem">The problem</h2>
+<p>Over the past year, I have been working to a large extent on migrating most Redox components away from using <code>redox_syscall</code>, our direct system call interface, to <a href="https://gitlab.redox-os.org/redox-os/libredox"><code>libredox</code></a>, a more stable API.
+<code>libredox</code> provides the common OS interfaces normally part of POSIX, but allows us to place much more of the functionality in userspace, with a written-in-Rust implementation (even this is currently done by <code>relibc</code>, which also implements the C standard library).
+This migration is now virtually complete.</p>
+<p>Normally, monolithic kernels will expose a stable syscall ABI, sometimes guaranteed (e.g. Linux), and otherwise stable in practice (FreeBSD), with the most notable exception being OpenBSD (in the Unix world).
+This makes sense on monolithic kernels, since they are large enough to ‘afford’ compatibility with older interfaces, and also because much of the actual performance-critical stack is fully in kernel mode, avoiding the user/kernel transition cost.
+On a microkernel however, the kernel is meant to be as minimal as possible, and because the syscall interface on most successful microkernels differs from monolithic kernels&#39; syscalls, that often match POSIX 1:1, this means our POSIX implementation will need to implement more POSIX logic in userspace.
+The primary example is currently the program loader, which along with <code>fork()</code> was fully moved to userspace during RSoC 2022.
+Along with possibly significant optimization opportunities, this is the rationale behind our <a href="https://www.redox-os.org/news/development-priorities-2023-09/">stable ABI policy</a> introduced last year, where the stable ABI boundary will be present in userspace rather than at the syscall ABI.</p>
+<p>The initial architecture will be roughly the following:</p>
+<hr/>
+<p><img src="https://www.redox-os.org/img/signals-project/abi.svg" alt="Redox ABI diagram"/></p>
+<p>A simple example of what <code>relibc</code> defers to userspace is the current working directory (changed during my <a href="https://www.redox-os.org/news/drivers-and-kernel-7">RSoC 2022</a>).
+This requires relibc to enter a <code>sigprocmask</code> critical section in order to lock the CWD, when implementing async-signal-safe <em>open(3)</em> (in this particular case there are workarounds, but in general such critical sections will be necessary):</p>
+<div><pre tabindex="0"><code data-lang="rust"><span>// relibc/src/platform/redox/path.rs
+</span><span></span><span>pub</span> <span>fn</span> <span>canonicalize</span>(path: <span>&amp;</span><span>str</span>) -&gt; Result<span>&lt;</span>String<span>&gt;</span> {
+    <span>// calls sigprocmask to disable signals
+</span><span></span>    <span>let</span> _siglock <span>=</span> SignalMask::lock();
+    <span>let</span> cwd <span>=</span> CWD.lock();
+    canonicalize_using_cwd(cwd.as_deref(), path).ok_or(Error::new(ENOENT))
+    <span>// sigprocmask is called again when _siglock goes out of scope
+</span><span></span>}
+</code></pre></div><p>If more kernel state is moved to relibc, such as the <code>O_CLOEXEC</code> and
+<code>O_CLOFORK</code> (added in POSIX 2024) bits, or say, some type of file descriptors
+were to take shortcuts in relibc (like pipes using ring buffers), the overhead
+of two <code>sigprocmask</code> syscalls, wrapping each critical section, will make lots of
+POSIX APIs unnecessarily slow. Thus, it would be useful if signals could be
+disabled quickly in userspace, using memory shared with the kernel.</p>
+<h2 id="userspace-signals">Userspace Signals</h2>
+<p>The currently proposed solution is to implement <code>sigaction</code>, <code>sigprocmask</code>, and
+signal delivery (including <code>sigreturn</code>) only using shared atomic memory
+accesses. The secret sauce is to use two <code>AtomicU64</code> bitsets (even i686
+supports that, via <code>CMPXCHG8B</code>) stored in the TCB, one for standard signals and
+one for realtime signals, where the low 32 bits are the pending bits, and the
+high 32 bits are the allowset bits (logical NOT of the signal mask). This
+allows, for signals directed at threads, changing the signal mask while
+simultaneously checking what the pending bits were at the time, making
+<code>sigprocmask</code> wait-free (if <code>fetch_add</code> is).</p>
+<p>Not all technical details have been finalized yet, but there is a
+<a href="https://gitlab.redox-os.org/4lDO2/rfcs/-/blob/signals/text/0000-userspace-signals.md">preliminary
+RFC</a>.
+Signals targeting whole processes is not yet implemented, since <a href="https://gitlab.redox-os.org/redox-os/kernel/-/issues/153">Redox’s
+kernel does not yet distinguish between processes and
+threads</a>. Once that
+has been fixed, work will continue to implement <code>siginfo_t</code> for both regular
+and queued signals, and to add the <code>sigqueue</code> API for realtime signals.</p>
+<p>This implementation proposal focuses primarily on optimizing the
+receive-related signal APIs, as opposed to <code>kill</code>/<code>pthread_kill</code> and
+<code>sigqueue</code>, which need exclusive access (which will probably not change), currently
+kept in the kernel. A <a href="https://gitlab.redox-os.org/redox-os/kernel/-/issues/152">userspace process
+manager</a> has also
+been proposed, where the <code>kill</code> and (future) <code>sigqueue</code> syscalls can be
+converted to IPC calls to that manager. The idea is for all POSIX ambient
+authority, such as absolute paths, UID/GID/PID/…s, to be represented using
+file descriptors (capabilities). This is one piece of the work that needs to be done to
+fully support sandboxing.</p>
+
+<p>So far, the signals project has been going according to plan, and hopefully,
+POSIX support for signals will be mostly complete by the end of summer, with in-kernel improvements to process management. After
+that, work on the userspace process manager will begin, possibly including new
+kernel performance and/or functionality improvements to facilitate this.</p>
+
+
+</div></div>
+  </body>
+</html>
