@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://pola.rs/posts/polars-string-type/">Original</a>
+    <h1>Why Polars rewrote its Arrow string data type</h1>
+    
+    <div id="readability-page-1" class="page"><section> <div> <div> <div> <p>Last couple of weeks I have been working on one, if not the, largest refactors of my life. We have completely rewritten
+the string/binary data structure we use in Polars. This was a refactor I wanted to do for a long time, but we couldn’t
+as several factors were not ready at the time.</p>
+<p>Initially Polars was a consumer of the Arrow2 crate (native Rust implementation of the Arrow spec). This meant that we
+couldn’t change the string type as the goal of the Arrow2 project was to follow the complete Arrow spec. End of last
+year we forked parts of Arrow2 in the crate <code>polars-arrow</code>, which is a trimmed down implementation of the Arrow spec and
+is tuned for Polars’ needs.</p>
+<p>Now we have the code under our control the refactor was imminent. As luck would have it, the Arrow spec was also finally
+making progress with adding the long anticipated German Style string types to the specification. Which, spoiler alert,
+is the type we implemented. These changes are not user facing and the only thing that is required from a user perspective
+is upgrading to the latest Polars version.</p>
+<p><small>If Arrow wouldn’t gone through with it, we would have. The goal of Polars is to have good interop with Arrow, but
+we might deviate from certain types if they better suite our needs.</small></p>
+<h2 id="1-why-the-change">1. Why the change?</h2>
+<p>Let’s take a step back. We haven’t touched on the reason for the change yet. The string type that was supported by the
+Apache Arrow spec was defined by three buffers. If we ignore the validity buffer (that indicates if data is valid or
+not), this is represented by Arrows’s default string type as follows. In the following example we hold a 3 rows
+<code>DataFrame</code> with artist names:</p>
+<pre tabindex="0" data-language="text"><code><span><span>shape: (3, 1)</span></span>
+<span><span>┌────────────────────────┐</span></span>
+<span><span>│ band                   │</span></span>
+<span><span>│ ---                    │</span></span>
+<span><span>│ str                    │</span></span>
+<span><span>╞════════════════════════╡</span></span>
+<span><span>│ ABBA                   │</span></span>
+<span><span>│ The Velvet Underground │</span></span>
+<span><span>│ Toots And The Maytals  │</span></span>
+<span><span>└────────────────────────┘</span></span>
+<span><span></span></span></code></pre>
+<p>All the string data would be stored contiguously in a single <code>data</code> buffer. And to keep track of the start and end of
+the strings, an extra buffer was allocated containing the offsets (Yes signed integers, because Arrow needs to interact
+with Java).</p>
+<p><img src="https://tech.michaelaltfield.net/_astro/band_names_strings.C_AyfDMg_Z2lLsLe.webp" alt="default arrow encoding" width="841" height="159" loading="lazy" decoding="async"/></p>
+<h3 id="11-the-good">1.1 The good</h3>
+<p>The positive thing about encoding string data like this, is that it is rather compact. All string allocations are
+amortized into a single buffer. This immediately has a downside as it is very hard to predict the size of your
+allocation up front. Per string we only have a single 64bit integer overhead (ignoring the starting <code>0</code>). Accessing the
+string requires an extra indirection, but sequential traversal is all local, so this is definitely cache friendly.</p>
+<h3 id="12-the-bad">1.2 The bad</h3>
+<p>As I mentioned above already pre-allocating the required size of <code>data</code> is hard. This leads to many reallocations and
+<code>memcopy</code>’s during the building of this type. However, this downside is very relative. The huge (in my opinion
+pathological) downside of the this data type is that the <code>gather</code> and <code>filter</code> operation on this type scale linear in
+time complexity with the string sizes. So if you have $n$ rows and on average $k$ bytes in your strings, materializing
+the output of a <code>join</code> operation would require $O(n \cdot k)$. This is ok if $k$ is small (which it often is), but when
+there is large string (or binary) data stored, this gets very expensive.</p>
+<p>Because a <code>gather</code> (taking rows by index) and <code>filter</code> (taking rows by boolean mask) are such core operations that are
+used by a lot of other operations (<code>group-by</code>, <code>join</code>, <code>window-functions</code> etc.) having large string data could really
+run a query to a halt.</p>
+<h2 id="2-hyperumbra-style-string-storage">2. Hyper/Umbra style string storage</h2>
+<p>The solution we (and the Arrow spec) adopted is designed by the
+<a href="https://www.cidrdb.org/cidr2020/papers/p29-neumann-cidr20.pdf">Hyper/Umbra</a> database system. Here the strings are
+stored as 16 bytes in a column (called a “view”). When the string has a length <code>&lt;=</code> 12 bytes, the string data is inlined
+and the view contains:</p>
+<ul>
+<li>4 bytes for the length: <code>u32</code></li>
+<li>4 bytes containing a prefix of the string data.</li>
+<li>8 bytes stores the remainder of the string (zero-padded)</li>
+</ul>
+<p>When the string is larger than 12 bytes, it is stored in a secondary buffer and the view contains:</p>
+<ul>
+<li>4 bytes for the length: <code>u32</code></li>
+<li>4 bytes containing a prefix of the string data.</li>
+<li>4 bytes for the buffer index</li>
+<li>4 bytes for the string offset (in the buffer)</li>
+</ul>
+<p><img src="https://tech.michaelaltfield.net/_astro/umbra_strings.6-lMqmZD_1XkuYt.webp" alt="hyper_string_encoding" width="927" height="702" loading="lazy" decoding="async"/></p>
+<h3 id="21-the-good">2.1 The good</h3>
+<p>Storing string data like this has several benefits.</p>
+<ul>
+<li>For small strings, all string data can be inlined in the views, meaning we don’t incur an indirection on access.</li>
+<li>Because the views are fixed width and larger string buffers can be appended, we can also mutate existing columns.</li>
+<li>Large strings can be <a href="https://en.wikipedia.org/wiki/String_interning">interned</a>, which can save a lot of space and
+allows for dictionary encoding large string data in the default string data type. This is partially encoding, as we
+always need to allocate the views.</li>
+<li>Operations that produce new values from existing columns, e.g. <code>filter</code>, <code>gather</code> and all supersets of operations that
+use these, now can copy an element in constant time. Only the views are gathered (and sometimes updated) and the
+buffers can remain as is.</li>
+<li>Many operations can be smart with this data structure and only work on (parts of the) views. We already optimized many
+of our string kernels with this, and more will follow.</li>
+</ul>
+<h3 id="22-the-bad">2.2 The bad</h3>
+<p>As always, there are trade-offs. Every data structure also has some downsides, however for this one they are not
+pathological anymore. Downsides are:</p>
+<ul>
+<li>storing unique strings requires slightly more space. The default Arrow string has 8 bytes overhead per string element.
+This binary view encoding has 16 bytes overhead per long string, or <code>4 bytes (length) + 12 - string length</code> for small
+strings. In my opinion, this is totally worth it considering we can elide an indirection and have fixed width random
+storage.</li>
+<li>What I consider the biggest downside is that we have to do garbage collection. When we <code>gather</code>/<code>filter</code> from an array
+with allocated long strings, we might keep strings alive that are not used anymore. This requires us to use some
+heuristics to determine when we will do a garbage collection pass on the string column. And because they are
+heuristics, sometimes they will be unneeded.</li>
+</ul>
+<h2 id="3-benchmarks">3. Benchmarks</h2>
+<p>This was a huge effort, and we are very glad this wasn’t in vain. Below we show the results various <code>filter</code> operations
+with different selectivities (percentage of values that evaluate <code>true</code>). For each of this plot/benchmark we prepared a
+<code>DataFrame</code> with 16 columns (equal to the number of cores) of string data. The string data was sampled with the
+following patterns:</p>
+<ul>
+<li>small: sample strings between 1 - 12 bytes.</li>
+<li>medium: sample strings between 1 - 201 bytes, thereby mixing inlined and externally allocated strings.</li>
+<li>large: sample strings of ~500 bytes representing large JSON objects.</li>
+</ul>
+<p><small>We use 16 columns because earlier Polars versions masked the pathological case by throwing more parallelism in
+the mix. By ensuring we use 16 columns, this extra parallelism will not help.</small></p>
+<p>These benchmarks were run on a <a href="https://aws.amazon.com/ec2/instance-types/m6i/">m6i.4xlarge</a> AWS instance. The results
+are huge improvement. Almost all cases outperform the old string type and the pathological cases are completely
+resolved. As we go from $O(n \cdot k)$ to $O(n)$, the <code>filter</code> performance is completely independent from the string
+length <code>k</code>.</p>
+
+
+
+<h2 id="4-more-to-come">4. More to come</h2>
+<p>Now Polars has its Arrow related code in its repository, we are able to tune our memory buffers more tightly for our
+use-case. We expect more performance increases to come from this, and are happy with the tight control we can now
+exercise over our full data-stack. Rewriting the string data-type was one such exercise. More to come!</p>
+
+
+ 
+
+
+ </div> </div> </div> </section></div>
+  </body>
+</html>
