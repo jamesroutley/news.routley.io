@@ -1,0 +1,1830 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.edgedb.com/blog/an-approach-to-optimizing-typescript-type-checking-performance#how-do-we-quantify-the-type-checker-s-workload">Original</a>
+    <h1>An approach to optimizing TypeScript type checking performance</h1>
+    
+    <div id="readability-page-1" class="page"><div data-theme="dark"><div><div>
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<section data-section-id="an-approach-to-optimizing-typescript-type-checking-performance" id="an-approach-to-optimizing-typescript-type-checking-performance">
+<!-- -->
+<p>As developers, we spend much of our time thinking about the runtime performance of our code. Things like asymptotic runtime complexity, cache misses, and memory usage are all important factors to consider. However, one area of performance that can be difficult to optimize is TypeScript’s type checking performance. This manifests as sluggish IDE responsiveness, extended compile times, or in extreme cases, TypeScript compiler crashes due to memory exhaustion.</p>
+<p>When you run into one of these types of performance issues related to type-checking, it can be hard to how to start troubleshooting. Unlike runtime performance problems, we can’t rely on our usual debugging approaches. The type checker operates within the TypeScript compiler during build time and the language server in your editor while editing, making it challenging to apply conventional debugging approaches.</p>
+<p>While the <a href="https://github.com/microsoft/TypeScript/wiki/Performance">TypeScript team provides general guidance about type performance in their wiki</a>, it can be daunting to determine how to effectively measure type checker performance and identify appropriate strategies to address any discovered issues.</p>
+<p>We recently faced a similar challenge when TypeScript 5.3 introduced changes to the type inference algorithm, resulting in a significant performance regression. So much so, that certain parts of our test suite would cause the TypeScript compiler to run out of memory, and froze any attempt to use the language server. It was time to roll up our sleeves and come up with a plan for measuring and improving the type inference performance of this specific construct.</p>
+<p>As we worked through this problem, we were struck by the scarcity of detailed information on effective workflows beyond the basic advice to use <code>--extendedDiagnostics</code> and <code>--generateTrace</code>. This led us to explore the landscape of available tools and devise a strategy to leverage them effectively.</p>
+<p>In this article, we’ll walk you through the approach we used and share some workflow tips along the way. We’ll use a simplified example, but keep in mind that our actual issue involved a more complex variation of the problem we’ll discuss.</p>
+<p>Before we dive in, I’d like to extend special thanks to:</p>
+<ul>
+<li>
+<p>My colleague at EdgeDB, Aleksandra Sikora, for her extensive work on TypeScript performance measurement and analysis.</p>
+</li>
+<li>
+<p>David Blass for the excellent <a href="https://arktype.io/">arktype</a> library and <code>attest</code> testing framework, and for his invaluable feedback on this article.</p>
+</li>
+<li>
+<p>Larry Layland for his helpful suggestions during the review of this article.</p>
+</li>
+<li>
+<p>The TypeScript team, especially those involved in documentation, for their guidance.</p>
+</li>
+</ul>
+<div data-section-id="setting-the-stage" id="setting-the-stage">
+
+<p>The EdgeDB query builder introspects the database to determine the valid operators as defined by the database itself, which includes the valid operands for a given operator, and it’s return type and cardinality. This information is used to create a set of overloads, 376 overloads in our initial implementation, for the <code>e.op</code> function, which is used to create expressions in the query builder.</p>
+<p>For example:</p>
+<div><div><div translate="no"><pre><span>e<span>.</span><span>select</span><span>(</span>e<span>.</span>User<span>,</span> <span>(</span>u<span>)</span> <span>=&gt;</span> <span>(</span><span>{</span>
+  accountAge<span>:</span> e<span>.</span><span>op</span><span>(</span>u<span>.</span>createdAt<span>,</span> <span>&#34;-&#34;</span><span>,</span> e<span>.</span><span>datetime_of_statement</span><span>(</span><span>)</span><span>)</span><span>,</span>
+<span>}</span><span>)</span><span>)</span><span>;</span></span></pre></div></div></div>
+<p>In this example, the <code>e.op</code> function will find the overload that takes a <code>datetime</code> value as the first operand, the string <code>&#34;-&#34;</code> as the operator, and another <code>datetime</code> as the second operand. It will find such an overload, and the return type of the expression will have an element type of <code>duration</code> with a cardinality of <code>One</code> (assuming <code>createdAt</code> is a required property).</p>
+<p>However, it should give us a type error if, for instance, you tried to have a <code>str</code> type as the second operand, or tried to provide an operator like <code>ilike</code> (which is only defined for <code>str</code> operands).</p>
+<p>Our query builder works with expression-based data, similar to an abstract syntax tree (AST) - a tree representation of the structure of code. Instead of TypeScript primitives, we use objects representing expressions of those types. These expressions can be combined and nested, much like how elements in an AST relate to each other. For this example, we’ll define <code>$Number</code>, <code>$String</code>, and <code>$Boolean</code> data types, along with operators that work with various combinations of these types. This approach allows us to model complex queries as composable expressions.</p>
+<p>In the actual query builder’s generated code, operands for scalar types are more complex. They can accept either literal scalars (such as <code>&#34;a&#34;</code> or <code>true</code>) or expressions of that type (like <code>e.select(someUser).name</code>). Due to this complexity, the approach we ultimately adopted is more sophisticated than the ones we’ll explore in this post.</p>
+<p>Let’s take a look at one such operator, the <code>=</code> operator which should take operands of the same type, and return a <code>$Boolean</code> with a cardinality of <code>One</code>.</p>
+<p>Our initial approach was to define operators like this:</p>
+<div><div><div translate="no"><pre><span><span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+<span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+<span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span></span></pre></div></div></div>
+<p>This naive approach works! It only defines overloads for valid operands and returns the correct expression type. It can even be nested since we have an overload defined for booleans:</p>
+<div><div><div translate="no"><pre><span><span>import</span> <span>{</span> $<span>string</span><span>,</span> $<span>number</span><span>,</span> $<span>boolean</span> <span>}</span> <span>from</span> <span>&#34;./typesystem.js&#34;</span><span>;</span>
+<span>import</span> <span>{</span> op <span>}</span> <span>from</span> <span>&#34;./operators.js&#34;</span><span>;</span>
+
+<span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+<span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+<span>op</span><span>(</span><span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+<span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;ilike&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;Apex&#34;</span><span>)</span><span>)</span><span>;</span></span></pre></div></div></div>
+<p>The issue with this approach is that the type checker has to go through all of the overloads to find the right match, and as the number of overloads increases, the amount of work the type checker has to do starts to be impacted by how far down the list it has to go to find a matching overload.</p>
+<p>Let’s create a minimal TypeScript project to explore these concepts more directly. This project will include TypeScript configuration, several TypeScript modules, and a basic package.json file. We’ll use this setup to define a bunch more operators and various combinations, giving us a better sense of the type checking performance in an almost-real-world scenario.</p>
+<div><div><p>index.ts</p><p>operators.ts</p><p>typesystem.ts</p><p>package.json</p><p>tsconfig.json</p></div><div><div><div><div translate="no"><pre><span><span>import</span> <span>{</span> $<span>string</span><span>,</span> $<span>number</span><span>,</span> $<span>boolean</span> <span>}</span> <span>from</span> <span>&#34;./typesystem.js&#34;</span><span>;</span>
+<span>import</span> <span>{</span> op <span>}</span> <span>from</span> <span>&#34;./operators.js&#34;</span><span>;</span>
+
+<span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+<span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+<span>op</span><span>(</span><span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+<span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;ilike&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;Apex&#34;</span><span>)</span><span>)</span><span>;</span></span></pre></div></div></div></div><div><div><div><div translate="no"><pre><span><span>import</span> <span>type</span> <span>{</span> $String<span>,</span> $Number<span>,</span> $Boolean<span>,</span> TypeSet <span>}</span> <span>from</span> <span>&#34;./typesystem.js&#34;</span><span>;</span>
+<span>import</span> <span>{</span> Cardinality <span>}</span> <span>from</span> <span>&#34;./typesystem.js&#34;</span><span>;</span>
+
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;!=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&gt;&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&lt;&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&gt;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&lt;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;?=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>AtMostOne<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;?!=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>AtMostOne<span>&gt;</span><span>;</span>
+
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;!=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&gt;&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&lt;&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&gt;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&lt;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;?=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>AtMostOne<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;?!=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>AtMostOne<span>&gt;</span><span>;</span>
+
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;!=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&gt;&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&lt;&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&gt;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;&lt;=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;?=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>AtMostOne<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;?!=&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>AtMostOne<span>&gt;</span><span>;</span>
+
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;and&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;or&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;+&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;-&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;*&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;/&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;%&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;//&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;^&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>Opr <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;&gt;</span></span></span><span>(</span>
+  op<span>:</span> <span>&#34;+&#34;</span><span>,</span>
+  opr<span>:</span> Opr
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>Opr <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;&gt;</span></span></span><span>(</span>
+  op<span>:</span> <span>&#34;-&#34;</span><span>,</span>
+  opr<span>:</span> Opr
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>Opr <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;&gt;</span></span></span><span>(</span>
+  op<span>:</span> <span>&#34;not&#34;</span><span>,</span>
+  opr<span>:</span> Opr
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;ilike&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;not ilike&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span><span>op</span><span><span>&lt;</span>
+  Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span>
+  Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span>
+<span>&gt;</span></span></span><span>(</span>
+  opr1<span>:</span> Opr1<span>,</span>
+  op<span>:</span> <span>&#34;++&#34;</span><span>,</span>
+  opr2<span>:</span> Opr2
+<span>)</span><span>:</span> TypeSet<span>&lt;</span>$String<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+<span>function</span> <span>op</span><span>(</span><span>...</span>args<span>:</span> <span>any</span><span>[</span><span>]</span><span>)</span> <span>{</span>
+  <span>return</span> <span>{</span><span>}</span> <span>as</span> <span>any</span><span>;</span>
+<span>}</span>
+
+<span>export</span> <span>{</span> op <span>}</span><span>;</span></span></pre></div></div></div></div><div><div><div><div translate="no"><pre><span><span>export</span> <span>enum</span> Cardinality <span>{</span>
+  AtMostOne <span>=</span> <span>&#34;AtMostOne&#34;</span><span>,</span>
+  One <span>=</span> <span>&#34;One&#34;</span><span>,</span>
+  Many <span>=</span> <span>&#34;Many&#34;</span><span>,</span>
+  AtLeastOne <span>=</span> <span>&#34;AtLeastOne&#34;</span><span>,</span>
+  Empty <span>=</span> <span>&#34;Empty&#34;</span><span>,</span>
+<span>}</span>
+
+<span>export</span> <span>interface</span> <span>BaseType</span> <span>{</span>
+  __name__<span>:</span> <span>string</span><span>;</span>
+  __tstype__<span>:</span> <span>string</span><span>;</span>
+<span>}</span>
+
+<span>export</span> <span>interface</span> <span>$String</span> <span>extends</span> <span>BaseType</span> <span>{</span>
+  __name__<span>:</span> <span>&#34;$String&#34;</span><span>;</span>
+  __tstype__<span>:</span> <span>&#34;string&#34;</span><span>;</span>
+<span>}</span>
+
+<span>export</span> <span>function</span> <span>$string</span><span>(</span>val<span>:</span> <span>string</span><span>)</span> <span>{</span>
+  <span>return</span> <span>{</span>
+    __element__<span>:</span> <span>{</span>
+      __name__<span>:</span> <span>&#34;$String&#34;</span><span>,</span>
+      __tstype__<span>:</span> <span>&#34;string&#34;</span><span>,</span>
+    <span>}</span><span>,</span>
+    __cardinality__<span>:</span> Cardinality<span>.</span>One<span>,</span>
+    __value__<span>:</span> val<span>,</span>
+  <span>}</span> <span>as</span> <span>const</span><span>;</span>
+<span>}</span>
+
+<span>export</span> <span>interface</span> <span>$Number</span> <span>extends</span> <span>BaseType</span> <span>{</span>
+  __name__<span>:</span> <span>&#34;$Number&#34;</span><span>;</span>
+  __tstype__<span>:</span> <span>&#34;number&#34;</span><span>;</span>
+<span>}</span>
+
+<span>export</span> <span>function</span> <span>$number</span><span>(</span>val<span>:</span> <span>number</span><span>)</span> <span>{</span>
+  <span>return</span> <span>{</span>
+    __element__<span>:</span> <span>{</span>
+      __name__<span>:</span> <span>&#34;$Number&#34;</span><span>,</span>
+      __tstype__<span>:</span> <span>&#34;number&#34;</span><span>,</span>
+    <span>}</span><span>,</span>
+    __cardinality__<span>:</span> Cardinality<span>.</span>One<span>,</span>
+    __value__<span>:</span> val<span>,</span>
+  <span>}</span> <span>as</span> <span>const</span><span>;</span>
+<span>}</span>
+
+<span>export</span> <span>interface</span> <span>$Boolean</span> <span>extends</span> <span>BaseType</span> <span>{</span>
+  __name__<span>:</span> <span>&#34;$Boolean&#34;</span><span>;</span>
+  __tstype__<span>:</span> <span>&#34;boolean&#34;</span><span>;</span>
+<span>}</span>
+
+<span>export</span> <span>function</span> <span>$boolean</span><span>(</span>val<span>:</span> <span>boolean</span><span>)</span> <span>{</span>
+  <span>return</span> <span>{</span>
+    __element__<span>:</span> <span>{</span>
+      __name__<span>:</span> <span>&#34;$Boolean&#34;</span><span>,</span>
+      __tstype__<span>:</span> <span>&#34;boolean&#34;</span><span>,</span>
+    <span>}</span><span>,</span>
+    __cardinality__<span>:</span> Cardinality<span>.</span>One<span>,</span>
+    __value__<span>:</span> val<span>,</span>
+  <span>}</span> <span>as</span> <span>const</span><span>;</span>
+<span>}</span>
+
+<span>export</span> <span>interface</span> <span>TypeSet<span>&lt;</span>
+  <span>T</span> <span>extends</span> BaseType <span>=</span> BaseType<span>,</span>
+  Card <span>extends</span> Cardinality <span>=</span> Cardinality<span>,</span>
+<span>&gt;</span></span> <span>{</span>
+  __element__<span>:</span> <span>T</span><span>;</span>
+  __cardinality__<span>:</span> Card<span>;</span>
+<span>}</span></span></pre></div></div></div></div><div><div><div><div translate="no"><pre><span><span>{</span>
+  <span>&#34;name&#34;</span><span>:</span> <span>&#34;tsperf-blog-post&#34;</span><span>,</span>
+  <span>&#34;version&#34;</span><span>:</span> <span>&#34;1.0.0&#34;</span><span>,</span>
+  <span>&#34;description&#34;</span><span>:</span> <span>&#34;&#34;</span><span>,</span>
+  <span>&#34;main&#34;</span><span>:</span> <span>&#34;index.js&#34;</span><span>,</span>
+  <span>&#34;type&#34;</span><span>:</span> <span>&#34;module&#34;</span><span>,</span>
+  <span>&#34;scripts&#34;</span><span>:</span> <span>{</span>
+    <span>&#34;test&#34;</span><span>:</span> <span>&#34;echo \&#34;Error: no test specified\&#34; &amp;&amp; exit 1&#34;</span>
+  <span>}</span><span>,</span>
+  <span>&#34;keywords&#34;</span><span>:</span> <span>[</span><span>]</span><span>,</span>
+  <span>&#34;author&#34;</span><span>:</span> <span>&#34;&#34;</span><span>,</span>
+  <span>&#34;license&#34;</span><span>:</span> <span>&#34;ISC&#34;</span><span>,</span>
+  <span>&#34;devDependencies&#34;</span><span>:</span> <span>{</span>
+    <span>&#34;@ark/attest&#34;</span><span>:</span> <span>&#34;^0.11.0&#34;</span><span>,</span>
+    <span>&#34;arktype&#34;</span><span>:</span> <span>&#34;^2.0.0-beta.3&#34;</span><span>,</span>
+    <span>&#34;tsx&#34;</span><span>:</span> <span>&#34;^4.16.2&#34;</span><span>,</span>
+    <span>&#34;typescript&#34;</span><span>:</span> <span>&#34;^5.5.3&#34;</span>
+  <span>}</span>
+<span>}</span></span></pre></div></div></div></div><div><div><div><div translate="no"><pre><span><span>{</span>
+  <span>&#34;compilerOptions&#34;</span><span>:</span> <span>{</span>
+    <span>&#34;strict&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;noImplicitAny&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;strictNullChecks&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;strictFunctionTypes&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;strictPropertyInitialization&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;strictBindCallApply&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;noImplicitThis&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;noImplicitReturns&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;alwaysStrict&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;esModuleInterop&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;declaration&#34;</span><span>:</span> <span>true</span><span>,</span>
+    <span>&#34;target&#34;</span><span>:</span> <span>&#34;ES2022&#34;</span><span>,</span>
+    <span>&#34;module&#34;</span><span>:</span> <span>&#34;NodeNext&#34;</span><span>,</span>
+    <span>&#34;moduleResolution&#34;</span><span>:</span> <span>&#34;NodeNext&#34;</span><span>,</span>
+    <span>&#34;skipLibCheck&#34;</span><span>:</span> <span>true</span>
+  <span>}</span><span>,</span>
+  <span>&#34;include&#34;</span><span>:</span> <span>[</span><span>&#34;./*.ts&#34;</span><span>]</span>
+<span>}</span></span></pre></div></div></div></div></div>
+</div>
+<div data-section-id="how-do-we-quantify-the-type-checker-s-workload" id="how-do-we-quantify-the-type-checker-s-workload">
+
+<p>The simplest way to measure type checker performance is to get diagnostics from the compiler. You can invoke the compiler with a flag that will output helpful metrics about the compilation process. For our use case there are a few metrics we’re interested in, the total number of type instantiations, and to a lesser degree, the wall-time spent in the type checking step. You can get these diagnostics by running the TypeScript compiler with the <code>--extendedDiagnostics</code> flag.</p>
+<p>The TypeScript type checker operates by analyzing the structure and relationships of types in your code. It performs type inference, checks for type compatibility, and ensures that operations are valid within the type system. During this process, the type checker often needs to create concrete instances of generic types, a process known as type instantiation. Each time a generic type is used with specific type arguments, a new type is instantiated. The number of type instantiations serves as a good proxy for the “amount of work” the type checker has to do because it directly correlates with the complexity of the type relationships in your code. More type instantiations generally indicate more complex type structures or a higher number of generic type usages, which require more processing time and memory from the type checker. By measuring the number of type instantiations, we can get a reliable, reproducible metric that reflects the workload on the type checker, independent of variations in hardware performance or other external factors.</p>
+<p>Let’s run these diagnostics now, with the <code>--noEmit</code> flag to avoid actually emitting JavaScript files since we only care about the type checking performance at the moment.</p>
+<div><div><div translate="no"><div><pre>$ </pre><pre><span>npx tsc <span>--noEmit</span> <span>--extendedDiagnostics</span></span></pre></div><div><pre>Files:                         66
+Lines of Library:           39995
+Lines of Definitions:           0
+Lines of TypeScript:          268
+Lines of JavaScript:            0
+Lines of JSON:                  0
+Lines of Other:                 0
+Identifiers:                43933
+Symbols:                    29170
+Types:                        288
+Instantiations:               191
+Memory used:               57207K
+Assignability cache size:      33
+Identity cache size:            0
+Subtype cache size:            10
+Strict subtype cache size:      0
+I/O Read time:              0.01s
+Parse time:                 0.28s
+ResolveModule time:         0.00s
+ResolveLibrary time:        0.06s
+Program time:               0.39s
+Bind time:                  0.16s
+Check time:                 0.08s
+printTime time:             0.00s
+Emit time:                  0.00s
+Total time:                 0.63s</pre></div></div></div></div>
+<p>We see here that we are currently instantiating 191 types in the process of checking this project.</p>
+<p>One drawback of using <code>--extendedDiagnostics</code> is that you do not get any real feedback about where to look to improve performance. The next tool we’ll look at, <code>--generateTrace</code>, gives you a more detailed breakdown of what is happening during the compilation process. It hooks into the type checker and provides a detailed report of what types are being instantiated, and how long it takes.</p>
+<p>Let’s take a look at what we see when using <code>--generateTrace</code> which takes the name of a directory as an argument. We’ll use today’s date and time to make it easy to compare these values across time.</p>
+<div><div><div translate="no"><div><pre>$ </pre><pre><span>npx tsc <span>--noEmit</span> <span>--generateTrace</span> 20240715T1634</span></pre></div></div></div></div>
+<p>The TypeScript compiler will generate two files: <code>trace.json</code> and <code>types.json</code>. Loading <code>trace.json</code> into a trace viewer like <a href="https://ui.perfetto.dev">Perfetto</a>, we can now see what was happening when compiling our code.</p>
+<p>The trace can give us some details about which expressions take the most time to check, but since it reports wall-time, it’s not a stable base to build our benchmark against. We’ll need to run this trace multiple times to get a good baseline. Luckily, our next tool gives us just such a stable measurement that is a good proxy for type-checker performance.</p>
+</div>
+<div data-section-id="marking-the-workbench" id="marking-the-workbench">
+
+<p>That tool is the fantastic <code>@arktype/attest</code> package which contains a really helpful benchmarking library that can measure type instantiations. Let’s replace our main script with a benchmarking script that we can run using Node.</p>
+<div><div><div translate="no"><pre><span> <span>import</span> <span>{</span> bench <span>}</span> <span>from</span> <span>&#34;@ark/attest&#34;</span><span>;</span>
+ <span>import</span> <span>{</span> $<span>string</span><span>,</span> $<span>number</span><span>,</span> $<span>boolean</span> <span>}</span> <span>from</span> <span>&#34;./typesystem.js&#34;</span><span>;</span>
+ <span>import</span> <span>{</span> op <span>}</span> <span>from</span> <span>&#34;./operators.js&#34;</span><span>;</span>
+
+ 
+ 
+ bench<span>.</span><span>baseline</span><span>(</span><span>(</span><span>)</span> <span>=&gt;</span> <span>$string</span><span>(</span><span>&#34;baseline&#34;</span><span>)</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: =&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: !=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;!=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: &gt;&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;&gt;&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: &lt;&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;&lt;&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: &gt;=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;&gt;=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: &lt;=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;&lt;=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: ?=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;?=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: ?!=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;?!=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: ++&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;++&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;b&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: =&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: !=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;!=&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: &gt;&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;&gt;&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: &lt;&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;&lt;&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: &gt;=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;&gt;=&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: &lt;=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;&lt;=&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: ?=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;?=&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: ?!=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;?!=&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: +&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;+&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: -&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;-&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: *&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;*&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: /&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;/&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: %&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;%&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: //&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;//&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: ^&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$number</span><span>(</span><span>1</span><span>)</span><span>,</span> <span>&#34;^&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: unary +&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>&#34;+&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;number: unary -&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>&#34;-&#34;</span><span>,</span> <span>$number</span><span>(</span><span>1</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: =&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: !=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;!=&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: &gt;&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;&gt;&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: &lt;&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;&lt;&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: &gt;=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;&gt;=&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: &lt;=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;&lt;=&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: ?=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;?=&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: ?!=&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;?!=&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: and&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;and&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: or&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$boolean</span><span>(</span><span>true</span><span>)</span><span>,</span> <span>&#34;or&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;boolean: not&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>&#34;not&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>true</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;nested boolean: =&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>)</span><span>,</span> <span>&#34;=&#34;</span><span>,</span> <span>$boolean</span><span>(</span><span>false</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: ilike&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;ilike&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;apex&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+ <span>bench</span><span>(</span><span>&#34;string: not ilike&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+   <span>return</span> <span>op</span><span>(</span><span>$string</span><span>(</span><span>&#34;a&#34;</span><span>)</span><span>,</span> <span>&#34;not ilike&#34;</span><span>,</span> <span>$string</span><span>(</span><span>&#34;apex&#34;</span><span>)</span><span>)</span><span>;</span>
+ <span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>1</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span></span></pre></div></div></div>
+<p>Running this benchmark with <code>tsx</code> will give us the following output:</p>
+<div><div><div translate="no"><div><pre> 🏌️  string: =
+ ⛳ Result: 8 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: =&#39; exceeded baseline by 700.00% (threshold is 20%).
+
+ 🏌️  string: !=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: !=&#39; exceeded baseline by 1100.00% (threshold is 20%).
+
+ 🏌️  string: &gt;
+ ⛳ Result: 16 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: &gt;&#39; exceeded baseline by 1500.00% (threshold is 20%).
+
+ 🏌️  string: &lt;
+ ⛳ Result: 20 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: &lt;&#39; exceeded baseline by 1900.00% (threshold is 20%).
+
+ 🏌️  string: &gt;=
+ ⛳ Result: 24 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: &gt;=&#39; exceeded baseline by 2300.00% (threshold is 20%).
+
+ 🏌️  string: &lt;=
+ ⛳ Result: 28 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: &lt;=&#39; exceeded baseline by 2700.00% (threshold is 20%).
+
+ 🏌️  string: ?=
+ ⛳ Result: 32 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: ?=&#39; exceeded baseline by 3100.00% (threshold is 20%).
+
+ 🏌️  string: ?!=
+ ⛳ Result: 36 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: ?!=&#39; exceeded baseline by 3500.00% (threshold is 20%).
+
+ 🏌️  string: ++
+ ⛳ Result: 93 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: ++&#39; exceeded baseline by 9200.00% (threshold is 20%).
+
+ 🏌️  number: =
+ ⛳ Result: 17 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: =&#39; exceeded baseline by 1600.00% (threshold is 20%).
+
+ 🏌️  number: !=
+ ⛳ Result: 21 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: !=&#39; exceeded baseline by 2000.00% (threshold is 20%).
+
+ 🏌️  number: &gt;
+ ⛳ Result: 25 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: &gt;&#39; exceeded baseline by 2400.00% (threshold is 20%).
+
+ 🏌️  number: &lt;
+ ⛳ Result: 29 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: &lt;&#39; exceeded baseline by 2800.00% (threshold is 20%).
+
+ 🏌️  number: &gt;=
+ ⛳ Result: 33 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: &gt;=&#39; exceeded baseline by 3200.00% (threshold is 20%).
+
+ 🏌️  number: &lt;=
+ ⛳ Result: 37 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: &lt;=&#39; exceeded baseline by 3600.00% (threshold is 20%).
+
+ 🏌️  number: ?=
+ ⛳ Result: 41 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: ?=&#39; exceeded baseline by 4000.00% (threshold is 20%).
+
+ 🏌️  number: ?!=
+ ⛳ Result: 45 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: ?!=&#39; exceeded baseline by 4400.00% (threshold is 20%).
+
+ 🏌️  number: +
+ ⛳ Result: 71 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: +&#39; exceeded baseline by 7000.00% (threshold is 20%).
+
+ 🏌️  number: -
+ ⛳ Result: 75 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: -&#39; exceeded baseline by 7400.00% (threshold is 20%).
+
+ 🏌️  number: *
+ ⛳ Result: 79 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: *&#39; exceeded baseline by 7800.00% (threshold is 20%).
+
+ 🏌️  number: /
+ ⛳ Result: 83 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: /&#39; exceeded baseline by 8200.00% (threshold is 20%).
+
+ 🏌️  number: %
+ ⛳ Result: 87 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: %&#39; exceeded baseline by 8600.00% (threshold is 20%).
+
+ 🏌️  number: //
+ ⛳ Result: 91 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: //&#39; exceeded baseline by 9000.00% (threshold is 20%).
+
+ 🏌️  number: ^
+ ⛳ Result: 95 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: ^&#39; exceeded baseline by 9400.00% (threshold is 20%).
+
+ 🏌️  number: unary +
+ ⛳ Result: 5 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: unary +&#39; exceeded baseline by 400.00% (threshold is 20%).
+
+ 🏌️  number: unary -
+ ⛳ Result: 6 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;number: unary -&#39; exceeded baseline by 500.00% (threshold is 20%).
+
+ 🏌️  boolean: =
+ ⛳ Result: 20 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: =&#39; exceeded baseline by 1900.00% (threshold is 20%).
+
+ 🏌️  boolean: !=
+ ⛳ Result: 25 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: !=&#39; exceeded baseline by 2400.00% (threshold is 20%).
+
+ 🏌️  boolean: &gt;
+ ⛳ Result: 29 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: &gt;&#39; exceeded baseline by 2800.00% (threshold is 20%).
+
+ 🏌️  boolean: &lt;
+ ⛳ Result: 33 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: &lt;&#39; exceeded baseline by 3200.00% (threshold is 20%).
+
+ 🏌️  boolean: &gt;=
+ ⛳ Result: 37 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: &gt;=&#39; exceeded baseline by 3600.00% (threshold is 20%).
+
+ 🏌️  boolean: &lt;=
+ ⛳ Result: 41 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: &lt;=&#39; exceeded baseline by 4000.00% (threshold is 20%).
+
+ 🏌️  boolean: ?=
+ ⛳ Result: 45 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: ?=&#39; exceeded baseline by 4400.00% (threshold is 20%).
+
+ 🏌️  boolean: ?!=
+ ⛳ Result: 49 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: ?!=&#39; exceeded baseline by 4800.00% (threshold is 20%).
+
+ 🏌️  boolean: and
+ ⛳ Result: 53 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: and&#39; exceeded baseline by 5200.00% (threshold is 20%).
+
+ 🏌️  boolean: or
+ ⛳ Result: 57 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: or&#39; exceeded baseline by 5600.00% (threshold is 20%).
+
+ 🏌️  boolean: not
+ ⛳ Result: 3 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;boolean: not&#39; exceeded baseline by 200.00% (threshold is 20%).
+
+ 🏌️  nested boolean: =
+ ⛳ Result: 28 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;nested boolean: =&#39; exceeded baseline by 2700.00% (threshold is 20%).
+
+ 🏌️  string: ilike
+ ⛳ Result: 85 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: ilike&#39; exceeded baseline by 8400.00% (threshold is 20%).
+
+ 🏌️  string: not ilike
+ ⛳ Result: 89 instantiations
+ 🎯 Baseline: 1 instantiations
+ 📈 &#39;string: not ilike&#39; exceeded baseline by 8800.00% (threshold is 20%).
+
+ ❌ &#39;string: =&#39; exceeded baseline by 700.00% (threshold is 20%).
+ ❌ &#39;string: !=&#39; exceeded baseline by 1100.00% (threshold is 20%).
+ ❌ &#39;string: &gt;&#39; exceeded baseline by 1500.00% (threshold is 20%).
+ ❌ &#39;string: &lt;&#39; exceeded baseline by 1900.00% (threshold is 20%).
+ ❌ &#39;string: &gt;=&#39; exceeded baseline by 2300.00% (threshold is 20%).
+ ❌ &#39;string: &lt;=&#39; exceeded baseline by 2700.00% (threshold is 20%).
+ ❌ &#39;string: ?=&#39; exceeded baseline by 3100.00% (threshold is 20%).
+ ❌ &#39;string: ?!=&#39; exceeded baseline by 3500.00% (threshold is 20%).
+ ❌ &#39;string: ++&#39; exceeded baseline by 9200.00% (threshold is 20%).
+ ❌ &#39;number: =&#39; exceeded baseline by 1600.00% (threshold is 20%).
+ ❌ &#39;number: !=&#39; exceeded baseline by 2000.00% (threshold is 20%).
+ ❌ &#39;number: &gt;&#39; exceeded baseline by 2400.00% (threshold is 20%).
+ ❌ &#39;number: &lt;&#39; exceeded baseline by 2800.00% (threshold is 20%).
+ ❌ &#39;number: &gt;=&#39; exceeded baseline by 3200.00% (threshold is 20%).
+ ❌ &#39;number: &lt;=&#39; exceeded baseline by 3600.00% (threshold is 20%).
+ ❌ &#39;number: ?=&#39; exceeded baseline by 4000.00% (threshold is 20%).
+ ❌ &#39;number: ?!=&#39; exceeded baseline by 4400.00% (threshold is 20%).
+ ❌ &#39;number: +&#39; exceeded baseline by 7000.00% (threshold is 20%).
+ ❌ &#39;number: -&#39; exceeded baseline by 7400.00% (threshold is 20%).
+ ❌ &#39;number: *&#39; exceeded baseline by 7800.00% (threshold is 20%).
+ ❌ &#39;number: /&#39; exceeded baseline by 8200.00% (threshold is 20%).
+ ❌ &#39;number: %&#39; exceeded baseline by 8600.00% (threshold is 20%).
+ ❌ &#39;number: //&#39; exceeded baseline by 9000.00% (threshold is 20%).
+ ❌ &#39;number: ^&#39; exceeded baseline by 9400.00% (threshold is 20%).
+ ❌ &#39;number: unary +&#39; exceeded baseline by 400.00% (threshold is 20%).
+ ❌ &#39;number: unary -&#39; exceeded baseline by 500.00% (threshold is 20%).
+ ❌ &#39;boolean: =&#39; exceeded baseline by 1900.00% (threshold is 20%).
+ ❌ &#39;boolean: !=&#39; exceeded baseline by 2400.00% (threshold is 20%).
+ ❌ &#39;boolean: &gt;&#39; exceeded baseline by 2800.00% (threshold is 20%).
+ ❌ &#39;boolean: &lt;&#39; exceeded baseline by 3200.00% (threshold is 20%).
+ ❌ &#39;boolean: &gt;=&#39; exceeded baseline by 3600.00% (threshold is 20%).
+ ❌ &#39;boolean: &lt;=&#39; exceeded baseline by 4000.00% (threshold is 20%).
+ ❌ &#39;boolean: ?=&#39; exceeded baseline by 4400.00% (threshold is 20%).
+ ❌ &#39;boolean: ?!=&#39; exceeded baseline by 4800.00% (threshold is 20%).
+ ❌ &#39;boolean: and&#39; exceeded baseline by 5200.00% (threshold is 20%).
+ ❌ &#39;boolean: or&#39; exceeded baseline by 5600.00% (threshold is 20%).
+ ❌ &#39;boolean: not&#39; exceeded baseline by 200.00% (threshold is 20%).
+ ❌ &#39;nested boolean: =&#39; exceeded baseline by 2700.00% (threshold is 20%).
+ ❌ &#39;string: ilike&#39; exceeded baseline by 8400.00% (threshold is 20%).
+ ❌ &#39;string: not ilike&#39; exceeded baseline by 8800.00% (threshold is 20%).</pre></div></div></div></div>
+<p>The <code>@arktype/attest</code> output provides a detailed breakdown of type instantiations for each expression, comparing them to our initial placeholder baseline. We’ll use these results as our actual baseline, updating our benchmark script with the real instantiation counts.</p>
+</div>
+<div data-section-id="the-bam-method" id="the-bam-method">
+
+<p>To address TypeScript type inference performance issues, I propose the “BAM” method: Branch, Adjust, Measure. This iterative approach involves:</p>
+<ol>
+<li>
+<p><b>Branch</b>: Create a new branch for each experiment</p>
+</li>
+<li>
+<p><b>Adjust</b>: Make changes based on a hypothesis</p>
+</li>
+<li>
+<p><b>Measure</b>: Benchmark the changes to measure their impact</p>
+</li>
+</ol>
+<p>By systematically applying this process, we can refine our code for better type inference performance. Crucially, the benchmarking step provides concrete measurements, ensuring we can verify our improvements.</p>
+<p>First, we’ll <em>branch</em> to create a new experimental version of our code. Let’s assume that we’re working on a branch called <code>1234-some-perf-work</code>. We will name this new experimental branch <code>1234-experiments/union-operators</code>.</p>
+<p>Our hypothesis is that defining a union to describe the various operators for a given operand-pair might be faster for the type checker to infer. This approach could potentially reduce the number of overloads the type checker needs to consider, as it groups similar operations together. By consolidating the operator types into a union, we might simplify the type inference process, potentially leading to fewer type instantiations and improved performance.</p>
+<p>Then, we’ll <em>adjust</em> our implementation based on this hypothesis. After making these adjustments, we’ll <em>measure</em> the impact using our benchmarking tools to verify if our hypothesis leads to improved performance.</p>
+<p>Branch:</p>
+<div><div><div translate="no"><div><pre>$ </pre><pre><span><span>git</span> checkout <span>-b</span> <span>1234</span>-experiments/union-operators <span>1234</span>-some-perf-work</span></pre></div></div></div></div>
+<p>Adjust:</p>
+<div><div><div translate="no"><pre><span> <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;&gt;</span></span></span><span>(</span>
+   opr1<span>:</span> Opr1<span>,</span>
+   op<span>:</span> <span>&#34;=&#34;</span> <span>|</span> <span>&#34;!=&#34;</span> <span>|</span> <span>&#34;&gt;&#34;</span> <span>|</span> <span>&#34;&lt;&#34;</span> <span>|</span> <span>&#34;&gt;=&#34;</span> <span>|</span> <span>&#34;&lt;=&#34;</span> <span>|</span> <span>&#34;ilike&#34;</span> <span>|</span> <span>&#34;not ilike&#34;</span><span>,</span>
+   opr2<span>:</span> Opr2<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+ <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;&gt;</span></span></span><span>(</span>
+   opr1<span>:</span> Opr1<span>,</span>
+   op<span>:</span> <span>&#34;?=&#34;</span> <span>|</span> <span>&#34;!?=&#34;</span><span>,</span>
+   opr2<span>:</span> Opr2<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>AtMostOne<span>&gt;</span><span>;</span>
+
+ <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;&gt;</span></span></span><span>(</span>
+   opr1<span>:</span> Opr1<span>,</span>
+   op<span>:</span> <span>&#34;=&#34;</span> <span>|</span> <span>&#34;!=&#34;</span> <span>|</span> <span>&#34;&gt;&#34;</span> <span>|</span> <span>&#34;&lt;&#34;</span> <span>|</span> <span>&#34;&gt;=&#34;</span> <span>|</span> <span>&#34;&lt;=&#34;</span><span>,</span>
+   opr2<span>:</span> Opr2<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+ <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;&gt;</span></span></span><span>(</span>
+   opr1<span>:</span> Opr1<span>,</span>
+   op<span>:</span> <span>&#34;?=&#34;</span> <span>|</span> <span>&#34;!?=&#34;</span><span>,</span>
+   opr2<span>:</span> Opr2<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>AtMostOne<span>&gt;</span><span>;</span>
+
+ <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;&gt;</span></span></span><span>(</span>
+   opr1<span>:</span> Opr1<span>,</span>
+   op<span>:</span> <span>&#34;=&#34;</span> <span>|</span> <span>&#34;!=&#34;</span> <span>|</span> <span>&#34;&gt;&#34;</span> <span>|</span> <span>&#34;&lt;&#34;</span> <span>|</span> <span>&#34;&gt;=&#34;</span> <span>|</span> <span>&#34;&lt;=&#34;</span> <span>|</span> <span>&#34;and&#34;</span> <span>|</span> <span>&#34;or&#34;</span><span>,</span>
+   opr2<span>:</span> Opr2<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+ <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;&gt;</span></span></span><span>(</span>
+   opr1<span>:</span> Opr1<span>,</span>
+   op<span>:</span> <span>&#34;?=&#34;</span> <span>|</span> <span>&#34;!?=&#34;</span><span>,</span>
+   opr2<span>:</span> Opr2<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>AtMostOne<span>&gt;</span><span>;</span>
+
+ <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;&gt;</span></span></span><span>(</span>
+   opr1<span>:</span> Opr1<span>,</span>
+   op<span>:</span> <span>&#34;+&#34;</span> <span>|</span> <span>&#34;-&#34;</span> <span>|</span> <span>&#34;*&#34;</span> <span>|</span> <span>&#34;/&#34;</span> <span>|</span> <span>&#34;%&#34;</span> <span>|</span> <span>&#34;//&#34;</span> <span>|</span> <span>&#34;^&#34;</span><span>,</span>
+   opr2<span>:</span> Opr2<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+ <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr <span>extends</span> TypeSet<span>&lt;</span>$Number<span>&gt;&gt;</span></span></span><span>(</span>
+   op<span>:</span> <span>&#34;+&#34;</span> <span>|</span> <span>&#34;-&#34;</span><span>,</span>
+   opr<span>:</span> Opr<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$Number<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+ <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr <span>extends</span> TypeSet<span>&lt;</span>$Boolean<span>&gt;&gt;</span></span></span><span>(</span>
+   op<span>:</span> <span>&#34;not&#34;</span><span>,</span>
+   opr<span>:</span> Opr<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$Boolean<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span>
+
+ <span>function</span> <span><span>op</span><span><span>&lt;</span>Opr1 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;</span><span>,</span> Opr2 <span>extends</span> TypeSet<span>&lt;</span>$String<span>&gt;&gt;</span></span></span><span>(</span>
+   opr1<span>:</span> Opr1<span>,</span>
+   op<span>:</span> <span>&#34;++&#34;</span><span>,</span>
+   opr2<span>:</span> Opr2<span>,</span>
+ <span>)</span><span>:</span> TypeSet<span>&lt;</span>$String<span>,</span> Cardinality<span>.</span>One<span>&gt;</span><span>;</span></span></pre></div></div></div>
+<p>Benchmark:</p>
+<div><div><div translate="no"><div><pre> 🏌️  string: =
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 8 instantiations
+ 📈 &#39;string: =&#39; exceeded baseline by 50.00% (threshold is 20%).
+
+ 🏌️  string: !=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  string: &gt;
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📉 string: &gt; was under baseline by 25.00%! Consider setting a new baseline.
+
+ 🏌️  string: &lt;
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 20 instantiations
+ 📉 string: &lt; was under baseline by 40.00%! Consider setting a new baseline.
+
+ 🏌️  string: &gt;=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 24 instantiations
+ 📉 string: &gt;= was under baseline by 50.00%! Consider setting a new baseline.
+
+ 🏌️  string: &lt;=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 28 instantiations
+ 📉 string: &lt;= was under baseline by 57.14%! Consider setting a new baseline.
+
+ 🏌️  string: ?=
+ ⛳ Result: 16 instantiations
+ 🎯 Baseline: 32 instantiations
+ 📉 string: ?= was under baseline by 50.00%! Consider setting a new baseline.
+
+ 🏌️  string: ?!=
+ ⛳ Result: 16 instantiations
+ 🎯 Baseline: 36 instantiations
+ 📉 string: ?!= was under baseline by 55.56%! Consider setting a new baseline.
+
+ 🏌️  string: ++
+ ⛳ Result: 8 instantiations
+ 🎯 Baseline: 102 instantiations
+ 📉 string: ++ was under baseline by 92.16%! Consider setting a new baseline.
+
+ 🏌️  number: =
+ ⛳ Result: 16 instantiations
+ 🎯 Baseline: 26 instantiations
+ 📉 number: = was under baseline by 38.46%! Consider setting a new baseline.
+
+ 🏌️  number: !=
+ ⛳ Result: 16 instantiations
+ 🎯 Baseline: 30 instantiations
+ 📉 number: != was under baseline by 46.67%! Consider setting a new baseline.
+
+ 🏌️  number: &gt;
+ ⛳ Result: 16 instantiations
+ 🎯 Baseline: 34 instantiations
+ 📉 number: &gt; was under baseline by 52.94%! Consider setting a new baseline.
+
+ 🏌️  number: &lt;
+ ⛳ Result: 16 instantiations
+ 🎯 Baseline: 38 instantiations
+ 📉 number: &lt; was under baseline by 57.89%! Consider setting a new baseline.
+
+ 🏌️  number: &gt;=
+ ⛳ Result: 16 instantiations
+ 🎯 Baseline: 42 instantiations
+ 📉 number: &gt;= was under baseline by 61.90%! Consider setting a new baseline.
+
+ 🏌️  number: &lt;=
+ ⛳ Result: 16 instantiations
+ 🎯 Baseline: 46 instantiations
+ 📉 number: &lt;= was under baseline by 65.22%! Consider setting a new baseline.
+
+ 🏌️  number: ?=
+ ⛳ Result: 20 instantiations
+ 🎯 Baseline: 50 instantiations
+ 📉 number: ?= was under baseline by 60.00%! Consider setting a new baseline.
+
+ 🏌️  number: ?!=
+ ⛳ Result: 20 instantiations
+ 🎯 Baseline: 54 instantiations
+ 📉 number: ?!= was under baseline by 62.96%! Consider setting a new baseline.
+
+ 🏌️  number: +
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 80 instantiations
+ 📉 number: + was under baseline by 62.50%! Consider setting a new baseline.
+
+ 🏌️  number: -
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 84 instantiations
+ 📉 number: - was under baseline by 64.29%! Consider setting a new baseline.
+
+ 🏌️  number: *
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 88 instantiations
+ 📉 number: * was under baseline by 65.91%! Consider setting a new baseline.
+
+ 🏌️  number: /
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 92 instantiations
+ 📉 number: / was under baseline by 67.39%! Consider setting a new baseline.
+
+ 🏌️  number: %
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 96 instantiations
+ 📉 number: % was under baseline by 68.75%! Consider setting a new baseline.
+
+ 🏌️  number: //
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 100 instantiations
+ 📉 number: // was under baseline by 70.00%! Consider setting a new baseline.
+
+ 🏌️  number: ^
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 104 instantiations
+ 📉 number: ^ was under baseline by 71.15%! Consider setting a new baseline.
+
+ 🏌️  number: unary +
+ ⛳ Result: 6 instantiations
+ 🎯 Baseline: 5 instantiations
+ 📊 Delta: +20.00%
+
+ 🏌️  number: unary -
+ ⛳ Result: 6 instantiations
+ 🎯 Baseline: 6 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  boolean: =
+ ⛳ Result: 22 instantiations
+ 🎯 Baseline: 44 instantiations
+ 📉 boolean: = was under baseline by 50.00%! Consider setting a new baseline.
+
+ 🏌️  boolean: !=
+ ⛳ Result: 22 instantiations
+ 🎯 Baseline: 48 instantiations
+ 📉 boolean: != was under baseline by 54.17%! Consider setting a new baseline.
+
+ 🏌️  boolean: &gt;
+ ⛳ Result: 22 instantiations
+ 🎯 Baseline: 52 instantiations
+ 📉 boolean: &gt; was under baseline by 57.69%! Consider setting a new baseline.
+
+ 🏌️  boolean: &lt;
+ ⛳ Result: 22 instantiations
+ 🎯 Baseline: 56 instantiations
+ 📉 boolean: &lt; was under baseline by 60.71%! Consider setting a new baseline.
+
+ 🏌️  boolean: &gt;=
+ ⛳ Result: 22 instantiations
+ 🎯 Baseline: 60 instantiations
+ 📉 boolean: &gt;= was under baseline by 63.33%! Consider setting a new baseline.
+
+ 🏌️  boolean: &lt;=
+ ⛳ Result: 22 instantiations
+ 🎯 Baseline: 64 instantiations
+ 📉 boolean: &lt;= was under baseline by 65.63%! Consider setting a new baseline.
+
+ 🏌️  boolean: ?=
+ ⛳ Result: 26 instantiations
+ 🎯 Baseline: 68 instantiations
+ 📉 boolean: ?= was under baseline by 61.76%! Consider setting a new baseline.
+
+ 🏌️  boolean: ?!=
+ ⛳ Result: 26 instantiations
+ 🎯 Baseline: 72 instantiations
+ 📉 boolean: ?!= was under baseline by 63.89%! Consider setting a new baseline.
+
+ 🏌️  boolean: and
+ ⛳ Result: 22 instantiations
+ 🎯 Baseline: 76 instantiations
+ 📉 boolean: and was under baseline by 71.05%! Consider setting a new baseline.
+
+ 🏌️  boolean: or
+ ⛳ Result: 22 instantiations
+ 🎯 Baseline: 80 instantiations
+ 📉 boolean: or was under baseline by 72.50%! Consider setting a new baseline.
+
+ 🏌️  boolean: not
+ ⛳ Result: 5 instantiations
+ 🎯 Baseline: 6 instantiations
+ 📊 Delta: -16.67%
+
+ 🏌️  nested boolean: =
+ ⛳ Result: 41 instantiations
+ 🎯 Baseline: 48 instantiations
+ 📊 Delta: -14.58%
+
+ 🏌️  string: ilike
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 94 instantiations
+ 📉 string: ilike was under baseline by 87.23%! Consider setting a new baseline.
+
+ 🏌️  string: not ilike
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 98 instantiations
+ 📉 string: not ilike was under baseline by 87.76%! Consider setting a new baseline.
+
+ ❌ &#39;string: =&#39; exceeded baseline by 50.00% (threshold is 20%).</pre></div></div></div></div>
+<p>Incredibly, everything with the exception of the very first operator and unary <code>+</code> got better. Let’s save a commit with these changes to this branch.</p>
+<div><div><div translate="no"><div><pre>$ </pre><pre><span><span>git</span> commit <span>-m</span> <span>&#34;Use a union of operators&#34;</span></span></pre></div></div></div></div>
+<p>I suggest making two separate commits: one with the changes to the implementation, and a second that updates the benchmark results. This makes it easier to compare approaches against the baseline, but also you can checkout the benchmark file across branches to compare how different approaches differ in the benchmarks. Let’s update the benchmark results in the <code>index.ts</code> file, and commit another change.</p>
+<div><div><div translate="no"><div><pre>$ </pre><pre><span><span>git</span> commit <span>-m</span> <span>&#34;Update benchmark results&#34;</span></span></pre></div></div></div></div>
+<p>Let’s branch again and explore a new hypothesis that builds on the existing construct. We will use the existing experiment as the starting point for our new branch rather than starting over from the base. However we should branch from the previous commit instead of the commit that updated the benchmarks. Let’s explore the hypothesis that the order of the overloads has an effect on the number of types the inference engine has to instantiate here. Let’s order them such that the same operators are grouped together.</p>
+<div><div><div translate="no"><div><pre>$ </pre><pre><span><span>git</span> checkout <span>-b</span> <span>1234</span>-experiments/union-operators/group-by-operators HEAD~1</span></pre></div></div></div></div>
+<p>Making our adjustments, we see the following benchmark results:</p>
+<div><div><div translate="no"><div><pre> 🏌️  string: =
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 8 instantiations
+ 📈 &#39;string: =&#39; exceeded baseline by 50.00% (threshold is 20%).
+
+ 🏌️  string: !=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  string: &gt;
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📉 string: &gt; was under baseline by 25.00%! Consider setting a new baseline.
+
+ 🏌️  string: &lt;
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 20 instantiations
+ 📉 string: &lt; was under baseline by 40.00%! Consider setting a new baseline.
+
+ 🏌️  string: &gt;=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 24 instantiations
+ 📉 string: &gt;= was under baseline by 50.00%! Consider setting a new baseline.
+
+ 🏌️  string: &lt;=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 28 instantiations
+ 📉 string: &lt;= was under baseline by 57.14%! Consider setting a new baseline.
+
+ 🏌️  string: ?=
+ ⛳ Result: 24 instantiations
+ 🎯 Baseline: 32 instantiations
+ 📉 string: ?= was under baseline by 25.00%! Consider setting a new baseline.
+
+ 🏌️  string: ?!=
+ ⛳ Result: 24 instantiations
+ 🎯 Baseline: 36 instantiations
+ 📉 string: ?!= was under baseline by 33.33%! Consider setting a new baseline.
+
+ 🏌️  string: ++
+ ⛳ Result: 8 instantiations
+ 🎯 Baseline: 102 instantiations
+ 📉 string: ++ was under baseline by 92.16%! Consider setting a new baseline.
+
+ 🏌️  number: =
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 26 instantiations
+ 📉 number: = was under baseline by 46.15%! Consider setting a new baseline.
+
+ 🏌️  number: !=
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 30 instantiations
+ 📉 number: != was under baseline by 53.33%! Consider setting a new baseline.
+
+ 🏌️  number: &gt;
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 34 instantiations
+ 📉 number: &gt; was under baseline by 58.82%! Consider setting a new baseline.
+
+ 🏌️  number: &lt;
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 38 instantiations
+ 📉 number: &lt; was under baseline by 63.16%! Consider setting a new baseline.
+
+ 🏌️  number: &gt;=
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 42 instantiations
+ 📉 number: &gt;= was under baseline by 66.67%! Consider setting a new baseline.
+
+ 🏌️  number: &lt;=
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 46 instantiations
+ 📉 number: &lt;= was under baseline by 69.57%! Consider setting a new baseline.
+
+ 🏌️  number: ?=
+ ⛳ Result: 24 instantiations
+ 🎯 Baseline: 50 instantiations
+ 📉 number: ?= was under baseline by 52.00%! Consider setting a new baseline.
+
+ 🏌️  number: ?!=
+ ⛳ Result: 24 instantiations
+ 🎯 Baseline: 54 instantiations
+ 📉 number: ?!= was under baseline by 55.56%! Consider setting a new baseline.
+
+ 🏌️  number: +
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 80 instantiations
+ 📉 number: + was under baseline by 62.50%! Consider setting a new baseline.
+
+ 🏌️  number: -
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 84 instantiations
+ 📉 number: - was under baseline by 64.29%! Consider setting a new baseline.
+
+ 🏌️  number: *
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 88 instantiations
+ 📉 number: * was under baseline by 65.91%! Consider setting a new baseline.
+
+ 🏌️  number: /
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 92 instantiations
+ 📉 number: / was under baseline by 67.39%! Consider setting a new baseline.
+
+ 🏌️  number: %
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 96 instantiations
+ 📉 number: % was under baseline by 68.75%! Consider setting a new baseline.
+
+ 🏌️  number: //
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 100 instantiations
+ 📉 number: // was under baseline by 70.00%! Consider setting a new baseline.
+
+ 🏌️  number: ^
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 104 instantiations
+ 📉 number: ^ was under baseline by 71.15%! Consider setting a new baseline.
+
+ 🏌️  number: unary +
+ ⛳ Result: 6 instantiations
+ 🎯 Baseline: 5 instantiations
+ 📊 Delta: +20.00%
+
+ 🏌️  number: unary -
+ ⛳ Result: 6 instantiations
+ 🎯 Baseline: 6 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  boolean: =
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 44 instantiations
+ 📉 boolean: = was under baseline by 59.09%! Consider setting a new baseline.
+
+ 🏌️  boolean: !=
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 48 instantiations
+ 📉 boolean: != was under baseline by 62.50%! Consider setting a new baseline.
+
+ 🏌️  boolean: &gt;
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 52 instantiations
+ 📉 boolean: &gt; was under baseline by 65.38%! Consider setting a new baseline.
+
+ 🏌️  boolean: &lt;
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 56 instantiations
+ 📉 boolean: &lt; was under baseline by 67.86%! Consider setting a new baseline.
+
+ 🏌️  boolean: &gt;=
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 60 instantiations
+ 📉 boolean: &gt;= was under baseline by 70.00%! Consider setting a new baseline.
+
+ 🏌️  boolean: &lt;=
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 64 instantiations
+ 📉 boolean: &lt;= was under baseline by 71.88%! Consider setting a new baseline.
+
+ 🏌️  boolean: ?=
+ ⛳ Result: 26 instantiations
+ 🎯 Baseline: 68 instantiations
+ 📉 boolean: ?= was under baseline by 61.76%! Consider setting a new baseline.
+
+ 🏌️  boolean: ?!=
+ ⛳ Result: 26 instantiations
+ 🎯 Baseline: 72 instantiations
+ 📉 boolean: ?!= was under baseline by 63.89%! Consider setting a new baseline.
+
+ 🏌️  boolean: and
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 76 instantiations
+ 📉 boolean: and was under baseline by 76.32%! Consider setting a new baseline.
+
+ 🏌️  boolean: or
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 80 instantiations
+ 📉 boolean: or was under baseline by 77.50%! Consider setting a new baseline.
+
+ 🏌️  boolean: not
+ ⛳ Result: 5 instantiations
+ 🎯 Baseline: 6 instantiations
+ 📊 Delta: -16.67%
+
+ 🏌️  nested boolean: =
+ ⛳ Result: 39 instantiations
+ 🎯 Baseline: 48 instantiations
+ 📊 Delta: -18.75%
+
+ 🏌️  string: ilike
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 94 instantiations
+ 📉 string: ilike was under baseline by 87.23%! Consider setting a new baseline.
+
+ 🏌️  string: not ilike
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 98 instantiations
+ 📉 string: not ilike was under baseline by 87.76%! Consider setting a new baseline.
+
+ ❌ &#39;string: =&#39; exceeded baseline by 50.00% (threshold is 20%).</pre></div></div></div></div>
+<p>This implementation is also great! Is it better than the previous experiment? We can check by checking out the benchmark commit from the other branch.</p>
+<div><div><div translate="no"><div><pre> $ </pre><pre><span><span>git</span> checkout <span>1234</span>-experiments/union-operators -- index.ts</span></pre></div></div></div><div><div translate="no"><div><pre> 🏌️  string: =
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  string: !=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  string: &gt;
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  string: &lt;
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  string: &gt;=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  string: &lt;=
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  string: ?=
+ ⛳ Result: 24 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📈 &#39;string: ?=&#39; exceeded baseline by 50.00% (threshold is 20%).
+
+ 🏌️  string: ?!=
+ ⛳ Result: 24 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📈 &#39;string: ?!=&#39; exceeded baseline by 50.00% (threshold is 20%).
+
+ 🏌️  string: ++
+ ⛳ Result: 8 instantiations
+ 🎯 Baseline: 8 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  number: =
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📊 Delta: -12.50%
+
+ 🏌️  number: !=
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📊 Delta: -12.50%
+
+ 🏌️  number: &gt;
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📊 Delta: -12.50%
+
+ 🏌️  number: &lt;
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📊 Delta: -12.50%
+
+ 🏌️  number: &gt;=
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📊 Delta: -12.50%
+
+ 🏌️  number: &lt;=
+ ⛳ Result: 14 instantiations
+ 🎯 Baseline: 16 instantiations
+ 📊 Delta: -12.50%
+
+ 🏌️  number: ?=
+ ⛳ Result: 24 instantiations
+ 🎯 Baseline: 20 instantiations
+ 📊 Delta: +20.00%
+
+ 🏌️  number: ?!=
+ ⛳ Result: 24 instantiations
+ 🎯 Baseline: 20 instantiations
+ 📊 Delta: +20.00%
+
+ 🏌️  number: +
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 30 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  number: -
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 30 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  number: *
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 30 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  number: /
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 30 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  number: %
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 30 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  number: //
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 30 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  number: ^
+ ⛳ Result: 30 instantiations
+ 🎯 Baseline: 30 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  number: unary +
+ ⛳ Result: 6 instantiations
+ 🎯 Baseline: 6 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  number: unary -
+ ⛳ Result: 6 instantiations
+ 🎯 Baseline: 6 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  boolean: =
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 22 instantiations
+ 📊 Delta: -18.18%
+
+ 🏌️  boolean: !=
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 22 instantiations
+ 📊 Delta: -18.18%
+
+ 🏌️  boolean: &gt;
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 22 instantiations
+ 📊 Delta: -18.18%
+
+ 🏌️  boolean: &lt;
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 22 instantiations
+ 📊 Delta: -18.18%
+
+ 🏌️  boolean: &gt;=
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 22 instantiations
+ 📊 Delta: -18.18%
+
+ 🏌️  boolean: &lt;=
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 22 instantiations
+ 📊 Delta: -18.18%
+
+ 🏌️  boolean: ?=
+ ⛳ Result: 26 instantiations
+ 🎯 Baseline: 26 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  boolean: ?!=
+ ⛳ Result: 26 instantiations
+ 🎯 Baseline: 26 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  boolean: and
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 22 instantiations
+ 📊 Delta: -18.18%
+
+ 🏌️  boolean: or
+ ⛳ Result: 18 instantiations
+ 🎯 Baseline: 22 instantiations
+ 📊 Delta: -18.18%
+
+ 🏌️  boolean: not
+ ⛳ Result: 5 instantiations
+ 🎯 Baseline: 5 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  nested boolean: =
+ ⛳ Result: 39 instantiations
+ 🎯 Baseline: 41 instantiations
+ 📊 Delta: -4.88%
+
+ 🏌️  string: ilike
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ 🏌️  string: not ilike
+ ⛳ Result: 12 instantiations
+ 🎯 Baseline: 12 instantiations
+ 📊 Delta: 0.00%
+
+ ❌ &#39;string: ?=&#39; exceeded baseline by 50.00% (threshold is 20%).
+ ❌ &#39;string: ?!=&#39; exceeded baseline by 50.00% (threshold is 20%).</pre></div></div></div></div>
+<p>It looks like it’s consistently better with the exception of the <code>?=</code> and <code>?!=</code> operators, which makes some sense since it has moved further down the list of overloads. We can choose to abandon the original branch, and make this a new top-level experimental branch, or keep them both around. We’ll still split this experiment into two separate commits: the first that changes the implementation, and the second that updates the benchmarks.</p>
+<p>Let’s look at another idea: maybe instead of clustering by operator, we should cluster by operand. After adjusting and benchmarking, it turns out this has roughly the same performance as <code>1234-experiments/union-operators</code> which since that branch just happened to be incidentally clustered by operand. A few of the operators got a little better, and a few got measureably worse. It is across-the-board worse than <code>1234-experiments/group-by-operator</code>, so we can abandon this new branch, and explore in other directions.</p>
+<p>As you can see, having benchmarks that track the number of type instantiations for a given expression allows us to quantify our experiments, turning wild guesses on what might be faster into concrete measurements. Often, different patterns of making a type present different trade-offs and it is difficult to know the overall impact of a change if you do not have some kind of comprehensive way to quantify the impact of a change.</p>
+</div>
+<div data-section-id="some-general-advice" id="some-general-advice">
+
+<p>While the specific focus of this post is about <em>how</em> to measure changes, I’d like to also provide a few rules of thumb that might apply and can be good starting points for your own experiments. Some of this is general advice from the TypeScript wiki, and some of this I’ve discovered after doing experiments.</p>
+<div data-section-id="prefer-interfaces-over-intersections" id="prefer-interfaces-over-intersections">
+
+<p>As noted in the TypeScript performance wiki:</p>
+<div><p>Type relationships between interfaces are also cached, as opposed to intersection types as a whole. A final noteworthy difference is that when checking against a target intersection type, every constituent is checked before checking against the “effective”/”flattened” type.</p></div>
+<p>Example:</p>
+<div><div><div translate="no"><pre><span><span>type</span> <span>Foo</span> <span>=</span> Bar <span>&amp;</span> Baz <span>&amp;</span> <span>{</span>
+    someProp<span>:</span> <span>string</span><span>;</span>
+<span>}</span>
+<span>interface</span> <span>Foo</span> <span>extends</span> <span>Bar</span><span>,</span> Baz <span>{</span>
+    someProp<span>:</span> <span>string</span><span>;</span>
+<span>}</span></span></pre></div></div></div>
+</div>
+<div data-section-id="name-conditional-types" id="name-conditional-types">
+
+<p>Another good one from the TypeScript performance wiki:</p>
+<div><div>
+<p>This is convenient, but today, every time <code>foo</code> is called, TypeScript has to re-run the conditional type. What’s more, relating any two instances of <code>SomeType</code> requires re-relating the structure of the return type of <code>foo</code>.</p>
+<p>If the return type in this example was extracted out to a type alias, more information can be cached by the compiler:</p>
+</div></div>
+<p>Example:</p>
+<div><div><div translate="no"><pre><span><span>interface</span> <span>SomeType<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>{</span>
+  <span><span>foo</span><span><span>&lt;</span><span>U</span><span>&gt;</span></span></span><span>(</span>x<span>:</span> <span>U</span><span>)</span><span>:</span>
+    <span>U</span> <span>extends</span> <span>TypeA<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>?</span> ProcessTypeA<span>&lt;</span><span>U</span><span>,</span> <span>T</span><span>&gt;</span> <span>:</span>
+    <span>U</span> <span>extends</span> <span>TypeB<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>?</span> ProcessTypeB<span>&lt;</span><span>U</span><span>,</span> <span>T</span><span>&gt;</span> <span>:</span>
+    <span>U</span> <span>extends</span> <span>TypeC<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>?</span> ProcessTypeC<span>&lt;</span><span>U</span><span>,</span> <span>T</span><span>&gt;</span> <span>:</span>
+    <span>U</span><span>;</span>
+<span>}</span>
+<span>type</span> <span>FooResult<span>&lt;</span><span>U</span><span>,</span> <span>T</span><span>&gt;</span></span> <span>=</span>
+  <span>U</span> <span>extends</span> <span>TypeA<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>?</span> ProcessTypeA<span>&lt;</span><span>U</span><span>,</span> <span>T</span><span>&gt;</span> <span>:</span>
+  <span>U</span> <span>extends</span> <span>TypeB<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>?</span> ProcessTypeB<span>&lt;</span><span>U</span><span>,</span> <span>T</span><span>&gt;</span> <span>:</span>
+  <span>U</span> <span>extends</span> <span>TypeC<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>?</span> ProcessTypeC<span>&lt;</span><span>U</span><span>,</span> <span>T</span><span>&gt;</span> <span>:</span>
+  <span>U</span><span>;</span>
+
+<span>interface</span> <span>SomeType<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>{</span>
+  <span><span>foo</span><span><span>&lt;</span><span>U</span><span>&gt;</span></span></span><span>(</span>x<span>:</span> <span>U</span><span>)</span><span>:</span> FooResult<span>&lt;</span><span>U</span><span>,</span> <span>T</span><span>&gt;</span><span>;</span>
+<span>}</span></span></pre></div></div></div>
+</div>
+<div data-section-id="move-expensive-types-into-generics" id="move-expensive-types-into-generics">
+
+<p>Type aliases have two “halves”:</p>
+<ol>
+<li>
+<p>The “left” side of the alias, which is the name of the type alias and defines any generics and their constraints</p>
+</li>
+<li>
+<p>The “right” side of the alias, which is the type that the alias refers to</p>
+</li>
+</ol>
+<p>Moving expensive generic expressions from the “right” side of a type alias to a new generic parameter on the “left” can sometimes improve performance. However, this approach isn’t universally beneficial and may require providing default values or explicit generic arguments. Always measure the impact of such changes to ensure they actually improve performance in your specific case.</p>
+<p>Example:</p>
+<div><div><div translate="no"><pre><span><span>export</span> <span>function</span> op<span>&lt;</span>
+  Opr1 <span>extends</span> <span>TypeSet<span>&lt;</span>$String<span>&gt;</span></span><span>,</span>
+  Opr2 <span>extends</span> <span>TypeSet<span>&lt;</span>$String<span>&gt;</span></span><span>,</span>
+  Result <span>extends</span> <span>$expr_Operator<span>&lt;</span>
+    Opr1<span>[</span><span>&#34;__element__&#34;</span><span>]</span><span>,</span>
+    multiplyCardinalities<span>&lt;</span>paramCardinality<span>&lt;</span>Opr1<span>&gt;</span><span>,</span> paramCardinality<span>&lt;</span>Opr2<span>&gt;&gt;</span>
+  <span>&gt;</span></span><span>,</span>
+<span>&gt;</span><span>(</span>op1<span>:</span> Opr1<span>,</span> op<span>:</span> <span>&#34;=&#34;</span><span>,</span> op2<span>:</span> Opr2<span>)</span><span>:</span> Result<span>;</span>
+<span>&gt;</span><span>(</span>op1<span>:</span> Opr1<span>,</span> op<span>:</span> <span>&#34;=&#34;</span><span>,</span> op2<span>:</span> Opr2<span>)</span><span>:</span> $expr_Operator<span>&lt;</span>
+   Opr1<span>[</span><span>&#34;__element__&#34;</span><span>]</span><span>,</span>
+   multiplyCardinalities<span>&lt;</span>paramCardinality<span>&lt;</span>Opr1<span>&gt;</span><span>,</span> paramCardinality<span>&lt;</span>Opr2<span>&gt;&gt;</span>
+ <span>&gt;</span><span>;</span>
+<span>}</span><span>;</span></span></pre></div></div></div>
+</div>
+<div data-section-id="order-of-conditionals-matters" id="order-of-conditionals-matters">
+
+<p>When creating a conditional type with a few conditions, the order of the conditions matters. The type checker will stop evaluating the rest of the conditions as soon as it finds a match, so you can “tune” how expensive a particular case is by moving it earlier or later in the conditional.</p>
+<p>Here’s a very contrived example, which borrows an expensive type from <code>arktype</code>:</p>
+<p>Example:</p>
+<div><div><div translate="no"><pre><span><span>import</span> <span>{</span> bench <span>}</span> <span>from</span> <span>&#34;@ark/attest&#34;</span><span>;</span>
+<span>import</span> <span>{</span> type<span>,</span> <span>type</span> <span>inferAmbient</span> <span>}</span> <span>from</span> <span>&#34;arktype&#34;</span><span>;</span>
+
+bench<span>.</span><span>baseline</span><span>(</span><span>(</span><span>)</span> <span>=&gt;</span> <span>type</span><span>(</span><span>&#34;never&#34;</span><span>)</span><span>)</span>
+
+<span>type</span> <span>StrangeType<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>=</span> <span>T</span> <span>extends</span> <span>0</span>
+  <span>?</span> <span>0</span>
+  <span>:</span> <span>T</span> <span>extends</span> <span>1</span>
+    <span>?</span> <span>1</span>
+    <span>:</span> <span>T</span> <span>extends</span> <span>2</span>
+      <span>?</span> inferAmbient<span>&lt;</span><span>&#34;(0|(1|(2|(3|(4|5)[])[])[])[])[]&#34;</span><span>&gt;</span>
+      <span>:</span> <span>T</span><span>;</span>
+
+<span>bench</span><span>(</span><span>&#34;StrangeType: 0&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+  <span>type</span> <span><span>T</span></span> <span>=</span> StrangeType<span>&lt;</span><span>0</span><span>&gt;</span><span>;</span>
+<span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>2</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+<span>bench</span><span>(</span><span>&#34;StrangeType: 1&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+  <span>type</span> <span><span>T</span></span> <span>=</span> StrangeType<span>&lt;</span><span>1</span><span>&gt;</span><span>;</span>
+<span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>3</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+<span>bench</span><span>(</span><span>&#34;StrangeType: 2&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+  <span>type</span> <span><span>T</span></span> <span>=</span> StrangeType<span>&lt;</span><span>2</span><span>&gt;</span><span>;</span>
+<span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>81</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span>
+
+<span>bench</span><span>(</span><span>&#34;StrangeType: 3&#34;</span><span>,</span> <span>(</span><span>)</span> <span>=&gt;</span> <span>{</span>
+  <span>type</span> <span><span>T</span></span> <span>=</span> StrangeType<span>&lt;</span><span>3</span><span>&gt;</span><span>;</span>
+<span>}</span><span>)</span><span>.</span><span>types</span><span>(</span><span>[</span><span>5</span><span>,</span> <span>&#34;instantiations&#34;</span><span>]</span><span>)</span><span>;</span></span></pre></div></div></div>
+<p>Our expensive conditional branch <code>2</code> takes 81 instantiations. Let’s move it first and see what happens:</p>
+<div><div><div translate="no"><pre><span><span>type</span> <span>StrangeType<span>&lt;</span><span>T</span><span>&gt;</span></span> <span>=</span> <span>T</span> <span>extends</span> <span>2</span>
+  <span>?</span> inferAmbient<span>&lt;</span><span>&#34;(0|(1|(2|(3|(4|5)[])[])[])[])[]&#34;</span><span>&gt;</span>
+  <span>:</span> <span>T</span> <span>extends</span> <span>0</span>
+    <span>?</span> <span>0</span>
+    <span>:</span> <span>T</span> <span>extends</span> <span>1</span>
+      <span>?</span> <span>1</span>
+      <span>:</span> <span>T</span><span>;</span></span></pre></div></div></div>
+<p>In this version, the expensive case only costs 79 instantiations, but each of the earlier cases cost an additional instantiation due to the <code>T extends 2</code> check now coming before them.</p>
+<p>Sometimes, it can be useful to rearrange your conditionals to either make the most expensive or the most common cases cheaper. Sometimes you have a clear win if the most expensive cases are also very common cases, but you’ll need to know a bit about the specifics of your use case to make that decision.</p>
+</div>
+</div>
+<div data-section-id="the-next-generation-of-performance-tools" id="the-next-generation-of-performance-tools">
+
+<p>Like many performance related issues, learning the tips and tricks of improving type inference performance is a temporary skill, but learning how to measure and quantify the impact of a change is a perennial skill that will continue to be useful no matter how TypeScript evolves.</p>
+<p>To that end, I’d love to see more tooling around type performance in the future. I’m aware of some projects that are in the early stage of development for this purpose. Here are some concrete things that are currently difficult that would improve this method of performance improvement iteration:</p>
+<ol>
+<li>
+<p>Measure the impact of a change on the language server wall time</p>
+</li>
+<li>
+<p>Trace the language server performance of a given expression and see what exactly the inference engine is doing (what types are being instantiated, what the call stack looks like, etc)</p>
+</li>
+<li>
+<p>Linting tools that provide performance-specific guidance</p>
+</li>
+<li>
+<p>Refactoring tool at the type level that help large refactors of types similar to runtime refactoring</p>
+</li>
+</ol>
+</div>
+</section>
+</div></div></div></div>
+  </body>
+</html>
