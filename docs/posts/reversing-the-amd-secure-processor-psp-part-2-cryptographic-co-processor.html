@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://dayzerosec.com/blog/2023/04/22/reversing-the-amd-secure-processor-psp-part-2-cryptographic-co-processor-ccp.html">Original</a>
+    <h1>Reversing the AMD Secure Processor (PSP) – Part 2: Cryptographic Co-Processor</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+			
+			
+			
+			
+<p>Part one: <a href="https://dayzerosec.com/blog/2023/04/17/reversing-the-amd-secure-processor-psp.html">https://dayzerosec.com/blog/2023/04/17/reversing-the-amd-secure-processor-psp.html</a></p><p>This is a follow-up part 2 to my previous post on the AMD Secure Processor (formerly known as the Platform Security Processor or &#34;PSP&#34;). In that post, I mentioned that the Cryptographic Co-Processor (CCP) is an essential component of how the PSP functions. It&#39;s primarily responsible for hardware-accelerated cryptography, but it&#39;s also used as a Direct Memory Access (DMA) copy engine for doing mass copy operations, which includes loading and decompressing firmware. Over time the CCP has evolved to include more and more functionality. For this post, we&#39;ll be talking about the latest version at the time of writing, CCPv5.</p><p>Even though the CCP is a proprietary and mostly undocumented Intellectual Property (IP) block, some public information exists via the Linux kernel&#39;s open-source CCP driver [1]. This implements the interface for submitting jobs from the kernel to the PSP Secure OS, which are then passed on to the CCP. At the heart of the CCP interface are local storage blocks and command queues for job submission.</p><p>Similar to Syshub and the System Management Network (SMN), the CCP leans on a slot concept for keeping context while performing various operations. These slots are contained inside Local Storage Blocks or &#34;LSBs&#34;. LSBs are an evolution of the CCPv3&#39;s Storage Blocks, which are blocks of memory local to the CCP. In CCPv3, these blocks could only be used for key storage with limited initialization, but in v5 they&#39;re more versatile. I believe you can actually encrypt and decrypt directly into and across LSBs, which could allow you to do some cool secure key derivation without sensitive information leaving these LSBs at all.</p><p>Headers from the Linux kernel driver can give us a lot of insight into how these storage blocks are divided up and utilized.</p><pre><code>#define MAX_LSB_CNT                 8
+
+#define LSB_SIZE                    16
+#define LSB_ITEM_SIZE               32
+#define PLSB_MAP_SIZE               (LSB_SIZE)
+#define SLSB_MAP_SIZE               (MAX_LSB_CNT * LSB_SIZE)
+
+#define LSB_ENTRY_NUMBER(LSB_ADDR)  (LSB_ADDR / LSB_ITEM_SIZE)
+</code></pre><p>There are a maximum of 8 LSBs. One LSB can hold 16 slots, which can hold 32 bytes of data each. This gives a total of 512 bytes per LSB, or 4KB of total storage. Commands sent to the CCP use virtual addressing for accessing into LSBs.</p><figure><img src="https://i.imgur.com/JFFaH9m.png" alt="img" loading="lazy"/></figure><p>Five of the LSBs are reserved for exclusive use for their respective command queue, leaving three for &#34;public use.&#34; Furthermore, the remaining LSBs can be enabled for access by multiple various queues and conversely can lock an LSB out from access by other queues. This can allow some fine-grained access control on which data can be used for various operations.</p><p>As hinted earlier, there are a total of five command queues that can be used for submitting to the CCP. Each queue can hold 16 commands, which are comprised of eight 32-bit double words or 256 bytes. Again, the header gives a decent breakdown of how commands are described [3].</p><pre><code>/**
+ * descriptor for version 5 CPP commands
+ * 8 32-bit words:
+ * word 0: function; engine; control bits
+ * word 1: length of source data
+ * word 2: low 32 bits of source pointer
+ * word 3: upper 16 bits of source pointer; source memory type
+ * word 4: low 32 bits of destination pointer
+ * word 5: upper 16 bits of destination pointer; destination memory type
+ * word 6: low 32 bits of key pointer
+ * word 7: upper 16 bits of key pointer; key memory type
+ */
+// ...
+</code></pre><p>Definitions for the structures and associated macros can be found in the CCP device header [3].</p><p>Descriptors are fairly straightforward, consisting mainly of a control word, length, and three pointers with encoded memory types for source, destination, and key information respectively. Pointers can be 48 bits wide, which may seem odd, but we&#39;ll come back to this when talking about memory types.</p><p>The main opcode used for dispatching comes from the control word at dword 0, specifically the function bits at 15:31.</p><pre><code>enum ccp_engine {
+	CCP_ENGINE_AES = 0,
+	CCP_ENGINE_XTS_AES_128,
+	CCP_ENGINE_DES3,
+	CCP_ENGINE_SHA,
+	CCP_ENGINE_RSA,
+	CCP_ENGINE_PASSTHRU,
+	CCP_ENGINE_ZLIB_DECOMPRESS,
+	CCP_ENGINE_ECC,
+	CCP_ENGINE__LAST,
+};
+</code></pre><p>This enum gives us an idea of just how many different engines and modes the CCP can support, from decompression to symmetric and asymmetric crypto to hashing.</p><p>You&#39;ll often see references to a &#34;type&#34; for source, destination, and keys. This is quite important to keep in mind, as the CCP can do I/O to different types of memory.</p><pre><code>enum ccp_memtype {
+	CCP_MEMTYPE_SYSTEM = 0,
+	CCP_MEMTYPE_SB,
+	CCP_MEMTYPE_LOCAL,
+	CCP_MEMTYPE__LAST,
+};
+</code></pre><p>&#34;System&#34; memory refers to DRAM / x86-accessible memory. As you can probably guess, &#34;SB&#34; refers to LSB memory, and &#34;Local&#34; refers to the PSP&#39;s local Static RAM (SRAM). In the PSP&#39;s off-chip Initial Program Loader (IPL), SB and Local memory types are used often. While local and SB memory addresses can fit inside 32 bits, it&#39;s not enough for physical DRAM addresses, which is why descriptors support 48-bit addresses.</p><p>Moving away from the kernel driver let&#39;s get back to the PSP IPL binary. By looking at the strings, I found this <code>spiRead()</code> function which is used to read data from the SPI flash.</p><figure><img src="https://i.imgur.com/rkGGMYu.png" alt="https://i.imgur.com/rkGGMYu.png" loading="lazy"/></figure><p>As you can see with the arguments reversed, it can support both compressed and non-compressed reading. If the data is less than 1KB, it&#39;ll use a standard <code>memcpy()</code> call, otherwise, it&#39;ll call <code>ccp_passthrough()</code>. You&#39;ll notice that in either case, it&#39;s copying to/from the same type of memory (local), as the CCP treats SMN/Syshub addresses as local PSP memory.</p><p>We&#39;ll look at the <code>ccp_passthrough()</code> function for doing a direct regular DMA copy and mostly skip over <code>ccp_zlib_inflate()</code> for compressed data since it&#39;s very similar.</p><pre><code>void ccp_mmio_write(struct ccp_mmio_req* req, int queue_idx, int a3)
+{
+	uint32_t* mmio_reg = (uint32_t*) (0x3001000 + (queue_idx * 0x1000));
+
+	do {
+		// busy wait on queue to be free
+	} while (mmio_req[0] &lt;&lt; 0x1F)
+	// ...
+
+	mmio_req[0] = req-&gt;ctrl;
+	mmio_req[1] = req-&gt;tail;
+	mmio_req[2] = req-&gt;head;
+}
+
+int ccp_passthrough(void* src, void* dest, uint32_t size, int src_type, int dest_type, int a6)
+{
+	struct ccp_passthrough_req req;
+	struct mmio_ccp_req mmio_req;
+
+	if (src == NULL || dest == NULL)
+		return BL_ERR_INVALID_PARAMETER;
+
+	bzero(&amp;req, sizeof(struct ccp_passthrough_req)); // size = 0x20
+	bzero((void*) 0xE680, 0x80);
+	
+	// Control
+	CCP5_CMD_SOC(&amp;req) = 1;
+	CCP5_CMD_EOM(&amp;req) = 1;
+	CCP5_CMD_FUNCTION(&amp;req) = CCP_ENGINE_PASSTHRU;
+
+	CCP5_CMD_LEN(&amp;req) = size;
+
+	// Source
+	if (src_type == CCP_MEMTYPE_LOCAL)
+		CCP5_CMD_SRC_LO(&amp;req) = sub_b0a0(src);
+	else
+		CCP5_CMD_SRC_LO(&amp;req) = src;
+	CCP5_CMD_SRC_MEM(&amp;req) = src_type;
+
+	// Dest
+	if (dest_type == CCP_MEMTYPE_LOCAL)
+		CCP5_CMD_DST_LO(&amp;req) = sub_b0a0(dest);
+	else
+		CCP5_CMD_DST_LO(&amp;req) = dest;
+	CCP5_CMD_DST_MEM(&amp;req) = dest_type;
+
+	// Copy and submit mmio write
+	memcpy((void*) 0xE680, &amp;req, sizeof(struct ccp_passthrough_req));
+	// ...
+
+	mmio_req.ctrl = CMD5_Q_RUN;
+	mmio_req.head = (void*) 0xE680;
+	mmio_req.tail = (void*) 0xE6A0;
+	// ...
+
+	*(uint32_t*) (0x3006000) = 1;
+	ccp_mmio_write(&amp;mmio_req, queue_idx: 0, 6);
+	// ...
+	if (ccp_wait_status_update(queue_idx: 0))
+		return BL_ERR_CCP_PASSTHR;
+	return 0;
+}</code></pre><p>What we have here is a fairly standard register-based Memory Mapped I/O (MMIO) request, which is used to submit the CCP requests via ringbuffer. Each queue gets a <code>0x1000</code> byte MMIO region, with the first three dwords being used for the control bits, tail, and head respectively. The head points to the setup request, and the tail to zero&#39;d / NOP data.</p><p>As far as I&#39;ve seen, all CCP requests made by the IPL will use command queue #0. This makes sense, as the IPL is relatively simple and doesn&#39;t need to use all the queues. Here&#39;s a diagram giving an overview of the setup for sending requests to the CCP:</p><figure><img src="https://i.imgur.com/iQ1n03p.png" alt="img" loading="lazy"/></figure><p>One of the main annoying features the PSP supports (from a research perspective at least), is the ability to have the firmware on the flash encrypted. In these cases, the firmware blobs are encrypted with what some other researchers have dubbed a Component Key (cK), which is embedded in the firmware&#39;s header contents. Of course, this key is encrypted with an Intermediate Key Encryption Key (iKEK), which is stored on the flash as well and is also encrypted with a Root Key (rK). Decryption involves first decrypting the iKEK with the Root Key (rK), to then decrypt the cK to finally decrypt the plaintext firmware. The root key stays in a locked CCP slot, and allegedly [2] can&#39;t easily be dumped even if you have code execution at this stage.</p><figure><img src="https://imgur.com/i8xpY4k.png" alt="img" loading="lazy"/></figure><p>Note: &#34;Imm.Secret&#34; = Immutable + Secret / Non-Readable</p><p>The &#34;One Glitch to Rule Them All&#34; paper [2] describes this at a high level, but let&#39;s go down the rabbit hole on the code responsible for retrieving and decrypting this component key and the firmware. It starts in what I&#39;ve tentatively named <code>_bootloader_enter_c_main()</code> after most of the bootloader initialization is complete.</p><pre><code>int _bootloader_enter_c_main() {
+	// ...
+	char wrapped_ikek[0x10] = {0};
+	err = spiReadPspDirEntry(entry_id: 0x21, dest: &amp;wrapped_ikek, size: 0x10);
+	if (err) { /* ... */ }
+	err = ccp_aes_ecb_decrypt(
+		key: 0x80,
+		key_type: CCP_MEMTYPE_SB,
+		key_size: 0x10,
+		src: &amp;wrapped_ikek,
+		src_type: CCP_MEMTYPE_LOCAL,
+		len: 0x10,
+		dest: (void*) 0xF2C0,
+		dest_type: CCP_MEMTYPE_LOCAL
+	);
+	// ...
+}</code></pre><p>The component key is stored at <code>0xF2C0</code> in this case, which will be used by various functions in the IPL when user-space requests a binary to be loaded via syscall. You&#39;ll notice the <code>key</code> of <code>0x80</code> is an LSB address (which resolves to slot 4 in LSB #0). Assumingly this region is reserved and locked by the CCP, and you can&#39;t just read it out.</p><p>Both <code>ccp_aes_ecb_decrypt()</code> and <code>ccp_aes_ecb_encrypt()</code> wrap around what I&#39;ve named <code>ccp_aes_ecb_crypt()</code> and just call it with one slightly different argument indicating if it&#39;s an encrypt or decrypt operation.</p><pre><code>int ccp_aes_ecb_crypt(
+	uint32_t key,
+	int key_type,
+	uint32_t key_size,
+	uint32_t a4,
+	void* src,
+	int src_type,
+	uint32_t size,
+	void* dest,
+	int dest_type,
+	int a10,
+	int is_encrypt) {
+	int aes_type;
+	int function;
+	struct ccp_aes_req req;
+	struct mmio_ccp_req mmio_req;
+
+	if (src == NULL || dest == NULL || key_type == CCP_MEMTYPE_SYSTEM)
+		return BL_ERR_INVALID_PARAMETER;
+
+	switch (key_size) {
+	case 0x10:
+		aes_type = 0; // aes-128
+		break;
+	case 0x18:
+		aes_type = 1; // aes-192
+		break;
+	case 0x20:
+		aes_type = 2; // aes-256
+		break;
+	default:
+		return BL_ERR_INVALID_PARAMETER;
+	}
+
+	bzero(&amp;req, sizeof(struct ccp_aes_req)); // size = 0x20
+	bzero((void*) 0xE680, 0x80);
+
+	// Control
+	CCP_AES_ENCRYPT(&amp;req) = is_encrypt;
+	CCP_AES_MODE(&amp;req) = CCP_AES_MODE_ECB;
+	CCP_AES_TYPE(&amp;req) = aes_type;
+
+	CCP5_CMD_SOC(&amp;req) = 1;
+	CCP5_CMD_EOM(&amp;req) = 1;
+	CCP5_CMD_LEN(&amp;req) = size;
+
+	// Key
+	if (key_type == CCP_MEMTYPE_LOCAL)
+		CCP5_CMD_KEY_LO(&amp;req) = sub_b0a0(key);
+	else
+		CCP5_CMD_KEY_LO(&amp;req) = key;
+	CCP5_CMD_KEY_MEM(&amp;req) = key_type;
+
+	// Source
+	if (src_type == CCP_MEMTYPE_LOCAL)
+		CCP5_CMD_SRC_LO(&amp;req) = sub_b0a0(src);
+	else
+		CCP5_CMD_SRC_LO(&amp;req) = src;
+	CCP5_CMD_SRC_MEM(&amp;req) = src_type;
+
+	// Dest
+	if (dest_type == CCP_MEMTYPE_LOCAL)
+		CCP5_CMD_DST_LO(&amp;req) = sub_b0a0(dest);
+	else
+		CCP5_CMD_DST_LO(&amp;req) = dest;
+	CCP5_CMD_DST_MEM(&amp;req) = dest_type;
+
+	// Copy and submit mmio write
+	memcpy((void*) 0xE680, &amp;req, sizeof(struct ccp_passthrough_req));
+	// ...
+
+	mmio_req.ctrl = CMD5_Q_RUN;
+	mmio_req.head = (void*) 0xE680;
+	mmio_req.tail = (void*) 0xE6A0;
+	// ...
+
+	ccp_mmio_write(&amp;mmio_req, queue_idx: 0, 6);
+	// ...
+	if (ccp_wait_status_update(queue_idx: 0))
+		return BL_ERR_CCP_AES;
+	return 0;
+}</code></pre><p>Looking at this function, we can see it&#39;s somewhat similar to the DMA copy passthrough, though with a lot more context provided where AES operations are more complex. Most of these CCP handlers look fairly similar, utilizing their respective macros to initialize the control bits and set up the request descriptor, so I won&#39;t do a deep dive on all of them.</p><p>Now that the IKEK is decrypted and stored in memory, we can see where it&#39;s used for decrypting firmware. The syscall handler for <code>SVC_ENTER</code> (which loads a firmware blob from the flash firmware filesystem) will eventually call what I&#39;ve dubbed <code>fw_copy()</code>. Note that <code>srcdest</code> contains both the source data already loaded and where to write the finalized contents to.</p><pre><code>int component_key_decrypt(char* enc_key, char* dec_key) {
+	return ccp_aes_ebc_crypt(
+		key: (void*) 0xF2C0, key_type: CCP_MEMTYPE_LOCAL, key_size: 0x10,
+		src: &amp;enc_key, src_type: CCP_MEMTYPE_LOCAL, size: 0x10,
+		dest: dec_key, dest_type: CCP_MEMTYPE_LOCAL
+	);
+}
+
+int fw_body_decrypt(
+	char* key,
+	int key_type,
+	uint32_t key_size,
+	char* iv,
+	char* src,
+	int src_type,
+	uint32_t size,
+	char* dest,
+	int dest_type) {
+	return ccp_aes_cbc_crypt(
+		key, key_type, key_size,
+		iv, src, src_type, size,
+		dest, dest_type, 1, is_encrypt: 0);
+}
+
+int fw_copy(char* srcdest, /* ... */) {
+	int err;
+	char enc_component_key[0x10];
+	char component_key[0x10];
+	// ...
+	if (srcdest[0x18] == 1) {                               // PSP header &#39;is_encrypted&#39;
+		memcpy(&amp;enc_encomponent_key, &amp;srcdest[0x80], 0x10); // PSP header &#39;wrapped_key&#39;
+		err = component_key_decrypt(&amp;enc_encomponent_key, &amp;component_key);
+		// ...
+		err = fw_body_decrypt(
+			key: &amp;component_key,
+			key_type: CCP_MEMTYPE_LOCAL,
+			key_size: 0x10,
+			iv: &amp;srcdest[0x20],                             // PSP header &#39;iv&#39;
+			src: &amp;srcdest[0x100],
+			src_type: CCP_MEMTYPE_LOCAL,
+			size: (uint32_t) (srcdest[0x14]),               // PSP header &#39;body_size&#39;
+			dest: &amp;srcdest[0x100],
+			dest_type: CCP_MEMTYPE_LOCAL
+		);
+	}
+}</code></pre><p>As expected, <code>fw_copy()</code> will first fetch and decrypt the Component Key, fetch other information from the PSP file header (such as the IV), and decrypt the file body via AES-128 CBC.</p><p>There is a good amount of other code relevant to firmware loading such as dealing with compression and verifying the firmware, but we&#39;ll skip that for this post at least.</p><p>While the CCP is a vital component of modern-day AMD systems, the interface to it isn&#39;t too complicated once you break it down. It seems the PSP uses basically the same request structures and IDs as what&#39;s exposed to the x86 kernel by the Secure OS, which is fair as there&#39;s no point in reinventing the wheel needlessly. I think the fact that it can support three different types of memory (PSP SRAM/local, local storage blocks, and system DRAM) is pretty cool, and you can get some interesting interactions between memory types. It also supports a lot of different types of operations which are fundamental to various encryption systems and key derivation.</p><p>Finally, the CCP holds some secrets of its own which are opaque even to the PSP itself, such as the Root Key. I&#39;d be interested in how this locking mechanism is implemented exactly, however, that&#39;s getting into hardware territory that I frankly don&#39;t understand well. I am curious though on how much the concept of locking slots and keeping them exclusive to a subset of command queues is leveraged for defense-in-depth. There could be some very interesting research opportunities if a particular system doesn&#39;t lock these down well, such as leakage of keys and other sensitive data. This will require study of the Secure OS though... perhaps we&#39;ll go into this in a future blog post!</p><ul><li>[1] Linux CCP driver: <a href="https://elixir.bootlin.com/linux/v5.19.17/source/drivers/crypto/ccp?ref=dayzerosec.com">https://elixir.bootlin.com/linux/v5.19.17/source/drivers/crypto/ccp</a></li><li>[2] &#34;One Glitch to Rule Them All: Fault Injection Attacks Against AMD&#39;s SEV&#34; whitepaper: <a href="https://arxiv.org/pdf/2108.04575.pdf?ref=dayzerosec.com">https://arxiv.org/pdf/2108.04575.pdf</a></li><li>[3] Linux CCP Dev header: <a href="https://elixir.bootlin.com/linux/v5.19.17/source/drivers/crypto/ccp/ccp-dev.h?ref=dayzerosec.com#L579">https://elixir.bootlin.com/linux/v5.19.17/source/drivers/crypto/ccp/ccp-dev.h#L579</a></li></ul>
+			
+  		
+		</div></div>
+  </body>
+</html>
