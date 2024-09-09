@@ -1,0 +1,1252 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://tookmund.com/2024/09/hibernation-preparation">Original</a>
+    <h1>Linux&#39;s Bedtime Routine</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    <p>How does Linux move from an awake machine to a hibernating one?
+How does it then manage to restore all state?
+These questions led me to read way too much C in trying to figure out
+how this particular hardware/software boundary is navigated.</p>
+
+<p>This investigation will be split into a few parts, with the first one going
+from invocation of hibernation to synchronizing all filesystems to disk.</p>
+
+<p>This article has been written using Linux version 6.9.9,
+the source of which can be found in many places, but can be navigated
+easily through the Bootlin Elixir Cross-Referencer:</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source">https://elixir.bootlin.com/linux/v6.9.9/source</a></p>
+
+<p>Each code snippet will begin with a link to the above giving
+the file path and the line number of the beginning of the snippet.</p>
+
+<h2 id="a-starting-point-for-investigation-syspowerstate-and-syspowerdisk">A Starting Point for Investigation: <code>/sys/power/state</code> and <code>/sys/power/disk</code></h2>
+
+<p>These two system files exist to <a href="https://www.kernel.org/doc/html/latest/power/basic-pm-debugging.html">allow debugging of hibernation</a>,
+and thus control the exact state used directly.
+Writing specific values to the <code>state</code> file controls the exact sleep mode used
+and <code>disk</code> controls the specific hibernation mode<sup id="fnref:hibermode" role="doc-noteref"><a href="#fn:hibermode" rel="footnote">1</a></sup>.</p>
+
+<p>This is extremely handy as an entry point to understand how these systems work,
+since we can just follow what happens when they are written to.</p>
+
+<h3 id="show-and-store-functions">Show and Store Functions</h3>
+<p>These two files are defined using the <code>power_attr</code> macro:</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/power.h#L80">kernel/power/power.h:80</a></p>
+<div><div><pre><code>#define power_attr(_name) \
+static struct kobj_attribute _name##_attr = {   \
+    .attr   = {             \
+        .name = __stringify(_name), \
+        .mode = 0644,           \
+    },                  \
+    .show   = _name##_show,         \
+    .store  = _name##_store,        \
+}
+</code></pre></div></div>
+
+<p><code>show</code> is called on reads and <code>store</code> on writes.</p>
+
+<p><code>state_show</code> is a little boring for our purposes, as it just prints all the
+available sleep states.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/main.c#L657">kernel/power/main.c:657</a></p>
+<div><div><pre><code>/*
+ * state - control system sleep states.
+ *
+ * show() returns available sleep state labels, which may be &#34;mem&#34;, &#34;standby&#34;,
+ * &#34;freeze&#34; and &#34;disk&#34; (hibernation).
+ * See Documentation/admin-guide/pm/sleep-states.rst for a description of
+ * what they mean.
+ *
+ * store() accepts one of those strings, translates it into the proper
+ * enumerated value, and initiates a suspend transition.
+ */
+static ssize_t state_show(struct kobject *kobj, struct kobj_attribute *attr,
+			  char *buf)
+{
+	char *s = buf;
+#ifdef CONFIG_SUSPEND
+	suspend_state_t i;
+
+	for (i = PM_SUSPEND_MIN; i &lt; PM_SUSPEND_MAX; i++)
+		if (pm_states[i])
+			s += sprintf(s,&#34;%s &#34;, pm_states[i]);
+
+#endif
+	if (hibernation_available())
+		s += sprintf(s, &#34;disk &#34;);
+	if (s != buf)
+		/* convert the last space to a newline */
+		*(s-1) = &#39;\n&#39;;
+	return (s - buf);
+}
+</code></pre></div></div>
+
+<p><code>state_store</code>, however, provides our entry point.
+If the string “disk” is written to the <code>state</code> file, it calls <code>hibernate()</code>.
+This is our entry point.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/main.c#L715">kernel/power/main.c:715</a></p>
+<div><div><pre><code>static ssize_t state_store(struct kobject *kobj, struct kobj_attribute *attr,
+			   const char *buf, size_t n)
+{
+	suspend_state_t state;
+	int error;
+
+	error = pm_autosleep_lock();
+	if (error)
+		return error;
+
+	if (pm_autosleep_state() &gt; PM_SUSPEND_ON) {
+		error = -EBUSY;
+		goto out;
+	}
+
+	state = decode_state(buf, n);
+	if (state &lt; PM_SUSPEND_MAX) {
+		if (state == PM_SUSPEND_MEM)
+			state = mem_sleep_current;
+
+		error = pm_suspend(state);
+	} else if (state == PM_SUSPEND_MAX) {
+		error = hibernate();
+	} else {
+		error = -EINVAL;
+	}
+
+ out:
+	pm_autosleep_unlock();
+	return error ? error : n;
+}
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/main.c#L688">kernel/power/main.c:688</a></p>
+<div><div><pre><code>static suspend_state_t decode_state(const char *buf, size_t n)
+{
+#ifdef CONFIG_SUSPEND
+	suspend_state_t state;
+#endif
+	char *p;
+	int len;
+
+	p = memchr(buf, &#39;\n&#39;, n);
+	len = p ? p - buf : n;
+
+	/* Check hibernation first. */
+	if (len == 4 &amp;&amp; str_has_prefix(buf, &#34;disk&#34;))
+		return PM_SUSPEND_MAX;
+
+#ifdef CONFIG_SUSPEND
+	for (state = PM_SUSPEND_MIN; state &lt; PM_SUSPEND_MAX; state++) {
+		const char *label = pm_states[state];
+
+		if (label &amp;&amp; len == strlen(label) &amp;&amp; !strncmp(buf, label, len))
+			return state;
+	}
+#endif
+
+	return PM_SUSPEND_ON;
+}
+</code></pre></div></div>
+
+<p>Could we have figured this out just via function names?
+Sure, but this way we know for sure that nothing else is happening before this
+function is called.</p>
+
+<h3 id="autosleep">Autosleep</h3>
+
+<p>Our first detour is into the autosleep system.
+When checking the state above, you may notice that
+the kernel grabs the <code>pm_autosleep_lock</code> before checking the current
+state.</p>
+
+<p>autosleep is a mechanism <a href="https://lwn.net/Articles/479841/">originally from Android</a>
+that sends the entire system to either suspend or hibernate whenever it is
+not actively working on anything.</p>
+
+<p>This is not enabled for most desktop configurations, since it’s primarily
+for mobile systems and inverts the standard suspend and hibernate interactions.</p>
+
+<p>This system is implemented as a workqueue<sup id="fnref:workqueue" role="doc-noteref"><a href="#fn:workqueue" rel="footnote">2</a></sup>
+that checks the current number of wakeup events, processes and drivers that
+need to run<sup id="fnref:wakeupevent" role="doc-noteref"><a href="#fn:wakeupevent" rel="footnote">3</a></sup>, and if there aren’t any, then the system is put
+into the autosleep state, typically suspend. However, it could be hibernate if
+configured that way via <code>/sys/power/autosleep</code> in a similar manner to
+using <code>/sys/power/state</code> to manually enable hibernation.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/main.c#L841">kernel/power/main.c:841</a></p>
+<div><div><pre><code>static ssize_t autosleep_store(struct kobject *kobj,
+			       struct kobj_attribute *attr,
+			       const char *buf, size_t n)
+{
+	suspend_state_t state = decode_state(buf, n);
+	int error;
+
+	if (state == PM_SUSPEND_ON
+	    &amp;&amp; strcmp(buf, &#34;off&#34;) &amp;&amp; strcmp(buf, &#34;off\n&#34;))
+		return -EINVAL;
+
+	if (state == PM_SUSPEND_MEM)
+		state = mem_sleep_current;
+
+	error = pm_autosleep_set_state(state);
+	return error ? error : n;
+}
+
+power_attr(autosleep);
+#endif /* CONFIG_PM_AUTOSLEEP */
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/autosleep.c#L24">kernel/power/autosleep.c:24</a></p>
+<div><div><pre><code>static DEFINE_MUTEX(autosleep_lock);
+static struct wakeup_source *autosleep_ws;
+
+static void try_to_suspend(struct work_struct *work)
+{
+	unsigned int initial_count, final_count;
+
+	if (!pm_get_wakeup_count(&amp;initial_count, true))
+		goto out;
+
+	mutex_lock(&amp;autosleep_lock);
+
+	if (!pm_save_wakeup_count(initial_count) ||
+		system_state != SYSTEM_RUNNING) {
+		mutex_unlock(&amp;autosleep_lock);
+		goto out;
+	}
+
+	if (autosleep_state == PM_SUSPEND_ON) {
+		mutex_unlock(&amp;autosleep_lock);
+		return;
+	}
+	if (autosleep_state &gt;= PM_SUSPEND_MAX)
+		hibernate();
+	else
+		pm_suspend(autosleep_state);
+
+	mutex_unlock(&amp;autosleep_lock);
+
+	if (!pm_get_wakeup_count(&amp;final_count, false))
+		goto out;
+
+	/*
+	 * If the wakeup occurred for an unknown reason, wait to prevent the
+	 * system from trying to suspend and waking up in a tight loop.
+	 */
+	if (final_count == initial_count)
+		schedule_timeout_uninterruptible(HZ / 2);
+
+ out:
+	queue_up_suspend_work();
+}
+
+static DECLARE_WORK(suspend_work, try_to_suspend);
+
+void queue_up_suspend_work(void)
+{
+	if (autosleep_state &gt; PM_SUSPEND_ON)
+		queue_work(autosleep_wq, &amp;suspend_work);
+}
+</code></pre></div></div>
+
+<h2 id="the-steps-of-hibernation">The Steps of Hibernation</h2>
+
+<h3 id="hibernation-kernel-config">Hibernation Kernel Config</h3>
+
+<p>It’s important to note that most of the hibernate-specific functions below
+do nothing unless you’ve defined <code>CONFIG_HIBERNATION</code> in your Kconfig<sup id="fnref:kconfig" role="doc-noteref"><a href="#fn:kconfig" rel="footnote">4</a></sup>.
+As an example, <code>hibernate</code> itself is defined as the following if
+<code>CONFIG_HIBERNATE</code> is not set.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/include/linux/suspend.h#L407">include/linux/suspend.h:407</a></p>
+<div><div><pre><code>static inline int hibernate(void) { return -ENOSYS; }
+</code></pre></div></div>
+
+<h3 id="check-if-hibernation-is-available">Check if Hibernation is Available</h3>
+<p>We begin by confirming that we actually can perform hibernation,
+via the <code>hibernation_available</code> function.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/hibernate.c#L742">kernel/power/hibernate.c:742</a></p>
+<div><div><pre><code>if (!hibernation_available()) {
+	pm_pr_dbg(&#34;Hibernation not available.\n&#34;);
+	return -EPERM;
+}
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/hibernate.c#L92">kernel/power/hibernate.c:92</a></p>
+<div><div><pre><code>bool hibernation_available(void)
+{
+	return nohibernate == 0 &amp;&amp;
+		!security_locked_down(LOCKDOWN_HIBERNATION) &amp;&amp;
+		!secretmem_active() &amp;&amp; !cxl_mem_active();
+}
+</code></pre></div></div>
+
+<p><code>nohibernate</code> is controlled by the kernel command line, it’s set via
+either <code>nohibernate</code> or <code>hibernate=no</code>.</p>
+
+<p><code>security_locked_down</code> is a hook for Linux Security Modules to prevent
+hibernation. This is used to prevent hibernating to an unencrypted storage
+device, as specified in the manual page
+<a href="https://man7.org/linux/man-pages/man7/kernel_lockdown.7.html"><code>kernel_lockdown(7)</code></a>.
+Interestingly, either level of lockdown, integrity or confidentiality,
+locks down hibernation because with the ability to hibernate you can extract
+bascially anything from memory and even reboot into a modified kernel image.</p>
+
+<p><code>secretmem_active</code> checks whether there is any active use of
+<code>memfd_secret</code>, and if so it prevents hibernation.
+<code>memfd_secret</code> returns a file descriptor that can be mapped into a process
+but is specifically unmapped from the kernel’s memory space.
+Hibernating with memory that not even the kernel is supposed to
+access would expose that memory to whoever could access the hibernation image.
+This particular feature of secret memory was apparently
+<a href="https://lwn.net/Articles/865256/">controversial</a>, though not as
+controversial as performance concerns around fragmentation when unmapping
+kernel memory
+(<a href="https://lwn.net/Articles/865256/">which did not end up being a real problem</a>).</p>
+
+<p><code>cxl_mem_active</code> just checks whether any CXL memory is active.
+A full explanation is provided in the
+<a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=9ea4dcf49878bb9546b8fa9319dcbdc9b7ee20f8">commit introducing this check</a>
+but there’s also a shortened explanation from <code>cxl_mem_probe</code> that
+sets the relevant flag when initializing a CXL memory device.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/drivers/cxl/mem.c#L186">drivers/cxl/mem.c:186</a></p>
+<div><div><pre><code>* The kernel may be operating out of CXL memory on this device,
+* there is no spec defined way to determine whether this device
+* preserves contents over suspend, and there is no simple way
+* to arrange for the suspend image to avoid CXL memory which
+* would setup a circular dependency between PCI resume and save
+* state restoration.
+</code></pre></div></div>
+
+<h3 id="check-compression">Check Compression</h3>
+
+<p>The next check is for whether compression support is enabled, and if so
+whether the requested algorithm is enabled.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/hibernate.c#L747">kernel/power/hibernate.c:747</a></p>
+<div><div><pre><code>/*
+ * Query for the compression algorithm support if compression is enabled.
+ */
+if (!nocompress) {
+	strscpy(hib_comp_algo, hibernate_compressor, sizeof(hib_comp_algo));
+	if (crypto_has_comp(hib_comp_algo, 0, 0) != 1) {
+		pr_err(&#34;%s compression is not available\n&#34;, hib_comp_algo);
+		return -EOPNOTSUPP;
+	}
+}
+</code></pre></div></div>
+
+<p>The <code>nocompress</code> flag is set via the <code>hibernate</code> command line parameter,
+setting <code>hibernate=nocompress</code>.</p>
+
+<p>If compression is enabled, then <code>hibernate_compressor</code> is copied to
+<code>hib_comp_algo</code>. This synchronizes the current requested compression
+setting (<code>hibernate_compressor</code>) with the current compression setting
+(<code>hib_comp_algo</code>).</p>
+
+<p>Both values are character arrays of size <code>CRYPTO_MAX_ALG_NAME</code>
+(128 in this kernel).</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/hibernate.c#L50">kernel/power/hibernate.c:50</a></p>
+<div><div><pre><code>static char hibernate_compressor[CRYPTO_MAX_ALG_NAME] = CONFIG_HIBERNATION_DEF_COMP;
+
+/*
+ * Compression/decompression algorithm to be used while saving/loading
+ * image to/from disk. This would later be used in &#39;kernel/power/swap.c&#39;
+ * to allocate comp streams.
+ */
+char hib_comp_algo[CRYPTO_MAX_ALG_NAME];
+</code></pre></div></div>
+
+<p><code>hibernate_compressor</code> defaults to <code>lzo</code> if that algorithm is enabled, otherwise to <code>lz4</code> if
+enabled<sup id="fnref:choicedefault" role="doc-noteref"><a href="#fn:choicedefault" rel="footnote">5</a></sup>. It can be overwritten using the <code>hibernate.compressor</code> setting to
+either <code>lzo</code> or <code>lz4</code>.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/Kconfig#L95">kernel/power/Kconfig:95</a></p>
+<div><div><pre><code>choice
+	prompt &#34;Default compressor&#34;
+	default HIBERNATION_COMP_LZO
+	depends on HIBERNATION
+
+config HIBERNATION_COMP_LZO
+	bool &#34;lzo&#34;
+	depends on CRYPTO_LZO
+
+config HIBERNATION_COMP_LZ4
+	bool &#34;lz4&#34;
+	depends on CRYPTO_LZ4
+
+endchoice
+
+config HIBERNATION_DEF_COMP
+	string
+	default &#34;lzo&#34; if HIBERNATION_COMP_LZO
+	default &#34;lz4&#34; if HIBERNATION_COMP_LZ4
+	help
+	  Default compressor to be used for hibernation.
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/hibernate.c#L1425">kernel/power/hibernate.c:1425</a></p>
+<div><div><pre><code>static const char * const comp_alg_enabled[] = {
+#if IS_ENABLED(CONFIG_CRYPTO_LZO)
+	COMPRESSION_ALGO_LZO,
+#endif
+#if IS_ENABLED(CONFIG_CRYPTO_LZ4)
+	COMPRESSION_ALGO_LZ4,
+#endif
+};
+
+static int hibernate_compressor_param_set(const char *compressor,
+		const struct kernel_param *kp)
+{
+	unsigned int sleep_flags;
+	int index, ret;
+
+	sleep_flags = lock_system_sleep();
+
+	index = sysfs_match_string(comp_alg_enabled, compressor);
+	if (index &gt;= 0) {
+		ret = param_set_copystring(comp_alg_enabled[index], kp);
+		if (!ret)
+			strscpy(hib_comp_algo, comp_alg_enabled[index],
+				sizeof(hib_comp_algo));
+	} else {
+		ret = index;
+	}
+
+	unlock_system_sleep(sleep_flags);
+
+	if (ret)
+		pr_debug(&#34;Cannot set specified compressor %s\n&#34;,
+			 compressor);
+
+	return ret;
+}
+static const struct kernel_param_ops hibernate_compressor_param_ops = {
+	.set    = hibernate_compressor_param_set,
+	.get    = param_get_string,
+};
+
+static struct kparam_string hibernate_compressor_param_string = {
+	.maxlen = sizeof(hibernate_compressor),
+	.string = hibernate_compressor,
+};
+</code></pre></div></div>
+
+<p>We then check whether the requested algorithm is supported via <code>crypto_has_comp</code>.
+If not, we bail out of the whole operation with <code>EOPNOTSUPP</code>.</p>
+
+<p>As part of <code>crypto_has_comp</code> we perform any needed initialization of the
+algorithm, loading kernel modules and running initialization code as needed<sup id="fnref:larval" role="doc-noteref"><a href="#fn:larval" rel="footnote">6</a></sup>.</p>
+
+<h3 id="grab-locks">Grab Locks</h3>
+
+<p>The next step is to grab the sleep and hibernation locks via
+<code>lock_system_sleep</code> and <code>hibernate_acquire</code>.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/hibernate.c#L758">kernel/power/hibernate.c:758</a></p>
+<div><div><pre><code>sleep_flags = lock_system_sleep();
+/* The snapshot device should not be opened while we&#39;re running */
+if (!hibernate_acquire()) {
+	error = -EBUSY;
+	goto Unlock;
+}
+</code></pre></div></div>
+
+<p>First, <code>lock_system_sleep</code> marks the current thread as not freezable, which
+will be important later<sup id="fnref:procfreeze" role="doc-noteref"><a href="#fn:procfreeze" rel="footnote">7</a></sup>. It then grabs the <code>system_transistion_mutex</code>,
+which locks taking snapshots or modifying how they are taken,
+resuming from a hibernation image, entering any suspend state, or rebooting.</p>
+
+<h4 id="the-gfp-mask">The GFP Mask</h4>
+<p>The kernel also issues a warning if the <code>gfp</code> mask is changed via either
+<code>pm_restore_gfp_mask</code> or <code>pm_restrict_gfp_mask</code>
+without holding the <code>system_transistion_mutex</code>.</p>
+
+<p>GFP flags tell the kernel how it is permitted to handle a request for memory.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/include/linux/gfp_types.h#L12">include/linux/gfp_types.h:12</a></p>
+<div><div><pre><code> * GFP flags are commonly used throughout Linux to indicate how memory
+ * should be allocated.  The GFP acronym stands for get_free_pages(),
+ * the underlying memory allocation function.  Not every GFP flag is
+ * supported by every function which may allocate memory.
+</code></pre></div></div>
+
+<p>In the case of hibernation specifically we care about the <code>IO</code> and <code>FS</code> flags,
+which are reclaim operators, ways the system is permitted to attempt to free
+up memory in order to satisfy a specific request for memory.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/include/linux/gfp_types.h#L176">include/linux/gfp_types.h:176</a></p>
+<div><div><pre><code> * Reclaim modifiers
+ * -----------------
+ * Please note that all the following flags are only applicable to sleepable
+ * allocations (e.g. %GFP_NOWAIT and %GFP_ATOMIC will ignore them).
+ *
+ * %__GFP_IO can start physical IO.
+ *
+ * %__GFP_FS can call down to the low-level FS. Clearing the flag avoids the
+ * allocator recursing into the filesystem which might already be holding
+ * locks.
+</code></pre></div></div>
+
+<p><code>gfp_allowed_mask</code> sets which flags are permitted to be set at the current time.</p>
+
+<p>As the comment below outlines, preventing these flags from being set
+avoids situations where the kernel needs to do I/O to allocate memory
+(e.g. read/writing swap<sup id="fnref:swap" role="doc-noteref"><a href="#fn:swap" rel="footnote">8</a></sup>) but the
+devices it needs to read/write to/from are not currently available.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/main.c#L24">kernel/power/main.c:24</a></p>
+<div><div><pre><code>/*
+ * The following functions are used by the suspend/hibernate code to temporarily
+ * change gfp_allowed_mask in order to avoid using I/O during memory allocations
+ * while devices are suspended.  To avoid races with the suspend/hibernate code,
+ * they should always be called with system_transition_mutex held
+ * (gfp_allowed_mask also should only be modified with system_transition_mutex
+ * held, unless the suspend/hibernate code is guaranteed not to run in parallel
+ * with that modification).
+ */
+static gfp_t saved_gfp_mask;
+
+void pm_restore_gfp_mask(void)
+{
+	WARN_ON(!mutex_is_locked(&amp;system_transition_mutex));
+	if (saved_gfp_mask) {
+		gfp_allowed_mask = saved_gfp_mask;
+		saved_gfp_mask = 0;
+	}
+}
+
+void pm_restrict_gfp_mask(void)
+{
+	WARN_ON(!mutex_is_locked(&amp;system_transition_mutex));
+	WARN_ON(saved_gfp_mask);
+	saved_gfp_mask = gfp_allowed_mask;
+	gfp_allowed_mask &amp;= ~(__GFP_IO | __GFP_FS);
+}
+</code></pre></div></div>
+
+<h4 id="sleep-flags">Sleep Flags</h4>
+<p>After grabbing the <code>system_transition_mutex</code> the kernel then returns and
+captures the previous state of the threads flags in <code>sleep_flags</code>.
+This is used later to remove <code>PF_NOFREEZE</code> if it wasn’t previously set on the
+current thread.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/main.c#L52">kernel/power/main.c:52</a></p>
+<div><div><pre><code>unsigned int lock_system_sleep(void)
+{
+	unsigned int flags = current-&gt;flags;
+	current-&gt;flags |= PF_NOFREEZE;
+	mutex_lock(&amp;system_transition_mutex);
+	return flags;
+}
+EXPORT_SYMBOL_GPL(lock_system_sleep);
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/include/linux/sched.h#L1633">include/linux/sched.h:1633</a></p>
+<div><div><pre><code>#define PF_NOFREEZE		0x00008000	/* This thread should not be frozen */
+</code></pre></div></div>
+
+<p>Then we grab the hibernate-specific semaphore to ensure no one can open a
+snapshot or resume from it while we perform hibernation.
+Additionally this lock is used to prevent <code>hibernate_quiet_exec</code>,
+which is used by the <code>nvdimm</code> driver to active its firmware with all
+processes and devices frozen, ensuring it is the only thing running at that
+time<sup id="fnref:nvdimm" role="doc-noteref"><a href="#fn:nvdimm" rel="footnote">9</a></sup>.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/hibernate.c#L82">kernel/power/hibernate.c:82</a></p>
+<div><div><pre><code>bool hibernate_acquire(void)
+{
+	return atomic_add_unless(&amp;hibernate_atomic, -1, 0);
+}
+</code></pre></div></div>
+
+<h3 id="prepare-console">Prepare Console</h3>
+<p>The kernel next calls <code>pm_prepare_console</code>.
+This function only does anything if <code>CONFIG_VT_CONSOLE_SLEEP</code> has been set.</p>
+
+<p>This prepares the virtual terminal for a suspend state, switching away to
+a console used only for the suspend state if needed.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/console.c#L130">kernel/power/console.c:130</a></p>
+<div><div><pre><code>void pm_prepare_console(void)
+{
+	if (!pm_vt_switch())
+		return;
+
+	orig_fgconsole = vt_move_to_console(SUSPEND_CONSOLE, 1);
+	if (orig_fgconsole &lt; 0)
+		return;
+
+	orig_kmsg = vt_kmsg_redirect(SUSPEND_CONSOLE);
+	return;
+}
+</code></pre></div></div>
+
+<p>The first thing is to check whether we actually need to switch the VT</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/console.c#L94">kernel/power/console.c:94</a></p>
+<div><div><pre><code>/*
+ * There are three cases when a VT switch on suspend/resume are required:
+ *   1) no driver has indicated a requirement one way or another, so preserve
+ *      the old behavior
+ *   2) console suspend is disabled, we want to see debug messages across
+ *      suspend/resume
+ *   3) any registered driver indicates it needs a VT switch
+ *
+ * If none of these conditions is present, meaning we have at least one driver
+ * that doesn&#39;t need the switch, and none that do, we can avoid it to make
+ * resume look a little prettier (and suspend too, but that&#39;s usually hidden,
+ * e.g. when closing the lid on a laptop).
+ */
+static bool pm_vt_switch(void)
+{
+	struct pm_vt_switch *entry;
+	bool ret = true;
+
+	mutex_lock(&amp;vt_switch_mutex);
+	if (list_empty(&amp;pm_vt_switch_list))
+		goto out;
+
+	if (!console_suspend_enabled)
+		goto out;
+
+	list_for_each_entry(entry, &amp;pm_vt_switch_list, head) {
+		if (entry-&gt;required)
+			goto out;
+	}
+
+	ret = false;
+out:
+	mutex_unlock(&amp;vt_switch_mutex);
+	return ret;
+}
+</code></pre></div></div>
+
+<p>There is an explanation of the conditions under which a switch is performed
+in the comment above the function, but we’ll also walk through the steps here.</p>
+
+<p>Firstly we grab the <code>vt_switch_mutex</code> to ensure nothing will modify the list
+while we’re looking at it.</p>
+
+<p>We then examine the <code>pm_vt_switch_list</code>.
+This list is used to indicate the drivers that require a switch during suspend.
+They register this requirement, or the lack thereof, via
+<code>pm_vt_switch_required</code>.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/console.c#L31">kernel/power/console.c:31</a></p>
+<div><div><pre><code>/**
+ * pm_vt_switch_required - indicate VT switch at suspend requirements
+ * @dev: device
+ * @required: if true, caller needs VT switch at suspend/resume time
+ *
+ * The different console drivers may or may not require VT switches across
+ * suspend/resume, depending on how they handle restoring video state and
+ * what may be running.
+ *
+ * Drivers can indicate support for switchless suspend/resume, which can
+ * save time and flicker, by using this routine and passing &#39;false&#39; as
+ * the argument.  If any loaded driver needs VT switching, or the
+ * no_console_suspend argument has been passed on the command line, VT
+ * switches will occur.
+ */
+void pm_vt_switch_required(struct device *dev, bool required)
+</code></pre></div></div>
+
+<p>Next, we check <code>console_suspend_enabled</code>. This is set to false
+by the kernel parameter <code>no_console_suspend</code>, but defaults to true.</p>
+
+<p>Finally, if there are any entries in the <code>pm_vt_switch_list</code>, then we
+check to see if any of them require a VT switch.</p>
+
+<p>Only if none of these conditions apply, then we return false.</p>
+
+<p>If a VT switch is in fact required, then we move first the currently active
+virtual terminal/console<sup id="fnref:console" role="doc-noteref"><a href="#fn:console" rel="footnote">10</a></sup> (<code>vt_move_to_console</code>)
+and then the current location of kernel messages (<code>vt_kmsg_redirect</code>)
+to the <code>SUSPEND_CONSOLE</code>.
+The <code>SUSPEND_CONSOLE</code> is the last entry in the list of possible
+consoles, and appears to just be a black hole to throw away messages.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/console.c#L16">kernel/power/console.c:16</a></p>
+<div><div><pre><code>#define SUSPEND_CONSOLE	(MAX_NR_CONSOLES-1)
+</code></pre></div></div>
+
+<p>Interestingly, these are separate functions because you can use
+<code>TIOCL_SETKMSGREDIRECT</code> (an <code>ioctl</code><sup id="fnref:ioctl" role="doc-noteref"><a href="#fn:ioctl" rel="footnote">11</a></sup>) to send kernel messages to a specific virtual terminal,
+but by default its the same as the currently active console.</p>
+
+<p>The locations of the previously active console and the previous kernel
+messages location are stored in <code>orig_fgconsole</code> and <code>orig_kmsg</code>, to
+restore the state of the console and kernel messages after the machine wakes
+up again.
+Interestingly, this means <code>orig_fgconsole</code> also ends up storing any errors,
+so has to be checked to ensure it’s not less than zero before we try to do
+anything with the kernel messages on both suspend and resume.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/drivers/tty/vt/vt_ioctl.c#L1268">drivers/tty/vt/vt_ioctl.c:1268</a></p>
+<div><div><pre><code>/* Perform a kernel triggered VT switch for suspend/resume */
+
+static int disable_vt_switch;
+
+int vt_move_to_console(unsigned int vt, int alloc)
+{
+	int prev;
+
+	console_lock();
+	/* Graphics mode - up to X */
+	if (disable_vt_switch) {
+		console_unlock();
+		return 0;
+	}
+	prev = fg_console;
+
+	if (alloc &amp;&amp; vc_allocate(vt)) {
+		/* we can&#39;t have a free VC for now. Too bad,
+		 * we don&#39;t want to mess the screen for now. */
+		console_unlock();
+		return -ENOSPC;
+	}
+
+	if (set_console(vt)) {
+		/*
+		 * We&#39;re unable to switch to the SUSPEND_CONSOLE.
+		 * Let the calling function know so it can decide
+		 * what to do.
+		 */
+		console_unlock();
+		return -EIO;
+	}
+	console_unlock();
+	if (vt_waitactive(vt + 1)) {
+		pr_debug(&#34;Suspend: Can&#39;t switch VCs.&#34;);
+		return -EINTR;
+	}
+	return prev;
+}
+</code></pre></div></div>
+
+<p>Unlike most other locking functions we’ve seen so far, <code>console_lock</code>
+needs to be careful to ensure nothing else is panicking and needs to
+dump to the console before grabbing the semaphore for the console
+and setting a couple flags.</p>
+
+<h4 id="panics">Panics</h4>
+<p>Panics are tracked via an atomic integer set to the id of the processor
+currently panicking.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/printk/printk.c#L2649">kernel/printk/printk.c:2649</a></p>
+<div><div><pre><code>/**
+ * console_lock - block the console subsystem from printing
+ *
+ * Acquires a lock which guarantees that no consoles will
+ * be in or enter their write() callback.
+ *
+ * Can sleep, returns nothing.
+ */
+void console_lock(void)
+{
+	might_sleep();
+
+	/* On panic, the console_lock must be left to the panic cpu. */
+	while (other_cpu_in_panic())
+		msleep(1000);
+
+	down_console_sem();
+	console_locked = 1;
+	console_may_schedule = 1;
+}
+EXPORT_SYMBOL(console_lock);
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/printk/printk.c#L362">kernel/printk/printk.c:362</a></p>
+<div><div><pre><code>/*
+ * Return true if a panic is in progress on a remote CPU.
+ *
+ * On true, the local CPU should immediately release any printing resources
+ * that may be needed by the panic CPU.
+ */
+bool other_cpu_in_panic(void)
+{
+	return (panic_in_progress() &amp;&amp; !this_cpu_in_panic());
+}
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/printk/printk.c#L345">kernel/printk/printk.c:345</a></p>
+<div><div><pre><code>static bool panic_in_progress(void)
+{
+	return unlikely(atomic_read(&amp;panic_cpu) != PANIC_CPU_INVALID);
+}
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/printk/printk.c#L350">kernel/printk/printk.c:350</a></p>
+<div><div><pre><code>/* Return true if a panic is in progress on the current CPU. */
+bool this_cpu_in_panic(void)
+{
+	/*
+	 * We can use raw_smp_processor_id() here because it is impossible for
+	 * the task to be migrated to the panic_cpu, or away from it. If
+	 * panic_cpu has already been set, and we&#39;re not currently executing on
+	 * that CPU, then we never will be.
+	 */
+	return unlikely(atomic_read(&amp;panic_cpu) == raw_smp_processor_id());
+}
+</code></pre></div></div>
+
+<p><code>console_locked</code> is a debug value, used to indicate that the lock should be
+held, and our first indication that this whole virtual terminal system is
+more complex than might initially be expected.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/printk/printk.c#L373">kernel/printk/printk.c:373</a></p>
+<div><div><pre><code>/*
+ * This is used for debugging the mess that is the VT code by
+ * keeping track if we have the console semaphore held. It&#39;s
+ * definitely not the perfect debug tool (we don&#39;t know if _WE_
+ * hold it and are racing, but it helps tracking those weird code
+ * paths in the console code where we end up in places I want
+ * locked without the console semaphore held).
+ */
+static int console_locked;
+</code></pre></div></div>
+
+<p><code>console_may_schedule</code> is used to see if we are permitted to sleep
+and schedule other work while we hold this lock.
+As we’ll see later, the virtual terminal subsystem is not re-entrant,
+so there’s all sorts of hacks in here to ensure we don’t leave important
+code sections that can’t be safely resumed.</p>
+
+<h4 id="disable-vt-switch">Disable VT Switch</h4>
+<p>As the comment below lays out, when another program is handling graphical
+display anyway, there’s no need to do any of this, so the kernel provides
+a switch to turn the whole thing off.
+Interestingly, this appears to only be used by three drivers,
+so the specific hardware support required must not be particularly common.</p>
+<div><div><pre><code>drivers/gpu/drm/omapdrm/dss
+drivers/video/fbdev/geode
+drivers/video/fbdev/omap2
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/drivers/tty/vt/vt_ioctl.c#L1308">drivers/tty/vt/vt_ioctl.c:1308</a></p>
+<div><div><pre><code>/*
+ * Normally during a suspend, we allocate a new console and switch to it.
+ * When we resume, we switch back to the original console.  This switch
+ * can be slow, so on systems where the framebuffer can handle restoration
+ * of video registers anyways, there&#39;s little point in doing the console
+ * switch.  This function allows you to disable it by passing it &#39;0&#39;.
+ */
+void pm_set_vt_switch(int do_switch)
+{
+	console_lock();
+	disable_vt_switch = !do_switch;
+	console_unlock();
+}
+EXPORT_SYMBOL(pm_set_vt_switch);
+</code></pre></div></div>
+
+<p>The rest of the <code>vt_switch_console</code> function is pretty normal,
+however, simply allocating space if needed to create the requested
+virtual terminal
+and then setting the current virtual terminal via <code>set_console</code>.</p>
+
+<h4 id="virtual-terminal-set-console">Virtual Terminal Set Console</h4>
+<p>With <code>set_console</code>, we begin (as if we haven’t been already) to enter the
+madness that is the virtual terminal subsystem.
+As mentioned previously, modifications to its state must be made very
+carefully, as other stuff happening at the same time could create complete
+messes.</p>
+
+<p>All this to say, calling <code>set_console</code> does not actually perform any
+work to change the state of the current console.
+Instead it indicates what changes it wants and then schedules that work.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/drivers/tty/vt/vt.c#L3153">drivers/tty/vt/vt.c:3153</a></p>
+<div><div><pre><code>int set_console(int nr)
+{
+	struct vc_data *vc = vc_cons[fg_console].d;
+
+	if (!vc_cons_allocated(nr) || vt_dont_switch ||
+		(vc-&gt;vt_mode.mode == VT_AUTO &amp;&amp; vc-&gt;vc_mode == KD_GRAPHICS)) {
+
+		/*
+		 * Console switch will fail in console_callback() or
+		 * change_console() so there is no point scheduling
+		 * the callback
+		 *
+		 * Existing set_console() users don&#39;t check the return
+		 * value so this shouldn&#39;t break anything
+		 */
+		return -EINVAL;
+	}
+
+	want_console = nr;
+	schedule_console_callback();
+
+	return 0;
+}
+</code></pre></div></div>
+
+<p>The check for <code>vc-&gt;vc_mode == KD_GRAPHICS</code> is where most end-user graphical
+desktops will bail out of this change, as they’re in graphics mode and don’t
+need to switch away to the suspend console.</p>
+
+<p><code>vt_dont_switch</code> is a flag used by the <code>ioctl</code>s<sup id="fnref:ioctl:1" role="doc-noteref"><a href="#fn:ioctl" rel="footnote">11</a></sup> <code>VT_LOCKSWITCH</code> and
+<code>VT_UNLOCKSWITCH</code> to prevent the system from switching virtual terminal
+devices when the user has explicitly locked it.</p>
+
+<p><code>VT_AUTO</code> is a flag indicating that automatic virtual terminal switching is enabled<sup id="fnref:vtauto" role="doc-noteref"><a href="#fn:vtauto" rel="footnote">12</a></sup>,
+and thus deliberate switching to a suspend terminal is not required.</p>
+
+<p>However, if you do run your machine from a virtual terminal, then we
+indicate to the system that we want to change to the requested virtual terminal
+via the <code>want_console</code> variable
+and schedule a callback via <code>schedule_console_callback</code>.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/drivers/tty/vt/vt.c#L315">drivers/tty/vt/vt.c:315</a></p>
+<div><div><pre><code>void schedule_console_callback(void)
+{
+	schedule_work(&amp;console_work);
+}
+</code></pre></div></div>
+
+<p><code>console_work</code> is a workqueue<sup id="fnref:workqueue:1" role="doc-noteref"><a href="#fn:workqueue" rel="footnote">2</a></sup> that will execute the given task asynchronously.</p>
+
+<h4 id="console-callback">Console Callback</h4>
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/drivers/tty/vt/vt.c#L3109">drivers/tty/vt/vt.c:3109</a></p>
+<div><div><pre><code>/*
+ * This is the console switching callback.
+ *
+ * Doing console switching in a process context allows
+ * us to do the switches asynchronously (needed when we want
+ * to switch due to a keyboard interrupt).  Synchronization
+ * with other console code and prevention of re-entrancy is
+ * ensured with console_lock.
+ */
+static void console_callback(struct work_struct *ignored)
+{
+	console_lock();
+
+	if (want_console &gt;= 0) {
+		if (want_console != fg_console &amp;&amp;
+		    vc_cons_allocated(want_console)) {
+			hide_cursor(vc_cons[fg_console].d);
+			change_console(vc_cons[want_console].d);
+			/* we only changed when the console had already
+			   been allocated - a new console is not created
+			   in an interrupt routine */
+		}
+		want_console = -1;
+	}
+...
+</code></pre></div></div>
+
+<p><code>console_callback</code> first looks to see if there is a console change wanted
+via <code>want_console</code> and then changes to it if it’s not the current console and
+has been allocated already.
+We do first remove any cursor state with <code>hide_cursor</code>.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/drivers/tty/vt/vt.c#L841">drivers/tty/vt/vt.c:841</a></p>
+<div><div><pre><code>static void hide_cursor(struct vc_data *vc)
+{
+	if (vc_is_sel(vc))
+		clear_selection();
+
+	vc-&gt;vc_sw-&gt;con_cursor(vc, false);
+	hide_softcursor(vc);
+}
+</code></pre></div></div>
+
+<p>A full dive into the <code>tty</code> driver is a task for another time, but this
+should give a general sense of how this system interacts with hibernation.</p>
+
+<h3 id="notify-power-management-call-chain">Notify Power Management Call Chain</h3>
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/hibernate.c#L767">kernel/power/hibernate.c:767</a></p>
+<div><div><pre><code>pm_notifier_call_chain_robust(PM_HIBERNATION_PREPARE, PM_POST_HIBERNATION)
+</code></pre></div></div>
+
+<p>This will call a chain of power management callbacks, passing first
+<code>PM_HIBERNATION_PREPARE</code> and then <code>PM_POST_HIBERNATION</code> on startup or
+on error with another callback.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/main.c#L98">kernel/power/main.c:98</a></p>
+<div><div><pre><code>int pm_notifier_call_chain_robust(unsigned long val_up, unsigned long val_down)
+{
+	int ret;
+
+	ret = blocking_notifier_call_chain_robust(&amp;pm_chain_head, val_up, val_down, NULL);
+
+	return notifier_to_errno(ret);
+}
+</code></pre></div></div>
+<p>The power management notifier is a blocking notifier chain, which means it
+has the following properties.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/include/linux/notifier.h#L23">include/linux/notifier.h:23</a></p>
+<div><div><pre><code> *	Blocking notifier chains: Chain callbacks run in process context.
+ *		Callouts are allowed to block.
+</code></pre></div></div>
+<p>The callback chain is a linked list with each entry containing a priority
+and a function to call. The function technically takes in a data value,
+but it is always <code>NULL</code> for the power management chain.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/include/linux/notifier.h#L49">include/linux/notifier.h:49</a></p>
+<div><div><pre><code>struct notifier_block;
+
+typedef	int (*notifier_fn_t)(struct notifier_block *nb,
+			unsigned long action, void *data);
+
+struct notifier_block {
+	notifier_fn_t notifier_call;
+	struct notifier_block __rcu *next;
+	int priority;
+};
+</code></pre></div></div>
+
+<p>The head of the linked list is protected by a read-write semaphore.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/include/linux/notifier.h#L65">include/linux/notifier.h:65</a></p>
+<div><div><pre><code>struct blocking_notifier_head {
+	struct rw_semaphore rwsem;
+	struct notifier_block __rcu *head;
+};
+</code></pre></div></div>
+
+<p>Because it is prioritized, appending to the list requires walking it until
+an item with lower<sup id="fnref:priority" role="doc-noteref"><a href="#fn:priority" rel="footnote">13</a></sup> priority is found to insert the current item before.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/notifier.c#L252">kernel/notifier.c:252</a></p>
+<div><div><pre><code>/*
+ *	Blocking notifier chain routines.  All access to the chain is
+ *	synchronized by an rwsem.
+ */
+
+static int __blocking_notifier_chain_register(struct blocking_notifier_head *nh,
+					      struct notifier_block *n,
+					      bool unique_priority)
+{
+	int ret;
+
+	/*
+	 * This code gets used during boot-up, when task switching is
+	 * not yet working and interrupts must remain disabled.  At
+	 * such times we must not call down_write().
+	 */
+	if (unlikely(system_state == SYSTEM_BOOTING))
+		return notifier_chain_register(&amp;nh-&gt;head, n, unique_priority);
+
+	down_write(&amp;nh-&gt;rwsem);
+	ret = notifier_chain_register(&amp;nh-&gt;head, n, unique_priority);
+	up_write(&amp;nh-&gt;rwsem);
+	return ret;
+}
+</code></pre></div></div>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/notifier.c#L20">kernel/notifier.c:20</a></p>
+<div><div><pre><code>/*
+ *	Notifier chain core routines.  The exported routines below
+ *	are layered on top of these, with appropriate locking added.
+ */
+
+static int notifier_chain_register(struct notifier_block **nl,
+				   struct notifier_block *n,
+				   bool unique_priority)
+{
+	while ((*nl) != NULL) {
+		if (unlikely((*nl) == n)) {
+			WARN(1, &#34;notifier callback %ps already registered&#34;,
+			     n-&gt;notifier_call);
+			return -EEXIST;
+		}
+		if (n-&gt;priority &gt; (*nl)-&gt;priority)
+			break;
+		if (n-&gt;priority == (*nl)-&gt;priority &amp;&amp; unique_priority)
+			return -EBUSY;
+		nl = &amp;((*nl)-&gt;next);
+	}
+	n-&gt;next = *nl;
+	rcu_assign_pointer(*nl, n);
+	trace_notifier_register((void *)n-&gt;notifier_call);
+	return 0;
+}
+</code></pre></div></div>
+
+<p>Each callback can return one of a series of options.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/include/linux/notifier.h#L18">include/linux/notifier.h:18</a></p>
+<div><div><pre><code>#define NOTIFY_DONE		0x0000		/* Don&#39;t care */
+#define NOTIFY_OK		0x0001		/* Suits me */
+#define NOTIFY_STOP_MASK	0x8000		/* Don&#39;t call further */
+#define NOTIFY_BAD		(NOTIFY_STOP_MASK|0x0002)
+						/* Bad/Veto action */
+</code></pre></div></div>
+
+<p>When notifying the chain, if a function returns <code>STOP</code> or <code>BAD</code> then
+the previous parts of the chain are called again with <code>PM_POST_HIBERNATION</code><sup id="fnref:pmpost" role="doc-noteref"><a href="#fn:pmpost" rel="footnote">14</a></sup>
+and an error is returned.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/notifier.c#L107">kernel/notifier.c:107</a></p>
+<div><div><pre><code>/**
+ * notifier_call_chain_robust - Inform the registered notifiers about an event
+ *                              and rollback on error.
+ * @nl:		Pointer to head of the blocking notifier chain
+ * @val_up:	Value passed unmodified to the notifier function
+ * @val_down:	Value passed unmodified to the notifier function when recovering
+ *              from an error on @val_up
+ * @v:		Pointer passed unmodified to the notifier function
+ *
+ * NOTE:	It is important the @nl chain doesn&#39;t change between the two
+ *		invocations of notifier_call_chain() such that we visit the
+ *		exact same notifier callbacks; this rules out any RCU usage.
+ *
+ * Return:	the return value of the @val_up call.
+ */
+static int notifier_call_chain_robust(struct notifier_block **nl,
+				     unsigned long val_up, unsigned long val_down,
+				     void *v)
+{
+	int ret, nr = 0;
+
+	ret = notifier_call_chain(nl, val_up, v, -1, &amp;nr);
+	if (ret &amp; NOTIFY_STOP_MASK)
+		notifier_call_chain(nl, val_down, v, nr-1, NULL);
+
+	return ret;
+}
+</code></pre></div></div>
+
+<p>Each of these callbacks tends to be quite driver-specific, so we’ll cease
+discussion of this here.</p>
+
+<h3 id="sync-filesystems">Sync Filesystems</h3>
+<p>The next step is to ensure all filesystems have been synchronized to disk.</p>
+
+<p>This is performed via a simple helper function that times how long the full
+synchronize operation, <code>ksys_sync</code> takes.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/kernel/power/main.c#L69">kernel/power/main.c:69</a></p>
+<div><div><pre><code>void ksys_sync_helper(void)
+{
+	ktime_t start;
+	long elapsed_msecs;
+
+	start = ktime_get();
+	ksys_sync();
+	elapsed_msecs = ktime_to_ms(ktime_sub(ktime_get(), start));
+	pr_info(&#34;Filesystems sync: %ld.%03ld seconds\n&#34;,
+		elapsed_msecs / MSEC_PER_SEC, elapsed_msecs % MSEC_PER_SEC);
+}
+EXPORT_SYMBOL_GPL(ksys_sync_helper);
+</code></pre></div></div>
+
+<p><code>ksys_sync</code> wakes and instructs a set of flusher threads to write out
+every filesystem, first their inodes<sup id="fnref:inode" role="doc-noteref"><a href="#fn:inode" rel="footnote">15</a></sup>, then the full filesystem, and
+then finally all block devices, to ensure all pages are written out
+to disk.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/fs/sync.c#L87">fs/sync.c:87</a></p>
+<div><div><pre><code>/*
+ * Sync everything. We start by waking flusher threads so that most of
+ * writeback runs on all devices in parallel. Then we sync all inodes reliably
+ * which effectively also waits for all flusher threads to finish doing
+ * writeback. At this point all data is on disk so metadata should be stable
+ * and we tell filesystems to sync their metadata via -&gt;sync_fs() calls.
+ * Finally, we writeout all block devices because some filesystems (e.g. ext2)
+ * just write metadata (such as inodes or bitmaps) to block device page cache
+ * and do not sync it on their own in -&gt;sync_fs().
+ */
+void ksys_sync(void)
+{
+	int nowait = 0, wait = 1;
+
+	wakeup_flusher_threads(WB_REASON_SYNC);
+	iterate_supers(sync_inodes_one_sb, NULL);
+	iterate_supers(sync_fs_one_sb, &amp;nowait);
+	iterate_supers(sync_fs_one_sb, &amp;wait);
+	sync_bdevs(false);
+	sync_bdevs(true);
+	if (unlikely(laptop_mode))
+		laptop_sync_completion();
+}
+</code></pre></div></div>
+
+<p>It follows an interesting pattern of using <code>iterate_supers</code> to run both
+<code>sync_inodes_one_sb</code> and then <code>sync_fs_one_sb</code> on each known filesystem<sup id="fnref:superblock" role="doc-noteref"><a href="#fn:superblock" rel="footnote">16</a></sup>.
+It also calls both <code>sync_fs_one_sb</code> and <code>sync_bdevs</code> twice, first without waiting
+for any operations to complete and then again waiting for completion<sup id="fnref:fscode" role="doc-noteref"><a href="#fn:fscode" rel="footnote">17</a></sup>.</p>
+
+<p>When <code>laptop_mode</code> is enabled the system runs additional filesystem synchronization
+operations after the specified delay without any writes.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/mm/page-writeback.c#L111">mm/page-writeback.c:111</a></p>
+<div><div><pre><code>/*
+ * Flag that puts the machine in &#34;laptop mode&#34;. Doubles as a timeout in jiffies:
+ * a full sync is triggered after this time elapses without any disk activity.
+ */
+int laptop_mode;
+
+EXPORT_SYMBOL(laptop_mode);
+</code></pre></div></div>
+
+<p>However, when running a filesystem synchronization operation, the system will
+add an additional timer to schedule more writes after the <code>laptop_mode</code> delay.
+We don’t want the state of the system to change at all while performing
+hibernation, so we cancel those timers.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/mm/page-writeback.c#L2198">mm/page-writeback.c:2198</a></p>
+<div><div><pre><code>/*
+ * We&#39;re in laptop mode and we&#39;ve just synced. The sync&#39;s writes will have
+ * caused another writeback to be scheduled by laptop_io_completion.
+ * Nothing needs to be written back anymore, so we unschedule the writeback.
+ */
+void laptop_sync_completion(void)
+{
+	struct backing_dev_info *bdi;
+
+	rcu_read_lock();
+
+	list_for_each_entry_rcu(bdi, &amp;bdi_list, bdi_list)
+		del_timer(&amp;bdi-&gt;laptop_mode_wb_timer);
+
+	rcu_read_unlock();
+}
+</code></pre></div></div>
+
+<p>As a side note, the <code>ksys_sync</code> function is simply called when the
+system call <code>sync</code> is used.</p>
+
+<p><a href="https://elixir.bootlin.com/linux/v6.9.9/source/fs/sync.c#L111">fs/sync.c:111</a></p>
+<div><div><pre><code>SYSCALL_DEFINE0(sync)
+{
+	ksys_sync();
+	return 0;
+}
+</code></pre></div></div>
+
+<h2 id="the-end-of-preparation">The End of Preparation</h2>
+<p>With that the system has finished preparations for hibernation.
+This is a somewhat arbitrary cutoff, but next the system will begin
+a full freeze of userspace to then dump memory out to an image and finally
+to perform hibernation. All this will be covered in future articles!</p>
+
+
+  </div></div>
+  </body>
+</html>
