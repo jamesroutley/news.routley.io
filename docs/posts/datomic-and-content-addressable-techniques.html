@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.latacora.com/blog/2024/09/13/datomic-and-content-addressable-techniques/">Original</a>
+    <h1>Datomic and Content Addressable Techniques</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>Latacora collects and analyzes data about services our clients use. You may
+have read about <a href="https://www.latacora.com/blog/2023/11/01/our-approach-to-building-security-tooling/" target="_self" rel="">our approach to building security
+tooling</a>, but the
+tl;dr is we make requests to all the (configuration metadata) read-only APIs
+available to us and store the results in S3. We leverage the data to understand
+our clients’ infrastructure and identify security issues and misconfigurations.
+We retain the files (“snapshots”) to support future IR/forensics efforts.</p>
+<p>This approach has served us well, but the limited scope of a snapshot meant
+there was always a problem of first needing to figure out which files to look
+at. We love <code>aws s3 sync</code> and <code>grep</code> as much as anyone but security analysis
+requires looking for complex relationships between resources; text search is,
+at best, only a Bloom filter. What we really wanted was a performant way to ask
+any question across all the data we have for a client that would support
+complex queries using logic programming.</p>
+<p>Improving connectivity of our data only helps us make the signal-to-noise ratio
+better by contextualizing vulnerabilities in one area with information from
+another. Is MFA disabled in Okta for the person who can assume roles with
+AdministratorAccess in AWS? Is code in that GitHub repo with a compromised
+supply chain running in production?</p>
+<p>Latacora has deep roots in the Clojure community. We’re a frequent conference
+sponsor and provide financial support for sustainable open source work in the
+form of <a href="https://www.clojuriststogether.org/members/" target="_blank" rel="noopener noreferrer">Clojurists Together</a>. All
+this to say, we’ve been following Datomic and databases like it for years. In
+fact, several of us were in attendance at Clojure/Conj when
+<a href="https://blog.datomic.com/2023/04/datomic-is-free.html" target="_blank" rel="noopener noreferrer">Datomic was announced as free</a>
+and we eagerly consumed the
+<a href="https://jepsen.io/analyses/datomic-pro-1.0.7075" target="_blank" rel="noopener noreferrer">recent Jepsen report</a>.</p>
+<p>Datomic is a database which stores information as immutable atomic facts and
+its indices support many access patterns that may be familiar to you from
+relational, graph, key/value, and columnar databases. Datomic implements
+queries using Datalog, a logic programming language with many attractive
+features like implicit joins and recursive evaluation supporting graph
+traversal. For many people, once you learn querying with Datalog it’s slightly
+unpleasant to use anything else. We already believed Datomic would be a nice
+place to end up but getting there meant working through some hard questions.</p>
+<h2 id="down-the-rabbit-hole">Down the Rabbit-Hole</h2>
+<p>Our collection processes run on a scheduled basis and collect everything we can
+about a service from scratch every time. This usually means resulting files are
+both large and contain redundant information overlapping other recent
+collections. Napkin math showed we’d run into exorbitant prices if we tried to
+accumulate data that way anywhere other than S3. To make storage viable we
+needed to give up on the approach or figure out how to only store one copy of
+unique information.</p>
+<p>Another problem is our tooling is so dynamic and dependent on the services we
+analyze at no point could a human reasonably sit down and write out all the
+attributes we might see. We’re not even sure all major cloud providers can do
+that for their own services. Even if we could, doing so is antithetical to our
+data collection philosophy and would mean imposing static constraints on an
+otherwise open world of data we don’t control. Yet, Datomic is rigorous in a
+healthy “eat your vegetables” way, so to maintain our open world assumption
+we’d need to dynamically infer a schema.</p>
+<p>Most of Latacora’s tools are batch-oriented: independent tools participating in
+one or more loosely coupled analysis and reporting pipelines. Even though our
+data is always stored in S3, we needed to define a standard file format that
+would work everywhere and help us achieve a uniform query interface.</p>
+<h2 id="through-the-looking-glass">Through the Looking Glass</h2>
+<p>We saw a need for a library oriented around writing and reading snapshots that
+would let us focus on intent and less on mechanism. We wanted the library to do
+the heavy lifting so existing tools could quickly pick it up and start
+participating in our vision of more connected data.</p>
+<h3 id="desirable-properties--abilities">Desirable properties / abilities:</h3>
+<ul>
+<li>Identify a snapshot</li>
+<li>Write a snapshot to S3</li>
+<li>Read a snapshot from S3</li>
+<li>Infer schema as we write data</li>
+<li>Append metadata to a snapshot</li>
+<li>Append collection data to a snapshot</li>
+<li>Identify and deduplicate redundant data</li>
+<li>Idempotent loading of snapshots into a database</li>
+<li>Organize snapshots in S3 by time to support lifecycle rules</li>
+<li>Work with arbitrarily large datasets in a streaming / chunked fashion</li>
+<li>Transact snapshots into in-memory databases to support testing and
+development</li>
+<li>Transact snapshots into long-running databases for reporting and ad-hoc
+questions</li>
+</ul>
+<p>Having worked with files containing this data for years we already knew file
+size would be a problem if we didn’t support streaming from the start. We also
+suspected we’d need to perform chunked transactions to avoid swamping the
+transactor with giant transactions. With those constraints in mind we
+considered the interaction patterns:</p>
+<h3 id="readers">Readers</h3>
+<ul>
+<li>Want to know schema up front before loading other data</li>
+<li>Want to read data in chunks and optionally release memory along the way</li>
+<li>Want an ability to read metadata at any point</li>
+</ul>
+<h3 id="writers">Writers</h3>
+<ul>
+<li>Want to infer a schema along the way and write it down at the very end</li>
+<li>Want to write data in chunks and optionally release memory along the way</li>
+<li>Want an ability to write metadata at any point</li>
+</ul>
+<p>Acknowledging these roles brought clarity to the design. We’d need separate
+append-only files for schema, metadata, and collection data. Together those
+three files could represent a snapshot in a way that is friendly to both
+streaming readers and writers. We could confidently say schema and metadata
+files would always be relatively small while still allowing collection data
+files to grow very large.</p>
+<p>We opted to generate a <code>UUIDv7</code> for every snapshot as the identity and use the
+embedded timestamp to derive a <code>yyyy/mm/dd/</code> prefix for S3. To load data into
+Datomic we’d transact the schema file followed by the collection data file in
+reasonably sized chunks. The snapshot metadata would be added to every
+transaction to facilitate data provenance and transaction grouping.</p>
+<h2 id="the-cheshire-cat">The Cheshire Cat</h2>
+<p>To deal with duplicate data we borrowed ideas from content addressable storage
+and began computing a hash for every entity to use as an identity. This
+probably sounds strange at first: don’t resources in our customers&#39;
+environments constantly change?</p>
+<p>The key observation is that what we actually record in our snapshots is simply
+data about API requests and responses. As we convert data into datoms, every
+single map in the original data becomes its own entity. Parent maps turn into
+entities with reference attributes pointing to their child map entities. There
+is no direct correspondence between our database entities and what you might
+consider to be the resources (or entities) of the services we collect data
+about.</p>
+<p>Our entity hash is therefore simply a reliable way to assign an identity to a
+map of data we’ve seen before. The hash is computed as an
+<a href="https://javadoc.io/doc/com.google.guava/guava/latest/com/google/common/hash/Hashing.html#combineUnordered%28java.lang.Iterable%29" target="_blank" rel="noopener noreferrer">unordered combination</a>
+of hashes from each key/value pair associated with the entity. To achieve
+unification (deduplication) we mark the attribute containing the hash as a
+<code>:db.unique/identity</code> attribute in the schema and trust Datomic to correctly
+wrangle all the pointers during a transaction.</p>
+<p>Given our collection approach we expected most of the maps to stay the same
+over time. Empirically, we now know only 5% of them “change” on a given day.
+Having achieved a low rate of data accumulation it became both affordable and
+realistic to transact every single snapshot into a long-running Datomic
+database for each customer. This also means every entity added by a snapshot
+contains truly novel information about our customer’s environments.</p>
+<p>Datomic records the transactions as entities themselves so the entire history
+remains queryable. If that sounds powerful, that’s because it is. Leveraging
+data this way has enabled us to start creating things like networking diagram
+diffs or heatmaps showing how customer environments evolve over time in just a
+few hours of coding.</p>
+<p>We can still answer point-in-time questions despite the unorthodox immutable
+entity sharing. This is achieved with a db filter that traverses references for
+datoms being considered during a query to determine if a shared entity (due to
+hashing) is in or out of scope when we want time bounded queries. This is
+possible because we know every snapshot has a root node so there will always be
+a path from the root to an entity if the entity was part of the snapshot’s
+observations.</p>
+<p>Assigning hash identities to every entity creates idempotency. Transacting the
+same snapshot twice quite literally does nothing at all. This means we can
+safely implement retries and automated recovery processes without worrying
+about famously elusive “exactly once” behavior.</p>
+<p>Elegance begets elegance, so it was no surprise when we noticed our design
+mirrors Clojure’s approach to immutable data structures with structural
+sharing. If you squint, a snapshot is just a tree described as an append-only
+log whose nodes might unify onto some existing nodes in the Datomic graph. Each
+snapshot minimally introduces a new root node to acknowledge observations as of
+a point in time, but everything else could very well be pointers to things we
+already knew.</p>
+<p><img alt="Content Addressable Sharing" src="https://www.latacora.com/blog/2024/09/13/datomic-and-content-addressable-techniques/sharing.svg"/></p>
+<h2 id="advice-from-a-caterpillar">Advice From a Caterpillar</h2>
+<p>It’s instructive to see how the data we write is transformed into triples
+before being appended to a snapshot. The snapshot APIs are exposed as
+“reducibles” (reifications of <code>clojure.lang.IReduceInit</code>) because they play
+nicely with transducers and offer clean incremental APIs even when IO resources
+are involved. Here we’re doing everything in memory for demo purposes, but the
+same APIs are available backed by files or network sockets.</p>
+<p>You’ll see we compute and inject <code>:content/hash</code> attributes for every entity
+when we convert the structured data to datoms. We then reuse the hash for the
+temporary IDs because it simplifies bookkeeping later when partitioning the
+datoms across multiple transactions.</p>
+<div><pre tabindex="0"><code data-lang="clojure"><span><span>
+</span></span><span><span><span>(</span><span>require</span> <span>&#39;</span><span>[</span><span>com.latacora.snapshot.core</span> <span>:as</span> <span>snap</span><span>])</span>
+</span></span><span><span>
+</span></span><span><span><span>; building a snapshot is very easy</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>def </span><span>rw</span> <span>(</span><span>snap/memory-reader-writer</span><span>))</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>def </span><span>original-data</span> <span>{</span><span>:aws</span> <span>{</span><span>:s3</span> <span>{</span><span>:ListBuckets</span> <span>{</span><span>:response</span> <span>{</span><span>:Buckets</span> <span>[{</span><span>:Name</span> <span>&#34;❤️Clojure&#34;</span><span>}]}}}}})</span>
+</span></span><span><span>
+</span></span><span><span><span>; prefix keys exists to help us generate unique attribute idents from structured data</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>def </span><span>prefixed-data</span> <span>(</span><span>snap/prefix-keys</span> <span>original-data</span><span>))</span>
+</span></span><span><span>
+</span></span><span><span><span>; =&gt;</span>
+</span></span><span><span><span>#</span><span>_</span><span>{</span><span>:aws</span>
+</span></span><span><span>   <span>{</span><span>:aws/s3</span>
+</span></span><span><span>    <span>{</span><span>:aws.s3/ListBuckets</span>
+</span></span><span><span>     <span>{</span><span>:aws.s3.ListBuckets/response</span>
+</span></span><span><span>      <span>{</span><span>:aws.s3.ListBuckets.response/Buckets</span>
+</span></span><span><span>       <span>[{</span><span>:aws.s3.ListBuckets.response.Buckets/Name</span> <span>&#34;❤️Clojure&#34;</span><span>}]}}}}}</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>snap/write-data-record!</span> <span>rw</span> <span>prefixed-data</span><span>)</span>
+</span></span><span><span>
+</span></span><span><span>
+</span></span><span><span><span>; after you&#39;ve created or acquired a snapshot, you can inspect the contents</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>into </span><span>[]</span> <span>(</span><span>snap/schema-reducible</span> <span>rw</span><span>))</span>
+</span></span><span><span>
+</span></span><span><span><span>; =&gt;</span>
+</span></span><span><span><span>#</span><span>_</span><span>[[</span><span>&#34;$TEMP$:snapshot/metadata&#34;</span> <span>:db/ident</span> <span>:snapshot/metadata</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/metadata&#34;</span> <span>:db/valueType</span> <span>:db.type/ref</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/metadata&#34;</span> <span>:db/isComponent</span> <span>true</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/metadata&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/one</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/roots&#34;</span> <span>:db/ident</span> <span>:snapshot/roots</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/roots&#34;</span> <span>:db/isComponent</span> <span>true</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/roots&#34;</span> <span>:db/valueType</span> <span>:db.type/ref</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/roots&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/many</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws&#34;</span> <span>:db/ident</span> <span>:aws</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws&#34;</span> <span>:db/isComponent</span> <span>true</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws&#34;</span> <span>:db/valueType</span> <span>:db.type/ref</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/one</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets.response/Buckets&#34;</span> <span>:db/ident</span> <span>:aws.s3.ListBuckets.response/Buckets</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets.response/Buckets&#34;</span> <span>:db/isComponent</span> <span>true</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets.response/Buckets&#34;</span> <span>:db/valueType</span> <span>:db.type/ref</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets.response/Buckets&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/many</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3/ListBuckets&#34;</span> <span>:db/ident</span> <span>:aws.s3/ListBuckets</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3/ListBuckets&#34;</span> <span>:db/isComponent</span> <span>true</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3/ListBuckets&#34;</span> <span>:db/valueType</span> <span>:db.type/ref</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3/ListBuckets&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/one</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets.response.Buckets/Name&#34;</span> <span>:db/ident</span> <span>:aws.s3.ListBuckets.response.Buckets/Name</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets.response.Buckets/Name&#34;</span> <span>:db/index</span> <span>true</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets.response.Buckets/Name&#34;</span> <span>:db/valueType</span> <span>:db.type/string</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets.response.Buckets/Name&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/one</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/id&#34;</span> <span>:db/ident</span> <span>:snapshot/id</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/id&#34;</span> <span>:db/unique</span> <span>:db.unique/identity</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/id&#34;</span> <span>:db/valueType</span> <span>:db.type/uuid</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:snapshot/id&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/one</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets/response&#34;</span> <span>:db/ident</span> <span>:aws.s3.ListBuckets/response</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets/response&#34;</span> <span>:db/isComponent</span> <span>true</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets/response&#34;</span> <span>:db/valueType</span> <span>:db.type/ref</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws.s3.ListBuckets/response&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/one</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws/s3&#34;</span> <span>:db/ident</span> <span>:aws/s3</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws/s3&#34;</span> <span>:db/isComponent</span> <span>true</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws/s3&#34;</span> <span>:db/valueType</span> <span>:db.type/ref</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:aws/s3&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/one</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:content/hash&#34;</span> <span>:db/ident</span> <span>:content/hash</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:content/hash&#34;</span> <span>:db/valueType</span> <span>:db.type/string</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:content/hash&#34;</span> <span>:db/unique</span> <span>:db.unique/identity</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:content/hash&#34;</span> <span>:db/cardinality</span> <span>:db.cardinality/one</span><span>]]</span>
+</span></span><span><span>
+</span></span><span><span>
+</span></span><span><span><span>; metadata contains the snapshot id and possibly other data contextualizing the collection</span>
+</span></span><span><span><span>; if the snapshot creator chose to add some (e.g. timestamps, permissions, region, account)</span>
+</span></span><span><span><span>(</span><span>into </span><span>[]</span> <span>(</span><span>snap/metadata-reducible</span> <span>rw</span><span>))</span>
+</span></span><span><span>
+</span></span><span><span><span>; =&gt;</span>
+</span></span><span><span><span>#</span><span>_</span><span>[[</span><span>&#34;datomic.tx&#34;</span> <span>:snapshot/metadata</span> <span>&#34;$TEMP$:0191e251-c4a1-87ba-967f-84bab9c4abff:meta&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:0191e251-c4a1-87ba-967f-84bab9c4abff:meta&#34;</span> <span>:snapshot/id</span> <span>#</span><span>uuid</span><span>&#34;0191e251-c4a1-87ba-967f-84bab9c4abff&#34;</span><span>]]</span>
+</span></span><span><span>
+</span></span><span><span><span>; finally, the collection data itself along with all the computed entity hashes</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>into </span><span>[]</span> <span>(</span><span>snap/data-reducible</span> <span>rw</span><span>))</span>
+</span></span><span><span>
+</span></span><span><span><span>; =&gt;</span>
+</span></span><span><span><span>#</span><span>_</span><span>[[</span><span>&#34;$TEMP$:0191e251-c4a1-87ba-967f-84bab9c4abff:root&#34;</span> <span>:content/hash</span> <span>&#34;L1$Empl0SWCfM5VqxlGuoF13g==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:0191e251-c4a1-87ba-967f-84bab9c4abff:root&#34;</span> <span>:snapshot/roots</span> <span>&#34;$TEMP$:L1$I3BP4J4RgqiSKAsx3Yfseg==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$I3BP4J4RgqiSKAsx3Yfseg==&#34;</span> <span>:content/hash</span> <span>&#34;L1$I3BP4J4RgqiSKAsx3Yfseg==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$I3BP4J4RgqiSKAsx3Yfseg==&#34;</span> <span>:aws</span> <span>&#34;$TEMP$:L1$QDqyNVa31W9mtE2dR/Ny8g==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$QDqyNVa31W9mtE2dR/Ny8g==&#34;</span> <span>:content/hash</span> <span>&#34;L1$QDqyNVa31W9mtE2dR/Ny8g==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$QDqyNVa31W9mtE2dR/Ny8g==&#34;</span> <span>:aws/s3</span> <span>&#34;$TEMP$:L1$7GaqvuJbYJUuqpGgd0/D4A==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$7GaqvuJbYJUuqpGgd0/D4A==&#34;</span> <span>:content/hash</span> <span>&#34;L1$7GaqvuJbYJUuqpGgd0/D4A==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$7GaqvuJbYJUuqpGgd0/D4A==&#34;</span> <span>:aws.s3/ListBuckets</span> <span>&#34;$TEMP$:L1$Y6tkNE33m+5MpHGN/7O9dQ==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$Y6tkNE33m+5MpHGN/7O9dQ==&#34;</span> <span>:content/hash</span> <span>&#34;L1$Y6tkNE33m+5MpHGN/7O9dQ==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$Y6tkNE33m+5MpHGN/7O9dQ==&#34;</span> <span>:aws.s3.ListBuckets/response</span> <span>&#34;$TEMP$:L1$KFNi79w6xjD3sqHXzAsUCA==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$KFNi79w6xjD3sqHXzAsUCA==&#34;</span> <span>:content/hash</span> <span>&#34;L1$KFNi79w6xjD3sqHXzAsUCA==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$KFNi79w6xjD3sqHXzAsUCA==&#34;</span> <span>:aws.s3.ListBuckets.response/Buckets</span> <span>&#34;$TEMP$:L1$EIL6q4pKOxLq6VD0oJAkiw==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$EIL6q4pKOxLq6VD0oJAkiw==&#34;</span> <span>:content/hash</span> <span>&#34;L1$EIL6q4pKOxLq6VD0oJAkiw==&#34;</span><span>]</span>
+</span></span><span><span>   <span>[</span><span>&#34;$TEMP$:L1$EIL6q4pKOxLq6VD0oJAkiw==&#34;</span> <span>:aws.s3.ListBuckets.response.Buckets/Name</span> <span>&#34;❤️Clojure&#34;</span><span>]]</span>
+</span></span><span><span>
+</span></span><span><span>
+</span></span><span><span><span>; if you&#39;ve used datomic before it&#39;s probably clear how you would</span>
+</span></span><span><span><span>; transact these pieces of data into a database. For us, it&#39;s just</span>
+</span></span><span><span><span>; a function call away</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>require</span> <span>&#39;</span><span>[</span><span>datomic.api</span> <span>:as</span> <span>d</span><span>])</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>def </span><span>db</span> <span>(</span><span>snap/memory-db</span> <span>rw</span><span>))</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>d/q</span> <span>&#39;</span><span>[</span><span>:find</span> <span>?name</span> <span>.</span>
+</span></span><span><span>       <span>:where</span>
+</span></span><span><span>       <span>[</span><span>_</span> <span>:aws.s3.ListBuckets.response.Buckets/Name</span> <span>?name</span><span>]]</span>
+</span></span><span><span>     <span>db</span><span>)</span>
+</span></span><span><span>
+</span></span><span><span><span>; =&gt; &#34;❤️Clojure&#34;</span>
+</span></span></code></pre></div><h2 id="adventures-in-wonderland">Adventures in Wonderland</h2>
+<p>Now that we know we can accumulate data from a bunch of tools into the same
+Datomic database and not worry about rapidly increasing storage costs, we can
+set our minds towards writing queries. Queries can start leveraging information
+from multiple tools to produce more specific, correct, and actionable findings.
+For fun, let’s look at a couple examples:</p>
+<h3 id="query-to-find-all-public-ips-reachable-by-the-internet">Query to find all public IPs reachable by the internet</h3>
+<p>One of the things we love about the attribute namespacing approach is anyone
+who knows even a little about the service APIs can begin to explore and write
+queries identifying items of interest or vulnerabilities.</p>
+<p>This query finds all the public IPs associated with any network interfaces, and
+then it checks whether there’s a security group on the interface allowing
+access from the entire internet.</p>
+<div><pre tabindex="0"><code data-lang="clojure"><span><span><span>(</span><span>d/q</span> <span>&#39;</span><span>[</span><span>:find</span> <span>[</span><span>?ip</span> <span>...</span><span>]</span>
+</span></span><span><span>       <span>:where</span>
+</span></span><span><span>       <span>[</span><span>?nic-association</span> <span>:aws.ec2.describe-network-interfaces.response.network-interfaces.association/public-ip</span> <span>?ip</span><span>]</span>
+</span></span><span><span>       <span>[</span><span>?nic</span> <span>:aws.ec2.describe-network-interfaces.response.network-interfaces/association</span> <span>?nic-association</span><span>]</span>
+</span></span><span><span>       <span>[</span><span>?nic</span> <span>:aws.ec2.describe-network-interfaces.response.network-interfaces/groups</span> <span>?nic-sg</span><span>]</span>
+</span></span><span><span>       <span>[</span><span>?nic-sg</span> <span>:aws.ec2.describe-network-interfaces.response.network-interfaces.groups/group-id</span> <span>?group-id</span><span>]</span>
+</span></span><span><span>       <span>[</span><span>?sg</span> <span>:aws.ec2.describe-security-groups.response.security-groups/group-id</span> <span>?group-id</span><span>]</span>
+</span></span><span><span>       <span>[</span><span>?sg</span> <span>:aws.ec2.describe-security-groups.response.security-groups/ip-permissions</span> <span>?sg-rule</span><span>]</span>
+</span></span><span><span>       <span>(</span><span>or-join</span> <span>[</span><span>?sg-rule</span><span>]</span>
+</span></span><span><span>                <span>(</span><span>and </span><span>[</span><span>?sg-rule</span> <span>:aws.ec2.describe-security-groups.response.security-groups.ip-permissions/ipv4ranges</span> <span>?ipv4-range</span><span>]</span>
+</span></span><span><span>                     <span>[</span><span>?ipv4-range</span> <span>:aws.ec2.describe-security-groups.response.security-groups.ip-permissions.ipv4ranges/cidr-ip</span> <span>&#34;0.0.0.0/0&#34;</span><span>])</span>
+</span></span><span><span>                <span>(</span><span>and </span><span>[</span><span>?sg-rule</span> <span>:aws.ec2.describe-security-groups.response.security-groups.ip-permissions/ipv6ranges</span> <span>?ipv6-range</span><span>]</span>
+</span></span><span><span>                     <span>[</span><span>?ipv6-range</span> <span>:aws.ec2.describe-security-groups.response.security-groups.ip-permissions.ipv6ranges/cidr-ipv6</span> <span>&#34;::/0&#34;</span><span>]))]</span>
+</span></span><span><span>     <span>db</span><span>)</span>
+</span></span></code></pre></div><h3 id="factoring-it-out">Factoring It Out</h3>
+<p>The previous query probably looks verbose, but it’s unambiguous. We can write
+shared datalog rules to encapsulate query fragments and improve readability.
+Here’s the same query factored out as a couple rules for checking security
+group ingress and discovering or testing whether an IP is publicly accessible.
+You can imagine how we could make it even more accurate by consulting route
+tables and prefix lists.</p>
+<div><pre tabindex="0"><code data-lang="clojure"><span><span><span>(</span><span>def </span><span>rules</span>
+</span></span><span><span>  <span>&#39;</span><span>[[(</span><span>sg-allows-internet?</span> <span>?group-id</span><span>)</span>
+</span></span><span><span>     <span>[</span><span>?sg</span> <span>:aws.ec2.describe-security-groups.response.security-groups/group-id</span> <span>?group-id</span><span>]</span>
+</span></span><span><span>     <span>[</span><span>?sg</span> <span>:aws.ec2.describe-security-groups.response.security-groups/ip-permissions</span> <span>?sg-rule</span><span>]</span>
+</span></span><span><span>     <span>(</span><span>or-join</span> <span>[</span><span>?sg-rule</span><span>]</span>
+</span></span><span><span>              <span>(</span><span>and </span><span>[</span><span>?sg-rule</span> <span>:aws.ec2.describe-security-groups.response.security-groups.ip-permissions/ipv4ranges</span> <span>?ipv4-range</span><span>]</span>
+</span></span><span><span>                   <span>[</span><span>?ipv4-range</span> <span>:aws.ec2.describe-security-groups.response.security-groups.ip-permissions.ipv4ranges/cidr-ip</span> <span>&#34;0.0.0.0/0&#34;</span><span>])</span>
+</span></span><span><span>              <span>(</span><span>and </span><span>[</span><span>?sg-rule</span> <span>:aws.ec2.describe-security-groups.response.security-groups.ip-permissions/ipv6ranges</span> <span>?ipv6-range</span><span>]</span>
+</span></span><span><span>                   <span>[</span><span>?ipv6-range</span> <span>:aws.ec2.describe-security-groups.response.security-groups.ip-permissions.ipv6ranges/cidr-ipv6</span> <span>&#34;::/0&#34;</span><span>]))]</span>
+</span></span><span><span>
+</span></span><span><span>    <span>[(</span><span>internet-accessible?</span> <span>?ip</span><span>)</span>
+</span></span><span><span>     <span>[</span><span>?nic-association</span> <span>:aws.ec2.describe-network-interfaces.response.network-interfaces.association/public-ip</span> <span>?ip</span><span>]</span>
+</span></span><span><span>     <span>[</span><span>?nic</span> <span>:aws.ec2.describe-network-interfaces.response.network-interfaces/association</span> <span>?nic-association</span><span>]</span>
+</span></span><span><span>     <span>[</span><span>?nic</span> <span>:aws.ec2.describe-network-interfaces.response.network-interfaces/groups</span> <span>?nic-sg</span><span>]</span>
+</span></span><span><span>     <span>[</span><span>?nic-sg</span> <span>:aws.ec2.describe-network-interfaces.response.network-interfaces.groups/group-id</span> <span>?group-id</span><span>]</span>
+</span></span><span><span>     <span>(</span><span>sg-allows-internet?</span> <span>?group-id</span><span>)]])</span>
+</span></span><span><span>
+</span></span><span><span><span>(</span><span>d/q</span> <span>&#39;</span><span>[</span><span>:find</span> <span>[</span><span>?ip</span> <span>...</span><span>]</span>
+</span></span><span><span>       <span>:in</span> <span>$</span> <span>%</span>
+</span></span><span><span>       <span>:where</span>
+</span></span><span><span>       <span>(</span><span>internet-accessible?</span> <span>?ip</span><span>)]</span>
+</span></span><span><span>     <span>db</span>
+</span></span><span><span>     <span>rules</span><span>)</span>
+</span></span></code></pre></div><h3 id="visualizing-aws-resource-changes-over-time-with-gource">Visualizing AWS resource changes over time with Gource</h3>
+<p>We’ll spare you the ~50 lines of code for this one, but suffice to say it finds
+all the AWS identifiers that exist anywhere in the graph and builds a custom
+<a href="https://gource.io/" target="_blank" rel="noopener noreferrer">Gource</a> changelog showing all the times any of those
+resources changed. The primary branches are AWS accounts followed by regions,
+services, resource types, and finally leaves representing individual resources.</p>
+
+
+    
+    <p>
+      <iframe allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen="allowfullscreen" loading="eager" referrerpolicy="strict-origin-when-cross-origin" src="https://www.youtube.com/embed/BPgcUJJEbsg?autoplay=0&amp;controls=1&amp;end=0&amp;loop=0&amp;mute=0&amp;start=0" title="YouTube video"></iframe>
+    </p>
+
+<h2 id="conclusion">Conclusion</h2>
+<p>We’ve already modified our most complex and important tools to output these
+snapshots and participate in the graph. We also defined infrastructure to
+launch a process whenever snapshots land in S3 and immediately ingest their
+contents into a long-running Datomic transactor. Answering arbitrary questions
+and searching for vulnerabilities is finally as easy as connecting a client and
+running queries, as it should be.</p>
+<p>In the coming weeks we’ll update our detection and reporting pipelines to be
+expressed purely in terms of these datalog queries against the unified data
+instead of analyzing different files for each tool. We expect the new division
+of responsibilities to allow us to iterate more efficiently on data collection,
+inferencing, analysis, and reporting mechanisms.</p>
+<p>Interested in working with Latacora to apply these power tools to your
+environment? Say <a href="mailto:hello@latacora.com" target="_self" rel="">hello@latacora.com</a>.</p>
+<ul>
+  
+</ul>
+
+    </div></div>
+  </body>
+</html>
