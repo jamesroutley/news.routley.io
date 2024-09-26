@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://dthompson.us/posts/optimizing-guile-scheme.html">Original</a>
+    <h1>Optimizing Guile Scheme</h1>
+    
+    <div id="readability-page-1" class="page"><div><p><a href="https://gnu.org/software/guile">Guile</a> is a rather niche language
+that I love dearly.  Guile is a Scheme dialect that features an
+advanced optimizing bytecode compiler, a JIT compiler, and a modest
+set of developer tools for inspecting and debugging.  Through my time
+spent developing <a href="https://dthompson.us/projects/chickadee.html">Chickadee</a>, a game
+programming library, I have gotten quite familiar with how to get the
+most out of Guile in terms of performance.  Every now and then I share
+a tip or two with someone on IRC or the fediverse and think “I should
+blog about this” so now I’m finally doing that.  These tips are quite
+simple and apply to optimizing any dynamic language.  The only
+difference is that there isn’t much in the way of helpful examples
+specifically for Guile… until now.</p><p>Scheme is a dynamic language which means that there is a limited
+amount of compile-time information that can be used by Guile to
+optimize the resulting bytecode.  When we put on our optimizer hat,
+our job is to give the compiler a hand so the optimization passes can
+do their thing.  I should stress that the level of code scrutiny we’re
+about to get into is usually unnecessary and the result doesn’t always
+look like the beautiful, functional Scheme you may be used to.
+However, most programs have some core loop or kernel, a small piece of
+the larger program, that would be benefit from being optimized to its
+fullest.  In Chickadee, the most performance sensitive code is in the
+graphics layer, where lots of floating point math happens.</p><h3>Rule 1: Don’t allocate</h3><p>If you can avoid allocation, you will probably have at least decent
+throughput without doing much else.  Some allocations are explicit;
+<code>(vector 1 2 3)</code> clearly allocates a vector.  Other allocations are
+implicit; <code>(+ x 1)</code> may or may not allocate depending on the value of
+<code>x</code>.</p><p>If <code>x</code> is <code>42</code> then there is no allocation because the result, <code>43</code>,
+is in the fixnum range (<code>[-2^63, 2^63)</code> on 64-bit machines.)  Guile
+stores fixnums as “immediate” values; values which are not heap
+allocated.  However, if <code>x</code> is <code>42.0</code> then Guile will allocate a float
+on the heap to store the result <code>43.0</code>.  Did you know that floats were
+heap allocated in Guile?  I didn’t when I was getting started!  All
+numbers besides fixnums are heap allocated.</p><p>Now that you know the hard truth about Guile’s floats, you might think
+that math is doomed to be slow on Guile; that any realtime graphics
+program will be a stuttery mess.  Keep reading and I will explain why
+this isn’t the case!</p><h3>Rule 2: Prefer monomorphic over polymorphic</h3><p>The base Scheme environment mostly provides monomorphic procedures;
+<code>append</code> is for lists, <code>string-append</code> is for strings, etc.  The big
+exception to this rule is the numeric tower.  While beautiful, it can
+be a hinderance to performant code.  All of the arithmetic operators
+are polymorphic; <code>+</code> adds any two numbers together and there are many
+types of numbers.</p><p>Compiled as-is, it means that multiple dispatch on the operands needs
+to happen at runtime to determine which specialized “add $type-a and
+$type-b” routine needs to be called.</p><p>The R6RS specification introduced monomorphic procedures for fixnums
+and floats such as <code>fx+</code> and <code>fl+</code>.  These procedures remove the
+overhead of generic dispatching, but they don&#39;t help with the
+allocation problem; Without a sufficiently advanced compiler, <code>(fl* (fl+ x y) z)</code> will allocate a new float to hold the intermediate
+result of <code>fl+</code> that gets thrown away after the <code>fl*</code> call.  But I
+wouldn’t be writing this if Guile <em>didn’t</em> have a sufficiently
+advanced compiler!</p><h3>Why not both?</h3><p>We can write numeric code that is both specialized and allocates
+minimally.  Guile’s compiler performs a <em>type inference</em> pass on our
+code and will specialize numeric operations wherever possible.  For
+example, if Guile can prove that all the variables involved in <code>(* (+ x y) z)</code> are floats, it will optimize the resulting bytecode so that:</p><ul><li>The floats within <code>x</code>, <code>y</code>, and <code>z</code> are used directly.</li><li><code>+</code> and <code>*</code> are compiled to specialized <code>fadd</code> and <code>fmul</code> primitives.</li><li>The intermediate result of <code>(+ x y)</code> does not allocate a new heap
+object.</li></ul><p>This is called <em>unboxing</em>.  Imagine every Scheme value as an object
+stored inside a little box.  Unboxing means removing some objects from
+their respective boxes, performing some sequence of operations on them
+<em>without</em> storing each intermediate result in a throwaway box, and
+then putting the final result into a new box.  Unboxing is how we we
+can satisfy both of our optimization rules for numeric code.</p><p>Unboxed floating point math is what allows Chickadee to do things like
+render thousands of sprites at 60 frames per second without constant
+GC-related stutter.</p><h3>The tools</h3><p>To optimize effectively, we need tools to help us identify problematic
+code and tools to validate that our changes are improving things.  The
+most essential tools I use are accessible via REPL commands:</p><ul><li><code>,profile</code>: Evaluate an expression in the context of <code>statprof</code> and
+print the results.</li><li><code>,disassemble</code>: Print the bytecode disassembly of a procedure.</li></ul><p>An additional tool that does not have it’s own REPL command is
+<code>gcprof</code>, which is a profiler that can help identify code that most
+frequently triggers garbage collection.  I won’t be using it here but
+you should know it exists.</p><p>Now, let’s get into some examples and walk through optimizing each
+one.</p><h3>Example 1: Variadic arguments</h3><p>It’s common in Scheme for procedures to handle an arbitrary number of
+arguments.  For example, the <code>map</code> procedure can process as many lists
+as you throw at it; <code>(map + &#39;(1 2 3) &#39;(4 5 6) &#39;(7 8 9))</code> produces the
+result <code>(12 15 18)</code>.</p><p>Supporting an arbitrary number of arguments makes for flexible
+interfaces, but a naive implementation will cause excessive GC churn
+in the common case where only a few arguments are passed.</p><p>Let’s analyze a contrived example.  The following procedure computes
+the average of all arguments:</p><pre><code><span>(</span><span>use-modules</span> <span>(</span><span>srfi</span> <span>srfi-1</span><span>)</span><span>)</span>
+
+<span>(</span><span>define</span> <span>(</span><span>average</span> <span>.</span> <span>args</span><span>)</span>
+  <span>(</span><span>/</span> <span>(</span><span>fold</span> <span>+</span> <span>0</span> <span>args</span><span>)</span> <span>(</span><span>length</span> <span>args</span><span>)</span><span>)</span><span>)</span></code></pre><p>Let&#39;s profile it and see how well it performs:</p><pre><code><span>scheme@</span><span>(</span><span>guile-user</span><span>)</span><span>&gt;</span> <span>,profile</span> <span>(</span><span>let</span> <span>lp</span> <span>(</span><span>(</span><span>i</span> <span>0</span><span>)</span><span>)</span>
+                                <span>(</span><span>when</span> <span>(</span><span>&lt;</span> <span>i</span> <span>100000000</span><span>)</span>
+                                  <span>(</span><span>average</span> <span>1</span> <span>2</span> <span>3</span><span>)</span>
+                                  <span>(</span><span>lp</span> <span>(</span><span>+</span> <span>i</span> <span>1</span><span>)</span><span>)</span><span>)</span><span>)</span>
+<span>%</span>     <span>cumulative</span>   <span>self</span>
+<span>time</span>   <span>seconds</span>     <span>seconds</span>  <span>procedure</span>
+ <span>31.99</span>     <span>13.68</span>      <span>4.43</span>  <span>&lt;current</span> <span>input&gt;:1918:16:average</span>
+ <span>23.43</span>      <span>7.94</span>      <span>3.25</span>  <span>srfi/srfi-1.scm:452:2:fold</span>
+ <span>22.73</span>      <span>3.15</span>      <span>3.15</span>  <span>+</span>
+  <span>8.22</span>      <span>1.14</span>      <span>1.14</span>  <span>length</span>
+  <span>5.94</span>      <span>0.82</span>      <span>0.82</span>  <span>list?</span>
+  <span>5.24</span>      <span>0.73</span>      <span>0.73</span>  <span>procedure?</span>
+  <span>1.22</span>     <span>13.85</span>      <span>0.17</span>  <span>&lt;current</span> <span>input&gt;:1979:9</span>
+  <span>1.22</span>      <span>0.17</span>      <span>0.17</span>  <span>%after-gc-thunk</span>
+  <span>0.00</span>      <span>0.17</span>      <span>0.00</span>  <span>anon</span> <span>#x19675c0</span>
+<span>---</span>
+<span>Sample</span> <span>count:</span> <span>572</span>
+<span>Total</span> <span>time:</span> <span>13.853321979</span> <span>seconds</span> <span>(</span><span>6.297763116</span> <span>seconds</span> <span>in</span> <span>GC</span><span>)</span></code></pre><p>Nearly half of our time was spent in GC.  Let&#39;s find out why by taking
+a look at the disassembly:</p><pre><code>scheme@(guile-user)&gt; ,disassemble average
+Disassembly of #&lt;procedure average args&gt; at #x1a9cbd0:
+
+   0    (instrument-entry 240)                                at (unknown file):1918:16
+   2    (assert-nargs-ge 1)
+   3    (bind-rest 1)                   ;; 2 slots
+   4    (alloc-frame 9)                 ;; 9 slots
+   5    (static-ref 8 189)              ;; #&lt;variable 7fa802ccba40 value: #&lt;procedure fold (kons knil list1) | (kons kni…&gt; at (unknown file):1919:6
+   7    (immediate-tag=? 8 7 0)         ;; heap-object?
+   9    (je 9)                          ;; -&gt; L1
+  10    (static-ref 8 162)              ;; #&lt;directory (guile-user) 7fa802cf8c80&gt;
+  12    (static-ref 6 192)              ;; fold
+  14    (call-scm&lt;-scm-scm 8 8 6 111)   ;; lookup-bound
+  16    (static-set! 8 178)             ;; #&lt;variable 7fa802ccba40 value: #&lt;procedure fold (kons knil list1) | (kons kni…&gt;
+L1:
+  18    (scm-ref/immediate 8 8 1)
+  19    (static-ref 6 187)              ;; #&lt;variable 7fa802c36a40 value: #&lt;procedure + (#:optional _ _ . _)&gt;&gt; at (unknown file):1919:11
+  21    (immediate-tag=? 6 7 0)         ;; heap-object?
+  23    (je 7)                          ;; -&gt; L2
+  24    (call-scm&lt;-scmn-scmn 6 194 198 113);; lookup-bound-private
+  28    (static-set! 6 178)             ;; #&lt;variable 7fa802c36a40 value: #&lt;procedure + (#:optional _ _ . _)&gt;&gt;
+L2:
+  30    (scm-ref/immediate 2 6 1)
+  31    (make-immediate 1 2)            ;; 0                  at (unknown file):1919:13
+  32    (mov 3 8)                                             at (unknown file):1919:5
+  33    (mov 0 7)
+  34    (handle-interrupts)
+  35    (call 5 4)
+  37    (receive 0 5 9)
+  39    (static-ref 6 191)              ;; #&lt;variable 7fa802c2d990 value: #&lt;procedure length (_)&gt;&gt; at (unknown file):1919:21
+  41    (immediate-tag=? 6 7 0)         ;; heap-object?
+  43    (je 7)                          ;; -&gt; L3
+  44    (call-scm&lt;-scmn-scmn 6 174 188 113);; lookup-bound-private
+  48    (static-set! 6 182)             ;; #&lt;variable 7fa802c2d990 value: #&lt;procedure length (_)&gt;&gt;
+L3:
+  50    (scm-ref/immediate 4 6 1)
+  51    (mov 3 7)
+  52    (handle-interrupts)
+  53    (call 4 2)
+  55    (receive 1 4 9)
+  57    (call-scm&lt;-scm-scm 8 8 7 5)     ;; div                at (unknown file):1919:2
+  59    (reset-frame 1)                 ;; 1 slot
+  60    (handle-interrupts)
+  61    (return-values)</code></pre><p>Note instruction 3, <code>bind-rest</code>.  The Guile manual says:</p><blockquote><p>Instruction: bind-rest f24:DST</p><p>Collect any arguments at or above DST into a list, and store that
+list at DST.</p></blockquote><p>So, for each call, a sequence of pairs is allocated to hold all of the
+arguments.  That&#39;s probably where a lot of our allocation is coming
+from.  To optimize this, let’s first assume that <code>average</code> is
+typically called with 3 arguments or less.  It would be great if we
+could make these common cases fast while still allowing the
+flexibility of passing an arbitrary number of arguments.  To do this,
+we’ll use <code>case-lambda</code>:</p><pre><code><span>(</span><span>define</span> <span>average</span>
+  <span>(</span><span>case-lambda</span>
+    <span>(</span><span>(</span><span>)</span> <span>0</span><span>)</span>
+    <span>(</span><span>(</span><span>x</span><span>)</span> <span>x</span><span>)</span>
+    <span>(</span><span>(</span><span>x</span> <span>y</span><span>)</span> <span>(</span><span>/</span> <span>(</span><span>+</span> <span>x</span> <span>y</span><span>)</span> <span>2</span><span>)</span><span>)</span>
+    <span>(</span><span>(</span><span>x</span> <span>y</span> <span>z</span><span>)</span> <span>(</span><span>/</span> <span>(</span><span>+</span> <span>x</span> <span>y</span> <span>z</span><span>)</span> <span>3</span><span>)</span><span>)</span>
+        <span>(</span><span>args</span>
+     <span>(</span><span>/</span> <span>(</span><span>fold</span> <span>+</span> <span>0</span> <span>args</span><span>)</span> <span>(</span><span>length</span> <span>args</span><span>)</span><span>)</span><span>)</span><span>)</span><span>)</span></code></pre><p>Let’s re-run the profiler to see if this is actually better:</p><pre><code>%     cumulative   self
+time   seconds     seconds  procedure
+ 76.47      0.63      0.63  &lt;current input&gt;:2055:2:average
+ 23.53      0.82      0.19  &lt;current input&gt;:2073:9
+---
+Sample count: 51
+Total time: 0.82462725 seconds (0.0 seconds in GC)</code></pre><p>I&#39;d say that nearly 17x faster with no GC is an improvement!</p><p>Let’s see what&#39;s changed in the disassembly:</p><pre><code>scheme@(guile-user)&gt; ,disassemble average
+Disassembly of #&lt;procedure average () | (x) | (x y) | (x y z) | args&gt; at #x1ab4c70:
+
+   0    (instrument-entry 278)                                at (unknown file):2055:2
+   2    (arguments&lt;=? 1)
+   3    (jne 6)                         ;; -&gt; L1
+   4    (alloc-frame 9)                 ;; 9 slots
+   5    (make-immediate 8 2)            ;; 0                  at (unknown file):2056:8
+   6    (reset-frame 1)                 ;; 1 slot
+   7    (handle-interrupts)
+   8    (return-values)
+L1:
+   9    (arguments&lt;=? 2)
+  10    (jne 6)                         ;; -&gt; L2
+  11    (alloc-frame 9)                 ;; 9 slots
+  12    (mov 8 7)
+  13    (reset-frame 1)                 ;; 1 slot
+  14    (handle-interrupts)
+  15    (return-values)
+L2:
+  16    (arguments&lt;=? 3)
+  17    (jne 10)                        ;; -&gt; L3
+  18    (alloc-frame 9)                 ;; 9 slots
+  19    (call-scm&lt;-scm-scm 8 7 6 0)     ;; add                at (unknown file):2058:14
+  21    (make-immediate 7 10)           ;; 2                  at (unknown file):2058:22
+  22    (call-scm&lt;-scm-scm 8 8 7 5)     ;; div                at (unknown file):2058:11
+  24    (reset-frame 1)                 ;; 1 slot
+  25    (handle-interrupts)
+  26    (return-values)
+L3:
+  27    (arguments&lt;=? 4)
+  28    (jne 12)                        ;; -&gt; L4
+  29    (alloc-frame 9)                 ;; 9 slots
+  30    (call-scm&lt;-scm-scm 8 7 6 0)     ;; add                at (unknown file):2059:16
+  32    (call-scm&lt;-scm-scm 8 8 5 0)     ;; add
+  34    (make-immediate 7 14)           ;; 3                  at (unknown file):2059:26
+  35    (call-scm&lt;-scm-scm 8 8 7 5)     ;; div                at (unknown file):2059:13
+  37    (reset-frame 1)                 ;; 1 slot
+  38    (handle-interrupts)
+  39    (return-values)
+L4:
+  40    (assert-nargs-ge 1)
+  41    (bind-rest 1)                   ;; 2 slots
+  42    (alloc-frame 9)                 ;; 9 slots
+  43    (static-ref 8 189)              ;; #f                 at (unknown file):2061:9
+  45    (immediate-tag=? 8 7 0)         ;; heap-object?
+  47    (je 9)                          ;; -&gt; L5
+  48    (static-ref 8 162)              ;; #&lt;directory (guile-user) 7fa802cf8c80&gt;
+  50    (static-ref 6 192)              ;; fold
+  52    (call-scm&lt;-scm-scm 8 8 6 111)   ;; lookup-bound
+  54    (static-set! 8 178)             ;; #f
+L5:
+  56    (scm-ref/immediate 8 8 1)
+  57    (static-ref 6 187)              ;; #f                 at (unknown file):2061:14
+  59    (immediate-tag=? 6 7 0)         ;; heap-object?
+  61    (je 7)                          ;; -&gt; L6
+  62    (call-scm&lt;-scmn-scmn 6 194 198 113);; lookup-bound-private
+  66    (static-set! 6 178)             ;; #f
+L6:
+  68    (scm-ref/immediate 2 6 1)
+  69    (make-immediate 1 2)            ;; 0                  at (unknown file):2061:16
+  70    (mov 3 8)                                             at (unknown file):2061:8
+  71    (mov 0 7)
+  72    (handle-interrupts)
+  73    (call 5 4)
+  75    (receive 0 5 9)
+  77    (static-ref 6 191)              ;; #f                 at (unknown file):2061:24
+  79    (immediate-tag=? 6 7 0)         ;; heap-object?
+  81    (je 7)                          ;; -&gt; L7
+  82    (call-scm&lt;-scmn-scmn 6 174 188 113);; lookup-bound-private
+  86    (static-set! 6 182)             ;; #f
+L7:
+  88    (scm-ref/immediate 4 6 1)
+  89    (mov 3 7)
+  90    (handle-interrupts)
+  91    (call 4 2)
+  93    (receive 1 4 9)
+  95    (call-scm&lt;-scm-scm 8 8 7 5)     ;; div                at (unknown file):2061:5
+  97    (reset-frame 1)                 ;; 1 slot
+  98    (handle-interrupts)
+  99    (return-values)</code></pre><p>There are more instructions now, but the branches for the known arity
+cases do not contain a <code>bind-rest</code> instruction.  Only branch <code>L4</code>, the
+one that handles the final clause of the <code>case-lambda</code>, uses
+<code>bind-rest</code>.</p><h3>Example 2: Floating point math</h3><blockquote><p>“Nothing brings fear to my heart more than a floating point number.”</p><p>— <a href="https://youtu.be/HB5TrK7A4pI?t=672">Gerald Sussman</a></p></blockquote><p>Programs that need to crunch numbers in realtime, such as games, rely
+on floating point numbers.  Dedicated hardware in the form of FPUs and
+GPUs make them essential for gettin’ math done quick and so we put up
+with their black magic.</p><p>Consider the following code that calculates the magnitude of a 2D
+vector:</p><pre><code><span>(</span><span>define</span> <span>(</span><span>magnitude</span> <span>x</span> <span>y</span><span>)</span>
+  <span>(</span><span>sqrt</span> <span>(</span><span>+</span> <span>(</span><span>*</span> <span>x</span> <span>x</span><span>)</span> <span>(</span><span>*</span> <span>y</span> <span>y</span><span>)</span><span>)</span><span>)</span><span>)</span></code></pre><p>Would you believe me if I told you the bytecode is less than perfect?</p><pre><code><span>scheme@</span><span>(</span><span>guile-user</span><span>)</span><span>&gt;</span> <span>,disassemble</span> <span>magnitude</span>
+<span>Disassembly</span> <span>of</span> <span>#&lt;procedure</span> <span>magnitude</span> <span>(</span><span>x</span> <span>y</span><span>)</span><span>&gt;</span> <span>at</span> <span>#x1a3fad8:</span>
+
+   <span>0</span>    <span>(</span><span>instrument-entry</span> <span>84</span><span>)</span>                                 <span>at</span> <span>(</span><span>unknown</span> <span>file</span><span>)</span><span>:2106:16</span>
+   <span>2</span>    <span>(</span><span>assert-nargs-ee/locals</span> <span>3</span> <span>0</span><span>)</span>       <span>3</span>    <span>(</span><span>call-scm&lt;-scm-scm</span> <span>2</span> <span>1</span> <span>1</span> <span>4</span><span>)</span>        <span>5</span>    <span>(</span><span>call-scm&lt;-scm-scm</span> <span>1</span> <span>0</span> <span>0</span> <span>4</span><span>)</span>        <span>7</span>    <span>(</span><span>call-scm&lt;-scm-scm</span> <span>2</span> <span>2</span> <span>1</span> <span>0</span><span>)</span>        <span>9</span>    <span>(</span><span>call-scm&lt;-scm</span> <span>2</span> <span>2</span> <span>68</span><span>)</span>            <span>11</span>    <span>(</span><span>reset-frame</span> <span>1</span><span>)</span>                   <span>12</span>    <span>(</span><span>handle-interrupts</span><span>)</span>
+  <span>13</span>    <span>(</span><span>return-values</span><span>)</span></code></pre><p>Note the <code>call-scm&lt;-scm-scm</code> instructions calling generic math
+primitives <code>mul</code> and <code>add</code>.</p><pre><code><span>scheme@</span><span>(</span><span>guile-user</span><span>)</span><span>&gt;</span> <span>,profile</span> <span>(</span><span>let</span> <span>lp</span> <span>(</span><span>(</span><span>i</span> <span>0</span><span>)</span><span>)</span>
+                                <span>(</span><span>when</span> <span>(</span><span>&lt;</span> <span>i</span> <span>100000000</span><span>)</span>
+                                  <span>(</span><span>magnitude</span> <span>3.0</span> <span>4.0</span><span>)</span>
+                                  <span>(</span><span>lp</span> <span>(</span><span>+</span> <span>i</span> <span>1</span><span>)</span><span>)</span><span>)</span><span>)</span>
+<span>%</span>     <span>cumulative</span>   <span>self</span>
+<span>time</span>   <span>seconds</span>     <span>seconds</span>  <span>procedure</span>
+ <span>85.12</span>     <span>26.94</span>     <span>24.50</span>  <span>&lt;current</span> <span>input&gt;:13:16:magnitude</span>
+  <span>8.48</span>      <span>2.44</span>      <span>2.44</span>  <span>%after-gc-thunk</span>
+  <span>6.40</span>     <span>28.79</span>      <span>1.84</span>  <span>&lt;current</span> <span>input&gt;:21:9</span>
+  <span>0.00</span>      <span>2.44</span>      <span>0.00</span>  <span>anon</span> <span>#x1e9e5c0</span>
+<span>---</span>
+<span>Sample</span> <span>count:</span> <span>672</span>
+<span>Total</span> <span>time:</span> <span>28.786191396</span> <span>seconds</span> <span>(</span><span>26.349479685</span> <span>seconds</span> <span>in</span> <span>GC</span><span>)</span></code></pre><p>Oof, nearly all of our time is spent in GC!</p><p>To fix this, we need to constrain our inputs by using predicates to
+guard the path to the numeric code.  This will inform Guile that
+certain types of numbers will never reach this branch and allow the
+compiler to choose more specialized primitives.  If we’re okay with
+only working with floats (we are) then we should constrain our
+procedure accordingly:</p><pre><code><span>(</span><span>define</span> <span>(</span><span>magnitude</span> <span>x</span> <span>y</span><span>)</span>
+  <span>(</span><span>unless</span> <span>(</span><span>and</span> <span>(</span><span>real?</span> <span>x</span><span>)</span> <span>(</span><span>inexact?</span> <span>x</span><span>)</span>
+               <span>(</span><span>real?</span> <span>y</span><span>)</span> <span>(</span><span>inexact?</span> <span>y</span><span>)</span><span>)</span>
+    <span>(</span><span>error</span> <span>&#34;expected floats&#34;</span> <span>x</span> <span>y</span><span>)</span><span>)</span>
+  <span>(</span><span>sqrt</span> <span>(</span><span>+</span> <span>(</span><span>*</span> <span>x</span> <span>x</span><span>)</span> <span>(</span><span>*</span> <span>y</span> <span>y</span><span>)</span><span>)</span><span>)</span><span>)</span></code></pre><p>And the stats:</p><pre><code><span>%</span>     <span>cumulative</span>   <span>self</span>
+<span>time</span>   <span>seconds</span>     <span>seconds</span>  <span>procedure</span>
+ <span>82.73</span>      <span>4.13</span>      <span>4.06</span>  <span>&lt;current</span> <span>input&gt;:177:16:magnitude</span>
+ <span>15.83</span>      <span>4.91</span>      <span>0.78</span>  <span>&lt;current</span> <span>input&gt;:187:9</span>
+  <span>1.44</span>      <span>0.07</span>      <span>0.07</span>  <span>%after-gc-thunk</span>
+  <span>0.00</span>      <span>0.07</span>      <span>0.00</span>  <span>anon</span> <span>#x1e9e5c0</span>
+<span>---</span>
+<span>Sample</span> <span>count:</span> <span>139</span>
+<span>Total</span> <span>time:</span> <span>4.909505945</span> <span>seconds</span> <span>(</span><span>3.970948419</span> <span>seconds</span> <span>in</span> <span>GC</span><span>)</span></code></pre><p>Our code now runs about 6x faster, but GC is still taking up most of
+that time.  Let&#39;s examine the disassembly:</p><pre><code>Disassembly of #&lt;procedure magnitude (x y)&gt; at #x1f41378:
+
+   0    (instrument-entry 206)                                at (unknown file):177:16
+   2    (assert-nargs-ee/locals 3 4)    ;; 7 slots (2 args)
+   3    (immediate-tag=? 5 3 2)         ;; fixnum?            at (unknown file):178:15
+   5    (je 10)                         ;; -&gt; L1
+   6    (immediate-tag=? 5 7 0)         ;; heap-object?
+   8    (jne 54)                        ;; -&gt; L3
+   9    (heap-tag=? 5 127 23)           ;; heap-number?
+  11    (jne 51)                        ;; -&gt; L3
+  12    (heap-tag=? 5 4095 791)         ;; compnum?
+  14    (je 48)                         ;; -&gt; L3
+L1:
+  15    (immediate-tag=? 5 3 2)         ;; fixnum?            at (unknown file):178:25
+  17    (je 45)                         ;; -&gt; L3
+  18    (heap-tag=? 5 4095 535)         ;; flonum?
+  20    (jne 42)                        ;; -&gt; L3
+  21    (immediate-tag=? 4 3 2)         ;; fixnum?            at (unknown file):179:15
+  23    (je 10)                         ;; -&gt; L2
+  24    (immediate-tag=? 4 7 0)         ;; heap-object?
+  26    (jne 36)                        ;; -&gt; L3
+  27    (heap-tag=? 4 127 23)           ;; heap-number?
+  29    (jne 33)                        ;; -&gt; L3
+  30    (heap-tag=? 4 4095 791)         ;; compnum?
+  32    (je 30)                         ;; -&gt; L3
+L2:
+  33    (immediate-tag=? 4 3 2)         ;; fixnum?            at (unknown file):179:25
+  35    (je 27)                         ;; -&gt; L3
+  36    (heap-tag=? 4 4095 535)         ;; flonum?
+  38    (jne 24)                        ;; -&gt; L3
+  39    (call-f64&lt;-scm 6 5 17)          ;; scm-&gt;f64           at (unknown file):181:11
+  41    (fmul 6 6 6)
+  42    (call-f64&lt;-scm 5 4 17)          ;; scm-&gt;f64           at (unknown file):181:19
+  44    (fmul 5 5 5)
+  45    (fadd 6 6 5)                                          at (unknown file):181:8
+  46    (call-f64&lt;-f64 6 6 70)                                at (unknown file):181:2
+  48    (allocate-pointerless-words/immediate 5 2)
+  49    (load-u64 4 0 535)
+  52    (word-set!/immediate 5 0 4)
+  53    (tail-pointer-ref/immediate 4 5 1)
+  54    (load-u64 3 0 0)
+  57    (f64-set! 4 3 6)
+  58    (mov 6 5)
+  59    (reset-frame 1)                 ;; 1 slot
+  60    (handle-interrupts)
+  61    (return-values)
+L3:
+  62    (static-ref 6 134)              ;; misc-error         at (unknown file):180:4
+  64    (make-immediate 3 4)            ;; #f
+  65    (make-non-immediate 2 133)      ;; &#34;expected floats ~S ~S&#34; at (unknown file):180:11
+  67    (make-immediate 1 772)          ;; ()                 at (unknown file):180:4
+  68    (allocate-words/immediate 0 2)
+  69    (scm-set!/immediate 0 0 4)
+  70    (scm-set!/immediate 0 1 1)
+  71    (allocate-words/immediate 4 2)
+  72    (scm-set!/immediate 4 0 5)
+  73    (scm-set!/immediate 4 1 0)
+  74    (allocate-words/immediate 5 2)
+  75    (scm-set!/immediate 5 0 3)
+  76    (scm-set!/immediate 5 1 1)
+  77    (allocate-words/immediate 1 2)
+  78    (scm-set!/immediate 1 0 4)
+  79    (scm-set!/immediate 1 1 5)
+  80    (allocate-words/immediate 5 2)
+  81    (scm-set!/immediate 5 0 2)
+  82    (scm-set!/immediate 5 1 1)
+  83    (allocate-words/immediate 4 2)
+  84    (scm-set!/immediate 4 0 3)
+  85    (scm-set!/immediate 4 1 5)
+  86    (throw 6 4)</code></pre><p>Important note: It seems that Guile 3.0.9, the latest stable release
+as of writing, does not perform the desired optimization here.  All
+the output you are seeing here is from a Guile built from commit
+<code>fb1f5e28b1a575247fd16184b1c83b8838b09716</code> of the main branch.  If you
+are reading this months/years into the future, then as long as you
+have Guile &gt; 3.0.9 you should be all set.</p><p>There&#39;s a lot more instructions, but starting with instruction 41 we
+can see that unboxed float instrutions like <code>fadd</code> and <code>fmul</code> are
+being used.  It&#39;s not made very clear, but instruction 46,
+<code>call-f64&lt;-f64</code>, is a call to a <code>sqrt</code> primitive specialized for
+floats.  Since our inputs have to be floats, Guile unboxes them as
+f64s via the <code>call-f64&lt;-scm</code> instruction.  The cost of the runtime
+checks is cheap compared to the cost of all the GC churn in the first
+version.</p><p>The source of our time spent in GC is the
+<code>allocate-pointerless-words/immediate</code> instruction at index 48.  This
+allocates a new heap object and the subsequent instructions like
+<code>f64-set!</code> set the contents of the heap object to the result of the
+<code>sqrt</code> call.  Our optimizations are local and once we cross the
+procedure call boundary we need boxed values again.</p><h3>Example 3: Please inline</h3><p>Guile will automatically inline procedures it considers small enough
+for the potential performance improvements to be worth the additional
+code size.  It’s a nice feature, but there are times when you wish
+something would be inlined but it doesn’t happen.</p><p>Let’s define a procedure that normalizes 2D vectors. To do so, we’ll
+build atop the <code>magnitude</code> procedure from example 2.</p><pre><code><span>(</span><span>define</span> <span>(</span><span>normalize</span> <span>x</span> <span>y</span><span>)</span>
+  <span>(</span><span>let</span> <span>(</span><span>(</span><span>mag</span> <span>(</span><span>magnitude</span> <span>x</span> <span>y</span><span>)</span><span>)</span><span>)</span>
+    <span>(</span><span>when</span> <span>(</span><span>=</span> <span>mag</span> <span>0.0</span><span>)</span>
+      <span>(</span><span>error</span> <span>&#34;cannot normalize vector with 0 magnitude&#34;</span> <span>x</span> <span>y</span><span>)</span><span>)</span>
+    <span>(</span><span>values</span> <span>(</span><span>/</span> <span>x</span> <span>mag</span><span>)</span> <span>(</span><span>/</span> <span>y</span> <span>mag</span><span>)</span><span>)</span><span>)</span><span>)</span></code></pre><p>It would be <em>great</em> if all the unboxed float goodness from <code>magnitude</code>
+spilled over to <code>normalize</code>.  Let’s see if that happened (it didn’t):</p><pre><code>scheme@(guile-user)&gt; ,disassemble normalize
+Disassembly of #&lt;procedure normalize (x y)&gt; at #x16609b0:
+
+   0    (instrument-entry 254)                                at (unknown file):17:19
+   2    (assert-nargs-ee/locals 3 6)    ;; 9 slots (2 args)
+   3    (static-ref 8 211)              ;; #&lt;variable 7f05e03e8490 value: #&lt;procedure magnitude (x y)&gt;&gt; at (unknown file):18:14
+   5    (immediate-tag=? 8 7 0)         ;; heap-object?
+   7    (je 9)                          ;; -&gt; L1
+   8    (static-ref 8 184)              ;; #&lt;directory (guile-user) 7f05ec481c80&gt;
+  10    (static-ref 5 214)              ;; magnitude
+  12    (call-scm&lt;-scm-scm 8 8 5 111)   ;; lookup-bound
+  14    (static-set! 8 200)             ;; #&lt;variable 7f05e03e8490 value: #&lt;procedure magnitude (x y)&gt;&gt;
+L1:
+  16    (scm-ref/immediate 2 8 1)
+  17    (mov 1 7)                                             at (unknown file):18:13
+  18    (mov 0 6)
+  19    (handle-interrupts)
+  20    (call 6 3)
+  22    (receive 0 6 9)
+  24    (static-ref 5 210)              ;; 0.0                at (unknown file):19:17
+  26    (=? 8 5)                                              at (unknown file):19:10
+  27    (je 11)                         ;; -&gt; L2
+  28    (call-scm&lt;-scm-scm 7 7 8 5)     ;; div                at (unknown file):21:12
+  30    (call-scm&lt;-scm-scm 8 6 8 5)     ;; div                at (unknown file):21:22
+  32    (mov 6 7)                                             at (unknown file):21:4
+  33    (mov 7 8)
+  34    (mov 8 6)
+  35    (reset-frame 2)                 ;; 2 slots
+  36    (handle-interrupts)
+  37    (return-values)
+L2:
+  38    (static-ref 8 206)              ;; misc-error         at (unknown file):20:6
+  40    (make-immediate 5 4)            ;; #f
+  41    (make-non-immediate 4 205)      ;; &#34;cannot normalize vector with 0 magnitude ~S ~S&#34; at (unknown file):20:13
+  43    (make-immediate 3 772)          ;; ()                 at (unknown file):20:6
+  44    (allocate-words/immediate 2 2)
+  45    (scm-set!/immediate 2 0 6)
+  46    (scm-set!/immediate 2 1 3)
+  47    (allocate-words/immediate 6 2)
+  48    (scm-set!/immediate 6 0 7)
+  49    (scm-set!/immediate 6 1 2)
+  50    (allocate-words/immediate 7 2)
+  51    (scm-set!/immediate 7 0 5)
+  52    (scm-set!/immediate 7 1 3)
+  53    (allocate-words/immediate 3 2)
+  54    (scm-set!/immediate 3 0 6)
+  55    (scm-set!/immediate 3 1 7)
+  56    (allocate-words/immediate 7 2)
+  57    (scm-set!/immediate 7 0 4)
+  58    (scm-set!/immediate 7 1 3)
+  59    (allocate-words/immediate 6 2)
+  60    (scm-set!/immediate 6 0 5)
+  61    (scm-set!/immediate 6 1 7)
+  62    (throw 8 6)</code></pre><p>Instruction 20 is <code>call</code>, so inlining didn’t happen.  Furthermore, the
+two <code>/</code> calls (instructions 28 and 30) use the generic division
+primitive rather than <code>fdiv</code>.  No unboxing for us.</p><p>The profiler confirms that things aren’t so great:</p><pre><code><span>scheme@</span><span>(</span><span>guile-user</span><span>)</span><span>&gt;</span> <span>,profile</span> <span>(</span><span>let</span> <span>lp</span> <span>(</span><span>(</span><span>i</span> <span>0</span><span>)</span><span>)</span>
+                                <span>(</span><span>when</span> <span>(</span><span>&lt;</span> <span>i</span> <span>100000000</span><span>)</span>
+                                  <span>(</span><span>normalize</span> <span>3.0</span> <span>4.0</span><span>)</span>
+                                  <span>(</span><span>lp</span> <span>(</span><span>+</span> <span>i</span> <span>1</span><span>)</span><span>)</span><span>)</span><span>)</span>
+<span>%</span>     <span>cumulative</span>   <span>self</span>
+<span>time</span>   <span>seconds</span>     <span>seconds</span>  <span>procedure</span>
+ <span>52.80</span>     <span>21.16</span>     <span>11.51</span>  <span>&lt;current</span> <span>input&gt;:17:19:normalize</span>
+ <span>41.01</span>      <span>9.36</span>      <span>8.94</span>  <span>&lt;current</span> <span>input&gt;:9:19:magnitude</span>
+  <span>3.29</span>      <span>0.72</span>      <span>0.72</span>  <span>%after-gc-thunk</span>
+  <span>2.90</span>     <span>21.80</span>      <span>0.63</span>  <span>&lt;current</span> <span>input&gt;:23:9</span>
+  <span>0.00</span>      <span>0.72</span>      <span>0.00</span>  <span>anon</span> <span>#x15fd5c0</span>
+<span>---</span>
+<span>Sample</span> <span>count:</span> <span>517</span>
+<span>Total</span> <span>time:</span> <span>21.795201408</span> <span>seconds</span> <span>(</span><span>19.704395422</span> <span>seconds</span> <span>in</span> <span>GC</span><span>)</span></code></pre><p>To force the compiler to inline <code>magnitude</code>, we’ll change the
+definition of to use <code>define-inlinable</code>:</p><pre><code><span>(</span><span>define-inlinable</span> <span>(</span><span>magnitude</span> <span>x</span> <span>y</span><span>)</span>
+  <span>(</span><span>unless</span> <span>(</span><span>and</span> <span>(</span><span>real?</span> <span>x</span><span>)</span> <span>(</span><span>inexact?</span> <span>x</span><span>)</span>
+               <span>(</span><span>real?</span> <span>y</span><span>)</span> <span>(</span><span>inexact?</span> <span>y</span><span>)</span><span>)</span>
+    <span>(</span><span>error</span> <span>&#34;expected floats&#34;</span> <span>x</span> <span>y</span><span>)</span><span>)</span>
+  <span>(</span><span>sqrt</span> <span>(</span><span>+</span> <span>(</span><span>*</span> <span>x</span> <span>x</span><span>)</span> <span>(</span><span>*</span> <span>y</span> <span>y</span><span>)</span><span>)</span><span>)</span><span>)</span></code></pre><p><code>define-inlinable</code> is a handy little macro that will substitute the
+procedure body into its call sites.</p><p>Now let’s see the disassembly:</p><pre><code>Disassembly of #&lt;procedure normalize (x y)&gt; at #x16993c8:
+
+   0    (instrument-entry 276)                                at (unknown file):58:19
+   2    (assert-nargs-ee/locals 3 4)    ;; 7 slots (2 args)
+   3    (immediate-tag=? 5 3 2)         ;; fixnum?            at (unknown file):59:13
+   5    (je 10)                         ;; -&gt; L1
+   6    (immediate-tag=? 5 7 0)         ;; heap-object?
+   8    (jne 97)                        ;; -&gt; L4
+   9    (heap-tag=? 5 127 23)           ;; heap-number?
+  11    (jne 94)                        ;; -&gt; L4
+  12    (heap-tag=? 5 4095 791)         ;; compnum?
+  14    (je 91)                         ;; -&gt; L4
+L1:
+  15    (immediate-tag=? 5 3 2)         ;; fixnum?
+  17    (je 88)                         ;; -&gt; L4
+  18    (heap-tag=? 5 4095 535)         ;; flonum?
+  20    (jne 85)                        ;; -&gt; L4
+  21    (immediate-tag=? 4 3 2)         ;; fixnum?
+  23    (je 10)                         ;; -&gt; L2
+  24    (immediate-tag=? 4 7 0)         ;; heap-object?
+  26    (jne 79)                        ;; -&gt; L4
+  27    (heap-tag=? 4 127 23)           ;; heap-number?
+  29    (jne 76)                        ;; -&gt; L4
+  30    (heap-tag=? 4 4095 791)         ;; compnum?
+  32    (je 73)                         ;; -&gt; L4
+L2:
+  33    (immediate-tag=? 4 3 2)         ;; fixnum?
+  35    (je 70)                         ;; -&gt; L4
+  36    (heap-tag=? 4 4095 535)         ;; flonum?
+  38    (jne 67)                        ;; -&gt; L4
+  39    (call-f64&lt;-scm 6 5 17)          ;; scm-&gt;f64
+  41    (fmul 3 6 6)
+  42    (call-f64&lt;-scm 2 4 17)          ;; scm-&gt;f64
+  44    (fmul 1 2 2)
+  45    (fadd 3 3 1)
+  46    (call-f64&lt;-f64 3 3 70)
+  48    (load-f64 1 0 0)                                      at (unknown file):60:10
+  51    (f64=? 3 1)
+  52    (je 28)                         ;; -&gt; L3
+  53    (fdiv 6 6 3)                                          at (unknown file):62:12
+  54    (allocate-pointerless-words/immediate 5 2)
+  55    (load-u64 4 0 535)
+  58    (word-set!/immediate 5 0 4)
+  59    (tail-pointer-ref/immediate 4 5 1)
+  60    (load-u64 1 0 0)
+  63    (f64-set! 4 1 6)
+  64    (fdiv 6 2 3)                                          at (unknown file):62:22
+  65    (allocate-pointerless-words/immediate 4 2)
+  66    (load-u64 3 0 535)
+  69    (word-set!/immediate 4 0 3)
+  70    (tail-pointer-ref/immediate 3 4 1)
+  71    (load-u64 2 0 0)
+  74    (f64-set! 3 2 6)
+  75    (mov 6 5)                                             at (unknown file):62:4
+  76    (mov 5 4)
+  77    (reset-frame 2)                 ;; 2 slots
+  78    (handle-interrupts)
+  79    (return-values)
+L3:
+  80    (static-ref 6 178)              ;; misc-error         at (unknown file):61:6
+  82    (make-immediate 3 4)            ;; #f
+  83    (make-non-immediate 2 177)      ;; &#34;cannot normalize vector with 0 magnitude ~S ~S&#34; at (unknown file):61:13
+  85    (make-immediate 1 772)          ;; ()                 at (unknown file):61:6
+  86    (allocate-words/immediate 0 2)
+  87    (scm-set!/immediate 0 0 4)
+  88    (scm-set!/immediate 0 1 1)
+  89    (allocate-words/immediate 4 2)
+  90    (scm-set!/immediate 4 0 5)
+  91    (scm-set!/immediate 4 1 0)
+  92    (allocate-words/immediate 5 2)
+  93    (scm-set!/immediate 5 0 3)
+  94    (scm-set!/immediate 5 1 1)
+  95    (allocate-words/immediate 1 2)
+  96    (scm-set!/immediate 1 0 4)
+  97    (scm-set!/immediate 1 1 5)
+  98    (allocate-words/immediate 5 2)
+  99    (scm-set!/immediate 5 0 2)
+ 100    (scm-set!/immediate 5 1 1)
+ 101    (allocate-words/immediate 4 2)
+ 102    (scm-set!/immediate 4 0 3)
+ 103    (scm-set!/immediate 4 1 5)
+ 104    (throw 6 4)
+L4:
+ 105    (static-ref 6 153)              ;; misc-error         at (unknown file):59:13
+ 107    (make-immediate 3 4)            ;; #f
+ 108    (make-non-immediate 2 160)      ;; &#34;expected floats ~S ~S&#34; at (unknown file):54:11
+ 110    (make-immediate 1 772)          ;; ()                 at (unknown file):59:13
+ 111    (allocate-words/immediate 0 2)
+ 112    (scm-set!/immediate 0 0 4)
+ 113    (scm-set!/immediate 0 1 1)
+ 114    (allocate-words/immediate 4 2)
+ 115    (scm-set!/immediate 4 0 5)
+ 116    (scm-set!/immediate 4 1 0)
+ 117    (allocate-words/immediate 5 2)
+ 118    (scm-set!/immediate 5 0 3)
+ 119    (scm-set!/immediate 5 1 1)
+ 120    (allocate-words/immediate 1 2)
+ 121    (scm-set!/immediate 1 0 4)
+ 122    (scm-set!/immediate 1 1 5)
+ 123    (allocate-words/immediate 5 2)
+ 124    (scm-set!/immediate 5 0 2)
+ 125    (scm-set!/immediate 5 1 1)
+ 126    (allocate-words/immediate 4 2)
+ 127    (scm-set!/immediate 4 0 3)
+ 128    (scm-set!/immediate 4 1 5)
+ 129    (throw 6 4)</code></pre><p>Much better!  All of the instructions for <code>magnitude</code> are now part of
+<code>normalize</code>.  <code>/</code> is compiled to <code>fdiv</code> just like we had hoped.</p><pre><code><span>%</span>     <span>cumulative</span>   <span>self</span>
+<span>time</span>   <span>seconds</span>     <span>seconds</span>  <span>procedure</span>
+ <span>93.04</span>      <span>9.24</span>      <span>9.19</span>  <span>&lt;current</span> <span>input&gt;:58:19:normalize</span>
+  <span>6.52</span>      <span>9.88</span>      <span>0.64</span>  <span>&lt;current</span> <span>input&gt;:71:9</span>
+  <span>0.43</span>      <span>0.04</span>      <span>0.04</span>  <span>%after-gc-thunk</span>
+  <span>0.00</span>      <span>0.04</span>      <span>0.00</span>  <span>anon</span> <span>#x15fd5c0</span>
+<span>---</span>
+<span>Sample</span> <span>count:</span> <span>230</span>
+<span>Total</span> <span>time:</span> <span>9.879456057</span> <span>seconds</span> <span>(</span><span>8.858042989</span> <span>seconds</span> <span>in</span> <span>GC</span><span>)</span></code></pre><p>We’re 2x faster now, though still a lot of GC.  For our final example,
+we will fully embrace <em>mutable state</em>.  As much us Schemers like
+functional programming, mutable state is sometimes necessary.</p><h3>Example 4: Bytevectors</h3><p>For <em>really</em> performance sensitive math code, we can go one step
+further to avoid allocation and use bytevectors to store the results
+of numeric operations.  Chickadee uses bytevectors extensively to
+minimize the number of heap allocated floats.  Bytevectors have the
+advantage of unboxed getters and setters, so they’re my preferred data
+structure for math intensive code.</p><p>Let&#39;s revisit the vector math of the previous two examples, but this
+time using bytevectors to represent 2D vectors.</p><pre><code><span>(</span><span>define-inlinable</span> <span>(</span><span>vec2</span> <span>x</span> <span>y</span><span>)</span>
+  <span>(</span><span>let</span> <span>(</span><span>(</span><span>bv</span> <span>(</span><span>make-f32vector</span> <span>2</span><span>)</span><span>)</span><span>)</span>
+    <span>(</span><span>f32vector-set!</span> <span>bv</span> <span>0</span> <span>x</span><span>)</span>
+    <span>(</span><span>f32vector-set!</span> <span>bv</span> <span>1</span> <span>y</span><span>)</span>
+    <span>bv</span><span>)</span><span>)</span>
+
+<span>(</span><span>define-inlinable</span> <span>(</span><span>vec2-x</span> <span>v</span><span>)</span>
+  <span>(</span><span>f32vector-ref</span> <span>v</span> <span>0</span><span>)</span><span>)</span>
+
+<span>(</span><span>define-inlinable</span> <span>(</span><span>vec2-y</span> <span>v</span><span>)</span>
+  <span>(</span><span>f32vector-ref</span> <span>v</span> <span>1</span><span>)</span><span>)</span>
+
+<span>(</span><span>define-inlinable</span> <span>(</span><span>magnitude</span> <span>v</span><span>)</span>
+  <span>(</span><span>let</span> <span>(</span><span>(</span><span>x</span> <span>(</span><span>vec2-x</span> <span>v</span><span>)</span><span>)</span>
+        <span>(</span><span>y</span> <span>(</span><span>vec2-y</span> <span>v</span><span>)</span><span>)</span><span>)</span>
+    <span>(</span><span>sqrt</span> <span>(</span><span>+</span> <span>(</span><span>*</span> <span>x</span> <span>x</span><span>)</span> <span>(</span><span>*</span> <span>y</span> <span>y</span><span>)</span><span>)</span><span>)</span><span>)</span><span>)</span>
+
+<span>(</span><span>define</span> <span>(</span><span>normalize</span> <span>v</span><span>)</span>
+  <span>(</span><span>let</span> <span>(</span><span>(</span><span>mag</span> <span>(</span><span>magnitude</span> <span>v</span><span>)</span><span>)</span><span>)</span>
+    <span>(</span><span>when</span> <span>(</span><span>=</span> <span>mag</span> <span>0.0</span><span>)</span>
+      <span>(</span><span>error</span> <span>&#34;cannot normalize vector with 0 magnitude&#34;</span> <span>v</span><span>)</span><span>)</span>
+    <span>(</span><span>vec2</span> <span>(</span><span>/</span> <span>(</span><span>vec2-x</span> <span>v</span><span>)</span> <span>mag</span><span>)</span> <span>(</span><span>/</span> <span>(</span><span>vec2-y</span> <span>v</span><span>)</span> <span>mag</span><span>)</span><span>)</span><span>)</span><span>)</span></code></pre><p>Here’s the disassembly for <code>normalize</code> now:</p><pre><code>Disassembly of #&lt;procedure normalize (v)&gt; at #x1b05d50:
+
+   0    (instrument-entry 492)                                at (unknown file):454:19
+   2    (assert-nargs-ee/locals 2 11)   ;; 13 slots (1 arg)
+   3    (make-immediate 12 2)           ;; 0                  at (unknown file):455:13
+   4    (immediate-tag=? 11 7 0)        ;; heap-object?
+   6    (jne 83)                        ;; -&gt; L8
+   7    (heap-tag=? 11 127 77)          ;; bytevector?
+   9    (jne 80)                        ;; -&gt; L8
+  10    (word-ref/immediate 10 11 1)
+  11    (load-s64 9 0 0)
+  14    (imm-u64&lt;? 10 3)
+  15    (jnl 72)                        ;; -&gt; L7
+  16    (usub/immediate 10 10 3)
+  17    (pointer-ref/immediate 8 11 2)
+  18    (f32-ref 7 8 9)
+  19    (make-immediate 6 18)           ;; 4
+  20    (load-s64 5 0 4)
+  23    (u64&lt;? 5 10)
+  24    (jnl 61)                        ;; -&gt; L6
+  25    (f32-ref 10 8 5)
+  26    (fmul 8 7 7)
+  27    (fmul 4 10 10)
+  28    (fadd 8 8 4)
+  29    (call-f64&lt;-f64 8 8 70)
+  31    (load-f64 4 0 0)                                      at (unknown file):456:10
+  34    (f64=? 8 4)
+  35    (je 48)                         ;; -&gt; L5
+  36    (fdiv 11 7 8)                                         at (unknown file):458:10
+  37    (fdiv 10 10 8)                                        at (unknown file):458:29
+  38    (static-ref 8 332)              ;; #f                 at (unknown file):388:13
+  40    (immediate-tag=? 8 7 0)         ;; heap-object?
+  42    (je 9)                          ;; -&gt; L1
+  43    (static-ref 8 305)              ;; #&lt;directory (guile-user) 7f05ec481c80&gt;
+  45    (static-ref 7 335)              ;; make-f32vector
+  47    (call-scm&lt;-scm-scm 8 8 7 111)   ;; lookup-bound
+  49    (static-set! 8 321)             ;; #f
+L1:
+  51    (scm-ref/immediate 1 8 1)
+  52    (make-immediate 0 10)           ;; 2                  at (unknown file):388:28
+  53    (handle-interrupts)                                   at (unknown file):458:4
+  54    (call 11 2)
+  56    (receive 4 11 13)
+  58    (immediate-tag=? 8 7 0)         ;; heap-object?
+  60    (jne 21)                        ;; -&gt; L4
+  61    (heap-tag=? 8 127 77)           ;; bytevector?
+  63    (jne 18)                        ;; -&gt; L4
+  64    (word-ref/immediate 7 8 1)
+  65    (imm-u64&lt;? 7 3)
+  66    (jnl 13)                        ;; -&gt; L3
+  67    (usub/immediate 12 7 3)
+  68    (pointer-ref/immediate 7 8 2)
+  69    (f32-set! 7 9 11)
+  70    (u64&lt;? 5 12)
+  71    (jnl 6)                         ;; -&gt; L2
+  72    (f32-set! 7 5 10)
+  73    (mov 12 8)
+  74    (reset-frame 1)                 ;; 1 slot
+  75    (handle-interrupts)
+  76    (return-values)
+L2:
+  77    (throw/value+data 6 331)        ;; #(out-of-range &#34;bytevector-ieee-single-native-set!&#34; &#34;Argument 2 out of rang…&#34;)
+L3:
+  79    (throw/value+data 12 329)       ;; #(out-of-range &#34;bytevector-ieee-single-native-set!&#34; &#34;Argument 2 out of rang…&#34;)
+L4:
+  81    (throw/value+data 8 353)        ;; #(wrong-type-arg &#34;bytevector-ieee-single-native-set!&#34; &#34;Wrong type argument …&#34;)
+L5:
+  83    (throw/value 11 377)            ;; #(misc-error #f &#34;cannot normalize vector with 0 magnitude ~S&#34;) at (unknown file):457:6
+L6:
+  85    (throw/value+data 6 391)        ;; #(out-of-range &#34;bytevector-ieee-single-native-ref&#34; &#34;Argument 2 out of range…&#34;) at (unknown file):455:13
+L7:
+  87    (throw/value+data 12 389)       ;; #(out-of-range &#34;bytevector-ieee-single-native-ref&#34; &#34;Argument 2 out of range…&#34;)
+L8:
+  89    (throw/value+data 11 395)       ;; #(wrong-type-arg &#34;bytevector-ieee-single-native-ref&#34; &#34;Wrong type argument i…&#34;)</code></pre><p>This looks pretty good!  All the math is done with unboxed floats and
+no heap floats are allocated at all.  Unboxed floats are pulled out of
+the bytevector with <code>f32-ref</code> and stuffed back in with <code>f32-set!</code>.
+But we’re still allocating a new bytevector at the end.  This is
+generally fine, but for <em>reeeeaaally</em> performance sensitive code we
+want to avoid this allocation, too.  For this case, we can write a
+variant of <code>normalize</code> that mutates another 2D vector to store the
+result.</p><pre><code><span>(</span><span>define-inlinable</span> <span>(</span><span>set-vec2-x!</span> <span>v</span> <span>x</span><span>)</span>
+  <span>(</span><span>f32vector-set!</span> <span>v</span> <span>0</span> <span>x</span><span>)</span><span>)</span>
+
+<span>(</span><span>define-inlinable</span> <span>(</span><span>set-vec2-y!</span> <span>v</span> <span>y</span><span>)</span>
+  <span>(</span><span>f32vector-set!</span> <span>v</span> <span>1</span> <span>y</span><span>)</span><span>)</span>
+
+<span>(</span><span>define</span> <span>(</span><span>normalize!</span> <span>v</span> <span>dst</span><span>)</span>
+  <span>(</span><span>let</span> <span>(</span><span>(</span><span>mag</span> <span>(</span><span>magnitude</span> <span>v</span><span>)</span><span>)</span><span>)</span>
+    <span>(</span><span>when</span> <span>(</span><span>=</span> <span>mag</span> <span>0.0</span><span>)</span>
+      <span>(</span><span>error</span> <span>&#34;cannot normalize vector with 0 magnitude&#34;</span> <span>v</span><span>)</span><span>)</span>
+    <span>(</span><span>set-vec2-x!</span> <span>dst</span> <span>(</span><span>/</span> <span>(</span><span>vec2-x</span> <span>v</span><span>)</span> <span>mag</span><span>)</span><span>)</span>
+    <span>(</span><span>set-vec2-y!</span> <span>dst</span> <span>(</span><span>/</span> <span>(</span><span>vec2-y</span> <span>v</span><span>)</span> <span>mag</span><span>)</span><span>)</span><span>)</span><span>)</span></code></pre><p>We can then define the functional version in terms of the imperative
+version:</p><pre><code><span>(</span><span>define</span> <span>(</span><span>normalize</span> <span>v</span><span>)</span>
+  <span>(</span><span>let</span> <span>(</span><span>(</span><span>v*</span> <span>(</span><span>vec2</span> <span>0.0</span> <span>0.0</span><span>)</span><span>)</span><span>)</span>
+    <span>(</span><span>normalize!</span> <span>v</span> <span>v*</span><span>)</span>
+    <span>v*</span><span>)</span><span>)</span></code></pre><p>Now we have options.  We can use the less elegant, imperative variant
+when we can’t afford to allocate and use the functional variant
+otherwise.  This is a simplified version of how vecs, matrices, and
+rects work in Chickadee.</p><p>Let’s compare the two.  First, the functional API:</p><pre><code><span>scheme@</span><span>(</span><span>guile-user</span><span>)</span><span>&gt;</span> <span>,profile</span> <span>(</span><span>let</span> <span>(</span><span>(</span><span>v</span> <span>(</span><span>vec2</span> <span>3.0</span> <span>4.0</span><span>)</span><span>)</span><span>)</span>
+                                <span>(</span><span>let</span> <span>lp</span> <span>(</span><span>(</span><span>i</span> <span>0</span><span>)</span><span>)</span>
+                                  <span>(</span><span>when</span> <span>(</span><span>&lt;</span> <span>i</span> <span>100000000</span><span>)</span>
+                                    <span>(</span><span>normalize</span> <span>v</span><span>)</span>
+                                    <span>(</span><span>lp</span> <span>(</span><span>+</span> <span>i</span> <span>1</span><span>)</span><span>)</span><span>)</span><span>)</span><span>)</span>
+<span>%</span>     <span>cumulative</span>   <span>self</span>
+<span>time</span>   <span>seconds</span>     <span>seconds</span>  <span>procedure</span>
+ <span>46.46</span>      <span>7.84</span>      <span>7.73</span>  <span>make-srfi-4-vector</span>
+ <span>31.61</span>      <span>5.26</span>      <span>5.26</span>  <span>&lt;current</span> <span>input&gt;:425:19:normalize!</span>
+ <span>12.95</span>     <span>16.23</span>      <span>2.15</span>  <span>&lt;current</span> <span>input&gt;:432:19:normalize</span>
+  <span>5.87</span>      <span>0.98</span>      <span>0.98</span>  <span>ice-9/boot-9.scm:408:31:make-f32vector</span>
+  <span>2.42</span>     <span>16.63</span>      <span>0.40</span>  <span>&lt;current</span> <span>input&gt;:439:32</span>
+  <span>0.69</span>      <span>0.11</span>      <span>0.11</span>  <span>%after-gc-thunk</span>
+  <span>0.00</span>      <span>0.11</span>      <span>0.00</span>  <span>anon</span> <span>#x15fd5c0</span>
+<span>---</span>
+<span>Sample</span> <span>count:</span> <span>579</span>
+<span>Total</span> <span>time:</span> <span>16.633395281</span> <span>seconds</span> <span>(</span><span>12.628994384</span> <span>seconds</span> <span>in</span> <span>GC</span><span>)</span></code></pre><p>And now the imperative API:</p><pre><code><span>scheme@</span><span>(</span><span>guile-user</span><span>)</span><span>&gt;</span> <span>,profile</span> <span>(</span><span>let</span> <span>(</span><span>(</span><span>v</span> <span>(</span><span>vec2</span> <span>3.0</span> <span>4.0</span><span>)</span><span>)</span>
+                                    <span>(</span><span>dst</span> <span>(</span><span>vec2</span> <span>0.0</span> <span>0.0</span><span>)</span><span>)</span><span>)</span>
+                                <span>(</span><span>let</span> <span>lp</span> <span>(</span><span>(</span><span>i</span> <span>0</span><span>)</span><span>)</span>
+                                  <span>(</span><span>when</span> <span>(</span><span>&lt;</span> <span>i</span> <span>100000000</span><span>)</span>
+                                    <span>(</span><span>normalize!</span> <span>v</span> <span>dst</span><span>)</span>
+                                    <span>(</span><span>lp</span> <span>(</span><span>+</span> <span>i</span> <span>1</span><span>)</span><span>)</span><span>)</span><span>)</span><span>)</span>
+<span>%</span>     <span>cumulative</span>   <span>self</span>
+<span>time</span>   <span>seconds</span>     <span>seconds</span>  <span>procedure</span>
+ <span>91.03</span>      <span>1.13</span>      <span>1.13</span>  <span>&lt;current</span> <span>input&gt;:272:19:normalize!</span>
+  <span>8.97</span>      <span>1.24</span>      <span>0.11</span>  <span>&lt;current</span> <span>input&gt;:343:32</span>
+<span>---</span>
+<span>Sample</span> <span>count:</span> <span>78</span>
+<span>Total</span> <span>time:</span> <span>1.244961515</span> <span>seconds</span> <span>(</span><span>0.0</span> <span>seconds</span> <span>in</span> <span>GC</span><span>)</span></code></pre><p>13x faster and no GC!  To use this technique in your own program, you
+may want to use something like a pool to reuse objects over and over;
+or just stash an object somewhere to use as scratch space.</p><p>Note: Unlike example 2, these optimizations <em>do</em> happen on Guile 3.0.9
+and IIRC any stable Guile 3.0.x release.</p><h3>Happy hacking</h3><p>Well, that’s all I’ve got!  There are other sources of allocation to
+be aware of, like closures, but I couldn’t come up with clean
+examples.  If I think of something good maybe I’ll update this post
+later.</p><p>To reiterate, most of the code you write doesn’t need to be examined
+this closely.  Don’t rush off and use <code>define-inlinable</code> everywhere
+and inflate the size of your compiled modules!  Let the profiler focus
+your attention on what matters.  May your Scheme be speedy and your
+GCs infrequent. 🙏</p></div></div>
+  </body>
+</html>
