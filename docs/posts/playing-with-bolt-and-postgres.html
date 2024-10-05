@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://vondra.me/posts/playing-with-bolt-and-postgres/">Original</a>
+    <h1>Playing with BOLT and Postgres</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>A couple days ago I had a bit of free time in the evening, and I was
+bored, so I decided to play with BOLT a little bit. No, not the <a href="https://en.wikipedia.org/wiki/Bolt_(Disney_character)">dog
+from a Disney movie</a>,
+the <a href="https://github.com/llvm/llvm-project/blob/main/bolt/README.md">BOLT</a>
+tool from LLVM project, aimed at optimizing binaries. It took me a
+while to get it working, but the results are unexpectedly good, in
+some cases up to 40%. So let me share my notes and benchmark results,
+and maybe there’s something we can learn from it. We’ll start by going
+through a couple rabbit holes first, though.</p><p>I do a fair amount of benchmarking during development, to assess impact
+of patches, compare possible approaches, etc. Often the impact is very
+clear - the throughput doubles, query that took 1000 milliseconds
+suddenly takes only 10 milliseconds, and so on. But sometimes the change
+is tiny, or maybe you even need to prove there’s no change at all.</p><p>That sounds trivial, right? You just run the benchmark enough times
+to get rid of random noise, and then compare the results. Sadly, it’s
+not that simple, and it gets harder the closer the results are. So in a
+way, proving a patch does not affect performance (and cause regression)
+is the hardest benchmarking task.</p><h2 id="binary-layout-matters">Binary layout matters</h2><p>It’s hard because of “binary layout” - layout of data structures,
+variables and functions etc. in the executable binary. We imagine the
+executable gets loaded into memory, and that memory is uniformly fast.
+And it’s not, we just live in the illusion of virtual address space.
+But it’s actually backed by a hierarchy of memory types with vastly
+different performance (throughput, latency, energy costs, …). There’s
+a <a href="https://people.freebsd.org/~lstewart/articles/cpumemory.pdf">wonderful paper by Ulrich Drepper</a>
+from 2007, discussing all this. I highly recommend reading it.</p><p>This means the structure of the compiled binary matters, and maybe the
+patch accidentally changes it. Maybe the patch adds a local variable
+that shifts something just enough to not fit in the same cache line.
+Maybe it adds just enough instructions or data to push something useful
+from iTLB/dTLB caches on the CPU, forcing access to DRAM later. Maybe
+it even affects branch prediction, or stuff like that.</p><p>These random changes to binary layout have a tiny impact - usually less
+than 1% or so, perhaps a bit more (say 5%?). I’m sure it’s possible to
+construct artificial examples with much bigger impact. But I’m talking
+about impact expected on “normal” patches.</p><p>To further complicate things, these layout effects are not additive. If
+you have two patches causing “1% regression” each because of layout, it
+does not mean applying both patches will regress by 2%. It might be 0%
+if the patches cancel out, for example.</p><p>When you benchmark a patch, and the difference is less than ~1%, it’s
+hard to say if it’s due to the patch or a small accidental change to the
+binary layout.</p><p>But we would like to know! 1% regression seems small, but if we happen
+to accept multiple of those, the total regression could be much worse.</p><p>What can we do about it?</p><h2 id="stabilizer">Stabilizer</h2><p>There’s a great “<a href="https://www.youtube.com/watch?v=r-TLSBdHe1A">Performance Matters</a>”
+talk about this very issue, by <a href="https://emeryberger.com/">Emery Berger</a>,
+presented at StrangeLoop 2019. It starts by explaining the issue - and
+it does a much better job than I did here. And then presents the
+<a href="https://github.com/ccurtsinger/stabilizer">Stabilizer</a> profiler,
+randomizing the binary layout to get rid of the differences.</p><p>The basic idea is very simple - the binary layout effects are random
+and should cancel out in the long run. Instead of doing many runs with
+a single fixed binary layout for a given executable, we can randomize
+the layout between runs. If we do that in a smart way, the effects will
+cancel out and disappear - magic.</p><p>Sadly, the Stabilizer project seems mostly inactive . The last commit
+touching code is from 2013, and it only supports LLVM 3.1 and GCC 4.6.2.
+Those are ancient versions. I don’t even know if you can build Postgres
+with them anymore, or how different the binary would be, compared to
+current LLVM/GCC versions.</p><p><strong>Note</strong>: I wonder if it would be possible to do “poor man’s Stabilizer”
+by randomly adding local variables to functions, to change the size of
+the stacks. AFAIK that’s essentially one of the things Stabilizer does,
+although it does it in a nice way at runtime, without rebuilds.</p><h2 id="bolt">BOLT</h2><p>While looking for tools that might replace Stabilizer, I realized that
+randomizing the layout may not be the only option. Maybe it would be
+possible to eliminate the random effects by ensuring the binary layout
+is “optimal” in some way (hopefully the same for both builds).</p><p>I don’t recall how exactly, but this eventually led me to <a href="https://github.com/llvm/llvm-project/tree/main/bolt">BOLT</a>,
+which started as a <a href="https://research.facebook.com/publications/bolt-a-practical-binary-optimizer-for-data-centers-and-beyond/">research project at META</a>.
+There’s a <a href="https://research.facebook.com/file/534990324471927/BOLT-A-Practical-Binary-Optimizer-for-Data-Centers-and-Beyond.pdf">nice paper</a>
+explaining the details, of course.</p><p>Dealing with binary layout differences for benchmarking is not the goal
+of BOLT, it’s meant to optimize the binary layout based on a profile.
+But my hope was that if I optimize the builds (unpatched and patched)
+the same way, the differences will not matter anymore.</p><p>So I decided to give it a try, and do some quick testing …</p><h3 id="what-didnt-quite-work">What didn’t quite work</h3><p>The first thing I tried was simply installing <code>bolt-16</code> (my machines are
+running Debian 12.7), and followed the instructions from the README.
+That seemed to work at first, but I quickly started to run into various
+problems.</p><p>BOLT requires builds with relocations enabled, so that it can reorganize
+the binary. So make sure you build Postgres with</p><div><pre tabindex="0"><code data-lang="bash"><span><span>LDFLAGS=<span>&#34;-Wl,--emit-relocs&#34;</span> 
+</span></span></code></pre></div><p>Collecting the profile is pretty simple, but that’s just regular <code>perf</code>
+(the <code>$PID</code> is a Postgres backend running some queries):</p><div><pre tabindex="0"><code data-lang="bash"><span><span>perf record -e cycles:u -j any,u -p $PID -o perf.data
+</span></span></code></pre></div><p>But then turning that into BOLT profile started to complain:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>$ perf2bolt-16 -p perf.data -o bolt.data /mnt/data/builds/master/bin/postgres 
+</span></span><span><span>BOLT-INFO: shared object or position-independent executable detected
+</span></span><span><span>perf2bolt-16: WARNING: reading perf data directly is unsupported, please use
+</span></span><span><span> -aggregate-only or perf2bolt.
+</span></span><span><span>!!! Proceed on your own risk. !!!
+</span></span><span><span>PERF2BOLT: Starting data aggregation job <span>for</span> perf.data
+</span></span><span><span>PERF2BOLT: spawning perf job to read branch events
+</span></span><span><span>...
+</span></span></code></pre></div><p>I’m just running the command the <code>README</code> tells me to, so I’m not sure
+why it’s complaining about “reading perf data directly” or recommending
+me to run the tool I’m actually running (maybe it’s checking the name
+somehow, and the “-16” confuses that check somehow?).</p><p>It does produce the <code>bolt.data</code> file with BOLT profile, though. So let’s
+try optimizing the binary using it:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>$ llvm-bolt-16 /mnt/data/builds/master/bin/postgres -o postgres.bolt <span>\
+</span></span></span><span><span><span></span>  -data=bolt.data -reorder-blocks=ext-tsp -reorder-functions=hfsort <span>\
+</span></span></span><span><span><span></span>  -split-functions -split-all-cold -split-eh -dyno-stats
+</span></span><span><span>BOLT-INFO: shared object or position-independent executable detected
+</span></span><span><span>BOLT-INFO: Target architecture: x86_64
+</span></span><span><span>BOLT-INFO: BOLT version: &lt;unknown&gt;
+</span></span><span><span>BOLT-INFO: first alloc address is 0x0
+</span></span><span><span>BOLT-INFO: creating new program header table at address 0xa00000, offset 0xa00000
+</span></span><span><span>BOLT-INFO: enabling relocation mode
+</span></span><span><span>BOLT-INFO: enabling lite mode
+</span></span><span><span>BOLT-INFO: pre-processing profile using branch profile reader
+</span></span><span><span>ERROR: no valid profile data found
+</span></span><span><span>BOLT-ERROR: <span>&#39;cannot pre-process profile&#39;</span>: Input/output error.
+</span></span></code></pre></div><p>I have no idea what’s wrong here. The <code>perf2bolt-161</code> command clearly
+produced a file, it’s a valid ELF file (<code>readelf</code> can dump it), but it
+just doesn’t work for some reason.</p><p>Maybe there’s some problem with <code>perf2bolt-16</code> after all? The README
+does mention it’s possible to instrument the binary to collect the
+profile directly, without using <code>perf</code>, so let’s try that:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>$ llvm-bolt-16 /mnt/data/builds/master/bin/postgres <span>\
+</span></span></span><span><span><span></span>               -instrument <span>\
+</span></span></span><span><span><span></span>               -o /mnt/data/builds/master/bin/postgres.instrumented
+</span></span><span><span>BOLT-INFO: shared object or position-independent executable detected
+</span></span><span><span>BOLT-INFO: Target architecture: x86_64
+</span></span><span><span>...
+</span></span><span><span>BOLT-ERROR: library not found: /usr/lib/libbolt_rt_instr.a
+</span></span></code></pre></div><p>Well, that didn’t work all that well :-( After a while I realized the
+library exists, but is in a different directory, so let’s create a
+symlink and try again:</p><div><pre tabindex="0"><code data-lang="bash"><span><span><span># ln -s /usr/lib/llvm-16/lib/libbolt_rt_instr.a /usr/lib/libbolt_rt_instr.a</span>
+</span></span></code></pre></div><p>Now the instrumentation should work - run the <code>-instrument</code> command
+again, and it’ll produce binary <code>postgres.instrumented</code>. Copy it over
+the original <code>postgres</code> binary (but keep the original build, you’ll
+need it for the actual optimization), start it, and run some queries.
+It will create a profile in <code>/tmp/prof.fdata</code>, which you can use to
+optimize the original binary:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>$ llvm-bolt-16 /mnt/data/builds/master/bin/postgres.orig <span>\
+</span></span></span><span><span><span></span>    -o /mnt/data/builds/master/bin/postgres.optimized <span>\
+</span></span></span><span><span><span></span>    -data=/tmp/prof.fdata -reorder-blocks=ext-tsp <span>\
+</span></span></span><span><span><span></span>    -reorder-functions=hfsort -split-functions -split-all-cold <span>\
+</span></span></span><span><span><span></span>    -split-eh -dyno-stats
+</span></span></code></pre></div><p>And this mostly works. I occasionally got some strange segfault crashes
+that seemed like an infinite loop. It seemed quite fragile (you look at
+it wrong, and it crashes). Maybe I did something wrong, or maybe the
+multi-version packages are confused a bit.</p><h3 id="making-it-work-better">Making it work better</h3><p>Issues with older LLVM builds are not a new thing, especially for
+relatively new projects like BOLT. The Debian version is from 16.0,
+while the git repository is on 20.0, so I decided to try a custom build,
+hoping it will fix the issues. It might also improve the optimization,
+of course.</p><p>First, clone the LLVM project repository, then build the three projects
+needed by BOLT (this may take a couple hours), and then install it into
+the <code>CMAKE_INSTALL_PREFIX</code> directory (you’ll need to adjust the path).</p><div><pre tabindex="0"><code data-lang="bash"><span><span>$ git clone https://github.com/llvm/llvm-project.git
+</span></span><span><span>
+</span></span><span><span>$ cd llmv-project
+</span></span><span><span>
+</span></span><span><span>$ cmake -S llvm -B build -G Ninja -DCMAKE_BUILD_TYPE=Release <span>\
+</span></span></span><span><span><span></span>        -DLLVM_ENABLE_PROJECTS=<span>&#34;bolt;clang;lld&#34;</span> <span>\
+</span></span></span><span><span><span></span>        -DCMAKE_INSTALL_PREFIX=<span>&#34;/home/tomas/tools&#34;</span>
+</span></span><span><span>
+</span></span><span><span>$ cmake --build build
+</span></span><span><span>
+</span></span><span><span>$ cmake --install build
+</span></span></code></pre></div><p>This custom build seems to work much better. I’m yet to see segfaults,
+the problems with missing library and input/output errors when
+processing <code>perf</code> data went away too.</p><p>At some point I ran into a problem when optimizing the binary, when
+<code>llvm-bolt</code> fails with an error:</p><div><pre tabindex="0"><code data-lang="fallback"><span><span>BOLT-ERROR: unable to get new address corresponding to input address
+</span></span><span><span>            0x2a5185 in function ExecInterpExpr/1(*2). Consider adding
+</span></span><span><span>            this function to --skip-funcs=...
+</span></span></code></pre></div><p>I don’t know what this is about exactly, but adding this option seems to
+have fixed it:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>-skip-funcs=ExecInterpExpr.*
+</span></span></code></pre></div><p>I’m not sure this is a good solution, though. This function is for the
+expression interpreter, and that’s likely one of the hottest functions
+in the executor. So not optimizing it may limit the possible benefits
+of the optimization for complex (analytical) queries.</p><h2 id="results">Results</h2><p>To measure the impact of BOLT optimization, I ran a couple traditional
+benchmarks - pgbench for OLTP, and the TPC-H queries for OLAP. I expect
+the optimizations to help especially CPU intensive workloads, so I ran
+the benchmarks on small data sets that fit into memory. That means
+scale 1 for pgbench, 10GB for TPC-H.</p><p>I always compared a “clean” build from the master branch, with a build
+optimized using BOLT. The profile used by BOLT was collected in various
+ways - how important the specific profile matters is one of the
+questions. I assume it matters quite a bit, because optimizing based on
+a profile is the main idea in BOLT. If it didn’t make a difference, why
+bother with a profile at all, right? We could just use a plain LTO.</p><h3 id="oltp--pgbench">OLTP / pgbench</h3><p>First, let’s look at simple read-only pgbench, with a single client,
+that is</p><div><pre tabindex="0"><code data-lang="bash"><span><span>$ pgbench -n -S -c 1 -M [simple|prepared] -T 15 db
+</span></span></code></pre></div><p>on regular build (labeled “master”), and then builds optimized using
+profiles collected for various <code>pgbench</code> workloads:</p><ul><li><strong>pgbench-simple</strong> - profile for <code>pgbench -S -M simple</code></li><li><strong>pgbench-prepared</strong> - profile for <code>pgbench -S -M prepared</code></li><li><strong>pgbench-both</strong> - simple/prepared profiles, combined by <code>merge-fdata</code></li></ul><p>The results (throughput in transactions per second, so higher values are
+better) look like this:</p><p><img src="https://vondra.me/posts/playing-with-bolt-and-postgres/bolt-pgbench-1.png" alt="pgbench throughput (absolute)"/></p><p>Or relative to “master” you get this:</p><p><img src="https://vondra.me/posts/playing-with-bolt-and-postgres/bolt-pgbench-2.png" alt="pgbench throughput (relative to master)"/></p><p>Those are pretty massive improvements. Read-only <code>pgbench</code> is a very
+simple workload, we’ve already optimized it a lot, it’s hard to improve
+it significantly. So seeing 30-40% improvements is simply astonishing.</p><p>There’s also the first sign that the actual profile matters. Running a
+test with <code>-M simple</code> on a build optimized using the <code>-M prepared</code>
+profile improves much less than with the <code>-M simple</code> profile.</p><p>Interestingly enough, for <code>-M prepared</code> there’s no such gap, likely
+because the <code>-M prepared</code> profile is a “subset” of profile collected
+for <code>-M simple</code>.</p><h3 id="olap--tpc-h">OLAP / TPC-H</h3><p>Let’s look at more complex queries too. I only took the 22 queries from
+the TPC-H benchmark, and ran those on a 10GB data set. For each query I
+measured the duration for a clean “master” build, and then also duration
+for a build optimized using a profile for that particular query.</p><p>The 22 queries take very different amounts of time, so I’m not going to
+compare the raw timings, just a comparison relative to a “master” build:</p><p><img src="https://vondra.me/posts/playing-with-bolt-and-postgres/bolt-tpch-master.png" alt="TPC-H query timing (relative to master)"/></p><p>Most queries improved by 5-10%, except for queries 8 and 18, which
+improved by ~50% and ~15%. That’s very nice, but I have expected to see
+bigger improvements, considering how CPU intensive these analytical
+queries are.</p><p>I suspect this might be related to the <code>-skip-funcs=ExecInterpExpr.*</code>
+thing. Complex queries with expressions are likely spending quite a bit
+of time in the expression interpreter. If the optimization skips all
+that, that doesn’t seem great.</p><p>Even so, 5-10% across the board seems like a nice improvement.</p><h3 id="cross-workload-profiles">Cross-workload profiles</h3><p>The natural question is how important the optimization profile is, and
+how it affects other workloads. I already touched on this in the OLTP
+section, when talking about using the <code>-M prepared</code> profile for
+<code>-M simple</code> workload.</p><p>It might be a “zero-sum game” where a profile improves workload A, but
+then also regresses some other workload B by the same amount. If you
+only do workload A that might still be a win, but if the instance
+handles a mix of workloads, you probably don’t want this.</p><p>I did a couple more benchmarks, using profiles combined from
+the earlier “specific” profiles and also a generic “installcheck”
+profile:</p><ul><li><strong>tpch-all</strong> - combines all the per-query profiles from TPC-H</li><li><strong>all</strong> - combines <code>tpch-all</code> and <code>pgbench-both</code> (so “everything”)</li><li><strong>installcheck</strong> - profile from running <code>make installcheck</code></li></ul><p>The results for OLTP look like this:</p><p><img src="https://vondra.me/posts/playing-with-bolt-and-postgres/bolt-pgbench-3.png" alt="pgbench throughput (throughput)"/>
+<img src="https://vondra.me/posts/playing-with-bolt-and-postgres/bolt-pgbench-4.png" alt="pgbench throughput (relative to master)"/></p><p>The “all” profile combining profiles for the workloads works great,
+pretty much the same as the best workload-specific profile. The profile
+derived from <code>make installcheck</code> is a bit worse, but still pretty good
+(25-30% gain would be wonderful).</p><p>Interestingly, none of the profiles makes it slower.</p><p>For TPC-H, I’ll only show one chart with the relative speedup for
+<code>tpch-all</code> and <code>all</code> profiles.</p><p><img src="https://vondra.me/posts/playing-with-bolt-and-postgres/bolt-tpch-comparison.png" alt="TPC-H query timing comparison (relative to master)"/></p><p>The improvements remain quite consistent for the “tpch-all” and “all”
+profiles, although query 8 gets worse as the profile gets less specific.
+Unfortunately the “installcheck” profile loses about half of the
+improvements for most queries, except for query #8. The ~5% speedup is
+still nice, of course.</p><p>It would be interesting to see if optimizing the interpreter (i.e.
+getting rid of <code>-skip-funcs=ExecInterpExpr.*</code>) makes the optimization
+more effective. I don’t know what exactly the issue is or how to make
+it work.</p><h2 id="is-it-correct">Is it correct?</h2><p>There’s also the question of correctness. There were some <a href="https://www.postgresql.org/message-id/CAGjvy28Srze%2B-QGhUEEWsrpZA-8gMn_kf43dt7v_iUs%3Do-y2EQ%40mail.gmail.com">recent</a>
+<a href="https://www.postgresql.org/message-id/427c7c25-e8e1-4fc5-a1fb-01ceff185e5b%40technowledgy.de">discussions</a>
+about possiblly supporting link-time optimization (LTO), in which some
+people suggested that we may be relying on files being “optimization
+barriers” in a couple places. And that maybe enabling LTO would break
+this, possibly leading to subtle hard-to-reproduce bugs.</p><p>The optimizations done by BOLT seem very similar to what link-time
+optimization (LTO) does, except that it leverages a workload profile to
+decide how to optimize for that particular workload. But if LTO may be
+incorrect, so would BOLT probably.</p><p>I’m no expert in this area, but but per the discussion in those threads
+it seems this may not be quite accurate. The “optimization barrier” only
+affects compilers, and CPUs can reorder stuff anyway. The proper way to
+deal with this are “compiler/memory barrier” instructions.</p><p>And some distributions apparently enabled LTO some time back, like
+Ubuntu in 22.04. And while it’s not a definitive proof of anything, we
+didn’t observe a massive influx of strange isses from them.</p><h2 id="conclusions">Conclusions</h2><p>I started looking at BOLT as a way to eliminate the impact of random
+changes to binary layout during benchmarking. But I got distracted by
+experimenting with BOLT on different workloads etc. I still think it
+might be possible to optimize the builds the same way, and thus get
+rid of the binary layout impact.</p><p>It’s clear adjusting the binary layout (and other optimizations) can
+yield significant speedups, on top of the existing optimizations already
+performed by the compilers. We don’t see 30-40% speedups in pgbench
+every day, that’s for sure.</p><p>But there’s also a lot of open questions. The profile used for the
+optimization matters a lot, so how would we collect a good profile to
+use for builds?</p><p>The nice thing is that I haven’t really seen any regressions - none of
+the cases got slower even if optimizing using a “wrong” profile. That’s
+nice, as it seems regressions are not very common.</p><p>FWIW I doubt we would start using BOLT directly, at least not by
+default. It’s more likely we’ll use it to learn how to adjust the code
+and builds to generate a better executable. Is there a way to “reverse
+engineer” the transformations performed by BOLT, and deduce how to
+adjust the code?</p></div><p>Do you have feedback on this post? Please reach out by e-mail to <a href="mailto:tomas@vondra.me">tomas@vondra.me</a>.</p></div>
+  </body>
+</html>
