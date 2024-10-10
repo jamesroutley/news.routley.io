@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://ibraheem.ca/posts/designing-papaya/">Original</a>
+    <h1>Designing a Fast Concurrent Hash Table</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        <div>
+            
+<div id="content">
+    
+    <p>I recently released <a href="https://github.com/ibraheemdev/papaya">papaya</a>, a fast and feature-complete concurrent hash table for Rust. In this post I want to dive into the design and research that went into creating it, as well as why you might consider using it over existing solutions. If you&#39;re looking for an overview of papaya, you might find it more useful to <a href="https://docs.rs/papaya">consult the documentation</a>.</p>
+<h2 id="philosophy"><a href="#philosophy" aria-label="Anchor link for: philosophy">Philosophy</a></h2>
+<p>Concurrent hash tables are a well explored topic, both in academic literature and open-source implementations. In some ways, they are the holy grail of concurrent data structures. On the other hand, a concurrent hash table is an inelegant blob of shared mutable data, often a marker of a poorly architectured program. Hash tables in general have many unfortunate properties, most of which are exacerbated in a concurrent context. However, despite their downsides, hash tables can be a necessary evil, especially for read-heavy use cases where alternative data structures are not competitive in terms of performance.</p>
+<p>There are a few important properties that a concurrent hash table cares about:</p>
+<ul>
+<li>Read throughput/latency</li>
+<li>Write throughput/latency</li>
+<li>Memory usage</li>
+</ul>
+<p>Concurrent hash tables fall into a large spectrum depending on which of the above properties are prioritized. papaya cares a lot more about readers than writers. Reads should be extremely low latency and never blocked by a slow writer. However, it also cares a lot about predictable latency in general. While write throughput may not be exceptional, neither readers nor writers should ever suffer from latency spikes.</p>
+<p>In general, use cases that care about write throughput are likely better served by alternative data structures such as <a href="https://arxiv.org/abs/1709.06056">hash tries</a>, which deserve more experimentation. papaya aims to instead serve read-heavy workloads.</p>
+<p>Another huge consideration was to have an easy to use API. While papaya may use locks internally, with careful consideration, the API is lock-free and impossible to deadlock.</p>
+<h2 id="basic-design"><a href="#basic-design" aria-label="Anchor link for: basic-design">Basic Design</a></h2>
+<p>Consider a basic <code>RwLock&lt;HashMap&lt;K, V&gt;&gt;</code>. There are a few glaring issues with this, the primary one being that every write operation takes exclusive access of the hash map. Not only is this very expensive to synchronize, it also means that readers cannot proceed in the face of even a single writer.</p>
+<p>However, even in a read-heavy or read-only workload, a <code>RwLock</code> is far from ideal. With a reader-writer lock, readers can execute in parallel. However, the lock is still a single-point of contention, even for readers. This means that every read operation will attempt to take exclusive access of the lock state to acquire the lock, resulting in an exorbitant amount of cache-coherency traffic and bringing scalability to a halt. This makes using reader-writer locks impractical for any scalable data-structure.</p>
+<p>There is a small improvement we can make to greatly improve scalability: sharding. Instead of forcing every core to acquire the same lock, we can shard keys across multiple maps with a <code>Box&lt;[RwLock&lt;HashMap&lt;K, V&gt;&gt;]&gt;</code>, deciding which keys go into which map based on their hash. Now, with a sufficient number of shards, the contention is distributed across multiple locks. This is the strategy <a href="https://github.com/xacrimon/dashmap">dashmap</a> uses.</p>
+<p>Sharding reduces contention, but it&#39;s far from ideal. Readers are still required to modify shared memory. That memory is less shared, but it&#39;s still shared, and writes to shared memory are expensive. Additionally, write operations still block readers, meaning even a small number of writers can greatly affect overall scalability. Locks in general pose a significant problem for read latency distributions in that a single slow writer can result in latency spikes for all readers.</p>
+<p>So how do we do better? The simplest lock-free hash table looks something like this:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>HashMap&lt;K, V&gt; {
+</span><span>    buckets: AtomicPtr&lt;[AtomicPtr&lt;Node&lt;K, V&gt;&gt;]&gt;
+</span><span>}
+</span><span>
+</span><span>struct </span><span>Node&lt;K, V&gt; {
+</span><span>    key: K,
+</span><span>    value: V,
+</span><span>    next: AtomicPtr&lt;Node&lt;K, V&gt;&gt;,
+</span><span>}
+</span></code></pre>
+<p>There&#39;s a couple important layers here. The entire table is wrapped around an atomic pointer, allowing it to be atomically swapped out during a resize. Additionally, every key-value pair is behind an atomic pointer, with collisions forming a concurrent linked-list.</p>
+<p>The use of atomic pointers is important. Most CPUs only support reading values up to 128-bits atomically, without tearing . To support keys and values of arbitrary size, entries need to be allocated. This allows us to swap the <em>pointer</em> atomically.</p>
+<p>Note that allocating every entry is a large fundamental design decision. It means sacrificing write throughput under heavy write load due to allocator pressure. However, this tradeoff is worth it, as it allows readers to access the table concurrently with writers. This is the design taken by C#&#39;s <a href="https://learn.microsoft.com/en-us/dotnet/api/system.collections.concurrent.concurrentdictionary-2?view=net-8.0"><code>ConcurrentDictionary</code></a>. However, it introduces another crucial issue.</p>
+<p>Now that every key-value pair is allocated, readers have to go through a pointer to access the key while iterating over the linked-list, implying a cache-miss. The cost of a cache-miss is even more severe in a concurrent setting as entries are being modified by writers, resulting in contention. We want to access as little shared memory as possible.</p>
+<p>Cache locality is also the reason most modern hash tables opt for <em>open addressing</em> over closed chaining. With open addressing, each bucket contains a single key-value pair. Instead of using a linked-list to resolve collisions, writers <em>probe</em> subsequent buckets until an empty one is found. When readers encounter an empty bucket in the sequence, they can stop probing knowing the key is not in the map. This allows the entire table to be represent by a flat <code>[(K, V)]</code>, making access extremely cache-friendly.</p>
+<p>At first glance, open addressing in a concurrent settings doesn&#39;t seem to provide much benefit, because entries are allocated anyways.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>HashMap&lt;K, V&gt; {
+</span><span>    buckets: AtomicPtr&lt;[AtomicPtr&lt;(K, V)&gt;]&gt;
+</span><span>}
+</span></code></pre>
+<p>However, it opens the door for a crucial optimization. Along with the entries array, we can include a second array known as a metadata table. Each key-value pair has a corresponding byte of metadata containing a subset of its hash.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>struct </span><span>HashMap&lt;K, V&gt; {
+</span><span>    table: AtomicPtr&lt;Table&lt;K, V&gt;&gt;
+</span><span>}
+</span><span>
+</span><span>struct </span><span>Table&lt;K, V&gt; {
+</span><span>    metadata: [AtomicU8],
+</span><span>    entries: [AtomicPtr&lt;(K, V)&gt;],
+</span><span>}
+</span></code></pre>
+<p>A metadata table allows reads to be extremely cache-efficient as they can probe the metadata instead of the entries. Note that because we only have 8 bits of metadata, there are still chances of false positives, but it&#39;s still a massive improvement.</p>
+<p>Metadata tables are present in most modern hash tables, including <a href="https://abseil.io/about/design/swisstables">swiss tables</a>, the basis of <code>std::collections::HashMap</code>. They are even <em>more</em> crucial in a concurrent hash table as entries are allocated, making probing through entries directly impractical.</p>
+<h2 id="probing-strategy"><a href="#probing-strategy" aria-label="Anchor link for: probing-strategy">Probing Strategy</a></h2>
+<p>One of the biggest decisions to make with an open addressing table is the probing strategy. The probing strategy decides the order in which buckets are probed if the initial bucket is full. While there are many interesting strategies such as <a href="https://en.wikipedia.org/wiki/Cuckoo_hashing">cuckoo</a>, <a href="https://programming.guide/robin-hood-hashing.html">robin-hood</a>, or <a href="https://en.wikipedia.org/wiki/Hopscotch_hashing">hopscotch</a> hashing, these are expensive to implementing concurrently requiring extra synchronization, especially with a metadata table.</p>
+<p>On the other hand, the existence of a metadata table means that probing becomes relatively cheap, and so a simpler probing strategy makes more sense. For example, <a href="https://github.com/rust-lang/hashbrown">hashbrown</a> uses a hybrid linear and quadratic probing strategy. Groups of 16 metadata entries are probed in parallel using a SIMD routine, while group-wise probing is quadratic. This allows for cache-efficient probing while avoiding <a href="https://en.wikipedia.org/wiki/Primary_clustering">primary clustering</a>, a common pitfall of linear probing.</p>
+<p>Unfortunately, there is an issue with SIMD probing in a concurrent hash table — atomic loads must be aligned. This means we can&#39;t simply load the next 16 entries from the probing position, we have to load aligned groups. Unfortunately, it turns out that SIMD probing is not worth it when this alignment is required in my testing. In fact, swiss tables saw a 20% performance improvement when switching to unaligned reads due to increased entropy from the hash bits. For this reason, papaya sticks to a traditional quadratic probing strategy, as well as a power-of-two capacity for the typical fast modulo.</p>
+<h2 id="load-factor"><a href="#load-factor" aria-label="Anchor link for: load-factor">Load Factor</a></h2>
+<p>There is another important part of a hash table, its load factor. The load factor determines when the hash table is too full and should resize. Determining whether the load factor has been reached requires keep track of the number of entries in the hash table. However, maintaining a counter is very expensive in a concurrent setting as it forms another singular point of contention! While the counter is only accessed by writers, it still affects performance quite severely.</p>
+<p>There are a couple of ways to work around this problem. The most obvious is to shard the length counter. While this reduces the contention when incrementing the counter, it makes accessing the total length even more expensive. papaya uses a sharded counter and exposes the length for convenience, but accessing all counter shards on every write is infeasible.</p>
+<p>One solution is to rely instead of a probabilistic counter for resizing, similar to <a href="https://en.wikipedia.org/wiki/HyperLogLog">HyperLogLog</a>. However, papaya takes a different approach, inspired by <a href="https://probablydance.com/2017/02/26/i-wrote-the-fastest-hashtable/">this article</a>. Instead of setting a load factor, the hash table sets a maximum <em>probe limit</em> based on the capacity of the table. Once the limit is reached, the table is resized. The probe limit is based on <code>log2</code> of the table&#39;s capacity, which tends to a ~80% load factor. I&#39;d be interested in a formalization of probe limits and their relationship to load factor, but this number seems to work very consistently in practice, and avoids the need to synchronize a concurrent counter.</p>
+<h2 id="deletion"><a href="#deletion" aria-label="Anchor link for: deletion">Deletion</a></h2>
+<p>In open addressing, you can&#39;t simply unlink a value from the linked-list chain to delete it. Instead, you typically put down a marker value known as a <em>tombstone</em>. There are more complex deletion schemes such as <a href="https://codecapsule.com/2013/11/17/robin-hood-hashing-backward-shift-deletion/">backshift deletion</a>, but these are difficult to implement concurrently without introducing extra synchronization.</p>
+<p>Tombstones are a bit unfortunate as they result in longer probe sequences. However, if an insert encounters a tombstone in its probe sequence, the entry can be reused for the new key. This somewhat mitigates the issue.</p>
+<p>However, concurrent deletions pose a problem with a metadata table. Imagine the following sequence of events:</p>
+<ul>
+<li>Thread 1 inserts key <code>&#34;a&#34;</code></li>
+<li>Thread 2 deletes key <code>&#34;a&#34;</code></li>
+<li>Thread 2 inserts key <code>&#34;b&#34;</code> in the same slot</li>
+<li>Thread 2 writes metadata <code>0b01</code></li>
+<li>Thread 1 writes metadata <code>0b10</code> late</li>
+</ul>
+<p>Synchronizing the entry and its metadata are in separate locations, making them difficult to synchronize when slots are reused. One solution is to store a lock for each entry that is taken when storing an entry and its metadata. This ensures synchronization but is a significant slowdown for writers.</p>
+<p>However, there is another option. Instead of using a lock, we can eliminate the problem entirely by not allowing entries to be reused after being deleted. This means that there is only one metadata value written to a given slot, so we don&#39;t have to worry about synchronization. This approach is taken by Cliff Click&#39;s <a href="https://www.youtube.com/watch?v=HJ-719EGIts">famous lock-free hash table</a>, although it uses it to synchronize keys and values instead of metadata. However, it is a pretty significant tradeoff, as it means workloads that insert and delete a lot of keys have to resize much more often to free up entries. We&#39;ll talk more about resizing later.</p>
+<h2 id="memory-reclamation"><a href="#memory-reclamation" aria-label="Anchor link for: memory-reclamation">Memory Reclamation</a></h2>
+<p>We&#39;ve been overlooking a large problem up till now, memory reclamation. Concurrent deletion becomes a lot more difficult in a lock-free environment. In particular, there is no obvious way of telling when it is safe to free an object, as arbitrary readers may be concurrently accessing it.</p>
+<p>The obvious solution to this problem is some form of reference counting. Unfortunately, reference counting is similar in cost to a reader-writer lock in that every access requires modifying shared memory. In particular, this is disastrous for synchronizing access to the table itself as it creates a single point of contention for all operations.</p>
+<p>There are many algorithms to solve this problem. One popular scheme is <a href="https://www.cs.otago.ac.nz/cosc440/readings/hazard-pointers.pdf">hazard pointers</a>, which forces threads to announce access to a given object through a thread-local list of pointers. While this can be very memory efficient, it is also quite expensive for readers.</p>
+<p>Another algorithm is <a href="https://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf">epoch-based reclamation</a>. Instead of keeping track of individual objects, threads keep track of which <em>epoch</em> they are in, based on a global epoch counter that is incremented occasionally. Objects are retired in a given epoch, and once all threads have moved on from that epoch, they are safe to reclaim.</p>
+<p>EBR is very lightweight. However, it is not as memory efficient as other algorithms as it tracks objects in <em>batches</em>. While this may be an acceptable tradeoff for the improved performance, EBR has a few other downsides.</p>
+<p>The biggest downside with EBR and related schemes is that reclamation is not very predictable. A batch of objects can only be reclaimed once all threads have moved on from the epoch. This means that to reclaim a batch, you must check the status of all active threads, which is very expensive and requires accessing thread-local shared memory. This results in a tradeoff between reclamation balancing and performance depending on how often reclamation is attempted. For example, the <a href="https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-epoch">crossbeam-epoch</a> crate checks for garbage every 128 operations. Importantly, the check must be performed by both readers and writers, causing reclamation to trigger unpredictably and leading to poor latency distributions.</p>
+<p>Because papaya allocates every entry and does not reuse tombstones, memory efficiency is a very important factor. Unfortunately, existing memory reclamation algorithms were not up to par in my testing.</p>
+<p>A few years ago, I stumbled across <a href="https://arxiv.org/pdf/1905.07903">hyaline</a>, an algorithm that solves a lot of these issues, which has since been implemented in the <a href="https://github.com/ibraheemdev/seize">seize</a> crate. In hyaline, the expensive cross-thread check is performed when a batch of objects is <em>retired</em>. The batch is propagated to all active threads just once. After this initial retirement phase, the batch is reclaimed using reference counting. This reclamation process is much more predictable, as threads can check for new garbage before every single operation without sacrificing performance. In practice, it tends to outperforms EBR due to the parallelism gains from workload balancing.</p>
+<p>Hyaline also solves another problem with EBR, robustness. In EBR, a single slow thread can prevent the reclamation of all objects in a given epoch. Hyaline counteracts this by keeping track of the epoch an object is created in, filtering out slow threads when reclaiming new objects. These additional properties make hyaline a perfect fit for papaya.</p>
+<h2 id="resizing"><a href="#resizing" aria-label="Anchor link for: resizing">Resizing</a></h2>
+<p>Once a hash table gets too full it needs to resize, relocating all keys and values to a larger table. In a concurrent setting, this can be quite expensive. To reduce the cost of resizing, multiple threads can help out with the migration and copy entries in parallel.</p>
+<p>There many tradeoffs to be made when implementing concurrent resizing. Ideally, readers should be unaffected by resizing. This would require all writers to complete the migration before making progress, allowing for a single source of truth for readers. However, resizing can be slow, introducing latency spikes for writers. For a large table, resizing can take hundreds of milliseconds or even <em>seconds</em> to complete. This is an unacceptable amount of latency for a large number of applications.</p>
+<p>To avoid latency spikes, we can implement <em>incremental resizing</em>, where entries are incrementally copied over to the new table instead of blocking. This is an approach taken even by single-threaded hash tables, such as the <a href="https://crates.io/crates/griddle">griddle</a> crate.</p>
+<p>Managing the state of two tables concurrently is tricky, but papaya implements a migration algorithm that allows concurrent updates to the old table and atomic copies to the new table. This does mean that during migration, many operations have to check both the new and old tables when searching for an entry. However, this is typically an acceptable tradeoff as resize operations are generally uncommon and slightly increased latency for a short period of time is better than extreme latency spikes.</p>
+<p>Incremental resizing also counteracts the effect of permanent tombstones, as the cost of resizing is amortized. However, for flexibility, papaya supports both resizing modes as an option. When write throughput or read latency is the primary concern, blocking resizes can be used instead.</p>
+<p>Note that resizing is the only case where papaya is not lock-free. Allocating the next table involves taking a lock to prevent excessive allocator pressure. Additionally, a write operation may block if its key is in the process of being copied to the new table. papaya uses a hybrid spinning strategy before falling back to blocking in this case. However, note that copying an entry does not involve allocating and is typically very fast. Blocking was an intentional design decision as true lock-free resizing is very expensive, but care was taken to mitigate any issues that might arise from blocking.</p>
+<h2 id="additional-features"><a href="#additional-features" aria-label="Anchor link for: additional-features">Additional Features</a></h2>
+<p>Along with all the performance characteristics mentioned above, papaya has some unique features. </p>
+<p>Because papaya does not contain locks, performing complex operations is more challenging. Instead, papaya exposes a number of atomic operations. The most powerful of these is <a href="https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.compute"><code>HashMap::compute</code></a>, which allows updating an entry using a compare-and-swap (CAS) function:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>let</span><span> map </span><span>= </span><span>papaya::HashMap::new();
+</span><span>
+</span><span>let </span><span>compute </span><span>= </span><span>|</span><span>entry</span><span>| </span><span>match</span><span> entry {
+</span><span>    </span><span>// Remove the value if it is even.
+</span><span>    </span><span>Some</span><span>((_key, value)) </span><span>if</span><span> value </span><span>% </span><span>2 </span><span>== </span><span>0 </span><span>=&gt; </span><span>{
+</span><span>        Operation::Remove
+</span><span>    }
+</span><span>
+</span><span>    </span><span>// Increment the value if it is odd.
+</span><span>    </span><span>Some</span><span>((_key, value)) </span><span>=&gt; </span><span>{
+</span><span>        Operation::Insert(value </span><span>+ </span><span>1</span><span>)
+</span><span>    }
+</span><span>
+</span><span>    </span><span>// Do nothing if the key does not exist
+</span><span>    </span><span>None </span><span>=&gt; </span><span>Operation::Abort(()),
+</span><span>};
+</span><span>
+</span><span>map.</span><span>pin</span><span>().</span><span>compute</span><span>(</span><span>&#39;A&#39;</span><span>, compute);
+</span></code></pre>
+<p>This allows performing complex operations despite the lack of locks.</p>
+<p>Another unique feature of papaya is async support. One of the biggest downsides of <a href="https://github.com/xacrimon/dashmap">dashmap</a> is that it uses synchronous locks and so holding a reference to an item from a <code>Dashmap</code> will lead to a deadlock. Because papaya has a lock-free API, deadlocking is impossible. However, accessing the map still requires <a href="https://docs.rs/papaya/latest/papaya/#usage">acquiring a guard</a> for memory reclamation, i.e. the call to <code>pin</code> in the above example. This guard is <code>!Send</code> as it is tied to the current thread&#39;s memory reclamation state. However, papaya also exposes <a href="https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.pin_owned">owned guards</a>, which are <code>Send</code> and <code>Sync</code>, independent of any given thread. These are more expensive to create, but are allowed to be held across <code>.await</code> points when using a work-stealing scheduler:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>async </span><span>fn </span><span>run</span><span>(</span><span>map</span><span>: Arc&lt;HashMap&lt;</span><span>i32</span><span>, </span><span>String</span><span>&gt;&gt;) {
+</span><span>    tokio::spawn(async </span><span>move </span><span>{
+</span><span>        </span><span>let</span><span> map </span><span>=</span><span> map.</span><span>pin_owned</span><span>(); </span><span>// &lt;--
+</span><span>        </span><span>for </span><span>(key, value) </span><span>in</span><span> map.</span><span>iter</span><span>() {
+</span><span>            tokio::fs::write(</span><span>&#34;db.txt&#34;</span><span>, format!(</span><span>&#34;</span><span>{key}</span><span>: </span><span>{value}\n</span><span>&#34;</span><span>)).await;
+</span><span>        }
+</span><span>    });
+</span><span>}
+</span></code></pre>
+<p>Async support is something I am very excited about and is not present in any existing concurrent hash tables that I am aware of.</p>
+<h2 id="comparisons"><a href="#comparisons" aria-label="Anchor link for: comparisons">Comparisons</a></h2>
+<p>There are a number of existing concurrent hash table crates. However, most of them lack in terms of read throughput and predictable latency compared to papaya. Additionally, async support is a difficult feature to find. However, there are cases where you might want to consider a different crate.</p>
+<ul>
+<li><a href="https://github.com/xacrimon/dashmap">dashmap</a> has a very simple design built on top of <a href="https://github.com/rust-lang/hashbrown">hashbrown</a>. It also closely mirrors the API of <code>std::collections::HashMap</code>. For write-heavy workloads, it may provide better performance. It is also lower overhead in terms of memory usage.</li>
+<li><a href="https://github.com/wvwwvwwv/scalable-concurrent-containers">scc</a> is similar to dashmap but shards bucket locks even more aggressively. For write-heavy workloads it should probably be your first choice, although the code itself seemed quite complicated and difficult to audit.</li>
+<li><a href="https://github.com/jonhoo/flurry">flurry</a> is a closed-addressing table with striped locks but lock-free reads. However, it suffers from performance and memory usage issues due to allocator pressure. papaya should outperform flurry in general for most workloads.</li>
+<li><a href="https://github.com/jonhoo/evmap">evmap</a> is great for <em>extremely</em> read-heavy use cases. However, it is eventually consistent, and writes are relatively expensive. Scalability suffers under load even for 99% read-heavy workloads.</li>
+<li><a href="https://github.com/robclu/leapfrog">leapfrog</a> provides excellent performance but is limited to 64-bit <code>Copy</code> values. This limitation is common in academic literature, and leapfrog falls back to spinlocks for arbitrary value types, which is unfortunate for a general purpose map.</li>
+</ul>
+<p>Consult the <a href="https://github.com/ibraheemdev/papaya/blob/master/BENCHMARKS.md">benchmarks</a> for more information, but as always, take them with a grain of salt. Always measure for your own workload.</p>
+<hr/>
+
+
+</div>
+
+        </div>
+        
+
+    </div></div>
+  </body>
+</html>
