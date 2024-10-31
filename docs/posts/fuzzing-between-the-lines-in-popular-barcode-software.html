@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://blog.trailofbits.com/2024/10/31/fuzzing-between-the-lines-in-popular-barcode-software/">Original</a>
+    <h1>Fuzzing between the lines in popular barcode software</h1>
+    
+    <div id="readability-page-1" class="page"><article id="post-108489">
+	<!-- .entry-header -->
+
+	<div>
+		<p><em>By Artur Cygan</em></p>
+<p>Fuzzing—one of the most successful techniques for finding security bugs, consistently featured in articles and industry conferences—has become so popular that you may think most important software has already been extensively fuzzed. But that’s not always the case. In this blog post, we show how we fuzzed the ZBar barcode scanning library and why, despite our limited time budget, we found serious bugs: an out-of-bounds stack buffer write that can lead to arbitrary code execution with a malicious barcode, and a memory leak that can be used to perform a denial-of-service attack.</p>
+<p>ZBar is an open-source library for reading barcodes written in C. It supports an impressive number of barcode formats, including QR codes. One of our clients used it, so we wanted to quickly assess its security. Given the extensive amount of code, manual review was not an option. Since we noticed no public mention of fuzzing, we decided to give it a shot.</p>
+<h3>Assessing the project’s fuzzing state</h3>
+<p>You might ask: how do you know whether or not software has been fuzzed? Although there’s no definitive answer to this question, it’s possible to make some educated guesses. First, we can check the repository for any mention of fuzzing, including searching issues, pull requests, and the code itself. For instance, <a href="https://github.com/mchehab/zbar/issues/233">this issue</a> proposes a fuzzing harness, but it was likely never run. Second, we can check <a href="https://github.com/google/oss-fuzz/tree/master/projects">the oss-fuzz projects</a>. If the project is fuzzed with oss-fuzz, it’s worth checking if the fuzzing harnesses are targeting the functionality we’re interested in and whether the project actually works. We observed cases where project builds were failing for months and were not actively fuzzed. Similarly to the project’s repository, oss-fuzz issues and pull requests can contain interesting information. Developers expressed <a href="https://github.com/google/oss-fuzz/issues/3863">some interest</a> in bringing ZBar to oss-fuzz, but this was ultimately abandoned.</p>
+<p>By this point we knew two things about ZBar: it was barely fuzzed (or not fuzzed at all), and we identified starting points for creating our own fuzzing campaign.</p>
+<h3>Instrumenting the build</h3>
+<p>To fuzz ZBar, it has to be built with sanitizer and fuzzer instrumentation. Building an unfamiliar project can be a time-consuming challenge on its own, and adding instrumentation for fuzzing often makes this task even more difficult. For that reason, it’s useful to take an existing build and tweak it. Fortunately, ZBar is already <a href="https://github.com/NixOS/nixpkgs/blob/011567f35433879aae5024fc6ec53f2a0568a6c4/pkgs/tools/graphics/zbar/default.nix">packaged in Nixpkgs</a>, so we could quickly modify the build:</p>
+<pre>zbar-instrumented = with pkgs; (zbar.override {
+  stdenv = clang16Stdenv;
+}).overrideAttrs (orig: {
+  buildInputs = orig.buildInputs ++ [ llvmPackages_16.openmp ];
+  dontStrip = true;
+  doCheck = false; # tests started failing with sanitizers
+  CFLAGS = &#34;-g -fsanitize=address,fuzzer-no-link&#34;;
+  LDFLAGS = &#34;-g -fsanitize=address,fuzzer-no-link&#34;;
+});
+</pre>
+<p>Figure 1: Instrumenting ZBar for fuzzing</p>
+<p>Nix packages are described with the Nix programming language and can be easily manipulated in various ways. In the case above, we use override to modify <a href="https://github.com/NixOS/nixpkgs/blob/011567f35433879aae5024fc6ec53f2a0568a6c4/pkgs/tools/graphics/zbar/default.nix#L1-L30">inputs</a> defined by the package where we set the package’s compiler to Clang (otherwise, GCC is used by default). The following <code>overrideAttrs</code> function is a free-form override that allows us to modify anything we want. With <code>overrideAttrs</code>, we add the missing <code>openmp</code> dependency, disable stripping so that debug build works properly, and disable the tests. Finally, we add the instrumentation compiler and linker flags for AddressSanitizer and libFuzzer. (If you’re unfamiliar with the instrumentation flags, our <a href="https://appsec.guide/">AppSec Testing Handbook</a> has excellent <a href="https://appsec.guide/docs/fuzzing/c-cpp/libfuzzer/">guidance</a>.)</p>
+<p>Obviously, Nix is not the only answer to this problem. Depending on the software and packaging, tweaking existing packages might be more difficult. However, we highly recommend trying it out, as we found it to be often the quickest way to achieve the goal.</p>
+<h3>How to identify the target</h3>
+<p>After preparing the instrumentation, we need to identify the fuzzing target. This part heavily depends on the project and can be non-trivial. Luckily, in ZBar the target was quite obvious: the function that takes an image and decodes barcode data from it. At this point there are a few questions to answer. How big should the image be? By default, ZBar tries to read all the known code types. Should we configure the scanner to specific codes or just try them all at once? We think it’s important not to overthink this and start with <em>something</em> to see how it performs. We started with the following harness, based on <a href="https://github.com/ZBar/ZBar/blob/854a5d97059e395807091ac4d80c53f7968abb8f/examples/scan_image.c#L65-L104">the official example</a>:</p>
+<pre>#include <span>&lt;stdio.h&gt;</span>
+#include <span>&lt;stdlib.h&gt;</span>
+#include <span>&lt;zbar.h&gt;</span>
+
+using namespace zbar;
+
+extern &#34;C&#34; int LLVMFuzzerTestOneInput(const uint8_t *data, uint32_t size) {
+  int width = 16, height = 16;
+  if (size != width*height) return 1;
+
+  zbar_image_t *image = zbar_image_create();
+  if(!image)
+    return 0;
+
+  zbar_image_set_size(image, width, height);
+  zbar_image_set_format(image, zbar_fourcc(&#39;Y&#39;, &#39;8&#39;, &#39;0&#39;, &#39;0&#39;));
+  zbar_image_set_data(image, data, size, NULL);
+
+  /* create a reader */
+  zbar_image_scanner_t *scanner = zbar_image_scanner_create();
+
+  /* configure the reader */
+  zbar_image_scanner_set_config(scanner, (zbar_symbol_type_t)0, ZBAR_CFG_ENABLE, 1);
+  zbar_scan_image(scanner, image);
+
+  /* clean up */
+  zbar_image_destroy(image);
+  zbar_image_scanner_destroy(scanner);
+  return 0;
+}
+</pre>
+<p>Figure 2: Initial testing harness</p>
+<p>In this harness, we essentially modified the sample to take the input image from the fuzzer and locked it down to a 2-by-2 pixel square (8 bits per pixel). Running this harness resulted in one <code>LeakSanitizer</code> crash reporting a memory leak. Because <code>libFuzzer</code> stops at the first crash, we disabled the memory leak detection with <code>-detect_leaks=0</code> and continued fuzzing. After a while, the coverage gains appeared to stall, so we decided to enlarge the input image to 4-by-4 pixels. Surprisingly, libFuzzer struggled to figure out that input should be of size 1024 and couldn’t start fuzzing. Even tweaking the <code>max_len</code> and <code>len_control</code> options didn’t help. we managed to kickstart fuzzing by manually passing a seed input of the right size:</p>
+<pre>$ head -c 1024 /dev/zero &gt; seed
+$ ./result/bin/zbar-fuzz -detect_leaks=0 -seed_inputs=seed
+</pre>
+<p>Figure 3: Manually passing the seed input</p>
+<p>After this, the fuzzer was able to quickly find another crash from AddressSanitizer caused by a stack buffer overflow. If you paid attention to the ZBar instrumentation code, we mentioned in the comment that its tests are disabled due to sanitizer failure. It turned out the failure during tests wasn’t a false positive and concerned the same bug the fuzzer discovered.</p>
+<p>Even with this simple approach, we managed to find some bugs in the library. However, with more time, we could have made a number of improvements to find even more bugs:</p>
+<ul>
+<li>Initiate the corpus with pictures of code types to help the fuzzer cover the code more quickly</li>
+<li>Target specific codes that could help the fuzzer maintain a homogenous corpus and generate more accurate mutations</li>
+<li>Check code coverage where it stalls to help the fuzzer get past any difficult branches</li>
+</ul>
+<h3>Diagnosing crashes</h3>
+<p>It turned out that the stack buffer out-of-bounds write bug was independently reported around the same time by another researcher. The vulnerability was assigned <a href="https://nvd.nist.gov/vuln/detail/CVE-2023-40890">CVE-2023-40890</a> and was fixed in commit <a href="https://github.com/mchehab/zbar/commit/012a030250a203e5529d09caedea7ad7173dacfd">012a030</a>. The issue lied in the lookup_sequence function, as the fuzzer pointed out:</p>
+<pre>==22005==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7fa297900578 at pc 0x7fa299b84ee2 bp 0x7ffe86531ef0 sp 0x7ffe86531ee8
+WRITE of size 4 at 0x7fa297900578 thread T0
+    #0 0x7fa299b84ee1 in lookup_sequence /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/decoder/databar.c:698:12
+    #1 0x7fa299b84ee1 in match_segment_exp /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/decoder/databar.c:758:21
+    #2 0x7fa299b7fc02 in decode_char /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/decoder/databar.c:1081:16
+    #3 0x7fa299b7e225 in _zbar_decode_databar /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/decoder/databar.c:1269:11
+    #4 0x7fa299b756a6 in zbar_decode_width /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/decoder.c:274:15
+    #5 0x7fa299b726c1 in process_edge /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/scanner.c:173:16
+    #6 0x7fa299b726c1 in zbar_scanner_flush /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/scanner.c:186:35
+    #7 0x7fa299b7088a in quiet_border /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/img_scanner.c:708:5
+    #8 0x7fa299b7088a in _zbar_scan_image /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/img_scanner.c:1020:13
+    #9 0x7fa299b6e978 in zbar_scan_image /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/img_scanner.c:1146:12
+    #10 0x55c5b5f36a0f in LLVMFuzzerTestOneInput /tmp/nix-build-zbar-fuzz-0.23.92.drv-0/zbar/fuzz.cpp:25:3
+    ...
+    #17 0x55c5b5d192e4 in _start (/nix/store/1lk9b8j92dx5xjfnhwh2g3x2g4d9mvsd-zbar-fuzz-0.23.92/bin/.zbar-fuzz-wrapped+0x352e4)
+
+Address 0x7fa297900578 is located in stack of thread T0 at offset 376 in frame
+    #0 0x7fa299b80b8f in match_segment_exp /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/decoder/databar.c:709
+
+  This frame has 4 object(s):
+    [32, 120) &#39;bestsegs&#39; (line 711)
+    [160, 248) &#39;segs&#39; (line 711)
+    [288, 376) &#39;seq&#39; (line 711) &lt;== Memory access at offset 376 overflows this variable
+    [416, 544) &#39;iseg&#39; (line 713)
+</pre>
+<p>Figure 4: Fuzzer triggered of out-of-bounds write bug</p>
+<p>This memory leak bug opens a denial-of-service attack vector, especially since the leak size depends on the input and appears to be the <code>image border size / 2 * 8 * 3 bytes</code>, so for an image with a border of 512, the leak is 6KiB. A program using ZBar to repeatedly scan untrusted codes can eventually exhaust memory and crash. The root issue is in the <a href="https://github.com/mchehab/zbar/blob/a549566ea11eb03622bd4458a1728ffe3f589163/zbar/sqcode.c#L300-L578"><code>_zbar_sq_decode</code></a> function, which fails to free allocated memory under certain error conditions. This is again correctly pointed out by the fuzzer:</p>
+<pre>==21815==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 48 byte(s) in 1 object(s) allocated from:
+    #0 0x55df498b66ff in __interceptor_malloc (/nix/store/ncb5qgjr6jds4na1iadf5cxgdym6fbl5-zbar-fuzz-0.23.92/bin/.zbar-fuzz-wrapped+0x20b6ff)
+    #1 0x7f71e9334cbf in _zbar_sq_decode /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/sqcode.c:397:19
+    #2 0x7f71e92d7cf8 in _zbar_scan_image /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/img_scanner.c:1055:5
+    #3 0x7f71e92d5978 in zbar_scan_image /tmp/nix-build-zbar-0.23.92.drv-0/source/zbar/img_scanner.c:1146:12
+    #4 0x55df498fda0f in LLVMFuzzerTestOneInput /tmp/nix-build-zbar-fuzz-0.23.92.drv-0/zbar/fuzz.cpp:25:3
+    ...
+    #11 0x7f71e8f8bacd in __libc_start_call_main (/nix/store/46m4xx889wlhsdj72j38fnlyyvvvvbyb-glibc-2.37-8/lib/libc.so.6+0x23acd) (BuildId: 2ed90a3fa8dfeee1e77c301df6ba346580b73e8a)
+...
+SUMMARY: AddressSanitizer: 144 byte(s) leaked in 3 allocation(s).
+</pre>
+<p>Figure 5: Fuzzer triggers a memory leak bug</p>
+<p>The root cause of the leak is missing memory cleanup in error paths. There are two instances where the <code>_zbar_sq_decode</code> function returns without executing the cleanup code under the <a href="https://github.com/mchehab/zbar/blob/a549566ea11eb03622bd4458a1728ffe3f589163/zbar/sqcode.c#L572-L576"><code>free_borders</code></a> label.</p>
+<pre>diff --git a/zbar/sqcode.c b/zbar/sqcode.c
+index 422c803d..a5e808fc 100644
+--- a/zbar/sqcode.c
++++ b/zbar/sqcode.c
+@@ -371,7 +371,7 @@ found_start:;
+        border_len = 1;
+        top_border = malloc(sizeof(sq_point));
+        if (!top_border)
+-       return 1;
++       goto free_borders;
+        top_border[0] = top_left_dot.center;
+    }
+     }
+@@ -471,7 +471,7 @@ found_start:;
+    }
+     }
+     if (cur_len != border_len || border_len &lt; 6)
+-   return 1;
++   goto free_borders;
+     inc_x        = right_border[5].x - right_border[3].x;
+     inc_y        = right_border[5].y - right_border[3].y;
+     right_border[2].x = right_border[3].x - 0.5 * inc_x;
+</pre>
+<p>Figure 6: _zbar_sq_decode returns without executing cleanup code</p>
+<p>We reported this issue along with the patch to the maintainer, however, after an extended period of time we still haven’t heard back. We published <a href="https://github.com/trail-of-forks/zbar/commit/6059b7f2c97595aca5077e6c357617ff132e79fd.patch">this patch on our ZBar fork</a> and opened <a href="https://github.com/mchehab/zbar/pull/294">a pull request</a> in the upstream ZBar repository.</p>
+<h3>Putting it all together</h3>
+<p>To reproduce the research from this article, save the fuzzing harness shown earlier as <code>zbar_harness.cpp</code> and the following Nix file as <code>zbar-fuzz.nix</code>. The Nix file already contains the instrumented ZBar build and the harness build. Build it with <code>nix-build zbar-fuzz.nix</code> and run <code>./result/bin/zbar-fuzz</code>. The <code>postInstall</code> phase is not strictly required but ensures that the harness has llvm-symbolizer available to show the source locations, which helps in diagnosing the root cause.</p>
+<pre>let
+  # nixpkgs snapshot from Aug 7, 2023
+  pkgs = import (fetchTarball &#34;https://github.com/NixOS/nixpkgs/archive/011567f35433879aae5024fc6ec53f2a0568a6c4.tar.gz&#34;) {};
+
+  zbar-instrumented = with pkgs; (zbar.override {
+    stdenv = clang16Stdenv;
+  }).overrideAttrs (orig: {
+    buildInputs = orig.buildInputs ++ [ llvmPackages_16.openmp ];
+    dontStrip = true;
+    doCheck = false; # tests fail with sanitizer
+    CFLAGS = &#34;-g -fsanitize=address,fuzzer-no-link&#34;;
+    LDFLAGS = &#34;-g -fsanitize=address,fuzzer-no-link&#34;;
+  });
+
+in with pkgs; clang16Stdenv.mkDerivation rec {
+ pname = &#34;zbar-fuzz&#34;;
+ version = zbar.version;
+ src = ./.;
+
+ nativeBuildInputs = [ makeWrapper ];
+
+ buildInputs = [ zbar-instrumented ];
+
+ dontStrip = true;
+
+ buildPhase = &#39;&#39;
+   mkdir -p $out/bin
+   clang++ zbar_harness.cpp -fsanitize=address,fuzzer -g -lzbar -o $out/bin/zbar-fuzz
+ &#39;&#39;;
+
+ postInstall = &#39;&#39;
+   wrapProgram $out/bin/zbar-fuzz \
+     --prefix PATH : ${lib.getBin llvmPackages_16.llvm}/bin
+ &#39;&#39;;
+}
+</pre>
+<p>Figure 7: Instrumented ZBar build and the harness build</p>
+<h3>Lessons learned</h3>
+<p>There are a few takeaways from this experiment. First, it’s important to fuzz the unsafe code even if you don’t have a lot of time to do so. Other researchers can expand on the work by increasing the code coverage of the fuzzer.</p>
+<p>Cut out any unnecessary features to limit attack vectors. ZBar by default scans all code types, which means that an attacker can trigger a bug in any of the scanners. If you only need to scan QR codes for instance, then ZBar can be configured to do so in the code:</p>
+<pre>zbar_image_scanner_set_config(scanner, (zbar_symbol_type_t)0, ZBAR_CFG_ENABLE, 0);
+zbar_image_scanner_set_config(scanner, ZBAR_QRCODE, ZBAR_CFG_ENABLE, 1);
+</pre>
+<p>Figure 8: Configuring ZBar to scan only QR codes</p>
+<p>Or when using the <code>zbarimg</code> CLI program, add the options: <code>--set &#39;*.enable=0&#39; --set &#39;qr.enable=1&#39;</code>.</p>
+<p>Finally, add sanitizer instrumentation to your build. At the bare minimum, you should use AddressSanitizer. As this ZBar example shows, if the test were built with sanitizers, it would have caught a critical memory safety vulnerability. Another benefit is that sanitizers save time and effort for adding fuzzing to a project, as sanitizers are essentially a required step for fuzzing C/C++ code.</p>
+<p>We use fuzzing extensively at Trail of Bits. Take a look at our <a href="https://appsec.guide/docs/fuzzing/">Testing Handbook</a> for more resources, and <a href="https://www.trailofbits.com/contact/">contact us</a> if you’re interested in custom fuzzing for your project.</p>
+
+			</div><!-- .entry-content -->
+
+	
+</article></div>
+  </body>
+</html>
