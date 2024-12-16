@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://v5.chriskrycho.com/journal/read-the-code/using-drop-for-safety-in-rust/">Original</a>
+    <h1>Using Drop for Safety in Rust</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      
+
+
+<p><b><a href="https://v4.chriskrycho.com/2018/assumed-audiences.html">Assumed audience</a>:</b> People who can read Rust and have a basic (and I do mean basic!) understanding of its ownership semantics and <a href="https://doc.rust-lang.org/1.82.0/std/ops/trait.Drop.html">its <code>Drop</code> trait</a>.</p><p>As I was working on some revisions to <cite>The Rust Programming Language</cite> book, I had cause to look at <a href="https://doc.rust-lang.org/1.83.0/std/vec/struct.Vec.html#method.drain">the <code>Vec::drain</code> method</a>, and that led me down a rabbit hole — the rabbit hole we are now going to traverse together.</p>
+<p>If you are not familiar with <code>Vec::drain</code>, you can use it like this to<span></span> <span>“</span>drain” items out of a <code>Vec</code> (there are similar methods for <code>String</code>, <code>HashMap</code>, and a bunch of other collection types):</p>
+<pre><code><span>let</span> <span>mut </span><span>values</span> = <span>vec!</span>[<span>1</span>, <span>2</span>, <span>3</span>, <span>4</span>, <span>5</span>];
+<span>for</span> <span>val</span> <span>in</span> values.<span>drain</span>(<span>1</span>..<span>3</span>) {
+    <span>println!</span>(<span>&#34;Removed: {val}&#34;</span>);
+}
+<span>println!</span>(<span>&#34;Remaining: {values:?}&#34;</span>);
+</code></pre>
+<p>The output from that code would be:</p>
+<pre><code>Removed: 2
+Removed: 3
+Remaining: [1, 4, 5]
+</code></pre>
+<p>Here’s how <a href="https://doc.rust-lang.org/1.83.0/std/vec/struct.Vec.html#method.drain">the docs</a> describe <code>Vec::drain</code> as of Rust 1.83 (emphasis mine):</p>
+<blockquote>
+<p>Removes the specified range from the vector in bulk, returning all removed elements as an iterator. If the iterator is dropped before being fully consumed, it drops the remaining removed elements.</p>
+<p>The returned iterator <em>keeps a mutable borrow</em> on the vector to optimize its implementation.</p>
+</blockquote>
+<p>That last sentence, particularly the bit I bolded, caught my attention and got me digging into the implementation.</p>
+<p>After all, there is a totally reasonable way you could do this: take in the <code>Vec</code>, copy out all the elements to be removed and place them into a new <code>Vec</code>, update the original <code>Vec</code> to remove all of those elements, and return an iterator backed by that newly allocated <code>Vec</code>.</p>
+<p>That could potentially be a <em>lot</em> of work for the computer to do right up front, though. If you have a large <code>Vec</code> (thousands or millions of elements) and are operating on some chunk in the middle of it, that is a lot of extra memory to allocate and a lot of copy operations to do before we even know if we are going to use any of those values.</p>
+<p>So Rust does something totally different here instead: it <em>keeps</em> a mutable reference to the original <code>Vec</code>, and it only ever reads from and updates the original storage. It can do that because of Rust’s ownership rules: nothing else is allowed to get read or write access to the original <code>Vec</code> as long as the iterator produced by <code>Vec::drain</code> exists, so nothing can ever get into a buggy state by invalidating the iterator or its backing storage (for example, by mutating the values in the <code>Vec</code>, changing its length, etc.).</p>
+<p>Rust does this <a href="https://github.com/rust-lang/rust/blob/1f3bf231e160b9869e2a85260fd6805304bfcee2/library/alloc/src/vec/mod.rs#L2603-L2631">by creating a new data structure</a>, quite reasonably named <a href="https://doc.rust-lang.org/1.83.0/std/vec/struct.Drain.html"><code>Drain</code></a>, which <a href="https://github.com/rust-lang/rust/blob/1f3bf231e160b9869e2a85260fd6805304bfcee2/library/alloc/src/vec/drain.rs#L22-L34">holds onto</a> that mutable reference to the original <code>Vec</code> and an iterator for accessing the values of the <code>Vec</code> by using a slice of the <code>Vec</code>. When you then use iterator methods on <code>Drain</code>, it forwards to an iterator over the slice. This means it does not have to implement the iteration itself, but can use the exact same (well-optimized!) implementation as any other iteration over a slice would. The one differences, and it is a critical one, is that <code>drain</code> immediately returns the values from the slice via an unsafe <code>std::ptr::read</code> call.</p>
+<p>That <em>would</em> be unsound if it were possible for someone to get access to the values in the <code>Vec</code> during or after the <code>Drain</code> iterator had access to it. As I noted above, though, nothing can get access to it while the <code>Drain</code> iterator has access, because it takes <code>self</code> by mutable reference. So far, this probably seems pretty straightforward if you are familiar with Rust — the <code>std::ptr::read</code> bit is the only unusual part.</p>
+<p>What about <em>after</em> you finish with the draining iterator, though? How does Rust guarantee that part of the contract?</p>
+<p>This is where it gets interesting.</p>
+<p>When the iterator is dropped — either because you hit the end of a <code>for</code> loop over it or because you drop it after iterating over some subset of elements — the <code>Drain</code> type’s implementation of <a href="https://doc.rust-lang.org/1.83.0/std/ops/trait.Drop.html">the <code>Drop</code> trait</a> takes over. That means that <code>impl Drop for Drain</code> is responsible for making sure that <code>Drain</code> is sound. This is a common pattern in Rust, well worth understanding, and it is also really <em>neat</em>, so let’s walk through it — all of it, every last line!</p>
+<section aria-label="Note" aria-role="note"><p>I am going to leave off the extra type parameter for the <code>Allocator</code>, but otherwise, this post includes every bit of code in <a href="https://github.com/rust-lang/rust/blob/1f3bf231e160b9869e2a85260fd6805304bfcee2/library/alloc/src/vec/drain.rs#L173-L240">the implementation</a> (in this case, as of Rust 1.85 nightly). Even so, you may want to pull up that code side by side with this post to make it easy to see all of it in context!</p>
+</section>
+<p>We’ll start with the boilerplate for the trait implementation:</p>
+<pre><code><span>impl</span>&lt;T&gt; <span>Drop</span> <span>for</span> <span>Drain</span>&lt;<span>&#39;_</span>, T&gt; {
+    <span>fn</span> <span>drop</span>(&amp;<span>mut</span> <span>self</span>) {
+        
+    }
+}
+</code></pre>
+<p>The thing to notice about this is that <code>drop</code> takes <code>&amp;mut self</code>. This means we cannot do anything which requires <em>ownership</em> of <code>self</code>, which in turn motivates the next thing that we’ll see:</p>
+<pre><code>
+<span>struct</span> <span>DropGuard</span>&lt;<span>&#39;r</span>, <span>&#39;a</span>, T&gt;(&amp;<span>&#39;r</span> <span>mut</span> Drain&lt;<span>&#39;a</span>, T&gt;);
+</code></pre>
+<p>This is an internal data structure, a type <em>only</em> available in the body of this particular function. As the documentation comment explains, the purpose of this is to provide a way to guarantee that this implementation will always move all the contents of the original <code>Vec</code> back into that <code>Vec</code>, with the correct locations. It does that, as its name might imply…</p>
+<pre><code><span>impl</span>&lt;<span>&#39;r</span>, <span>&#39;a</span>, T&gt; <span>Drop</span> <span>for</span> <span>DropGuard</span>&lt;<span>&#39;r</span>, <span>&#39;a</span>, T&gt; {
+    <span>fn</span> <span>drop</span>(&amp;<span>mut</span> <span>self</span>) {
+        
+    }
+}
+</code></pre>
+<p>…by way of its <em>own</em> implementation of <code>Drop</code>! This is a <em>relatively</em> straightforward implementation, and it is therefore relatively easy to check for safety, but it <em>is</em> doing a bunch of things that have to be done in an <code>unsafe</code> block because this is all valid if and only if it happens in the context where you have <code>&amp;mut self</code> access to the <code>DropGuard</code> and therefore also to the <code>Drain</code> struct.</p>
+<p>The first thing this does is check whether there is anything to do at all by checking the <code>tail_len</code>:</p>
+<pre><code><span>if</span> <span>self</span>.<span>0</span>.tail_len &gt; <span>0</span> {
+    
+}
+</code></pre>
+<p>The<span></span> <span>“</span>tail” whose length is calculated here is the set of elements which come after the end of the range specified when calling <code>Vec::drain</code>. Returning to the example code I showed at the beginning:</p>
+<pre><code><span>let</span> <span>mut </span><span>values</span> = <span>vec!</span>[<span>1</span>, <span>2</span>, <span>3</span>, <span>4</span>, <span>5</span>];
+<span>for</span> <span>val</span> <span>in</span> values.<span>drain</span>(<span>1</span>..<span>3</span>) {
+    <span>println!</span>(<span>&#34;Removed: {val}&#34;</span>);
+}
+<span>println!</span>(<span>&#34;Remaining: {values:?}&#34;</span>);
+</code></pre>
+<p>The tail here are the values <code>4</code> and <code>5</code>, which are not drained.</p>
+<p>The <code>tail_len</code> value is set only once, when the struct is initialized in <code>Vec::drain</code>, along with <code>tail_start</code>:</p>
+<pre><code><span>pub</span> <span>fn</span> <span>drain</span>&lt;R&gt;(&amp;<span>mut</span> <span>self</span>, range: R) <span>-&gt;</span> Drain&lt;<span>&#39;_</span>, T&gt;
+<span>where</span>
+    R: RangeBounds&lt;<span>usize</span>&gt;,
+{
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    <span>let</span> <span>len</span> = <span>self</span>.<span>len</span>();
+    <span>let</span> <span>Range</span> { start, end } = slice::<span>range</span>(range, ..len);
+
+    <span>unsafe</span> {
+        
+        <span>self</span>.<span>set_len</span>(start);
+        <span>let</span> <span>range_slice</span> = slice::<span>from_raw_parts</span>(<span>self</span>.<span>as_ptr</span>().<span>add</span>(start), end - start);
+        Drain {
+            tail_start: end,
+            tail_len: len - end,
+            iter: range_slice.<span>iter</span>(),
+            vec: NonNull::<span>from</span>(<span>self</span>),
+        }
+    }
+}
+</code></pre>
+<p>Here you can see that <code>tail_start</code> and <code>tail_end</code> represent anything <em>after</em> the section you are pulling out with <code>drain</code>, with a special bit of handling to guarantee memory safety when dealing with the original <code>Vec</code><span></span><span>’</span>s contents.</p>
+<p>Thus, in my example code, <code>tail_start</code> will be <code>3</code> and <code>tail_end</code> will be <code>4</code>: <code>..</code> <em>excludes</em> the end of the range, with the values <code>4</code> and <code>5</code>, exactly as I described above.</p>
+<p>If there is a tail, the <code>DropGuard</code> relocates each of those items using <a href="https://doc.rust-lang.org/1.83.0/std/ptr/fn.copy.html">the <code>std::ptr::copy</code> function</a>, which is similar to the C function <code>memmove</code>. It gets a mutable reference to the original <code>Vec</code>, and again only copies over the values if the tail is not already at the end of the original <code>Vec</code>.</p>
+<pre><code><span>if</span> <span>self</span>.<span>0</span>.tail_len &gt; <span>0</span> {
+    <span>unsafe</span> {
+        <span>let</span> <span>source_vec</span> = <span>self</span>.<span>0</span>.vec.<span>as_mut</span>();
+        
+        <span>let</span> <span>start</span> = source_vec.<span>len</span>();
+        <span>let</span> <span>tail</span> = <span>self</span>.<span>0</span>.tail_start;
+        <span>if</span> tail != start {
+            <span>let</span> <span>src</span> = source_vec.<span>as_ptr</span>().<span>add</span>(tail);
+            <span>let</span> <span>dst</span> = source_vec.<span>as_mut_ptr</span>().<span>add</span>(start);
+            ptr::<span>copy</span>(src, dst, <span>self</span>.<span>0</span>.tail_len);
+        }
+        source_vec.<span>set_len</span>(start + <span>self</span>.<span>0</span>.tail_len);
+    }
+}
+</code></pre>
+<p>Finally, this implementation updates the length of the original <code>Vec</code>. This is an unsafe operation because it does not even bother trying to uphold the normal invariants about a <code>Vec</code>: that it contains no uninitialized memory, that the new length is less than or equal to the total allocated capacity of the <code>Vec</code>, and so on. Here, we can see that it is safe by inspection because we guarantee at construction that the <code>tail_len</code> is bounded by the length of the original vector — but we can (and Rust <em>does</em>) also do a bunch of extra dynamic analysis with the <a href="https://github.com/rust-lang/miri">Miri</a> tool to <em>make sure</em> that is true via extensive testing.</p>
+<details><summary>A bit more about Miri (click to expand!)</summary>
+<p>Per its <span>README</span>:</p>
+<blockquote>
+<p>Miri is an <a href="https://doc.rust-lang.org/reference/behavior-considered-undefined.html">Undefined Behavior</a> detection tool for Rust. It can run binaries and test suites of cargo projects and detect unsafe code that fails to uphold its safety requirements.</p>
+</blockquote>
+<p>You can read a little about how to use it in <a href="https://doc.rust-lang.org/nightly/book/ch20-01-unsafe-rust.html#using-miri-to-check-unsafe-code">a section I recently added</a> to <cite>The Rust Programming Language</cite>, and much more in <a href="https://github.com/rust-lang/miri">its repo</a>.</p>
+</details>
+<p>When I said earlier that we would minimize the work done for relocating items, this is what I meant: we <em>only</em> move these items after actually using the <code>Drain</code>; we do not preemptively move the originals out of place and move these over.</p>
+<p>(If you’re wondering, this does mean that if you are draining some small part of a large <code>Vec</code>, you may see a performance hiccup when you’re done with the <code>Drain</code>. As always with performance, though, you should measure before you assume this is a problem!)</p>
+<p>Once the memory move is done, the <code>DropGuard</code> is also done. We will see shortly how it gets <em>used</em>, and I will explain then why it is used <em>this way</em>. Back to the rest of the <code>drop</code> implementation for <code>Drain</code>.</p>
+<p>First, it pulls the range iterator out of the <code>Drain</code> and uses it to figure out how many items it needs to drop when cleaning everything up — because, as the docs noted,<span></span> <span>“</span>If the iterator is dropped before being fully consumed, it drops the remaining removed elements.”</p>
+<pre><code><span>let</span> <span>iter</span> = mem::<span>take</span>(&amp;<span>mut</span> <span>self</span>.iter);
+<span>let</span> <span>drop_len</span> = iter.<span>len</span>();
+</code></pre>
+<p><a href="https://doc.rust-lang.org/1.83.0/std/mem/fn.take.html">The <code>mem::take</code> function</a> replaces a given value with whatever its <em>default</em> value is, as defined by its implementation of <a href="https://doc.rust-lang.org/1.83.0/std/default/trait.Default.html">the <code>std::default::Default</code> trait</a>. For a <code>Range&lt;usize&gt;</code> (as we have for indexing into a <code>Vec</code>), that is <code>0..0</code>, which runs from <code>0</code>-inclusive to <code>0</code>-exclusive. In other words, it is the <em>empty</em> range, which is hopefully what you would expect. That step sets <code>self.iter</code> to a useless value and makes the <code>iter</code> value available for further manipulation — and, critically, <em>available to drop</em> when this <code>Drain</code> goes out of scope, but not attached to it, which matters for some pointer arithmetic which happens later.</p>
+<p>Next up, this <code>drop</code> implementation gets a mutable reference to the original <code>Vec</code>:</p>
+<pre><code><span>let</span> <span>mut </span><span>vec</span> = <span>self</span>.vec;
+</code></pre>
+<p>At first read, it might not be obvious that it is a <em>reference</em> that we are getting there, but the type of <code>self.vec</code> here is <code>NonNull&lt;Vec&lt;T&gt;&gt;</code>, which always wraps a reference. In this case, it was constructed by calling <code>NonNull::from(self)</code> back when <code>Drain</code> got constructed, where <code>self</code> was <code>&amp;mut self</code> referencing the <code>Vec</code> we called <code>drain</code> on:</p>
+<pre><code><span>pub</span> <span>fn</span> <span>drain</span>&lt;R&gt;(&amp;<span>mut</span> <span>self</span>, range: R) <span>-&gt;</span> Drain&lt;<span>&#39;_</span>, T&gt;
+<span>where</span>
+    R: RangeBounds&lt;<span>usize</span>&gt;,
+{
+    
+    <span>unsafe</span> {
+        
+        Drain {
+            
+            vec: NonNull::<span>from</span>(<span>self</span>),
+        }
+    }
+}
+</code></pre>
+<p>So <code>let mut vec = self.vec</code> is a mutable reference to <a href="https://doc.rust-lang.org/1.83.0/std/ptr/struct.NonNull.html">the <code>NonNull</code> pointer</a> to the <code>Vec</code>, which in turn we can use via its implementation of <a href="https://doc.rust-lang.org/1.83.0/std/ops/trait.Deref.html">the <code>Deref</code> trait</a> to use all the normal <code>Vec</code> methods. That is exactly what we do next.</p>
+<p>First, there is a special case for zero-sized types. A zero-sized type is a type like this — </p>
+<pre><code><span>struct</span> <span>TotallyEmpty</span>;
+</code></pre>
+<p> — that is, one that has no data associated with it and that the compiler will thus guarantee takes up no memory at all. We have to handle this case distinctly because there is nothing to move!</p>
+<section aria-label="Note" aria-role="note"><p>Idiomatic Rust uses these kinds of types for a couple of reasons — neither of them <em>extremely</em> common, but not especially <em>uncommon</em>, either:</p>
+<ul>
+<li>
+<p>As a<span></span> <span>“</span>marker” for distinguishing between other types. This can help provide type safety without any additional runtime cost, because Rust will distinguish between two zero-sized types. This can be super handy for implementing type-safe state machines, for example.</p>
+</li>
+<li>
+<p>To have a useful place to implement a trait. You cannot implement a trait on <em>nothing</em>. You can, however, <code>impl SomeTrait for TotallyEmpty</code>. That can be useful, especially when in conjunction with use as a marker type! One time you might want this is as a marker to make a given type opt out of being <code>Send</code> or <code>Sync</code>.</p>
+</li>
+</ul>
+<p>I could say a lot more about zero-sized types, but instead: back to the <code>drop</code> implementation!</p>
+</section>
+<p>The implementation therefore starts by doing something a little interesting: checking a value on <code>T</code>. But <code>T</code> is a type!</p>
+<pre><code><span>if</span> T::IS_ZST {
+    
+    
+    <span>unsafe</span> {
+        <span>let</span> <span>vec</span> = vec.<span>as_mut</span>();
+        <span>let</span> <span>old_len</span> = vec.<span>len</span>();
+        vec.<span>set_len</span>(old_len + drop_len + <span>self</span>.tail_len);
+        vec.<span>truncate</span>(old_len + <span>self</span>.tail_len);
+    }
+
+    <span>return</span>;
+}
+</code></pre>
+<p>This is actually <a href="https://github.com/rust-lang/rust/blob/75716b45105e443199ce9800c7009ddfd6d2be53/library/core/src/mem/mod.rs#L1239">implemented</a> in Rust’s standard library — technically in <code>libcore</code> — using an unstable feature currently only designed for internal use like this. That means you cannot write this in your own code, as you can confirm with <a href="https://play.rust-lang.org/?version=stable&amp;mode=debug&amp;edition=2021&amp;gist=b935f58d234eb36ce3a2cbfcdc360905">this playground</a>. Under the hood, though, it is doing something pretty simple:</p>
+<pre><code><span>pub</span> <span>trait</span> <span>SizedTypeProperties</span>: <span>Sized</span> {
+    
+
+    <span>const</span> IS_ZST: <span>bool</span> = size_of::&lt;<span>Self</span>&gt;() == <span>0</span>;
+}
+
+<span>impl</span>&lt;T&gt; SizedTypeProperties <span>for</span> <span>T</span> {}
+</code></pre>
+<p>That is, at compile time, it determines for any type <code>T</code> whether it is a zero-sized type or not, and then Rust’s internals can use that associated field. This <em>is</em> something you can do yourself for other traits (see <a href="https://play.rust-lang.org/?version=stable&amp;mode=debug&amp;edition=2021&amp;gist=d6f069372555fe4eb8c1f2e1d77abf43">this playground</a> for a silly example); it is just not something you see very often!</p>
+<p>Back to the <code>drop</code> implementation, we can see that all we need to do in this case is update the length of the original <code>Vec</code>, with no need to copy memory around. Then we <code>return</code> because there is nothing else to do in that case, and the <code>Drain</code> instance can be safely cleaned up.</p>
+<pre><code><span>unsafe</span> {
+    <span>let</span> <span>vec</span> = vec.<span>as_mut</span>();
+    <span>let</span> <span>old_len</span> = vec.<span>len</span>();
+    vec.<span>set_len</span>(old_len + drop_len + <span>self</span>.tail_len);
+    vec.<span>truncate</span>(old_len + <span>self</span>.tail_len);
+}
+
+<span>return</span>;
+</code></pre>
+<p>The<span></span> <span>“</span>normal” pattern, though, is for types which <em>do</em> have a size. In that case, the <code>DropGuard</code> finally makes its appearance:</p>
+<pre><code>
+
+<span>let</span> <span>_guard</span> = <span>DropGuard</span>(<span>self</span>);
+</code></pre>
+<p>The comment explains why <code>DropGuard</code> exists: we need to <em>guarantee</em> the constraint I outlined at the top, and the reason this all exists — that the original values from the <code>Vec</code> are <em>never</em> accessible once they are included in a <code>Drain</code>, because otherwise we would violate Rust’s memory safety guarantees. We will see what the <code>drop_in_place</code> bit refers to in a moment, but there is one other thing to do first: return immediately if there is nothing extra to drop!</p>
+<p>Remember, we got the number of items to drop, i.e. the number of items left in the iterator. If there is nothing left to drop, we’re done:</p>
+<pre><code><span>let</span> <span>iter</span> = mem::<span>take</span>(&amp;<span>mut</span> <span>self</span>.iter);
+<span>let</span> <span>drop_len</span> = iter.<span>len</span>();
+
+
+
+<span>if</span> drop_len == <span>0</span> {
+    <span>return</span>;
+}
+</code></pre>
+<p>And by<span></span> <span>“</span>done”, I mean that the drop method returns, and so the drop guard we declared with <code>let _guard = DropGuard(self)</code> now goes out of scope. That means its <code>Drop</code> implementation — where we started! — will run. Anything that needs to be moved in the original <code>Vec</code> will be moved here at the end of the scope.</p>
+<p>The same basic thing will apply, with a small tweak, for the final part of this <code>drop</code> implementation:</p>
+<pre><code>
+
+
+
+<span>let</span> <span>drop_ptr</span> = iter.<span>as_slice</span>().<span>as_ptr</span>();
+
+<span>unsafe</span> {
+    
+    
+    
+    
+    
+    <span>let</span> <span>vec_ptr</span> = vec.<span>as_mut</span>().<span>as_mut_ptr</span>();
+    <span>let</span> <span>drop_offset</span> = drop_ptr.<span>sub_ptr</span>(vec_ptr);
+    <span>let</span> <span>to_drop</span> = ptr::<span>slice_from_raw_parts_mut</span>(vec_ptr.<span>add</span>(drop_offset), drop_len);
+    ptr::<span>drop_in_place</span>(to_drop);
+}
+</code></pre>
+<p>The comment on the first line of code here tells us why we handled the <code>drop_len</code> check <em>before</em> doing any of this. It is also suggestive of a theme that has been here implicitly throughout: Rust makes it <em>easier</em> to isolate safety checks, but they are often impossible to make totally local. In this case, <a href="https://doc.rust-lang.org/1.83.0/std/vec/struct.Splice.html">the <code>Splice</code> type</a> created via <a href="https://doc.rust-lang.org/1.83.0/std/vec/struct.Vec.html#method.splice">the <code>Vec::splice</code> method</a> uses <code>Drain</code>, and also uses <code>unsafe</code> pointers to the original <code>Vec</code> in its own <code>Drop</code> implementation, so <code>Drain</code> has to be careful not to violate the assumptions that <code>Splice</code> makes. This is hard to get right! And it’s why we use Miri, as I noted above — that’s what <a href="https://github.com/rust-lang/rust/pull/106950">led to</a> this bit of code being written the way it is!</p>
+<p>The next block of comments and the first line in the unsafe block get into something Rust is working hard to improve in terms of its model of safety: <em>provenance</em>. In brief, provenance is about tracking not just the address of a pointer but <em>where it came from</em> and therefore what we can prove about it. Provenance is an incredibly deep and fascinating subject about which I know too little, so I won’t say much more than that.</p>
+<p>Here, the point is to make sure we have a valid pointer provenance to use when dropping any values that are unused at the end of the original range specified when calling <code>drain</code>: Miri will (rightly!) complain otherwise.</p>
+<p>Once we have pointers with valid provenances, we get a<span></span> <span>“</span>raw slice” with <a href="https://doc.rust-lang.org/1.83.0/std/ptr/fn.slice_from_raw_parts_mut.html">the <code>std::ptr::slice_from_raw_parts_mut</code> function</a>. A<span></span> <span>“</span>raw slice” is <em>basically</em> just a chunk of memory interpreted as a contiguous sequence of items of a given type. It is called<span></span> <span>“</span>raw” because it is unsafe: it is constructed directly from a pointer and size; it is on the caller to make sure it is valid. We use the <code>_mut</code> version of the function here because the next, and next-to-last, thing we do is call <a href="https://doc.rust-lang.org/1.83.0/std/primitive.pointer.html#method.drop_in_place">the <code>std::ptr::drop_in_place</code> function</a>, which runs the <code>Drop</code> implementation for whatever it is called on <em>without</em> moving them. Called on a slice, that will in turn recursively call the <code>Drop</code> on each item in the slice.</p>
+<p><code>drop_in_place</code> is unsafe because it leaves the resulting memory exactly as it was, modulo whatever a given item’s own <code>Drop</code> implementation might do. That takes us back to the guarantee we have to uphold about clearing all of that memory. That is also why I said calling <code>drop_in_place</code> is the<span></span> <span>“</span>next-to-last” thing this does, though: This is the end of the function, and thus the end of the scope, which means the <code>_guard</code> instance of <code>DropGuard</code> goes out of scope and runs. That means the guarantee gets upheld! And, as the comment at the creation of the <code>DropGuard</code> instance indicated — </p>
+<pre><code>
+
+<span>let</span> <span>_guard</span> = <span>DropGuard</span>(<span>self</span>);
+</code></pre>
+<p> — Rust will run the <code>DropGuard</code> implementation of <code>Drop</code> even if <code>drop_in_place</code> panics, which could happen if something in some inner type’s <code>Drop</code> implementation is ill-behaved. This allows this function to <em>guarantee</em> that even if something went wrong with the data which was originally in the <code>Vec</code>, the memory itself is valid, and the <code>Vec</code> itself remains valid afterward. That is: There might be a serious bug or problem, but it will not be a bug or problem that violates Rust’s safety and soundness guarantees.</p>
+<hr/>
+<p>That was a lot of ground, but it showed off some interesting bits about providing a safe abstraction for unsafe code and how Rust can take advantage of its ownership semantics to provide great performance while upholding those guarantees. In particular:</p>
+<ol>
+<li>The original <code>Vec</code> is never accessible in an invalid state during or after using <code>drain</code> on it.</li>
+<li>The iterator over that <code>Vec</code> can never be invalidated either.</li>
+<li>Both (1) and (2) are true <em>even in the face of badly behaved implementations of other types</em>, as long as there is no <em>unsound</em> code in that bad behavior.</li>
+</ol>
+<p>It is also worth seeing that while this <em>includes</em> memory safety, the way the ownership semantics work in the public <abbr title="application programming interface">API</abbr> here eliminates <em>other</em> kinds of bugs too. You can have iterator invalidation bugs in Java or JavaScript just fine if you don’t take care! In Rust, you can only have an iterator invalidation bug by explicitly opting into <code>unsafe</code>. That’s neat, and it’s one reason I miss Rust when working in other languages!</p>
+<p>I also particularly want to note this use of a <code>DropGuard</code> to uphold those guarantees. This is <em>similar</em> to the kind of thing you can do with the <code>using</code> construct in C# or JavaScript or the <code>with</code> construct in Python — but in those cases, there is a special language affordance built in to handle that kind of scoping so you can deploy it for cases where you need it. In Rust, it falls directly out of the combination of ownership and having a destructor that runs automatically when an item goes out of scope. You do not <em>need</em> any special language constructs for it other than those two.</p>
+<h2 id="further-reading" tabindex="-1"><a href="#further-reading">Further reading</a></h2>
+<p>If you want to read more about provenance, check out these posts by Rust memory model expert Ralf Jung:</p>
+<ul>
+<li><a href="https://www.ralfj.de/blog/2018/07/24/pointers-and-bytes.html">Pointers Are Complicated, or: What’s in a Byte?</a></li>
+<li><a href="https://www.ralfj.de/blog/2020/12/14/provenance.html">Pointers Are Complicated II, or: We need better language specs</a></li>
+<li><a href="https://www.ralfj.de/blog/2022/04/11/provenance-exposed.html">Pointers Are Complicated III, or: Pointer-integer casts exposed</a></li>
+</ul>
+<p>You might also want to look into <a href="https://www.cl.cam.ac.uk/research/security/ctsrd/cheri/">the <abbr title="Capability Hardware Enhanced RISC Instructions">CHERI</abbr> project</a>, which is working on adding provenance to pointers at the hardware instruction level, which would help immensely with safety in C.</p>
+<p>For two more great reads on how you can (and Rust does) use ownership in related ways to provide powerful guarantees about your code, check out Cliff Biffle’s posts <a href="https://cliffle.com/blog/rust-typestate/">The Typestate Pattern in Rust</a> and <a href="https://cliffle.com/blog/rust-mutexes/">Why Rust mutexes look like they do</a>. Those are where I first came to understand the pattern I walked through in this post!</p>
+
+
+
+   </div></div>
+  </body>
+</html>
