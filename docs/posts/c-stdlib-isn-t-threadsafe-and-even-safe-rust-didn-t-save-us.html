@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.edgedb.com/blog/c-stdlib-isn-t-threadsafe-and-even-safe-rust-didn-t-save-us">Original</a>
+    <h1>C stdlib isn&#39;t threadsafe and even safe Rust didn&#39;t save us</h1>
+    
+    <div id="readability-page-1" class="page"><div data-theme="dark"><div><div>
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<section data-section-id="c-stdlib-isn-t-threadsafe-and-even-safe-rust-didn-t-save-us" id="c-stdlib-isn-t-threadsafe-and-even-safe-rust-didn-t-save-us">
+<!-- -->
+<p>We’re in the process of porting a significant portion of the network I/O code
+            in EdgeDB from Python to Rust, and we’ve been learning a lot of very
+            interesting lessons in the process.</p>
+<div data-section-id="the-crash-that-only-happened-on-arm64" id="the-crash-that-only-happened-on-arm64">
+
+<p>We’ve been working on a new HTTP fetch feature for EdgeDB, using <code>reqwest</code>
+                as our HTTP client library. Everything was going smoothly: the feature
+                worked locally, passed tests on x86_64 CI runners, and seemed stable.
+                But then we noticed something strange: the tests started failing
+                intermittently on our ARM64 CI runners.</p>
+<p>At first glance, it looked like a deadlock. The test runner would start,
+                hang indefinitely, and then the CI job would time out. The logs showed no
+                errors—just a test spinning forever. And then, after a few hours, the job
+                would fail with a timeout error.</p>
+<p>Here’s what the CI output looked like:</p>
+<div><div><div translate="no"><pre><span>Current runner version: &#39;2.321.0&#39;
+Runner name: &#39;&lt;instance-id&gt;&#39;
+Runner group name: &#39;Default&#39;
+
+(... 6 hrs of logs ...)
+
+still running:
+test_immediate_connection_drop_streaming (pid=451) for 19874.78s
+
+still running:
+test_immediate_connection_drop_streaming (pid=451) for 19875.78s
+
+still running:
+test_immediate_connection_drop_streaming (pid=451) for 19876.78s
+
+still running:
+test_immediate_connection_drop_streaming (pid=451) for 19877.78s
+
+Shutting down test cluster...</span></pre></div></div></div>
+<p>Not much to go on here. It looked like a deadlock causing an async task to
+                improperly block to us at first. It turns out we were wrong.</p>
+</div>
+<div data-section-id="initial-theories" id="initial-theories">
+
+<p>Why just ARM64? This didn’t make a lot of sense to us in the beginning.
+                Our first theories were in the difference of memory models between Intel and
+                ARM64. Intel has a fairly strict memory model—while some unusual behaviors
+                can happen, memory writes have a total order that all processors agree on
+                (<a href="https://www.msully.net/blog/2015/02/25/the-x86-memory-model/">[1]</a>, <a href="https://research.swtch.com/hwmm">[2]</a>, <a href="https://www.cl.cam.ac.uk/~pes20/weakmemory/x86tso-paper.tphols.pdf">[3]</a>).
+                ARM has a much more weakly-ordered memory model <a href="https://dl.acm.org/doi/10.1145/1353522.1353528">[4]</a>, where
+                (among other things) writes may appear in different orders to different
+                threads.</p>
+<p>Since Sully’s Ph.D. thesis was on this stuff <a href="https://www.msully.net/thesis/">[5]</a>,
+                this is when he got pulled in to take a look.</p>
+</div>
+<div data-section-id="debugging-on-the-ci-machine" id="debugging-on-the-ci-machine">
+
+<p>Our nightly CI machines run on Amazon AWS, which has the advantage of giving
+                us a real, uncontainerized root user. While you can connect github runners via
+                ssh <a href="https://github.com/marketplace/actions/ssh-to-github-action-runner">[6]</a>, it’s
+                nice to have the ability to connect as the true root user to get access to
+                dmesg and other system logs.</p>
+<p>To figure out what was going on, we (Sully and Matt) decided to connect
+                directly to the ARM64 runner and see what was happening under the hood.</p>
+<p>First, we SSH’d into the CI machine to try and find that hung process
+                to connect to it:</p>
+<div><div><div translate="no"><pre><span>$ aws ssm start-session --region us-west-2 --target i-&lt;instance-id&gt;
+$ ps aux | grep &#34;451&#34;
+&lt;no output&gt;</span></pre></div></div></div>
+<p>Oh, that’s right! We run the build in a Docker container and it has its own
+                process namespace:</p>
+<div><div><div translate="no"><pre><span>$ sudo docker exec -it &lt;container-id&gt; /bin/sh
+# ps aux | grep &#34;451&#34;
+&lt;no output&gt;</span></pre></div></div></div>
+<p>Wait, hold on. The hung process isn’t there either.</p>
+<p>This wasn’t a deadlock — the process had crashed.</p>
+<p>It turns out our test runner failed to detect this—but that’s fine, and a fix
+                for another day. We can see if the process left a coredump. Since a Docker
+                container is just a process namespace, the core dump gets passed to the Docker
+                host itself. We can try to find that from outside the container with
+                <code>journalctl</code>:</p>
+<div><div><div translate="no"><pre><span>$ sudo journalctl
+systemd-coredump: Process 59530 (python3) of user 1000 dumped core.
+                  Stack trace of thread &lt;tid&gt;:
+                  ...</span></pre></div></div></div>
+<p>Aha! We found it. And the core for that process lives in
+                <code>/var/lib/systemd/coredump/</code> as expected. Note that we see a different pid
+                here because of process namespaces: the pid outside of the container (59530)
+                is different than the one inside (1000).</p>
+<p>We loaded the core dump into <code>gdb</code> to see what happened. Unfortunately,
+                we were greeted with a number of errors:</p>
+<div><div><div translate="no"><pre><span>$ gdb
+(gdb) core-file core.python3.1000.&lt;...&gt;.59530.&lt;...&gt;
+warning: Can&#39;t open file /lib64/libnss_files-2.17.so during file-backed mapping note processing
+warning: Can&#39;t open file /lib64/librt-2.17.so during file-backed mapping note processing
+warning: Can&#39;t open file /lib64/libc-2.17.so during file-backed mapping note processing
+warning: Can&#39;t open file /lib64/libm-2.17.so during file-backed mapping note processing
+warning: Can&#39;t open file /lib64/libutil-2.17.so during file-backed mapping note processing
+... etc ...
+(gdb) bt
+#0  0x0000ffff805a3e90 in ?? ()
+#1  0x0000ffff806a7000 in ?? ()
+Backtrace stopped: not enough registers or memory available to unwind further</span></pre></div></div></div>
+<p>Ack. That’s not useful. We don’t have the necessary files outside of the
+                container, and our containers are quite minimal and don’t allow us to easily
+                install <code>gdb</code>.</p>
+<p>Instead, we need to copy the relevant libraries out of the container,
+                and tell <code>gdb</code> where the <code>.so</code> files live:</p>
+<div><div><div translate="no"><pre><span># mkdir /container
+# docker cp &lt;instance&gt;:/lib /container
+# docker cp &lt;instance&gt;:/usr /container
+... etc ...
+$ gdb
+(gdb) set solib-absolute-prefix /container
+(gdb) file /container/edgedb/bin/python3
+Reading symbols from /container/edgedb/bin/python3...
+(No debugging symbols found in /container/edgedb/bin/python3)
+(gdb) core-file core.python3.1000.&lt;...&gt;.59530.&lt;...&gt;
+(gdb) bt
+#0  0x0000ffff805a3e90 in getenv () from /container/lib64/libc.so.6
+#1  0x0000ffff8059c174 in __dcigettext () from /container/lib64/libc.so.6</span></pre></div></div></div>
+<p>Much better!</p>
+<p>But rather than a crash in our new HTTP code, the backtrace revealed
+                something unexpected:</p>
+<div><div><div translate="no"><pre><span>(gdb) bt
+#0  0x0000ffff805a3e90 in getenv () from /container/lib64/libc.so.6
+#1  0x0000ffff8059c174 in __dcigettext () from /container/lib64/libc.so.6
+#2  0x0000ffff805f263c in strerror_r () from /container/lib64/libc.so.6
+#3  0x0000ffff805f254c in strerror () from /container/lib64/libc.so.6
+#4  0x00000000005bb76c in PyErr_SetFromErrnoWithFilenameObjects ()
+#5  0x00000000004e4c14 in ?? ()
+#6  0x000000000049f66c in PyObject_VectorcallMethod ()
+#7  0x00000000005d21e4 in ?? ()
+#8  0x00000000005d213c in ?? ()
+#9  0x00000000005d1ed4 in ?? ()
+#10 0x00000000004985ec in _PyObject_MakeTpCall ()
+#11 0x00000000004a7734 in _PyEval_EvalFrameDefault ()
+#12 0x000000000049ccb4 in _PyObject_FastCallDictTstate ()
+#13 0x00000000004ebce8 in ?? ()
+#14 0x00000000004985ec in _PyObject_MakeTpCall ()
+#15 0x00000000004a7734 in _PyEval_EvalFrameDefault ()
+#16 0x00000000005bee10 in ?? ()
+#17 0x0000ffff7ee1f5dc in ?? () from /container/.../_asyncio.cpython-312-aarch64-linux-gnu.so
+#18 0x0000ffff7ee1fd94 in ?? () from /container/.../_asyncio.cpython-312-aarch64-linux-gnu.so</span></pre></div></div></div>
+<p>We disassembled the crashing <code>getenv</code> function. Knowing that we build our
+                containers using GLIBC 2.17, we also located the relevant source for <code>getenv</code>
+                to follow along <a href="https://elixir.bootlin.com/glibc/glibc-2.17.90/source/stdlib/getenv.c#L33">[7]</a>:</p>
+<div><div><div translate="no"><pre><span>
+<span>char</span> <span>*</span> <span>getenv</span> <span>(</span><span>const</span> <span>char</span> <span>*</span>name<span>)</span> <span>{</span>
+  <span>size_t</span> len <span>=</span> <span>strlen</span> <span>(</span>name<span>)</span><span>;</span>
+  <span>char</span> <span>*</span><span>*</span>ep<span>;</span>
+  <span>uint16_t</span> name_start<span>;</span>
+
+  <span>if</span> <span>(</span>__environ <span>==</span> <span>NULL</span> <span>||</span> name<span>[</span><span>0</span><span>]</span> <span>==</span> <span>&#39;\0&#39;</span><span>)</span>
+    <span>return</span> <span>NULL</span><span>;</span>
+
+  <span>if</span> <span>(</span>name<span>[</span><span>1</span><span>]</span> <span>==</span> <span>&#39;\0&#39;</span><span>)</span> <span>{</span>
+    
+    name_start <span>=</span> <span>(</span><span>&#39;=&#39;</span> <span>&lt;&lt;</span> <span>8</span><span>)</span> <span>|</span> <span>*</span><span>(</span><span>const</span> <span>unsigned</span> <span>char</span> <span>*</span><span>)</span> name<span>;</span>
+    <span>for</span> <span>(</span>ep <span>=</span> __environ<span>;</span> <span>*</span>ep <span>!=</span> <span>NULL</span><span>;</span> <span>++</span>ep<span>)</span> <span>{</span>
+        <span>uint16_t</span> ep_start <span>=</span> <span>(</span><span>(</span><span>(</span><span>unsigned</span> <span>char</span> <span>*</span><span>)</span> <span>*</span>ep<span>)</span><span>[</span><span>0</span><span>]</span>
+                           <span>|</span> <span>(</span><span>(</span><span>(</span><span>unsigned</span> <span>char</span> <span>*</span><span>)</span> <span>*</span>ep<span>)</span><span>[</span><span>1</span><span>]</span> <span>&lt;&lt;</span> <span>8</span><span>)</span><span>)</span><span>;</span>
+      <span>if</span> <span>(</span>name_start <span>==</span> ep_start<span>)</span>
+        <span>return</span> <span>&amp;</span><span>(</span><span>*</span>ep<span>)</span><span>[</span><span>2</span><span>]</span><span>;</span>
+    <span>}</span>
+  <span>}</span> <span>else</span> <span>{</span>
+    name_start <span>=</span> <span>(</span><span>(</span><span>(</span><span>const</span> <span>unsigned</span> <span>char</span> <span>*</span><span>)</span> name<span>)</span><span>[</span><span>0</span><span>]</span>
+      <span>|</span> <span>(</span><span>(</span><span>(</span><span>const</span> <span>unsigned</span> <span>char</span> <span>*</span><span>)</span> name<span>)</span><span>[</span><span>1</span><span>]</span> <span>&lt;&lt;</span> <span>8</span><span>)</span><span>)</span><span>;</span>
+    len <span>-=</span> <span>2</span><span>;</span>
+    name <span>+=</span> <span>2</span><span>;</span>
+
+    <span>for</span> <span>(</span>ep <span>=</span> __environ<span>;</span> <span>*</span>ep <span>!=</span> <span>NULL</span><span>;</span> <span>++</span>ep<span>)</span> <span>{</span>
+      <span>uint16_t</span> ep_start <span>=</span> <span>(</span><span>(</span><span>(</span><span>unsigned</span> <span>char</span> <span>*</span><span>)</span> <span>*</span>ep<span>)</span><span>[</span><span>0</span><span>]</span>
+                           <span>|</span> <span>(</span><span>(</span><span>(</span><span>unsigned</span> <span>char</span> <span>*</span><span>)</span> <span>*</span>ep<span>)</span><span>[</span><span>1</span><span>]</span> <span>&lt;&lt;</span> <span>8</span><span>)</span><span>)</span><span>;</span>
+      <span>if</span> <span>(</span>name_start <span>==</span> ep_start <span>&amp;&amp;</span> <span>!</span><span>strncmp</span> <span>(</span><span>*</span>ep <span>+</span> <span>2</span><span>,</span> name<span>,</span> len<span>)</span>
+          <span>&amp;&amp;</span> <span>(</span><span>*</span>ep<span>)</span><span>[</span>len <span>+</span> <span>2</span><span>]</span> <span>==</span> <span>&#39;=&#39;</span><span>)</span>
+        <span>return</span> <span>&amp;</span><span>(</span><span>*</span>ep<span>)</span><span>[</span>len <span>+</span> <span>3</span><span>]</span><span>;</span>
+    <span>}</span>
+  <span>}</span>
+
+  <span>return</span> <span>NULL</span><span>;</span>
+<span>}</span></span></pre></div></div></div>
+<div><div><div translate="no"><pre><span>(gdb) disassemble getenv
+Dump of assembler code for function getenv:
+    0x0000ffff805a3de4 &lt;+0&gt;:     stp     x29, x30, [sp, #-64]!
+    0x0000ffff805a3de8 &lt;+4&gt;:     mov     x29, sp
+    0x0000ffff805a3dec &lt;+8&gt;:     stp     x19, x20, [sp, #16]
+    0x0000ffff805a3df0 &lt;+12&gt;:    stp     x21, x22, [sp, #32]
+    0x0000ffff805a3df4 &lt;+16&gt;:    stp     x23, x24, [sp, #48]
+    0x0000ffff805a3df8 &lt;+20&gt;:    mov     x22, x0
+    0x0000ffff805a3dfc &lt;+24&gt;:    bl      0xffff805f2784 &lt;strlen&gt;
+    0x0000ffff805a3e00 &lt;+28&gt;:    mov     x24, x0
+    0x0000ffff805a3e04 &lt;+32&gt;:    adrp    x0, 0xffff806eb000
+    0x0000ffff805a3e08 &lt;+36&gt;:    ldr     x0, [x0, #3704]
+    0x0000ffff805a3e0c &lt;+40&gt;:    ldr     x20, [x0]
+    0x0000ffff805a3e10 &lt;+44&gt;:    cbz     x20, 0xffff805a3ed8 &lt;getenv+244&gt;
+    0x0000ffff805a3e14 &lt;+48&gt;:    ldrb    w1, [x22]
+    0x0000ffff805a3e18 &lt;+52&gt;:    cbz     w1, 0xffff805a3ed0 &lt;getenv+236&gt;
+    0x0000ffff805a3e1c &lt;+56&gt;:    ldrb    w21, [x22, #1]
+    0x0000ffff805a3e20 &lt;+60&gt;:    ldr     x19, [x20]
+    0x0000ffff805a3e24 &lt;+64&gt;:    cbnz    w21, 0xffff805a3e70 &lt;getenv+140&gt;
+    0x0000ffff805a3e28 &lt;+68&gt;:    mov     w21, #0x3d00                    // #15616
+    0x0000ffff805a3e2c &lt;+72&gt;:    orr     w21, w1, w21
+    0x0000ffff805a3e30 &lt;+76&gt;:    cbnz    x19, 0xffff805a3e40 &lt;getenv+92&gt;
+    0x0000ffff805a3e34 &lt;+80&gt;:    b       0xffff805a3e58 &lt;getenv+116&gt;
+    0x0000ffff805a3e38 &lt;+84&gt;:    ldr     x19, [x20, #8]!
+    0x0000ffff805a3e3c &lt;+88&gt;:    cbz     x19, 0xffff805a3e58 &lt;getenv+116&gt;
+    0x0000ffff805a3e40 &lt;+92&gt;:    ldrb    w1, [x19, #1]
+    0x0000ffff805a3e44 &lt;+96&gt;:    ldrb    w0, [x19]
+    0x0000ffff805a3e48 &lt;+100&gt;:   orr     w0, w0, w1, lsl #8
+    0x0000ffff805a3e4c &lt;+104&gt;:   cmp     w21, w0
+    0x0000ffff805a3e50 &lt;+108&gt;:   b.ne    0xffff805a3e38 &lt;getenv+84&gt;  // b.any
+    0x0000ffff805a3e54 &lt;+112&gt;:   add     x19, x19, #0x2
+    0x0000ffff805a3e58 &lt;+116&gt;:   mov     x0, x19
+    0x0000ffff805a3e5c &lt;+120&gt;:   ldp     x21, x22, [sp, #32]
+    0x0000ffff805a3e60 &lt;+124&gt;:   ldp     x19, x20, [sp, #16]
+    0x0000ffff805a3e64 &lt;+128&gt;:   ldp     x23, x24, [sp, #48]
+    0x0000ffff805a3e68 &lt;+132&gt;:   ldp     x29, x30, [sp], #64
+    0x0000ffff805a3e6c &lt;+136&gt;:   ret
+    0x0000ffff805a3e70 &lt;+140&gt;:   orr     w21, w1, w21, lsl #8
+    0x0000ffff805a3e74 &lt;+144&gt;:   sxth    w21, w21
+    0x0000ffff805a3e78 &lt;+148&gt;:   sub     x23, x24, #0x2
+    0x0000ffff805a3e7c &lt;+152&gt;:   add     x22, x22, #0x2
+    0x0000ffff805a3e80 &lt;+156&gt;:   cbnz    x19, 0xffff805a3e90 &lt;getenv+172&gt;
+    0x0000ffff805a3e84 &lt;+160&gt;:   b       0xffff805a3e58 &lt;getenv+116&gt;
+    0x0000ffff805a3e88 &lt;+164&gt;:   ldr     x19, [x20, #8]!
+    0x0000ffff805a3e8c &lt;+168&gt;:   cbz     x19, 0xffff805a3e58 &lt;getenv+116&gt;
+ =&gt; 0x0000ffff805a3e90 &lt;+172&gt;:   ldrb    w4, [x19, #1]
+    0x0000ffff805a3e94 &lt;+176&gt;:   ldrb    w3, [x19]
+    0x0000ffff805a3e98 &lt;+180&gt;:   orr     w3, w3, w4, lsl #8
+    0x0000ffff805a3e9c &lt;+184&gt;:   cmp     w21, w3, sxth
+    0x0000ffff805a3ea0 &lt;+188&gt;:   b.ne    0xffff805a3e88 &lt;getenv+164&gt;  // b.any
+    0x0000ffff805a3ea4 &lt;+192&gt;:   add     x0, x19, #0x2
+    0x0000ffff805a3ea8 &lt;+196&gt;:   mov     x1, x22
+    0x0000ffff805a3eac &lt;+200&gt;:   mov     x2, x23
+    0x0000ffff805a3eb0 &lt;+204&gt;:   bl      0xffff805f2a44 &lt;strncmp&gt;
+    0x0000ffff805a3eb4 &lt;+208&gt;:   cbnz    w0, 0xffff805a3e88 &lt;getenv+164&gt;
+    0x0000ffff805a3eb8 &lt;+212&gt;:   ldrb    w0, [x19, x24]
+    0x0000ffff805a3ebc &lt;+216&gt;:   cmp     w0, #0x3d
+    0x0000ffff805a3ec0 &lt;+220&gt;:   b.ne    0xffff805a3e88 &lt;getenv+164&gt;  // b.any
+    0x0000ffff805a3ec4 &lt;+224&gt;:   add     x24, x24, #0x1
+    0x0000ffff805a3ec8 &lt;+228&gt;:   add     x19, x19, x24
+    0x0000ffff805a3ecc &lt;+232&gt;:   b       0xffff805a3e58 &lt;getenv+116&gt;
+    0x0000ffff805a3ed0 &lt;+236&gt;:   mov     x19, #0x0                       // #0
+    0x0000ffff805a3ed4 &lt;+240&gt;:   b       0xffff805a3e58 &lt;getenv+116&gt;
+    0x0000ffff805a3ed8 &lt;+244&gt;:   mov     x19, x20
+    0x0000ffff805a3edc &lt;+248&gt;:   b       0xffff805a3e58 &lt;getenv+116&gt;
+    0x0000ffff805a3eb8 &lt;+212&gt;:   ldrb    w0, [x19, x24]
+    0x0000ffff805a3ebc &lt;+216&gt;:   cmp     w0, #0x3d
+    0x0000ffff805a3ec0 &lt;+220&gt;:   b.ne    0xffff805a3e88 &lt;getenv+164&gt;  // b.any
+    0x0000ffff805a3ec4 &lt;+224&gt;:   add     x24, x24, #0x1
+    0x0000ffff805a3ec8 &lt;+228&gt;:   add     x19, x19, x24
+    0x0000ffff805a3ecc &lt;+232&gt;:   b       0xffff805a3e58 &lt;getenv+116&gt;
+    0x0000ffff805a3ed0 &lt;+236&gt;:   mov     x19, #0x0                       // #0
+    0x0000ffff805a3ed4 &lt;+240&gt;:   b       0xffff805a3e58 &lt;getenv+116&gt;
+    0x0000ffff805a3ed8 &lt;+244&gt;:   mov     x19, x20
+    0x0000ffff805a3edc &lt;+248&gt;:   b       0xffff805a3e58 &lt;getenv+116&gt;
+ End of assembler dump.</span></pre></div></div></div>
+<p>Huh, so it’s crashing when loading a byte while scanning for the environment
+                variable of interest.</p>
+<p>We can dump the current state of all the registers:</p>
+<div><div><div translate="no"><pre><span>(gdb) info reg
+...
+x19            0x220               544
+x20            0x248b5000          613109760
+...
+sp             0xffffddd93c80      0xffffddd93c80
+pc             0xffff805a3e90      0xffff805a3e90</span></pre></div></div></div>
+<p>So <code>getenv</code> was crashing trying to load from an invalid memory location
+                (<code>0x220</code> – a clearly invalid memory value). But how?</p>
+</div>
+<div data-section-id="what-was-happening" id="what-was-happening">
+
+<p>At first, we were stumped. The crash was happening deep inside <code>libc</code>.
+                We suspected something to do with environment variable corruption, given
+                the call to <code>getenv</code>, but there wasn’t enough information to go on.</p>
+<p>We started inspecting the environment block using <code>gdb</code>.</p>
+<p>As a refresher, <code>environ</code> is defined as a <code>char **</code> by the POSIX
+                standard <a href="https://www.man7.org/linux/man-pages/man7/environ.7.html">[8]</a>, and is effectively an list of pointers to environment
+                strings, with the end of the list marked as a <code>NULL</code> pointer.</p>
+<div><div><div translate="no"><pre><span>(gdb) x/s ((char**) environ)[0]
+0xffffddd95e6a: &#34;GITHUB_STATE=/github/file_commands/save_state_0e5b7bd6-...&#34;
+...
+(gdb) x/s ((char**) environ)[66]
+0xffff6401f0b0: &#34;SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt&#34;
+(gdb) x/s ((char**) environ)[67]
+0xffff6401f8d0: &#34;SSL_CERT_DIR=/etc/ssl/certs&#34;
+(gdb) x/s ((char**) environ)[68]
+0x0:    &lt;error: Cannot access memory at address 0x0&gt;
+&lt;etc&gt;</span></pre></div></div></div>
+<p>But it didn’t make sense—we were seeing a load from a space of memory that
+                should not be possible, and the environment here seems to be completely valid
+                and consistent. And exactly why were we calling <code>getenv</code> here?</p>
+<p>And then Yury dropped in with a comment and link to an old blog post:</p>
+<div><div><div translate="no"><pre><span>&lt;yury&gt; Some file IO related operation seem to error out,
+       and Python attempts to construct an exception from
+       errno with PyErr_SetFromErrnoWithFilenameObjects
+
+&lt;yury&gt; which probably checks on gettext (translation hook?)
+       which goes into getenv
+
+&lt;yury&gt; this could be why -- getenv isn&#39;t threadsafe
+       https://rachelbythebay.com/w/2017/01/30/env/</span></pre></div></div></div>
+</div>
+<div data-section-id="the-real-culprit-setenv-and-getenv" id="the-real-culprit-setenv-and-getenv">
+<h2 id="the-real-culprit-setenv-and-getenv">The Real Culprit: setenv and getenv</h2>
+<p><code>setenv</code> is not a safe function to call in a multithreaded environment.
+                This is often a problem, and occasionally rediscovered as developers like us
+                hit weird crashes in libc’s <code>getenv</code>
+<a href="https://www.evanjones.ca/setenv-is-not-thread-safe.html">[9]</a>, <a href="https://rachelbythebay.com/w/2017/01/30/env/">[10]</a>,
+                <a href="https://github.com/golang/go/issues/63567">[11]</a>, <a href="https://blogs.gnome.org/mcatanzaro/2018/02/28/on-setenv-and-explosions/">[12]</a>.</p>
+<p>This seemed like a possible cause, but given the lack of symbols here,
+                we couldn’t understand how the threads that were running could contribute
+                to that crash.</p>
+<p>Reading the disassembly, and cross-referencing it with the C code, we
+                determined that the register <code>x20</code> corresponded with the variable <code>ep</code>,
+                the pointer used to walk through the <code>environ</code> array. But <code>x20</code>
+                was <code>0x248b5000</code>, and <code>environ</code> was <code>0x28655750</code>, almost
+                60 megabytes later in memory.</p>
+<p>Since <code>x20</code> is the pointer being used to read the old environment,
+                we could look at the surrounding memory to see if anything sensible
+                is still there, and could then compare that to the current <code>environ</code>.</p>
+<div><div><div translate="no"><pre><span>(gdb) x/100g (char**)environ
+0x28655750:     0x0000ffffddd95e6a      0x0000ffffddd95ebd
+...
+0x28655930:     0x0000ffffddd96f34      0x0000ffffddd96f6e
+0x28655940:     0x0000ffffddd96fa5      0x0000ffffddd96fc3
+0x28655950:     0x0000000024c1f710      0x0000000025213a70
+0x28655960:     0x0000ffff6401f0b0      0x0000ffff6401f8d0
+0x28655970:     0x0000000000000000      0x0000000000003401
+(gdb) x/20g $x20-40
+0x248b4fd8:     0x0000ffffddd96f6e      0x0000ffffddd96fa5
+0x248b4fe8:     0x0000ffffddd96fc3      0x0000000024c1f710
+0x248b4ff8:     0x0000000025213a70      0x0000000000000220
+0x248b5008:     0x0000000000000020      0x0000ffff7f5192a8
+0x248b5018:     0x0000000000000000      0x000000000a000150
+0x248b5028:     0x0000000000000031      0x0000ffff7f5192b8
+0x248b5038:     0x0000000000000000      0x000000000a0001c6
+0x248b5048:     0x000000000094af78      0x0000000000000030
+0x248b5058:     0x0000000000000041      0x0000000000000000
+0x248b5068:     0x0000000000000000      0x0000000000000000</span></pre></div></div></div>
+<p>Interesting! The pointer values in the two areas of memory are very similar!
+                And where do they start to differ? The final entries at <code>0x0000ffff6401f0b0</code>
+                and <code>0x0000ffff6401f8d0</code>: corresponding to <code>SSL_CERT_FILE=...</code>
+                and  <code>SSL_CERT_DIR=...</code>!</p>
+<p>This was a clear hint that the race condition idea was right, and another
+                thread was moving <code>environ</code> as part of a call to <code>setenv</code>! Looking at
+                <code>setenv</code>, it seemed that the space of memory holding the environment block
+                is too small, and it might have been reallocated to fit the new variables
+                <a href="https://elixir.bootlin.com/glibc/glibc-2.17.90/source/stdlib/setenv.c#L33">[13]</a>.</p>
+<p>That still left us with the question of how to find what code is calling
+                <code>setenv</code>. It seemed like it could be possible that OpenSSL and/or one of
+                <code>reqwest</code>’s other TLS-related dependencies (<code>rust-native-tls</code>) was
+                causing the crash, but how?</p>
+</div>
+<div data-section-id="the-connection-to-openssl-probe" id="the-connection-to-openssl-probe">
+
+<p>A google search for those environment variables in concert with
+                <code>rust-native-tls</code> pulled up an old issue: <a href="https://github.com/sfackler/rust-native-tls/issues/154">[14]</a>. And hidden in one of
+                the comments was this:</p>
+<div><div><div translate="no"><pre><span>Not sure about openssl. It looks like it currently
+loads the system certs by using openssl-probe to set
+the SSL_CERT_FILE and SSL_CERT_DIR environment variables,
+and then relies on SslConnector::builder to call
+ctx.set_default_verify_paths, which looks at those
+environment variables. Given that the environment variables
+are set globally once, it might be best to just try to clear
+the store afterwards. This seemed to work for me locally:</span></pre></div></div></div>
+<p>Interesting. So <code>openssl-probe</code> sets those variables. And sure enough,
+                we’re using the <code>rust-native-tls</code>
+<code>openssl</code> backend on Linux which calls
+                into these functions!</p>
+<p>Here’s the unsafe-free, completely-innocent-looking offending lines from the
+                <code>openssl-probe</code> library <a href="https://github.com/alexcrichton/openssl-probe/blob/db67c9e5b333b1b4164467b17f5d99207fad004c/src/lib.rs#L65-L76">[15]</a>:</p>
+<div><div><div translate="no"><pre><span><span>pub</span> <span>fn</span> <span>try_init_ssl_cert_env_vars</span><span>(</span><span>)</span> <span>-&gt;</span> <span>bool</span> <span>{</span>
+    <span>let</span> <span>ProbeResult</span> <span>{</span> cert_file<span>,</span> cert_dir <span>}</span> <span>=</span> <span>probe</span><span>(</span><span>)</span><span>;</span>
+    
+    
+    
+    <span>if</span> <span>let</span> <span>Some</span><span>(</span>path<span>)</span> <span>=</span> <span>&amp;</span>cert_file <span>{</span>
+        <span>env<span>::</span></span><span>set_var</span><span>(</span><span>ENV_CERT_FILE</span><span>,</span> path<span>)</span><span>;</span>
+    <span>}</span>
+    <span>if</span> <span>let</span> <span>Some</span><span>(</span>path<span>)</span> <span>=</span> <span>&amp;</span>cert_dir <span>{</span>
+        <span>env<span>::</span></span><span>set_var</span><span>(</span><span>ENV_CERT_DIR</span><span>,</span> path<span>)</span><span>;</span>
+    <span>}</span>
+
+    cert_file<span>.</span><span>is_some</span><span>(</span><span>)</span> <span>||</span> cert_dir<span>.</span><span>is_some</span><span>(</span><span>)</span>
+ <span>}</span></span></pre></div></div></div>
+<p>And that’s how we ended up with a crash, caused by <code>unsafe</code>-free Rust
+                code badly interacting with the use of <code>libc</code> elsewhere in the program.</p>
+</div>
+<div data-section-id="an-aside-what-even-is-risc" id="an-aside-what-even-is-risc">
+
+<p>While we both had experience with reverse engineering, our aarch64 assembly
+                skills were either rusty (Matt) or nonexistent (Sully), and so we spent
+                some time confused about one of the main loops in the assembly. The code
+                seemed to expect <code>x20</code> to be changing, and it was the clearest candidate
+                to be the register representing <code>ep</code>, but it didn’t appear on the left
+                hand side of any instruction.</p>
+<p>Then we noticed a curious exclamation mark:</p>
+<div><div><div translate="no"><pre><span>0x0000ffff805a3e88 &lt;+164&gt;:   ldr     x19, [x20, #8]!</span></pre></div></div></div>
+<p>It turns out this is the “pre-index” address mode, which behaves like
+                <code>x19 = *(x20 + 8); x20 = x20 + 8</code>
+<a href="https://developer.arm.com/documentation/102374/0102/Loads-and-stores---addressing">[16]</a>.</p>
+<p>This is a cute little operator, but we are old enough to remember being told
+                that auto-increment address modes were a legacy of old-school CISC machines
+                like the VAX, eschewed even by more modern CISC machines like x86, and certainly
+                by the elegant and simple RISC designs. Everything old is new again, I suppose.</p>
+</div>
+<div data-section-id="so-why-only-arm64-linux" id="so-why-only-arm64-linux">
+
+<p>Because this crash is caused by a memory-moving <code>realloc</code>, triggered by
+                <code>setenv</code> which happens at the same time another thread is calling <code>getenv</code>,
+                it requires a lot of pieces to fall into the right place. The number of
+                environment variables needs to be just right to cause a realloc.
+                An unrelated I/O failure picked up by <code>asyncio</code> needs to call <code>getenv</code> to
+                retrieve the <code>LANGUAGE</code> environment variable at exactly the same time.</p>
+<p>The value <code>0x220</code> looks suspiciously close to the size of the old environment
+                in 64-bit words <code>(0x220 / 8 = 68)</code>, and this value was written over the
+                terminating <code>NULL</code> of the environment block before it was moved, likely to
+                indicate the size of the free block to the system malloc but convenienty
+                providing an improper invalid pointer landmine for use-after-free victims
+                to hit.</p>
+<p>Given all these preconditions, we were pretty lucky that it was even mostly
+                reproducible on a single platform.</p>
+</div>
+<div data-section-id="the-fix" id="the-fix">
+
+<p>In the end, we decided that we’re going to migrate away from <code>reqwest</code>’s
+                <code>rust-native-tls</code>/<code>openssl</code> backend to <code>rustls</code> on Linux. Our original
+                thinking behind using the native TLS backend was that we’d get to avoid
+                shipping two TLS engines as we continue to port Python code to Rust.
+                With this issue popping up, we decided that shipping two engines would be OK
+                in the short term.</p>
+<p>Another option would have been to arrange to call <code>try_init_ssl_cert_env_vars</code>
+                for the first time with Python’s Global Interpreter Lock (the dreaded GIL) held.
+                Rust has an internal lock to prevent races between Rust code reading and writing
+                the environment at the same time, but it doesn’t prevent code in other languages
+                from using <code>libc</code> directly. Holding the GIL would prevent us from racing with
+                our Python threads, at least.</p>
+<p>The Rust project has already identified this as an issue, and has planned
+                on making the environment-setter functions unsafe in the 2024 edition
+                <a href="https://github.com/rust-lang/rust/issues/124866">[17]</a>. The glibc project has also
+                (very) recently added more thread-safety to <code>getenv</code>, by avoiding the
+                <code>realloc</code> and leaking the older environments <a href="https://github.com/bminor/glibc/commit/7a61e7f557a97ab597d6fca5e2d1f13f65685c61">[18]</a>.</p>
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+<!-- -->
+</div>
+</section>
+</div></div></div></div>
+  </body>
+</html>
