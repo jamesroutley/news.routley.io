@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://adriacabeza.github.io/2024/07/12/caffeine-cache.html">Original</a>
+    <h1>Analyzing the codebase of Caffeine: a high performance caching library</h1>
+    
+    <div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>The other day, while wasting time reading reddit, I stumbled upon a blogpost mentioning <a href="https://s3fifo.com">S3 FIFO</a>, a method claiming to outperform LRU (Least Recently Used) in terms of cache miss ratio. Notable companies like RedPandas, Rising Wave, and Cloudflare have already implemented it in various capacities, so this piqued my interest. Caches are a pretty darn interesting and at Datadog, we rely heavily on them in several services, so I knew I had to put S3 FIFO to the test, or at least, make sure I understood its core ideas.</p>
+
+<p>However, diving into a new caching approach without a deep understanding of our current system seemed premature. In my team we extensively use <a href="https://github.com/ben-manes/caffeine">Caffeine</a> and let’s be sincere, I do not know it’s internals and I have never actually checked if there were knobs and parameters to fine tune. This post is a summary of my notes trying to understand Caffeine’s inner workings, to dissect its code.</p>
+
+<p>Join me as we unravel some of the complexities of one of the most used cache systems in the world. Whether you’re a seasoned engineer or just curious about advanced caching mechanisms, this exploration promises insights and practical takeaways. Let’s dive in.</p>
+
+
+
+<p><img src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/8c/Caffeine_structure.svg/1920px-Caffeine_structure.svg.png" width="300px"/>
+</p>
+
+
+<p>Caffeine is a high performance, near optimal caching library. It provides awesome features like automatic loading of entries, size-based eviction, statistics, time-based expiration and it is used in a lot of impactful projects like Kafka, Solr, Cassandra, HBase or Neo4j.</p>
+
+<p>Given that there are a lot of different aspects that can be discussed, I have separated them by topic and explored them separately:</p>
+
+
+<p>Caching is all about maximizing the hit ratio - that is, ensuring the most frequently used data is retained in the cache. The eviction policy is the algorithm that decides which entries to keep and which to discard when the cache is full.</p>
+
+<p>The traditional Least Recently Used (LRU) policy is a good starting point, as it’s simple and performs well in many workloads. But modern caches can do better by considering both recency and frequency of access. Recency captures the likelihood that a recently accessed item will be accessed again soon. Frequency captures the likelihood that an item accessed frequently will continue to be accessed frequently. Caffeine uses a policy called Window <a href="https://arxiv.org/abs/1512.00727">TinyLFU</a> to combine these two signals. Moreover, it offers a high hit rate, O(1) time complexity and a small footprint (see <code>BoundedLocalCache.java</code> for more). It works like this:</p>
+
+<p><img src="https://adriacabeza.github.io/img/tinylfu.png"/>
+</p>
+
+
+<ul>
+  <li><strong>Admission Window</strong>: When a new entry is added, it goes through an “admission window” before being fully admitted to the main space. This allows us to have a high hit rate when entries exhibit a bursty access pattern.</li>
+  <li><strong>Frequency Sketch</strong>: Caffeine uses a compact data structure called a CountMinSketch to track the frequency of access for cache entries. This allows it to efficiently estimate the access frequency of the items. If the main space is already full and a new entry needs to be added, Caffeine checks the frequency sketch. It will only admit the new entry if its estimated frequency is higher than the entry that would need to be evicted to make room.</li>
+</ul>
+
+<div><div><pre><code> <span>/**
+   * Determines if the candidate should be accepted into the main space, as determined by its
+   * frequency relative to the victim. A small amount of randomness is used to protect against hash
+   * collision attacks, where the victim&#39;s frequency is artificially raised so that no new entries
+   * are admitted.
+   *
+   * @param candidateKey the key for the entry being proposed for long term retention
+   * @param victimKey the key for the entry chosen by the eviction policy for replacement
+   * @return if the candidate should be admitted and the victim ejected
+   */</span>
+  <span>@GuardedBy</span><span>(</span><span>&#34;evictionLock&#34;</span><span>)</span>
+  <span>boolean</span> <span>admit</span><span>(</span><span>K</span> <span>candidateKey</span><span>,</span> <span>K</span> <span>victimKey</span><span>)</span> <span>{</span>
+    <span>int</span> <span>victimFreq</span> <span>=</span> <span>frequencySketch</span><span>().</span><span>frequency</span><span>(</span><span>victimKey</span><span>);</span>
+    <span>int</span> <span>candidateFreq</span> <span>=</span> <span>frequencySketch</span><span>().</span><span>frequency</span><span>(</span><span>candidateKey</span><span>);</span>
+    <span>if</span> <span>(</span><span>candidateFreq</span> <span>&gt;</span> <span>victimFreq</span><span>)</span> <span>{</span>
+      <span>return</span> <span>true</span><span>;</span>
+    <span>}</span> <span>else</span> <span>if</span> <span>(</span><span>candidateFreq</span> <span>&gt;=</span> <span>ADMIT_HASHDOS_THRESHOLD</span><span>)</span> <span>{</span>
+      <span>// The maximum frequency is 15 and halved to 7 after a reset to age the history. An attack</span>
+      <span>// exploits that a hot candidate is rejected in favor of a hot victim. The threshold of a warm</span>
+      <span>// candidate reduces the number of random acceptances to minimize the impact on the hit rate.</span>
+      <span>int</span> <span>random</span> <span>=</span> <span>ThreadLocalRandom</span><span>.</span><span>current</span><span>().</span><span>nextInt</span><span>();</span>
+      <span>return</span> <span>((</span><span>random</span> <span>&amp;</span> <span>127</span><span>)</span> <span>==</span> <span>0</span><span>);</span>
+    <span>}</span>
+    <span>return</span> <span>false</span><span>;</span>
+  <span>}</span>
+</code></pre></div></div>
+
+<ul>
+  <li><strong>Aging</strong>: To keep the cache history fresh, Caffeine periodically “ages” the frequency sketch by halving all the counters. This ensures the cache adapts to changing access patterns over time.</li>
+  <li><strong>Segmented LRU</strong>: For the main space, Caffeine uses a Segmented LRU policy. Entries start in a “probationary” segment, and on subsequent access are promoted to a “protected” segment. When the protected segment is full, entries are evicted back to the probationary segment, where they may eventually be discarded. This is done to ensure that the hottest entries are retained and those that are less often reused become eligible for eviction.</li>
+</ul>
+
+
+
+<p>As mentioned, the FrequencySketch class is a key component in the cache’s eviction policy as it provides an efficient way to estimate the popularity (frequency of access) of cache entries. The implementation can be found in the <code>FrequencySketch.java</code> file and is implemented as a <code>4-bit</code> CountMinSketch. The idea of CountMinSketch is to provide a space-efficient probabilistic data structure for estimating the frequency of items in a data stream. It uses multiple hash functions to map items to a fixed-size array of counters, allowing for a compact representation of frequency information:</p>
+
+<p><img src="https://adriacabeza.github.io/img/countminsketch.png"/>
+</p>
+
+
+<ol>
+  <li>When an item is added or accessed in the cache, it is hashed using multiple hash functions.</li>
+  <li>Each hash function maps the item to a specific counter in the sketch.</li>
+  <li>The counters corresponding to the item are incremented.</li>
+  <li>To estimate an item’s frequency, the minimum value among its corresponding counters is used.</li>
+</ol>
+
+<p>This approach is very clever because it has constant time operations both for updates and queries, regardless of the number of unique items in the cache; it is scalable and memory efficient (it allows to track frequency information with a fixed amount of memory). Let’s look at some interesting bits of its implementation in Caffeine:</p>
+
+<p><strong>1. Data Structure</strong>
+The sketch itself is represented as a single-dimensional array of 64 bit long values (<code>table</code>). Each long value holds 16 <code>4-bit</code> counters, corresponding to 16 different hash buckets. This layout is chosen to improve efficiency as it keeps the counters for a single entry within a single cache line. Note that the length of the <code>table</code> array is set to the closest power of two greater than or equal to the maximum size of the cache, to enable efficient bit masking operations.</p>
+
+<p><img src="https://adriacabeza.github.io/img/sketch.png"/>
+</p>
+
+
+<p><strong>2. Hashing</strong>
+The sketch uses two hashing functions <code>spread()</code> and <code>rehash()</code> to apply supplemental hash functions to the normal element’s hash code.</p>
+
+<div><div><pre><code><span>...</span>
+    <span>int</span> <span>blockHash</span> <span>=</span> <span>spread</span><span>(</span><span>e</span><span>.</span><span>hashCode</span><span>());</span>
+    <span>int</span> <span>counterHash</span> <span>=</span> <span>rehash</span><span>(</span><span>blockHash</span><span>);</span>
+<span>...</span>
+
+ <span>/** Applies a supplemental hash function to defend against a poor quality hash. */</span>
+  <span>static</span> <span>int</span> <span>spread</span><span>(</span><span>int</span> <span>x</span><span>)</span> <span>{</span>
+    <span>x</span> <span>^=</span> <span>x</span> <span>&gt;&gt;&gt;</span> <span>17</span><span>;</span>
+    <span>x</span> <span>*=</span> <span>0xed5ad4bb</span><span>;</span>
+    <span>x</span> <span>^=</span> <span>x</span> <span>&gt;&gt;&gt;</span> <span>11</span><span>;</span>
+    <span>x</span> <span>*=</span> <span>0xac4c1b51</span><span>;</span>
+    <span>x</span> <span>^=</span> <span>x</span> <span>&gt;&gt;&gt;</span> <span>15</span><span>;</span>
+    <span>return</span> <span>x</span><span>;</span>
+  <span>}</span>
+
+  <span>/** Applies another round of hashing for additional randomization. */</span>
+  <span>static</span> <span>int</span> <span>rehash</span><span>(</span><span>int</span> <span>x</span><span>)</span> <span>{</span>
+    <span>x</span> <span>*=</span> <span>0x31848bab</span><span>;</span>
+    <span>x</span> <span>^=</span> <span>x</span> <span>&gt;&gt;&gt;</span> <span>14</span><span>;</span>
+    <span>return</span> <span>x</span><span>;</span>
+  <span>}</span>
+</code></pre></div></div>
+
+<p><strong>3. Frequency Retrieval</strong></p>
+
+<p>The frequency retrieval happens in the method <code>frequency()</code> where it takes the minimum of the 4 relevant counters as a good approximation:</p>
+<div><div><pre><code>  <span>@NonNegative</span>
+  <span>public</span> <span>int</span> <span>frequency</span><span>(</span><span>E</span> <span>e</span><span>)</span> <span>{</span>
+    <span>if</span> <span>(</span><span>isNotInitialized</span><span>())</span> <span>{</span>
+      <span>return</span> <span>0</span><span>;</span>
+    <span>}</span>
+
+    <span>int</span><span>[]</span> <span>count</span> <span>=</span> <span>new</span> <span>int</span><span>[</span><span>4</span><span>];</span>
+    <span>int</span> <span>blockHash</span> <span>=</span> <span>spread</span><span>(</span><span>e</span><span>.</span><span>hashCode</span><span>());</span>
+    <span>int</span> <span>counterHash</span> <span>=</span> <span>rehash</span><span>(</span><span>blockHash</span><span>);</span>
+    <span>int</span> <span>block</span> <span>=</span> <span>(</span><span>blockHash</span> <span>&amp;</span> <span>blockMask</span><span>)</span> <span>&lt;&lt;</span> <span>3</span><span>;</span>
+    <span>for</span> <span>(</span><span>int</span> <span>i</span> <span>=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>4</span><span>;</span> <span>i</span><span>++)</span> <span>{</span>
+      <span>int</span> <span>h</span> <span>=</span> <span>counterHash</span> <span>&gt;&gt;&gt;</span> <span>(</span><span>i</span> <span>&lt;&lt;</span> <span>3</span><span>);</span>
+      <span>int</span> <span>index</span> <span>=</span> <span>(</span><span>h</span> <span>&gt;&gt;&gt;</span> <span>1</span><span>)</span> <span>&amp;</span> <span>15</span><span>;</span>
+      <span>int</span> <span>offset</span> <span>=</span> <span>h</span> <span>&amp;</span> <span>1</span><span>;</span>
+      <span>count</span><span>[</span><span>i</span><span>]</span> <span>=</span> <span>(</span><span>int</span><span>)</span> <span>((</span><span>table</span><span>[</span><span>block</span> <span>+</span> <span>offset</span> <span>+</span> <span>(</span><span>i</span> <span>&lt;&lt;</span> <span>1</span><span>)]</span> <span>&gt;&gt;&gt;</span> <span>(</span><span>index</span> <span>&lt;&lt;</span> <span>2</span><span>))</span> <span>&amp;</span> <span>0xf</span><span>L</span><span>);</span>
+    <span>}</span>
+    <span>return</span> <span>Math</span><span>.</span><span>min</span><span>(</span><span>Math</span><span>.</span><span>min</span><span>(</span><span>count</span><span>[</span><span>0</span><span>],</span> <span>count</span><span>[</span><span>1</span><span>]),</span> <span>Math</span><span>.</span><span>min</span><span>(</span><span>count</span><span>[</span><span>2</span><span>],</span> <span>count</span><span>[</span><span>3</span><span>]));</span>
+  <span>}</span>
+</code></pre></div></div>
+
+<p>The first time I read this I did not understand most of it. It required me to go over a paper and a pencil and do the bit manipulation myself. Moreover, the same happens with the method <code>increment</code> which increments the popularity of an element. Here it is a breakdown of the key steps:</p>
+
+<ul>
+  <li><code>blockHash = spread(e.hashCode())</code>: This spreads the hash code of the input element e to get a better distribution of the hash values.</li>
+  <li><code>counterHash = rehash(blockHash)</code>: This further rehashes the blockHash to get a different hash value, which will be used to index into the 16 different hash buckets.</li>
+  <li><code>int block = (blockHash &amp; blockMask) &lt;&lt; 3</code>: 
+To understand this part, we first need to check <code>blockMask</code> and how it is created. It is calculated as <code>(table.length &gt;&gt; 3 ) - 1</code>. The reason why we right-shift the table length by 3 bits is because it is equivalent to divide by 8. Given that each block in the <code>table</code> array contains 16 counters, and each counter is 4 bits wide, the total size of each block is <code>16*4=64 bits (8 bytes)</code>. This means that by right-shifting by 3, we are effectively getting the number of blocks in the table array.  We then substract 1 to have all the possible values. For example, if the table length is 256, <code>table.length &gt;&gt; 3</code> would give us 32; we substract one so it gives us <code>31</code>, in binary <code>11111</code>. That includes all the 32 possible values from 0 to 31.</li>
+</ul>
+
+<p>Thus, by masking the <code>blockHash</code> with the <code>blockMask</code>, we ensure that the resulting blocking index is always within the range of the <code>table</code> array.</p>
+
+<p>Then for each iteration (0 to 3), we compute the 4 counter indices:</p>
+<ul>
+  <li><code>int h = counterHash &gt;&gt;&gt; (i &lt;&lt; 3)</code>: This extracts a 8-bit value from the counterHash by right-shifting it by <code>i * 8 bits</code>. This gives us the hash value for the current 4-bit counter.</li>
+  <li><code>int index = (h &gt;&gt;&gt; 1) &amp; 15</code>: We first perform a logical right-shift of <code>h</code> by 1 (aka divide by 2) to take the least significant bit. The reason why we do this is to use it later for the offset calculation. We then mask it with <code>15</code> (<code>1111</code> in binary) to get the 4 least significant bits. This gives us the counter index within the block (as there are <code>16</code> counters).</li>
+  <li><code>int offset = h &amp; 1</code>: This line calculates the offset within the <code>64-bit</code> block which is either 0 or 1. It does it by taking the least significant bit of the 8-bit hash value.</li>
+  <li><code>count[i] = (int) ((table[block + offset + (i &lt;&lt; 1)] &gt;&gt;&gt; (index &lt;&lt; 2)) &amp; 0xfL)</code>: This retrieves the 4-bit counter value from the table by:</li>
+</ul>
+
+<p>Computing the index in the table array where the 4 counters for the given element are located: <code>block + offset + (i &lt;&lt; 1)</code>:</p>
+<ul>
+  <li><code>block</code> is the starting index of the block in the <code>table</code> array</li>
+  <li><code>offset</code> is either 0 or 1, depending on which of the two 8-byte segments within the block we are accessing.</li>
+  <li><code>(i &lt;&lt; 1)</code> is the offset within that 8-byte segment that contains the 4 counters, where <code>i</code> is the counter index (0 to 3). This effectively multiplies i by 2, giving us offsets of 0, 2, 4, or 6 bytes within the 16-byte segment.</li>
+</ul>
+
+<p>Then it righ-shifts this 64-bit value by <code>index * 4</code> bits with <code>&gt;&gt;&gt; (index &lt;&lt; 2)</code>. This aligns our 4-bit counter with the least significant bit of the long value. We multiply it by 4 because each counter is 4 bits wide. Then finally, it applies a bitmask to the extracted counter value to ensure that it is a 4-bit unsigned integer <code>&amp; 0xfL</code> (<code>1111</code> in binary).</p>
+
+<p>Finally, the method returns the minimum value among the 4 frequency counts stored in the count array.</p>
+
+<p><strong>4. Aging</strong>
+Periodically, when the number of observed events reaches a certain threshold (<code>sampleSize</code>) the <code>reset()</code> method is called. This method halves the value of all counters and substract the number of odd counters.</p>
+
+
+
+<p>In case we want to understand how things are actually evicted/expired, we must look a bit deeper into the implementation details. For instance, the LRU policies we have seen before in the Segmented LRU and the Admission Window are implemented using an access-order queue, the time-to-live policy (aka eviction based on how long has it been sinde the last write) uses a write-order queue, and the variable expiration uses a hierarchical timer wheel. All of them are implemented efficiently with a O(1) time complexity.</p>
+
+<h2 id="order-queues">Order queues</h2>
+<p>Caffeine uses two main queues in the cache that ensure a fast eviction policy. The idea of the queuing policies is to allow for peeking the oldest entry to determine if it has expired. If it has not, then the younger entries must not have expired either. They are both based on the <a href="https://github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/AbstractLinkedDeque.java#L32">AbstractLinkedDeque.java</a> which provides an optimised double linked list. These are some of the interesting aspects of its implementation:</p>
+
+<p><strong>1. No sentinel nodes</strong></p>
+
+<p>The class uses a double-linked list without sentinel nodes (dummy nodes at the start and the end of the list). As we can see in a comment in the code:</p>
+<div><div><pre><code>The first and last elements are manipulated instead of a slightly more convenient sentinel element to avoid the insertion of null checks with NullPointerException throws in the byte code. 
+</code></pre></div></div>
+<p>this is done to reduce null checks. However, both elements are declared as <code>@Nullable</code>:</p>
+<div><div><pre><code><span>@Nullable</span> <span>E</span> <span>first</span><span>;</span>
+<span>@Nullable</span> <span>E</span> <span>last</span><span>;</span>
+</code></pre></div></div>
+<p>so how does it exactly reduce null checks? In a sentinel-based implementation, you always have non-null head and tail nodes. This means you can always safely access <code>head.next</code> and <code>tail.prev</code> without null checks. However, in this implementation without sentinels, first and last can be null. Shouldn’t this require more null checks? The key is in how the JVM handles null checks. When you access a field or method on a potentially null object, the JVM automatically inserts null checks in the bytecode. If the object is null, it throws a <code>NullPointerException</code>. By carefully structuring the code to handle the null cases explicitly, this implementation avoids these automatic null checks and potential <code>NullPointerExceptions</code> in critical paths.</p>
+
+<p>For example, consider the <code>linkFirst</code> method:</p>
+
+<div><div><pre><code><span>void</span> <span>linkFirst</span><span>(</span><span>final</span> <span>E</span> <span>e</span><span>)</span> <span>{</span>
+  <span>final</span> <span>E</span> <span>f</span> <span>=</span> <span>first</span><span>;</span>
+  <span>first</span> <span>=</span> <span>e</span><span>;</span>
+
+  <span>if</span> <span>(</span><span>f</span> <span>==</span> <span>null</span><span>)</span> <span>{</span>
+    <span>last</span> <span>=</span> <span>e</span><span>;</span>
+  <span>}</span> <span>else</span> <span>{</span>
+    <span>setPrevious</span><span>(</span><span>f</span><span>,</span> <span>e</span><span>);</span>
+    <span>setNext</span><span>(</span><span>e</span><span>,</span> <span>f</span><span>);</span>
+  <span>}</span>
+  <span>modCount</span><span>++;</span>
+<span>}</span>
+</code></pre></div></div>
+<p>This method handles the case where the list is empty <code>(f == null)</code> separately from the case where it’s not. By doing so, it avoids the need for the JVM to insert automatic null checks when accessing fields or methods of <code>f</code>.
+In a sentinel-based implementation, you might have code like this:</p>
+<div><div><pre><code><span>void</span> <span>linkFirst</span><span>(</span><span>final</span> <span>E</span> <span>e</span><span>)</span> <span>{</span>
+  <span>Node</span> <span>newNode</span> <span>=</span> <span>new</span> <span>Node</span><span>(</span><span>e</span><span>);</span>
+  <span>newNode</span><span>.</span><span>next</span> <span>=</span> <span>head</span><span>.</span><span>next</span><span>;</span>
+  <span>newNode</span><span>.</span><span>prev</span> <span>=</span> <span>head</span><span>;</span>
+  <span>head</span><span>.</span><span>next</span><span>.</span><span>prev</span> <span>=</span> <span>newNode</span><span>;</span>  <span>// Potential automatic null check</span>
+  <span>head</span><span>.</span><span>next</span> <span>=</span> <span>newNode</span><span>;</span>       <span>// Potential automatic null check</span>
+<span>}</span>
+</code></pre></div></div>
+<p>Here, the JVM might insert automatic null checks for head.next, even though we know it’s never null.</p>
+
+<p><strong>2. Structural modification tracking</strong></p>
+
+<p>The class maintains an integer <code>modCount</code> to track structural modifications, which is used to detect concurrent modifications during iteration. It is incremented every time an element is added or removed and its primary purpose is to support fail-fast behaviours in iterators:</p>
+<ul>
+  <li>When an iterator is created, it captures the current <code>modCount</code>:
+    <div><div><pre><code><span>AbstractLinkedIterator</span><span>(</span><span>@Nullable</span> <span>E</span> <span>start</span><span>)</span> <span>{</span>
+  <span>expectedModCount</span> <span>=</span> <span>modCount</span><span>;</span>
+  <span>cursor</span> <span>=</span> <span>start</span><span>;</span>
+<span>}</span>
+</code></pre></div>    </div>
+  </li>
+  <li>Every time the iterator perform an operation, it checks if the <code>modCount</code> has changed. If it has changed, it means the list was modified outside of the iterator so it throws an exception:
+    <div><div><pre><code><span>void</span> <span>checkForComodification</span><span>()</span> <span>{</span>
+<span>if</span> <span>(</span><span>modCount</span> <span>!=</span> <span>expectedModCount</span><span>)</span> <span>{</span>
+  <span>throw</span> <span>new</span> <span>ConcurrentModificationException</span><span>();</span>
+<span>}</span>
+<span>}</span>
+</code></pre></div>    </div>
+    <p>The modCount is incremented in methods that structurally modify the list, such as <code>linkFirst()</code>, <code>linkLast()</code>, <code>unlinkFirst()</code>, <code>unlinkLast()</code>, and <code>unlink()</code>.</p>
+  </li>
+</ul>
+
+<h3 id="access-order-queue-accessorderdequejava">Access Order Queue: AccessOrderDeque.java</h3>
+<p>The Access Order Queue keeps track of all the entries that are in the hash table based on how recently they were accessed. It is a doubly linked list that maintains the order of cache entries based on access frequency.</p>
+
+<p>When an entry is accessed, it is moved to the tail of the list, ensuring that the least recently used (LRU) entry is always at the head. This is vital for implementing the Least Recently Used (LRU) eviction policy. For example, if we have a cache with entries <code>[A &lt;-&gt; B &lt;-&gt; C]</code> where <code>A</code> is the least recently accessed and <code>C</code> is the most recently accessed, and we access <code>B</code>, it will move it to the end of the queue keeping it like this: <code>[A &lt;-&gt; C &lt;-&gt; B]</code></p>
+
+<h3 id="write-order-queue-writeorderdequejava">Write Order Queue: WriteOrderDeque.java</h3>
+<p>Similar to the Access Order Queue, the Write Order Queue orders entries based on their creation or update time. It keeps track of the entries based on their write times. This is particularly useful when we want to expire entries after a certain duration since their last write (<code>expireAfterWrite</code>).</p>
+
+<p>For example, consider a scenario where <code>[A &lt;-&gt; B &lt;-&gt; C]</code> are written in that order. If we update A, it will move it to the end of the queue: <code>[B &lt;-&gt; C &lt;-&gt; A]</code>.</p>
+
+<h2 id="hierarchical-timer-wheel-timerwheeljava">Hierarchical Timer Wheel: TimerWheel.java</h2>
+<p>A timer wheel is data structure used to manage time-based events efficiently. The basic idea is that it stores timer events in buckets on a circular buffer, each bucket representing a specific time span (like seconds or minutes).</p>
+
+<p>In the case of Caffeine, the entries are added to these buckets based on their expiration times, allowing efficient addition, removal and expiration in O(1) time. Each bucket contains a linked list where the items are added. Given that the circular buffer size is limited, we would have problems when an event needs to be scheduled for a moment in future larger than the size of the ring. That is why we use a hierarchical timer wheel which simply layers multiple timer wheels with different resolutions.</p>
+
+<p><img src="https://adriacabeza.github.io/img/timer.png"/>
+</p>
+
+
+<p>Let’s take a brief look at the <code>TimerWheel.java</code> code:</p>
+
+<p><strong>1. Hierarchical Structure: Buckets and spans</strong></p>
+
+<p>Each element in the <code>BUCKETS</code> array represents the number of buckets in a timer wheel level, while <code>SPANS</code> defines the duration each bucket covers. As mentioned earlier, the hierarchical structure allows events to cascade from broader to finer time spans. These are the values that were chosen for the Caffeine implementation:</p>
+
+<div><div><pre><code><span>static</span> <span>final</span> <span>int</span><span>[]</span> <span>BUCKETS</span> <span>=</span> <span>{</span> <span>64</span><span>,</span> <span>64</span><span>,</span> <span>32</span><span>,</span> <span>4</span><span>,</span> <span>1</span> <span>};</span>
+<span>static</span> <span>final</span> <span>long</span><span>[]</span> <span>SPANS</span> <span>=</span> <span>{</span>
+    <span>ceilingPowerOfTwo</span><span>(</span><span>TimeUnit</span><span>.</span><span>SECONDS</span><span>.</span><span>toNanos</span><span>(</span><span>1</span><span>)),</span> <span>// 1.07s</span>
+    <span>ceilingPowerOfTwo</span><span>(</span><span>TimeUnit</span><span>.</span><span>MINUTES</span><span>.</span><span>toNanos</span><span>(</span><span>1</span><span>)),</span> <span>// 1.14m</span>
+    <span>ceilingPowerOfTwo</span><span>(</span><span>TimeUnit</span><span>.</span><span>HOURS</span><span>.</span><span>toNanos</span><span>(</span><span>1</span><span>)),</span>   <span>// 1.22h</span>
+    <span>ceilingPowerOfTwo</span><span>(</span><span>TimeUnit</span><span>.</span><span>DAYS</span><span>.</span><span>toNanos</span><span>(</span><span>1</span><span>)),</span>    <span>// 1.63d</span>
+    <span>BUCKETS</span><span>[</span><span>3</span><span>]</span> <span>*</span> <span>ceilingPowerOfTwo</span><span>(</span><span>TimeUnit</span><span>.</span><span>DAYS</span><span>.</span><span>toNanos</span><span>(</span><span>1</span><span>)),</span> <span>// 6.5d</span>
+    <span>BUCKETS</span><span>[</span><span>3</span><span>]</span> <span>*</span> <span>ceilingPowerOfTwo</span><span>(</span><span>TimeUnit</span><span>.</span><span>DAYS</span><span>.</span><span>toNanos</span><span>(</span><span>1</span><span>)),</span> <span>// 6.5d</span>
+<span>};</span>
+</code></pre></div></div>
+
+<p><strong>2. Clever Bit Manipulation</strong>
+The implementation uses bit manipulation techniques to efficiently calculate bucket indices:</p>
+<div><div><pre><code><span>long</span> <span>ticks</span> <span>=</span> <span>(</span><span>time</span> <span>&gt;&gt;&gt;</span> <span>SHIFT</span><span>[</span><span>i</span><span>]);</span>
+<span>int</span> <span>index</span> <span>=</span> <span>(</span><span>int</span><span>)</span> <span>(</span><span>ticks</span> <span>&amp;</span> <span>(</span><span>wheel</span><span>[</span><span>i</span><span>].</span><span>length</span> <span>-</span> <span>1</span><span>));</span>
+</code></pre></div></div>
+<p>This avoids performing expensive modulo operations. Here is a breakdown of how it works:</p>
+
+<div><div><pre><code><span>static</span> <span>final</span> <span>long</span><span>[]</span> <span>SPANS</span> <span>=</span> <span>{</span>
+    <span>ceilingPowerOfTwo</span><span>(</span><span>TimeUnit</span><span>.</span><span>SECONDS</span><span>.</span><span>toNanos</span><span>(</span><span>1</span><span>)),</span> <span>// 1.07s</span>
+    <span>ceilingPowerOfTwo</span><span>(</span><span>TimeUnit</span><span>.</span><span>MINUTES</span><span>.</span><span>toNanos</span><span>(</span><span>1</span><span>)),</span> <span>// 1.14m</span>
+    <span>// ...</span>
+<span>};</span>
+
+<span>static</span> <span>final</span> <span>long</span><span>[]</span> <span>SHIFT</span> <span>=</span> <span>{</span>
+    <span>Long</span><span>.</span><span>numberOfTrailingZeros</span><span>(</span><span>SPANS</span><span>[</span><span>0</span><span>]),</span>
+    <span>Long</span><span>.</span><span>numberOfTrailingZeros</span><span>(</span><span>SPANS</span><span>[</span><span>1</span><span>]),</span>
+    <span>// ...</span>
+<span>};</span>
+</code></pre></div></div>
+<p>Each <code>SPAN</code> value is rounded up to the nearest power of 2 and the SHIFT array stores the number of trailing zeros for each <code>SPAN</code> value, which is equivalent to $log_2{span[i]}$. It represents the duration of one tick for that wheel. Then, in order to calculate the bucket index we can do some bit manipulation for a very quick calculation of which bucket an event belogs in:</p>
+
+<div><div><pre><code><span>long</span> <span>ticks</span> <span>=</span> <span>(</span><span>time</span> <span>&gt;&gt;&gt;</span> <span>SHIFT</span><span>[</span><span>i</span><span>]);</span>
+<span>int</span> <span>index</span> <span>=</span> <span>(</span><span>int</span><span>)</span> <span>(</span><span>ticks</span> <span>&amp;</span> <span>(</span><span>wheel</span><span>[</span><span>i</span><span>].</span><span>length</span> <span>-</span> <span>1</span><span>));</span>
+</code></pre></div></div>
+
+<ul>
+  <li><code>time &gt;&gt; SHIFT[i]</code>: this right shifts the appropiate amount for the current wheel, its equivalent to dividing by <code>SPANS[i]</code></li>
+  <li><code>wheel[i].length - 1</code>: this is a bitmask. Since wheel[i].length is always a power of 2, this creates a mask of all 1s in the lower bits.</li>
+  <li><code>ticks &amp; (wheel[i].length - 1)</code>: this performs a bitwise AND with the mask, which is equivalent to <code>ticks % wheel[i].length</code> but again, much faster.</li>
+</ul>
+
+<p>Let’s look at an example. Suppose we have:</p>
+<div><div><pre><code>time = 1,500,000,000 nanoseconds (1.5 seconds)
+SPANS[i] = 1,073,741,824 (2^30, about 1.07 seconds)
+SHIFT[i] = 30
+</code></pre></div></div>
+
+<p>In binary:</p>
+<div><div><pre><code>time = 1011001010000000000000000000000
+</code></pre></div></div>
+<p>Now, when we do <code>time &gt;&gt;&gt; SHIFT[i]</code>, we’re shifting right by <code>30</code> bits:</p>
+<div><div><pre><code>1011001010000000000000000000000 &gt;&gt;&gt; 30 = 1
+</code></pre></div></div>
+<p>This result, <code>1</code>, means means that 1 full tick of this wheel has elapsed. For the next part, let’s assume that <code>wheel[i].length</code> is <code>64</code>. In binary:</p>
+<div><div><pre><code>ticks = 00000000000000000000000000000001
+wheel[i].length - 1 = 00000000000000000000000000111111
+</code></pre></div></div>
+
+<p>we perform the bitwise AND:</p>
+<div><div><pre><code>  00000000000000000000000000000001
+&amp; 00000000000000000000000000111111
+  --------------------------------
+  00000000000000000000000000000001
+</code></pre></div></div>
+<p>and the result is 1, so our index is 1. What this means in practice is that the time (1.5 seconds) has causes the wheel to tick once and this tick places the event in the second bucket of the wheel. The beauty of this approach is that it wraps around automatically. If we had 64 ticks, the index would be 0 again, as 64 &amp; 63 = 0. Suppose the next time value is 3.000.000.000 nanoseconds (3 seconds):</p>
+<div><div><pre><code>3,000,000,000 &gt;&gt;&gt; 30 = 2 (ticks)
+2 &amp; 63 = 2 (index)
+</code></pre></div></div>
+<p>So this event would go into the third bucket (index 2) of the wheel.</p>
+
+
+<p>Caffeine takes a dynamic approach to cache management, continuously adjusting its admission window and main space based on workload characteristics. This adaptation is driven by a hill-climbing algorithm, a straightforward optimization technique that seeks to maximize performance.</p>
+
+<p>The hill-climbing method works by making incremental changes and evaluating their impact. In Caffeine’s context, this means altering the cache configuration (e.g., enlarging the window cache size) and comparing the resulting hit ratio to the previous one. If performance improves, the change is continued in the same direction. If not, the direction is reversed.</p>
+
+<p>The challenge lies in determining the optimal step size and frequency. Measuring hit ratios over short periods can be noisy, making it difficult to distinguish between configuration-induced changes and random fluctuations.</p>
+
+<p>After extensive testing, Caffeine’s developers opted for infrequent but relatively large changes. For example, let’s look at the code that performs the adjustments of window size (source: <code>BoundedLocalCache.java</code>):</p>
+
+<div><div><pre><code>  <span>/** Calculates the amount to adapt the window by and sets {@link #adjustment()} accordingly. */</span>
+  <span>@GuardedBy</span><span>(</span><span>&#34;evictionLock&#34;</span><span>)</span>
+  <span>void</span> <span>determineAdjustment</span><span>()</span> <span>{</span>
+    <span>// check frequency sketch is initalized</span>
+    <span>if</span> <span>(</span><span>frequencySketch</span><span>().</span><span>isNotInitialized</span><span>())</span> <span>{</span>
+      <span>setPreviousSampleHitRate</span><span>(</span><span>0.0</span><span>);</span>
+      <span>setMissesInSample</span><span>(</span><span>0</span><span>);</span>
+      <span>setHitsInSample</span><span>(</span><span>0</span><span>);</span>
+      <span>return</span><span>;</span>
+    <span>}</span>
+
+    <span>int</span> <span>requestCount</span> <span>=</span> <span>hitsInSample</span><span>()</span> <span>+</span> <span>missesInSample</span><span>();</span>
+    <span>if</span> <span>(</span><span>requestCount</span> <span>&lt;</span> <span>frequencySketch</span><span>().</span><span>sampleSize</span><span>)</span> <span>{</span>
+      <span>return</span><span>;</span>
+    <span>}</span>
+
+    <span>double</span> <span>hitRate</span> <span>=</span> <span>(</span><span>double</span><span>)</span> <span>hitsInSample</span><span>()</span> <span>/</span> <span>requestCount</span><span>;</span>
+    <span>double</span> <span>hitRateChange</span> <span>=</span> <span>hitRate</span> <span>-</span> <span>previousSampleHitRate</span><span>();</span>
+    <span>double</span> <span>amount</span> <span>=</span> <span>(</span><span>hitRateChange</span> <span>&gt;=</span> <span>0</span><span>)</span> <span>?</span> <span>stepSize</span><span>()</span> <span>:</span> <span>-</span><span>stepSize</span><span>();</span>
+    <span>double</span> <span>nextStepSize</span> <span>=</span> <span>(</span><span>Math</span><span>.</span><span>abs</span><span>(</span><span>hitRateChange</span><span>)</span> <span>&gt;=</span> <span>HILL_CLIMBER_RESTART_THRESHOLD</span><span>)</span>
+        <span>?</span> <span>HILL_CLIMBER_STEP_PERCENT</span> <span>*</span> <span>maximum</span><span>()</span> <span>*</span> <span>(</span><span>amount</span> <span>&gt;=</span> <span>0</span> <span>?</span> <span>1</span> <span>:</span> <span>-</span><span>1</span><span>)</span>
+        <span>:</span> <span>HILL_CLIMBER_STEP_DECAY_RATE</span> <span>*</span> <span>amount</span><span>;</span>
+    <span>setPreviousSampleHitRate</span><span>(</span><span>hitRate</span><span>);</span>
+    <span>setAdjustment</span><span>((</span><span>long</span><span>)</span> <span>amount</span><span>);</span>
+    <span>setStepSize</span><span>(</span><span>nextStepSize</span><span>);</span>
+    <span>setMissesInSample</span><span>(</span><span>0</span><span>);</span>
+    <span>setHitsInSample</span><span>(</span><span>0</span><span>);</span>
+  <span>}</span>
+</code></pre></div></div>
+
+<p>It calculates the hit rate based on the hits and total requets of a sample. It compares the current hit rate with the previous one. It the hit rate has improved (or stayed the same), it uses a positive step size; otherwise negative. If the hit rate change is significant, it calculated a larger step size based on a percentage of the maximum possible. Otherwise, it decays the current step size which reduced the magnitude of the change. Finally it ends up updating the state.</p>
+
+<p>This adaptive policy allows Caffeine to fine-tune its behavior to the specific needs of each application, optimizing performance without requiring manual intervention. It’s a testament to the thoughtful design that makes Caffeine stand out in the world of caching solutions.</p>
+
+
+
+<p>While there are other intriguing aspects of Caffeine’s internals, such as separate buffers for reads and writes, automatic metrics, and the simulator, I believe we’ve covered enough to grasp its main concepts and inner workings.</p>
+
+<p>Diving into Caffeine’s codebase was truly a blast - it’s a remarkable piece of engineering. From clever bit manipulations to well-designed data structures, it showcases thoughtful and efficient design at every level.</p>
+
+<p>If you found this interesting, I encourage you to visit the repository and give it a star. Ben Manes has created something genuinely impressive here, and it’s worth acknowledging. Hope you learned something valuable from this exploration. High-performance caching might not be glamorous, but it’s a crucial part of many systems, and Caffeine shows how it can be done right.</p>
+
+  </div>
+</article>
+
+      </div>
+    </div></div>
+  </body>
+</html>
