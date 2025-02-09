@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://brooker.co.za/blog/2025/02/04/versioning.html">Original</a>
+    <h1>Versioning versus Coordination</h1>
+    
+    <div id="readability-page-1" class="page"><div id="post">
+
+
+
+
+
+
+
+
+<p>Spoiler: Versioning Wins.</p>
+
+<p>Today, we’re going to build a little database system. For availability, latency, and scalability, we’re going to divide our data into multiple shards, have multiple replicas of each shard, and allow multiple concurrent queries. As a block diagram, it’s going to look something like this:</p>
+
+<p><img src="https://brooker.co.za/blog/images/db_architecture.png" alt=""/></p>
+
+<p>Next, borrowing heavily from <a href="https://github.com/ept/hermitage">Hermitage</a>, we’re going to run some SQL.</p>
+
+<pre><code>begin; -- T0
+create table test (id int primary key, value int); -- T0
+insert into test (id, value) values (1, 10), (2, 20), (3, 30); -- T0
+commit; -- T0
+</code></pre>
+
+<p>So far so good. We’ve inserted three rows into our database. Next, we’re going to run two concurrent transactions (from two different connections, call them <code>T1</code> and <code>T2</code>), like so:</p>
+
+<pre><code>begin; -- T2
+begin; -- T1
+
+select * from test where id = 1; -- T1. A: We want this to show 1 =&gt; 10.
+update test set value = value + 2; -- T2
+select * from test where id = 2; -- T1. B: We want this to show 2 =&gt; 20.
+commit; -- T2
+
+select * from test where id = 3; -- T1. C: We want this to show 3 =&gt; 30.
+commit; -- T1
+</code></pre>
+
+<p>There’s only one valid serializable<sup><a href="#foot1">1</a></sup> ordering of these transactions: at line <code>A</code>, <code>T1</code> has seen the world before <code>T2</code> commits, and so must see that same pre-<code>T2</code> world until it commits. Therefore <code>T1</code> must happen before <code>T2</code> in the serial order.</p>
+
+<p>How might we implement this requirement in our distributed architecture?</p>
+
+<p>We could use locking: <code>T1</code> takes a shared lock on <code>id = 1</code> at <code>A</code>, <code>T2</code> blocks on it when trying to get an exclusive lock to update the row, and <code>T1</code> can complete. There are two practical problems with this approach. First, we’re blocking a writer on a reader, which reduces concurrency and throughput. Second, specific to our distributed architecture, <code>T1</code> needs to take its lock in a single place where <code>T2</code> needs to look for it. With multiple replicas, where this single place is is not obvious. That can be solved by choosing a primary replica, implementing a single lock manager, or by locking on all replicas<sup><a href="#foot2">2</a></sup>. In all three cases, read scalability is lost and read coordination is required.</p>
+
+<p>Enter <a href="https://dspace.mit.edu/handle/1721.1/16279">David P. Reed’s 1979 work on versions</a>. Instead of <code>T2</code> making its desired changes in-place, it creates a new <em>version</em> of the rows, that only becomes visible to transactions that start after <code>T2</code> commits. <code>T1</code>, which started earlier, does not see these new versions. The storage layer needs to provide <code>T1</code> a way to request its reads <em>as of</em> a particular version, which it does by storing multiple copies of the data.</p>
+
+<p>The effect this has on the coordination in our database is significant: <code>T2</code> never has to block on <code>T1</code>. In fact, <code>T2</code> doesn’t even need to know that <code>T1</code> exists at all. <code>T1</code> could be off in the corner, doing its reads happily against one of a million data replicas, and <code>T2</code> is none the wiser. This helps scalability (<a href="https://brooker.co.za/blog/2021/01/22/cloud-scale.html">avoiding coordination is key to scalability</a>), but also helps throughput (writers never have to wait for readers, readers never have to wait for writers, readers never have to wait for readers), and performance consistency (no waiting means other transactions can’t slow you down). Since the early 1980s, multi-versioning has been a core technique in the implementation of database systems, but it’s role in avoiding coordination in distributed systems is less well-known.</p>
+
+<p>The reason multi-versioning is so powerful is because it allows the system to have an extra piece of information (when was this data created?) about the <em>data</em> that it doesn’t need to discover from coordination patterns. As Reed wrote in 1979:</p>
+
+<blockquote>
+  <p>Since [versions] are objects that are used by programs, they give a tool for
+programming that allows explicit recognition of consistent states within the program. In contrast,
+traditional synchronization mechanisms, such as semaphores, locking, monitors, send-receive, etc.
+do not give a tool for representing or naming consistent states – one can deduce the states
+assumed by the system by timing relationships among the execution of steps of programs.</p>
+</blockquote>
+
+<p>Versions are the difference between knowing consistent states and having to <em>deduce</em> consistent states! That’s a powerful idea.</p>
+
+<p><em>Picking A Version, Serving A Version</em></p>
+
+<p>Above, I mentioned that <code>T1</code> requests it’s reads <em>as-of</em> a particular version. This raises two questions: how to pick the version, and how the storage engine keeps track of all the versions.</p>
+
+<p>How to pick a version depends a lot on the properties you want. Serializability, in one common definition, would allow read-only transactions to pick almost any version (including <em>the beginning of time</em>, returning empty results for all reads). This definition is silly. Let’s go back to SQL to think about the results we want:</p>
+
+<pre><code>begin; -- T2
+begin; -- T1
+select * from test where id = 1; -- T1. A: We want this to show 1 =&gt; 10.
+update test set value = value + 2; -- T2
+commit; -- T2
+
+begin; -- T3
+select * from test where id = 3; -- T3. D: We want this to show 3 =&gt; 32.
+commit; -- T3
+
+select * from test where id = 3; -- T1. C: We want this to show 3 =&gt; 30.
+commit; -- T1
+</code></pre>
+
+<p>Here, lines <code>A</code> and <code>C</code> are doing the same thing as in our first snippet, but we’ve introduced a third transaction <code>T3</code>. At line <code>D</code>, we’re showing what most programmers would expect: a new transaction that starts after <code>T2</code> commits sees the results of <code>T2</code>’s writes. This goal is, informally, called <em>read-after-write consistency</em> (generally considered a type of <em>strong consistency</em>)<sup><a href="#foot3">3</a></sup>. There are many ways to achieve this goal. One would be to have a <em>version authority</em> that hands out transaction version numbers in a strict order - but this re-introduces the exact coordination we were trying to avoid!</p>
+
+<p>In <a href="https://aws.amazon.com/rds/aurora/dsql/">Aurora DSQL</a>, we pick this time using a physical clock (EC2’s <a href="https://aws.amazon.com/about-aws/whats-new/2023/11/amazon-time-sync-service-microsecond-accurate-time/">microsecond-accurate</a> <a href="https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html">time-sync service</a>). This allows us to avoid all coordination between readers, including reads inside read-write transactions (e.g. notice for <code>T2</code>’s <code>UPDATE</code> has to be a read-modify-write to find the new <code>value</code> for each row).</p>
+
+<p>The fundamental idea of using physical time this way dates back to the late 1970s, although mostly with folks acknowledging the difficulty of the synchronization problem. Somewhat amusingly, Reed says:</p>
+
+<blockquote>
+  <p>Synchronizing the system clocks whenever they come up by using the operator’s watch will usually get the system time accurate within a few minutes</p>
+</blockquote>
+
+<p>before going on to note that Lamport clocks allow the system to do better. The 1970s consensus seems to be that adequate physical clock synchronization wasn’t possible - today it’s easily available in the cloud.</p>
+
+<p><em>Keeping Track of All Those Versions!</em></p>
+
+<p>The next question is how to keep track of all those versions. This is a deep question of its own, with tons of interesting trade-offs and different approaches. I won’t dive into those here, but instead take a different tack. Let’s isolate <code>T1</code> from our last example:</p>
+
+<pre><code>begin; -- T1
+select * from test where id = 1; -- T1. A: We want this to show 1 =&gt; 10.
+select * from test where id = 3; -- T1. C: We want this to show 3 =&gt; 30.
+commit; -- T1
+</code></pre>
+
+<p>which we can then <em>rewrite</em> as:</p>
+
+<pre><code>begin; -- T1 (gets timestamp &#39;t1_v&#39;)
+select * from test where id = 1 and version &lt;= t1_v order by version desc limit 1;
+select * from test where id = 3 and version &lt;= t1_v order by version desc limit 1;
+commit; -- T1
+</code></pre>
+
+<p>Similarly, <code>T2</code> would be re-written as an <code>INSERT</code> at a new version number. I don’t know of any database system that’s implemented this way, but it’s a good illustration which bring us to two invariants we need to maintain around versions:</p>
+
+<ol>
+  <li>There must be at least one version of every existing row, and</li>
+  <li>The versions used by running transactions must be kept.</li>
+</ol>
+
+<p>In other words, we must retain the last version (or we lose durability), and we must retain <code>t1_v</code> at least until <code>T1</code> is done. The former property is a local one, that can be implemented by each replica with no coordination. The latter is a distributed one, which brings us back to our theme of coordination.</p>
+
+<p>Again, we could clearly solve this problem with coordination: register each running transaction in a list, unregister it on commit, keep track of the low-water-mark timestamp. That’s possible to build (and even scale arbitrarily), but it’s nice to avoid that coordination. In Aurora DSQL we avoid that coordination in a simple way: transactions are limited in time (five minutes in the current preview release), and versions are tied to physical time. This turns invariant 2 into a local property too, once again avoiding coordination<sup><a href="#foot4">4</a></sup>.</p>
+
+<p><em>Conclusion</em></p>
+
+<p>In distributed database systems, versioning and physical clocks allow coordination to be avoided in nearly all read cases. This is an extremely powerful tool, because avoiding coordination improves throughput and scalability, reduces latency and cost, helps availability, and simplifies the design of systems.</p>
+
+<p><em>Footnotes</em></p>
+
+<ol>
+  <li><a name="foot1"></a> If we want to translate this to SQL isolation levels, seeing <code>1=&gt;10</code> at <code>A</code> and <code>3=&gt;32</code> at <code>C</code> would be allowed at <code>READ COMMITTED</code> but not allowed at <code>REPEATABLE READ</code> or higher isolation levels (inlcuding PostgreSQL’s snapshot-isolated <code>REPEATABLE READ</code> level). Seeing <code>1=&gt;10</code> at <code>A</code> and <code>2=&gt;22</code> at <code>B</code> would only be allowed by <code>READ UNCOMMITTED</code>. Line <code>B</code> is showing that our system prevents <em>dirty reads</em>, and <code>C</code> is showing that it prevents <em>read skew</em>.</li>
+  <li><a name="foot2"></a> Bernstein and Goodman’s 1981 paper <a href="https://dl.acm.org/doi/10.1145/356842.356846">Concurrency Control in Distributed Database Systems</a> surveys these techniques in Section 3.</li>
+  <li><a name="foot3"></a> If you want to go deep on this, <a href="https://jepsen.io/consistency/models">Jepsen’s consistency models page</a> is a great place to start.</li>
+  <li><a name="foot4"></a> This works because of DSQL’s OLTP focus, but wouldn’t in an OLAP or reporting system where much longer transactions are expected. In those systems, a different approach is needed, which comes with a whole set of challenges.</li>
+</ol>
+
+</div></div>
+  </body>
+</html>
