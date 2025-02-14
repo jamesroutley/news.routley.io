@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://dasl.cc/2025/01/01/debugging-our-new-linux-kernel/">Original</a>
+    <h1>Linux kernel cgroups writeback high CPU troubleshooting</h1>
+    
+    <div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  <div itemprop="articleBody">
+    <p>Read on to learn how we used network packet captures and BPF to debug web server performance, ultimately uncovering a Linux kernel performance issue. This investigation was a collaboration between myself and my colleagues.</p>
+
+<p><strong>Contents</strong></p>
+<ul id="markdown-toc">
+  <li><a href="#background" id="markdown-toc-background">Background</a></li>
+  <li><a href="#what-are-listen-overflows" id="markdown-toc-what-are-listen-overflows">What are listen overflows?</a></li>
+  <li><a href="#whats-causing-listen-overflows" id="markdown-toc-whats-causing-listen-overflows">What’s causing listen overflows?</a></li>
+  <li><a href="#why-were-web-requests-served-slowly-in-the-first-few-minutes-after-new-hosts-were-pooled" id="markdown-toc-why-were-web-requests-served-slowly-in-the-first-few-minutes-after-new-hosts-were-pooled">Why were web requests served slowly in the first few minutes after new hosts were pooled?</a>    <ul>
+      <li><a href="#is-it-the-network-no" id="markdown-toc-is-it-the-network-no">Is it the network? (no)</a></li>
+      <li><a href="#is-it-due-to-elevated-system-cpu-yes" id="markdown-toc-is-it-due-to-elevated-system-cpu-yes">Is it due to elevated system CPU? (yes)</a></li>
+      <li><a href="#why-did-we-initially-suspect-the-network" id="markdown-toc-why-did-we-initially-suspect-the-network">Why did we initially suspect the network?</a></li>
+    </ul>
+  </li>
+  <li><a href="#whats-causing-elevated-system-cpu" id="markdown-toc-whats-causing-elevated-system-cpu">What’s causing elevated system CPU?</a>    <ul>
+      <li><a href="#is-it-writeback-no" id="markdown-toc-is-it-writeback-no">Is it writeback? (no)</a></li>
+      <li><a href="#is-it-inode-cgroup-switching-yes" id="markdown-toc-is-it-inode-cgroup-switching-yes">Is it inode cgroup switching? (yes)</a></li>
+    </ul>
+  </li>
+  <li><a href="#the-fix" id="markdown-toc-the-fix">The fix</a></li>
+  <li><a href="#followup-questions" id="markdown-toc-followup-questions">Followup questions</a>    <ul>
+      <li><a href="#do-we-have-a-minimal-reproduction-script" id="markdown-toc-do-we-have-a-minimal-reproduction-script">Do we have a minimal reproduction script?</a></li>
+      <li><a href="#why-wasnt-centos-affected" id="markdown-toc-why-wasnt-centos-affected">Why wasn’t CentOS affected?</a></li>
+      <li><a href="#why-couldnt-we-reproduce-when-running-rsync-manually" id="markdown-toc-why-couldnt-we-reproduce-when-running-rsync-manually">Why couldn’t we reproduce when running rsync manually?</a></li>
+      <li><a href="#is-this-a-hypervisor-or-a-kernel-performance-issue" id="markdown-toc-is-this-a-hypervisor-or-a-kernel-performance-issue">Is this a hypervisor or a kernel performance issue?</a></li>
+    </ul>
+  </li>
+</ul>
+
+    
+
+<p>We’ve been upgrading the operating system from CentOS to Ubuntu on hosts across our fleet. Our CentOS hosts run an outdated Linux kernel version (3.10), whereas our Ubuntu hosts run a more modern kernel version (6.8). In August 2024, we began rolling out the Ubuntu upgrade across our Apache web servers. When we migrated larger portions of our fleet to Ubuntu, we began seeing elevated listen overflow errors. This elevated error rate prompted us to roll back the Ubuntu upgrade while we debugged:</p>
+
+<p><img src="https://dasl.cc/assets/posts/2025-01-01-debugging-our-new-linux-kernel/i1.png" alt="graph of web server listen overflows"/></p>
+
+    
+
+<p>Apache listens on a socket for incoming web requests. When incoming requests arrive more quickly than Apache can serve them, the queue of requests waiting to be served grows longer. This queue is capped to a configurable size. When the queue overflows its maximum size, we have a <em>listen overflow</em>.</p>
+
+<p>Listen overflows are a symptom of either of two things: the rate of incoming web requests is too high, and / or Apache is serving web requests too slowly.</p>
+
+<p>Each listen overflow that occurs means we failed to serve a web request. This can result in user-facing errors. Furthermore, if the listen overflows are a symptom of web requests being served slowly, it means users may be experiencing slow page loads.</p>
+
+    
+
+<p>Listen overflows occurred a few minutes after a newly autoscaled web server was pooled. They did not tend to recur subsequently. Furthermore, web requests had elevated latency during this same time period:</p>
+
+<p><img src="https://dasl.cc/assets/posts/2025-01-01-debugging-our-new-linux-kernel/i2.png" alt="web server listen overflow and web request latency graphs"/></p>
+
+<p>We believed listen overflows were occurring because web requests served in the first few minutes after the host was pooled were being served unusually slowly.</p>
+
+    
+<h2 id="is-it-the-network-no">
+  
+  
+    Is it the network? (no) <a href="#is-it-the-network-no">#</a>
+  
+  
+</h2>
+    
+
+<p>Log lines, <code>strace</code> timing information, and <a href="https://github.com/adsr/phpspy"><code>phpspy</code></a> flame graphs showed that network operations were executing particularly slowly. But investigating further, we found evidence that the network was performing normally. Instead, PHP had seemingly stalled for over a second. The below log line indicates that a memcached SET command was slow, but network packet captures on both the client and the server that we analyzed in Wireshark indicate that the SET command experienced normal network latency. The client waited over 1 second before sending the subsequent GET command, as if our PHP script stalled after the packet was received but before we recorded the elapsed time.</p>
+
+<p><code>[Tue Sep 24 21:20:54 2024] [info] Memcached operation exceeded 20ms :operation=&#34;set&#34; <b>latency=&#34;1354.68292236&#34;</b> key=&#34;warmup_key_7746_2&#34;</code></p>
+
+<p><img src="https://dasl.cc/assets/posts/2025-01-01-debugging-our-new-linux-kernel/i3.png" alt="wireshark packet capture"/>
+<i><b>Left:</b> client side (web server) packet capture. <b>Right:</b> server side (memcached) packet capture</i></p>
+<h2 id="is-it-due-to-elevated-system-cpu-yes">
+  
+  
+    Is it due to elevated system CPU? (yes) <a href="#is-it-due-to-elevated-system-cpu-yes">#</a>
+  
+  
+</h2>
+    
+
+<p>Adding on to the evidence pointing away from network problems, we saw a large spike in system CPU usage about four minutes after newly autoscaled hosts were booted. If we waited until after this spike in system CPU to pool the hosts, we experienced no listen overflows. This spike in system CPU only occurred on Ubuntu hosts – CentOS did not have this problem:</p>
+
+<p><img src="https://dasl.cc/assets/posts/2025-01-01-debugging-our-new-linux-kernel/i4.png" alt="system CPU graph"/></p>
+
+<p>This made us realize that the problems we were seeing were unrelated to pooling the hosts – the spike in system CPU occurred regardless of whether the hosts were pooled. During the spike in system CPU, we saw logs in <code>dmesg</code>:</p>
+
+<p><code>workqueue: inode_switch_wbs_work_fn hogged CPU for &gt;10000us 4 times, consider switching to WQ_UNBOUND</code></p>
+
+<p>And <code>htop</code> showed kernel workers were using lots of CPU in a function <code>inode_switch_wbs</code>:</p>
+
+<p><img src="https://dasl.cc/assets/posts/2025-01-01-debugging-our-new-linux-kernel/i5.png" alt="htop screenshot"/></p>
+
+<p>We made a <code>perf</code> recording demonstrating that when system CPU spikes, the kernel is busy inside <code>inode_switch_wbs_work_fn</code>:</p>
+
+<p><img src="https://dasl.cc/assets/posts/2025-01-01-debugging-our-new-linux-kernel/perf.png" alt="perf recording flamegraph"/></p>
+<h2 id="why-did-we-initially-suspect-the-network">
+  
+  
+    Why did we initially suspect the network? <a href="#why-did-we-initially-suspect-the-network">#</a>
+  
+  
+</h2>
+    
+
+<p>Our logs and profiling tools showed that network operations were executing particularly slowly. However, when CPU is busy, network operations may appear to slow down disproportionately. Network calls require CPU <a href="https://en.wikipedia.org/wiki/Context_switch">context switches</a> (I think?). After a process blocked on network receives a response, the process may spend a long time waiting in the CPU <a href="https://en.wikipedia.org/wiki/Run_queue">run queue</a> before it gets scheduled again when the CPU is busy. Network operations that appear slow at the user space level may be a symptom of CPU busyness.</p>
+
+<p>Although there can be cases where this is not true, it has been my experience that when the network is the cause of slowness, CPU usage on client hosts is often lower than normal. When the client is blocked waiting for the network, it is often more idle. In retrospect, perhaps the fact that elevated CPU was one of the symptoms we were seeing should have pointed us away from network issues.</p>
+
+    
+<h2 id="is-it-writeback-no">
+  
+  
+    Is it writeback? (no) <a href="#is-it-writeback-no">#</a>
+  
+  
+</h2>
+    
+
+<p>We believed something in the kernel function <a href="https://github.com/torvalds/linux/blob/906bd684e4b1e517dd424a354744c5b0aebef8af/fs/fs-writeback.c#L490"><code>inode_switch_wbs_work_fn</code></a> was causing elevated system CPU. This function is in a file <a href="https://github.com/torvalds/linux/blob/master/fs/fs-writeback.c"><code>fs-writeback.c</code></a>, which contains functions related to the <a href="https://github.com/firmianay/Life-long-Learner/blob/master/linux-kernel-development/chapter-16.md">writeback functionality of the Linux page cache</a>. We knew that system CPU was elevated about four minutes after new hosts were booted. One of the first things a new host does is download the latest code – this is part of our host bootstrapping process and involves writing thousands of files to disk. We wondered if the process of flushing the dirty pages to disk was causing the elevated system CPU. While we did not see elevated disk write metrics during the system CPU spike, we decided to test this theory. We added a <a href="https://www.man7.org/linux/man-pages/man1/sync.1.html"><code>sync</code></a> call after the <code>rsync</code> command that downloads the code on new hosts. In theory, that should synchronously write the dirty pages in the page cache to disk. Perhaps by controlling when the page cache was flushed to disk, we could control when the spike in system CPU occurred and ensure that it occurred before we pooled the host. This attempt, however, was unsuccessful. We saw no spike in system CPU when calling <code>sync</code>. Furthermore, we still saw the spike in system CPU a minute or two later.</p>
+
+<p>We were back to the drawing board. As we mentioned above, one of the first things a new host does is download the latest code. This process is called <code>setupwebroot</code>, and it runs as a <a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html">systemd oneshot</a> service. We found something perplexing: if we prevented the <code>setupwebroot</code> service from running, we never saw the spike in system CPU. And if we subsequently ran the <code>setupwebroot</code> service manually, we would see the spike in system CPU a couple minutes later. This implies that something in <code>setupwebroot</code> was the cause of the issues. However, if we ran the <code>rsync</code> command in <code>setupwebroot</code> manually in our interactive shell, we saw no spikes in system CPU. This apparent contradiction led us on a wild goose chase of trying to determine if some systemd service that was dependent on <code>setupwebroot</code> was the cause of the elevated system CPU, or if there was some subtle difference in the way we were running the commands in our shell versus how systemd was running the commands.</p>
+<h2 id="is-it-inode-cgroup-switching-yes">
+  
+  
+    Is it inode cgroup switching? (yes) <a href="#is-it-inode-cgroup-switching-yes">#</a>
+  
+  
+</h2>
+    
+
+<p>Each of the thousands of files that is written by the <code>setupwebroot</code> service has a corresponding <a href="https://www.kernel.org/doc/html/latest/filesystems/ext4/inodes.html">index node</a>, also known as an inode, that the kernel uses to store file metadata. <a href="https://www.kernel.org/doc/html/v5.0/admin-guide/cgroup-v2.html#control-group-v2">Control groups</a>, also known as cgroups, are a feature of Linux which allows for setting per process limits on system resources. For example, cgroups allow us to limit a given process from consuming too much memory, disk I/O, network bandwidth, etc. Every process belongs to a cgroup. Cgroups form a tree-like hierarchical structure. Processes in a given cgroup are given limits both by the cgroup to which they belong and that cgroup’s parents.</p>
+
+<p>In the context of cgroups, page cache writeback is tracked at the inode level. A given inode is assigned to whichever cgroup contains the process that is responsible for the majority of writes to the inode’s file. If a new process starts writing a lot to a file, the file’s inode may switch to the new process’s cgroup. Likewise, if a process managed by systemd is terminated, systemd will <a href="https://systemd.io/CGROUP_DELEGATION/#controller-support">remove the process’s cgroup</a>, at which point any inodes assigned to the process’s cgroup will be moved to the parent cgroup.</p>
+
+<p><img src="https://dasl.cc/assets/posts/2025-01-01-debugging-our-new-linux-kernel/i6.png" alt="cgroup diagram"/>
+<em>Initially, inodes are assigned to <code>setupwebroot</code>’s cgroup</em></p>
+
+
+
+<p>The <a href="https://github.com/torvalds/linux/blob/906bd684e4b1e517dd424a354744c5b0aebef8af/fs/fs-writeback.c#L490"><code>inode_switch_wbs_work_fn</code></a> that we believed was causing the elevated system CPU is responsible for moving an inode from one cgroup to another in the context of writeback. We got more insight by running this <a href="https://github.com/bpftrace/bpftrace"><code>bpftrace</code></a> command on a newly booted host:</p>
+
+<div><div><pre><code>% sudo bpftrace -e &#39;
+tracepoint:writeback:inode_switch_wbs {
+  printf(
+    &#34;[%s] inode is switching! inode: %d old cgroup: %d new cgroup: %d\n&#34;,
+    strftime(&#34;%H:%M:%S&#34;, nsecs),
+    args-&gt;ino,
+    args-&gt;old_cgroup_ino,
+    args-&gt;new_cgroup_ino
+  );
+}&#39;
+</code></pre></div></div>
+
+<p>During the spike in system CPU, we saw thousands of these lines printed out by the <code>bpftrace</code> command:</p>
+
+<div><div><pre><code>[20:49:30] inode is switching! inode: 3730800 old cgroup: 22438 new cgroup: 88
+[20:49:30] inode is switching! inode: 3730799 old cgroup: 22438 new cgroup: 88
+...
+
+</code></pre></div></div>
+
+<p>Each line corresponds to a file written by <code>setupwebroot</code> that was switching from <code>setupwebroot</code>’s dying cgroup to the parent cgroup. The old cgroup identifier (<code>22438)</code> corresponds to <code>setupwebroot</code>’s cgroup. The new cgroup identifier (<code>88</code>) corresponds to the parent cgroup.</p>
+
+<p>The <code>bpftrace</code> command prints out data from a <a href="https://github.com/torvalds/linux/blob/906bd684e4b1e517dd424a354744c5b0aebef8af/fs/fs-writeback.c#L415">kernel tracepoint</a> in the Linux kernel’s <a href="https://github.com/torvalds/linux/blob/906bd684e4b1e517dd424a354744c5b0aebef8af/include/trace/events/writeback.h#L216-L243">writeback code</a>. The fields available to print in this tracepoint can be viewed via:</p>
+<div><div><pre><code>% sudo cat /sys/kernel/debug/tracing/events/writeback/inode_switch_wbs/format
+name: inode_switch_wbs
+ID: 886
+format:
+    field:unsigned short common_type;   offset:0;   size:2; signed:0;
+    field:unsigned char common_flags;   offset:2;   size:1; signed:0;
+    field:unsigned char common_preempt_count;   offset:3;   size:1; signed:0;
+    field:int common_pid;   offset:4;   size:4; signed:1;
+
+    field:char name[32];    offset:8;   size:32;    signed:0;
+    field:ino_t ino;    offset:40;  size:8; signed:0;
+    field:ino_t old_cgroup_ino; offset:48;  size:8; signed:0;
+    field:ino_t new_cgroup_ino; offset:56;  size:8; signed:0;
+
+print fmt: &#34;bdi %s: ino=%lu old_cgroup_ino=%lu new_cgroup_ino=%lu&#34;, REC-&gt;name, (unsigned long)REC-&gt;ino, (unsigned long)REC-&gt;old_cgroup_ino, (unsigned long)REC-&gt;new_cgroup_ino
+</code></pre></div></div>
+
+<p>We found that when we added a <code>sleep 3600</code> to the end of the script that <code>setupwebroot</code> executes, we could delay the spike in system CPU by one hour. Because systemd only removes a service’s cgroup when its process exits, the <code>sleep</code> delayed when inodes switched from one cgroup to another.</p>
+
+    
+
+<p>We found a systemd directive that allows us to turn off certain cgroup accounting features: <a href="https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#Control%20Group%20Management"><code>DisableControllers</code></a>. If either the <code>io</code> or <code>memory</code> controllers are disabled, the kernel <a href="https://github.com/torvalds/linux/blob/c291c9cfd76a8fb92ef3d66567e507009236ce90/include/linux/backing-dev.h#L172">will not</a> perform cgroup writeback or any of the related accounting and cgroup switching. We found that by creating a systemd <a href="https://gist.github.com/dasl-/87b849625846aed17f1e4841b04ecc84#file-dasl-slice-L5">slice with those controllers disabled</a> and configuring <code>setupwebroot</code>’s unit file to <a href="https://gist.github.com/dasl-/06ced03d4b905fd79d8d58283ecaf67d#file-setupwebroot-service-L7">use that slice</a>, we could no longer reproduce the elevated system CPU. We had solved our performance issue.</p>
+
+<p>No more system CPU spike and no more listen overflows:
+<img src="https://dasl.cc/assets/posts/2025-01-01-debugging-our-new-linux-kernel/i8.png" alt="system CPU graph"/></p>
+
+<p><img src="https://dasl.cc/assets/posts/2025-01-01-debugging-our-new-linux-kernel/i9.png" alt="listen overflows graph"/></p>
+
+    
+<h2 id="do-we-have-a-minimal-reproduction-script">
+  
+  
+    Do we have a minimal reproduction script? <a href="#do-we-have-a-minimal-reproduction-script">#</a>
+  
+  
+</h2>
+    
+
+<p>We came up with a minimal reproduction of the issue:</p>
+
+<p><code>$ sudo mkdir -p /var/random-files &amp;&amp; sudo systemd-run --property=Type=oneshot bash -c &#39;dd if=/dev/urandom bs=1024 count=400000 | split -a 16 -b 1k - /var/random-files/file.&#39;</code></p>
+
+<p>This command creates 400,000 files, each consisting of 1,024 random bytes. The files have names like <code>/var/random-files/file.aaaaaaaaaaaaaaaa</code> and <code>/var/random-files/file.aaaaaaaaaaaaaaab</code>. This command is run as a systemd oneshot service. Within anywhere from 30 seconds to 3 minutes after this command finishes, we see a spike in system CPU. Viewing <code>htop</code> will confirm this (press <code>shift + k</code> to show kernel threads in <code>htop</code>) – we see kernel workers using lots of CPU in the function <code>inode_switch_wbs</code>.</p>
+<h2 id="why-wasnt-centos-affected">
+  
+  
+    Why wasn’t CentOS affected? <a href="#why-wasnt-centos-affected">#</a>
+  
+  
+</h2>
+    
+
+<p>The initial release of <a href="https://man7.org/linux/man-pages/man7/cgroups.7.html">cgroups</a>, known as cgroups v1, was in kernel version 2.6.24. Cgroups v1 has since been replaced by a new implementation: cgroups v2. Cgroups v2 was officially released in kernel version 4.5. Our old CentOS operating system used kernel version 3.10. We believe this inode switching CPU issue is related to the <code>io</code> and <code>memory</code> controllers introduced in cgroups v2. Thus CentOS, which uses cgroups v1, is not vulnerable to this issue.</p>
+<h2 id="why-couldnt-we-reproduce-when-running-rsync-manually">
+  
+  
+    Why couldn’t we reproduce when running rsync manually? <a href="#why-couldnt-we-reproduce-when-running-rsync-manually">#</a>
+  
+  
+</h2>
+    
+
+<p><a href="#is-it-writeback-no">Recall</a> that when we ran the <code>rsync</code> command from <code>setupwebroot</code> manually in our interactive shell, we saw no spike in system CPU. It turns out that each interactive ssh session you have open creates its own cgroup. Below is the output of <code>systemd-cgls</code> on a web server on which I have two interactive ssh sessions open. One session is running a <code>sleep 100</code> command, and the other session is running <code>systemd-cgls</code>. The two cgroups are called <code>session-17450.scope</code> and <code>session-17455.scope</code>:</p>
+
+<pre>% sudo systemd-cgls
+Control group /:
+-.slice
+├─user.slice
+│ └─user-10101.slice
+│   ├─user@10101.service …
+│   │ └─init.scope
+│   │   ├─1710746 /lib/systemd/systemd --user
+│   │   └─1710793 (sd-pam)
+│   ├─<b>session-17450.scope</b>
+│   │ ├─1708943 sshd: dleibovic [priv]
+│   │ ├─1711073 sshd: dleibovic@pts/0
+│   │ ├─1711171 -zsh
+│   │ └─1716022 sleep 100
+│   └─<b>session-17455.scope</b>
+│     ├─1780667 sshd: dleibovic [priv]
+│     ├─1781414 sshd: dleibovic@pts/1
+│     ├─1781577 -zsh
+│     └─1791367 systemd-cgls
+...
+</pre>
+
+<p>These <code>session-*.scope</code> cgroups stick around until you terminate your ssh session. After terminating your ssh session, systemd removes the corresponding cgroup. With this insight, we tested terminating the interactive ssh session after manually running the <code>rsync</code> commands. Sure enough, about 2 minutes after we terminated the ssh session, we saw the big spikes in system CPU caused by inode cgroup switching.</p>
+<h2 id="is-this-a-hypervisor-or-a-kernel-performance-issue">
+  
+  
+    Is this a hypervisor or a kernel performance issue? <a href="#is-this-a-hypervisor-or-a-kernel-performance-issue">#</a>
+  
+  
+</h2>
+    
+
+<p>We suspected that this performance issue was caused by either the hypervisor or the kernel. We shared our findings with Canonical, the company behind Ubuntu. Canonical confirmed that it is a kernel issue that was likely introduced by a Linux kernel commit from 2021. More details are available in the <a href="https://bugs.launchpad.net/ubuntu/+source/linux-oem-6.5/+bug/2038492">public bug report</a>, in which I have commented. We are hopeful that Canonical will engage with the Linux kernel developers and eventually fix this performance issue.</p>
+
+  </div>
+
+  
+
+</article>
+
+      </div>
+    </div></div>
+  </body>
+</html>
