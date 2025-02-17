@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://yosefk.com/blog/cxx-thread-local-storage-performance.html">Original</a>
+    <h1>0&#43;0 &gt; 0: C&#43;&#43; thread-local storage performance</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+<p>We&#39;ll discuss how to make sure that your access to TLS (thread-local storage) is fast. If you’re interested strictly in TLS
+performance guidelines and don&#39;t care about the details, <a href="#summary-of-performance-guidelines">skip right to the end</a>
+— but be aware that you’ll be missing out on assembly listings of profound emotional depth, which can shake even a cynical,
+battle-hardened programmer. If you don’t want to miss out on that — and who would?! — read on, and you shall learn the
+computer-scientific insight behind the intriguing inequality 0+0 &gt; 0.</p>
+<p>I’ve recently <a href="https://yosefk.com/blog/profiling-in-production-with-function-call-traces.html">published</a> a new
+C++ profiler, <a href="https://github.com/yosefk/funtrace">funtrace</a>, which traces function calls &amp; returns as well as
+thread state changes, showing an execution timeline like this (the screenshot is from <a href="https://krita.org/">Krita</a>, a
+“real-world,” complicated drawing program):</p>
+<p><img alt="image8.png" height="776" src="https://yosefk.com/img/funtrace/image8.png" title="a trace of Krita made by funtrace &amp; displayed by vizviewer" width="576"/></p>
+<p>One thing a software-based tracing profiler needs is a per-thread buffer for traced data. Actually it would waste less memory
+for all threads to share the same buffer, and this is how things “should” work in a system with some fairly minimal <a href="https://yosefk.com/blog/profiling-in-production-with-function-call-traces.html#hardware-assisted-tracing">hardware support
+for tracing, which I suggested in the funtrace writeup</a>, and which would look roughly like this:</p>
+<p><img alt="image5.png" height="336" src="https://yosefk.com/img/funtrace/image5.png" title="A trace writer with a DMA bypassing the CPU cache system" width="556"/></p>
+<p>But absent such trace data writing hardware, the data must be written using store instructions through the caches<a href="#fn1" id="fnref1" role="doc-noteref"><sup>1</sup></a>. So many CPUs sharing a trace buffer results in
+them constantly yanking lines from each other’s caches in order to append to the buffer, with a spectacular slowdown. And then
+you&#39;d need to synchronize updates to the current write position — still more slowdown. A shared buffer can be fine for <a href="https://yosefk.com/blog/delayed-printf-for-real-time-logging.html">user-initiated printing</a>, but it’s too slow for
+tracing every call and return.</p>
+<p>So per-thread buffers it is — bringing us to C++’s <code>thread_local</code> keyword, which gives each thread its own copy of
+a variable in the global scope — perfect for our trace buffers, it would seem. But it turns out that <strong>we need to be
+careful with exactly how we use <code>thread_local</code> to keep our variable access time from exploding</strong>, as explained
+in the rest of this document.</p>
+<p>The C toolchain — not the C++ compiler front-end, but assemblers, linkers and such — is generally quite ossified, with <a href="https://stackoverflow.com/questions/76925604/why-is-the-constructor-of-a-global-variable-not-called-in-a-library">decades-old
+linker bugs enshrined as a standard</a><a href="#fn2" id="fnref2" role="doc-noteref"><sup>2</sup></a>. TLS
+is an interesting case when this toolchain was actually given quite the facelift to support a new feature — with the result of
+simple, convenient syntax potentially hiding fairly high overhead (contrary to the more typical case of inconvenient syntax, no
+new work in the toolchain, and resource use being fairly explicit.)</p>
+<p>At first glance, TLS looks wonderfully efficient, with a whole machine register dedicated to making access to these exotic
+variables fast, and a whole scheme set up in the linker to use this register. Let’s take this code accessing a
+<code>thread_local</code> object named <code>tls_obj</code>:</p>
+<pre><code>int get_first() {
+  return tls_obj.first_member;
+}</code></pre>
+<p>This compiles to the following assembly code:</p>
+<pre>  <b><span>movl  %fs:<i>tls_obj</i>@tpoff, %eax</span></b>
+</pre>
+<p>This loads data from the address of <code>tls_obj</code> into the <code>%eax</code> register where the return value should
+go. The address of tls_obj is computed by adding the value of the register <code>%fs</code> and the constant offset
+<code>tls_obj@tpoff</code>. Here, <code>%fs</code> is the TLS base address register on x86; other machines similarly reserve a
+register for this. <code>tls_obj@tpoff</code> is an offset from the base address of the TLS area allocated per thread, and it’s
+assigned by the linker such that room is reserved within the TLS area for every <code>thread_local</code> object in the linked
+binary. Is this awesome or what?!</p>
+<h2 id="constructors">Constructors</h2>
+<p>If instead we access a <code>thread_local</code> object with a constructor — let&#39;s call it <code>tls_with_ctor</code> — we
+get assembly code like this (and this is with <code>-O3</code> – you really don’t want to see the unoptimized version of
+this):</p>
+<pre>  <span>cmpb  $0, %fs:<b><i>__tls_guard</i></b>@tpoff
+  je    .slow_path</span>
+  <b><span>movl  %fs:<i>tls_with_ctor</i>@tpoff, %eax</span></b>
+  ret
+<b>.slow_path:</b>
+  // inlined call to __tls_init, which constructs
+  // <b>all</b> the TLS variables in this translation unit…
+  pushq %rbx
+  movq  %fs:0, %rbx
+  movb  $1, %fs:<b><i>__tls_guard</i></b>@tpoff
+  leaq  <b><i>tls_with_ctor</i></b>@tpoff(%rbx), %rdi
+  call  <b><i>Class::Class()</i></b>
+  leaq  <b><i>tls_with_ctor2</i></b>@tpoff(%rbx), %rdi
+  call  <b><i>Class2::Class2()</i></b>
+  // …followed by our function’s code
+  <b><span>movl    %fs:<i>tls_with_ctor</i>@tpoff, %eax</span></b>
+  popq  %rbx
+  ret
+</pre>
+<p>Our simple access to a register plus offset has evolved to first check a thread-local “guard variable”, and if it’s not yet
+set to 1, it now calls the constructors for all of the thread-local objects in the translation unit. (<code>__tls_guard</code>
+is an implicitly generated <code>static</code>, per-translation-unit boolean.)</p>
+<p>While funtrace’s call/return hooks, which get their trace buffer pointer from TLS, are called all the time, access to
+<code>thread_local</code>s should be more rare in “normal” code — so not sure it’s fair to brand this <code>__tls_guard</code>
+approach as having “unacceptable overhead.” Of course, the inlining only happens if your thread_local is defined in the same
+translation unit where you access it; <strong>accessing an <code>extern thread_local</code> with a constructor involves a
+function call</strong>, with the function testing the guard variable of the translation unit where the thread_local is defined.
+But with inlining, the fast path is quite fast on a good processor (I come from an embedded background where you usually have
+<em>cheap </em>CPUs rather than <em>good</em>, so an extra load and a branch depending on the loaded value shock me more than
+they should; a superscalar out-of-order branch-predicting speculatively-executing CPU will handle this just fine.)</p>
+<p>What I don’t understand is why. Like, <em>why.</em> Generating this code must have taken a bunch of compiler work; it didn’t
+“just happen for free.” Furthermore, the <code>varname@tpoff</code> thing must have involved some linker work; it’s not like
+keeping the linker unchanged was a constraint. Why not arrange for the <code>__tls_init</code> function of every translation
+unit (the one that got inlined into the slow path above) to be called before a thread’s entry point is called? Because it would
+require a little bit of libc or libpthread work?..</p>
+<p>I mean, this was done for <em>global constructors</em>. You don’t check whether you called the global constructors of a
+translation unit before accessing a global with a constructor (and sure, <em>that </em>would have been even slower than the TLS
+init code checking <code>__tls_guard</code>, because it would need to have been a <em>thread-safe</em> guard variable access;
+though even <em>this </em>was implemented for calling the constructors of <em>static variables declared inside functions,
+</em>see also <code>-fno-threadsafe-statics</code>.) It’s not really harder to do this for TLS constructors than for global
+constructors, except that we need <code>pthread_create</code> to call this code, which, why not?..</p>
+<p>Is this a deliberate performance tradeoff, benefitting code with lots of thread_locals and starting threads constantly, with
+each thread using few of the thread_locals, and some thread_locals having slow constructors? But such code isn&#39;t great to begin
+with?.. Anyway, I don’t really get why the ugly thing above is generated from <code>thread_local</code>s’ constructors. The way
+I handled it in my case is, <strong>funtrace sidesteps the TLS constructor problem by <a href="https://docs.oracle.com/cd/E19683-01/816-1386/chapter3-26/index.html">interposing</a>
+<code>pthread_create</code></strong>, and initializing its <code>thread_local</code>s in its pthread_create wrapper.</p>
+
+<p>And now let’s see what happens when we put our thread-local variable, the one without a constructor, into a shared library
+(compiling with <code>-fPIC</code> and linking with <code>-shared</code>):</p>
+<pre><b><span>push %rbp
+mov  %rsp,%rbp
+<span>data16 lea <i>tls_obj</i>(%rip),%rdi
+data16 data16 callq <i>__tls_get_addr</i>@plt</span>
+mov  (%rax),%eax
+pop  %rbp</span></b>
+retq 
+</pre>
+<p>All this colorful code is generated instead of what used to be a single <b><span>movl
+%fs:<i>tls_obj</i><span data-cites="tpoff">@tpoff</span>, %eax</span></b>. More code was generated than before,
+forcing us to <strong><span>spill and restore registers</span></strong>. But the worst part is that our
+TLS access now requires <strong><span>a function call</span></strong> — we need
+<code>__tls_get_addr</code> to find the TLS area of the currently running shared library.</p>
+<p><strong>Why don’t we just use the same code as before — the <code>movl</code> instruction — with the dynamic linker
+substituting the right value for <code>tls_obj@tpoff</code>? </strong>This is an honest question; I don’t understand why this
+isn’t a job for the dynamic linker like any other kind of dynamic relocation. Is this to save work in libc again?.. Like, for
+<code>tls_obj@tpoff</code> to be an offset <em>from the same base address</em> no matter which shared library
+<code>tls_obj</code> was linked into, you would need the TLS areas of all the shared libraries to be allocated contiguously:</p>
+<ul>
+<li>main executable at offset 0</li>
+<li>the first loaded .so at the offset <code>sizeof(main TLS)</code></li>
+<li>the next one at the offset <code>sizeof(main TLS) + sizeof(first.so TLS)</code></li>
+<li>…</li>
+</ul>
+<p>But for this, libc would need to do this contiguous allocation, and of course you can’t move the TLS data once you’ve
+allocated it, since someone might be keeping pointers into it<a href="#fn3" id="fnref3" role="doc-noteref"><sup>3</sup></a>. So you need to carve out a chunk of the memory space — no biggie with a 64-bit or even
+“just” a 48-bit address space, right?.. — and you need to put the executable’s TLS at some magic address with <code>mmap</code>
+and then you keep <code>mmap</code>ing the TLS areas of newly loaded .so’s one next to another.</p>
+<p>But this now becomes a part of the ABI (“these addresses are reserved for TLS”), and I guess nobody wanted to soil the ABI
+this way “just” to make TLS fast for shared libraries?.. In any case, looks like TLS areas are allocated non-contiguously and so
+you need a different base address every time and you can’t use an offset… but <em>still</em>, couldn’t the dynamic linker bake
+this address into the code, instead of calling a function to get it?.. Feels to me that this was doable but deemed not worth the
+trouble, more than it being impossible, though maybe I’m missing something.</p>
+<p>A curious bit is those <code>data16</code><a href="#fn4" id="fnref4" role="doc-noteref"><sup>4</sup></a>
+in the code:</p>
+<pre><b><span>data16 lea <i>tls_obj</i>(%rip),%rdi
+data16 data16 callq <i>__tls_get_addr</i>@plt</span></b>
+</pre>
+<p>What is this for?.. Actually, the <code>data16</code> prefix does nothing in this context except padding the instructions to
+take more space, making things slightly slower still, though it’s peanuts compared to the function call. Why does the compiler
+put this padding in? Because if you compile with <code>-fPIC</code> but then link the code into an executable, without the
+<code>-shared</code>, the function call gets replaced with faster code:</p>
+<pre><b><span>push %rbp
+mov  %rsp,%rbp
+<span>mov  %fs:0x0,%rax
+lea  -0x4(%rax),%rax</span>
+mov  (%rax),%eax
+pop  %rbp</span></b>
+retq
+</pre>
+<p>The generated code is still scarred with the <strong><span>register spilling</span></strong> and
+what-not, and we don’t get our simple <b><span>movl %fs:<i>tls_obj</i><span data-cites="tpoff">@tpoff</span>, %eax</span></b> back, but still, we have to be very thankful for the compiler &amp; linker
+work here, done for the benefit of the <em>many </em>people whose build system compiles everything with <code>-fPIC</code>,
+including code that is then linked without <code>-shared</code> (because who knows if the .o will be linked into a shared
+library or an executable? It’s not like the build system knows <em>the entire graph of build dependencies — </em>wait, it
+actually <em>does — </em>but still, it obviously shouldn’t be <em>bothered </em>to find out if -fPIC is needed — this type of
+mundane concern would just distract it from its noble goal of Scheduling a Graph of Completely Generic Tasks. Seriously, no C++
+build system out there stoops to this - not one, and goodness knows there are A LOT of them.)</p>
+<p>In any case, the <code>data16</code>s are generated by the compiler to make the red instructions take enough space for the
+green instructions to fit into, in case we link without <code>-shared</code> after all.</p>
+
+<p>And now let’s see what happens if we put (1) a thread_local object with (2) a constructor into a shared library, for a fine
+example of how 2 of C++’s famously “zero-overhead” features compose. We’ve all heard how “the whole is greater than the sum of
+its parts,” occasionally expressed by the peppier HRy people as “1 + 1 = 3.” I suggest a similarly inspiring expression “0 + 0
+&gt; 0”, which quite often applies to “zero overhead”:</p>
+<pre>sub  $0x8,%rsp
+<b><span>callq</span> <i>TLS init function for tls_with_ctor</i></b>@plt
+data16 lea <b><i>tls_with_ctor</i></b>(%rip),%rdi
+data16 data16 <b><span>callq</span> <i>__tls_get_addr</i></b>@plt
+mov  (%rax),%eax
+add  $0x8,%rsp
+retq
+</pre>
+<p>So, now we have 2 function calls — one for calling the constructor in case it wasn’t called yet, and another to get the
+address of the <code>thread_local</code> variable from its ID. Makes sense, except that I recall that under <code>-O3</code>,
+this “TLS init function” business was inlined, and now it no longer is? Say, I wonder what code got generated for this “TLS init
+function”?..</p>
+<pre>  subq  $8, %rsp
+  leaq  <b><i>__tls_guard</i></b>@tlsld(%rip), %rdi
+  <b><span>call</span>  <i>__tls_get_addr</i></b>@PLT
+  cmpb  $0, <b><i>__tls_guard@dtpoff</i></b>(%rax)
+  je    .slow_path
+  addq  $8, %rsp
+  ret
+<b>.slow_path:</b>
+  movb  $1, <b><i>__tls_guard</i></b>@dtpoff(%rax)
+  data16  leaq  <b><i>tls_with_ctor</i></b>@tlsgd(%rip), %rdi
+  data16 data16 <b><span>call</span>  <i>__tls_get_addr</i></b>@PLT
+  movq  %rax, %rdi
+  call  <b><i>Class::Class</i></b>()@PLT
+  data16  leaq  <b><i>tls_with_ctor2</i></b>@tlsgd(%rip), %rdi
+  data16 data16 <b><span>call</span>  <i>__tls_get_addr</i></b>@PLT
+  addq  $8, %rsp
+  movq  %rax, %rdi
+  jmp   <b><i>Class2::Class2</i></b>()@PLT
+</pre>
+<p>Oh boy. So not only doesn’t this thing get inlined, but it calls <code>__tls_get_addr</code> <em>again, <strong>even on the
+fast path</strong>. </em>And then you have the slow path, which calls __tls_get_addr <em>again and again</em>…not that we care,
+it runs just once, but it kinda shows that this __tls_get_addr business doesn’t optimize very well. I mean, it’s not just the
+slow path of the init code — here’s how a function accessing 2 thread_local objects with constructors looks like:</p>
+<pre>pushq   %rbx
+<b><span>call</span></b>    TLS init function for tls_with_ctor@PLT
+data16 leaq tls_with_ctor@tlsgd(%rip), %rdi
+data16 data16 <b><span>call</span></b> __tls_get_addr@PLT
+movl    (%rax), %ebx
+<b><span>call</span></b>    TLS init function for tls_with_ctor2@PLT
+data16 leaq tls_with_ctor2@tlsgd(%rip), %rdi
+data16 data16 <b><span>call</span></b> __tls_get_addr@PLT
+addl    (%rax), %ebx
+movl    %ebx, %eax
+popq    %rbx
+</pre>
+<p>Like… man. This calls __tls_get_addr <span><strong><em>4 times</em></strong></span>, twice per
+accessed thread_local (once directly, and once from the “TLS init functions”).</p>
+<p>Why do we call <em>2 </em>“TLS init function for whatever” when <em>both </em>do the same thing — check the guard variable
+and run the constructors of <em>all </em>objects in the translation unit (and in this case the two objects are defined in the
+same translation unit, the same one where the function is defined)? Is it because in the general case, the two objects come from
+2 different translation units, and nobody bothered to optimize the case where they’re from the same one? I guess I can see how
+that could happen…</p>
+<p>And what about the __tls_get_addr calls to get the addresses of the objects themselves? Why call <em>that </em>twice? Why not
+call something just once that gives you the base address of the module’s TLS, and then add offsets to it? Is it because in the
+general case, the two objects could come from 2 different shared libraries? Or is this actually done to help the case when we
+compile with <code>-fPIC</code> but link without <code>-shared</code>, so that we can neatly replace both calls to
+__tls_get_addr with cheaper instructions computing the offset — remember how we thanked compiler &amp; linker people for doing
+that? Whereas with a single call to <code>__tls_get_module_base</code> or whatever we’d call it, we wouldn’t have room to put
+the faster instruction sequences in at link time (but I guess we could use some NOPW sequence for that instead, but nobody
+bothered)? A case of “no good deed goes unpunished,” or rather “no improvement to the performance of executables goes without a
+degradation of the performance of shared libraries?..”</p>
+<p>And BTW, with clang 20 (the latest version ATM), it’s seemingly enough for <em>one </em>thread-local object in a translation
+unit to have a constructor for the compiler to generate a “TLS init function” for <em>every </em>thread-local object, and call
+it when the object is accessed… so, seriously, <strong>don’t </strong>use <code>thread_local</code> with constructors, even if
+you don’t care about the overhead, as long as there’s even one thread_local object where you <em>do </em>care about access
+time.</p>
+<p>What does <code>__tls_get_addr</code> do? Here’s the fast path:</p>
+<pre>mov  %fs:DTV_OFFSET, %RDX_LP
+mov  GL_TLS_GENERATION_OFFSET+_rtld_local(%rip), %RAX_LP
+cmp  %RAX_LP, (%rdx)
+jne  .slow_path
+mov  TI_MODULE_OFFSET(%rdi), %RAX_LP
+salq $4, %rax
+movq (%rdx,%rax), %rax
+cmp  $-1, %RAX_LP
+je   .slow_path
+add  TI_OFFSET_OFFSET(%rdi), %RAX_LP
+ret
+</pre>
+<p>These 11 instructions on the fast path enable lazy allocation of a shared library’s TLS — every thread only allocates a TLS
+for a given shared library upon its first attempt to access one of its thread-local variables. (Each “variable ID” passed to
+<code>__tls_get_addr</code> is a pointer to a struct with module ID and an offset within that module’s TLS;
+<code>__tls_get_addr</code> checks whether TLS was allocated for the module, and if it wasn’t, calls
+<code>__tls_get_addr_slow</code> in order to allocate it.)</p>
+<p>Is this lazy allocation the answer to why the whole thing is so slow? Do we <em>really</em> want to only call constructors
+for thread-local variables upon first use, and ideally to even allocate memory for them upon first use? Note that we allocate
+memory <em>for all the thread_locals <strong>in a shared library</strong> </em>upon the first use of even one; but we call
+constructors <em>for all the thread_locals <strong>in a translation unit </strong></em>upon the first use of even one; which is
+a bit random for the C++ standard to prescribe, not to mention that it doesn’t really concern itself with dynamic loading? So
+it’s more, the standard gave implementations room to do this, rather than prescribed them to do this?.. I don’t know about you,
+but I’d prefer a contiguous allocation for all the TLS areas of all the modules in all the threads, and fast access to the
+variables over this lazy allocation and initialization; I wonder if this was a deliberate tradeoff or “just how things ended up
+being.”</p>
+<h2 id="summary-of-performance-guidelines">Summary of performance guidelines</h2>
+<ul>
+<li>Access to <code>thread_local</code> objects without constructors linked into an executable is <em>very</em> efficient</li>
+<li>Constructors make this slower…</li>
+<li>Especially if you access an <code>extern thread_local</code> from another translation unit…</li>
+<li>Separately from constructors, compiling with <code>-fPIC</code> also makes TLS access slower…</li>
+<li>…and linking code compiled with <code>-fPIC</code> with the <code>-shared</code> flag makes it <em>seriously </em>slower,
+worse than either constructors or compiling with <code>-fPIC</code>...</li>
+<li>…but constructors together with <code>-fPIC -shared</code> <em>really </em>takes the cake and is the slowest by far!</li>
+<li>…and actually, a thread_local variable x having a constructor might slow down access to a thread_local variable y in the
+same translation unit</li>
+<li>Prefer putting the data into one thread_local object rather than several when you can (true for globals, too, BTW.) It can’t
+hurt, and it can probably help a lot, by having fewer calls to <code>__tls_get_addr</code> if your code is linked into a shared
+library.</li>
+</ul>
+<h2 id="future-work">Future work</h2>
+<p>It annoys me to no end that the funtrace runtime has to be linked into the executable to avoid the price of
+<code>__tls_get_addr</code>. (This also means that funtrace must export its runtime functions from the executable, which
+precludes shared libraries using the funtrace runtime API (for taking trace snapshots) from linking with
+<code>-Wl,--no-undefined</code>.)</p>
+<p>I just want a tiny thread-local struct. It can’t be that I can’t do that efficiently without modifying the executable, so
+that for instance a Python extension module can be traced without recompiling the Python executable. Seriously, there’s a limit
+to how idiotic things should be able to get.</p>
+<p>I’m sure there’s some dirty trick or other, based on knowing the guts of libc and other such, which, while dirty, is going to
+work for a long time, and where you can reasonably safely detect if it stopped working and upgrade it for whatever changes the
+guts of libc will have undergone. If you have an idea, please share it! If not, I guess I’ll get to it one day; I released
+funtrace before getting around to this bit, but generally, working around a large number of stupid things like this is a big
+chunk of what I do.</p>
+<h2 id="knowing-what-you-shouldnt-know">Knowing what you shouldn’t know</h2>
+<p>If I manage to stay out of trouble, it’s rarely because of knowing that much, but more because I’m relatively good at 2 other
+things: knowing what I don’t know, and knowing what I shouldn’t know. To look at our example, you could argue that the above
+explanations are shallower than they could be — I ask why something was done instead of looking up the history, and I only
+briefly touch on what <code>TI_MODULE_OFFSET</code> and <code>TI_OFFSET_OFFSET</code> (yes, TI_OFFSET_OFFSET) are, and I don’t
+say a word about GL_TLS_GENERATION_OFFSET, for example, and I <em>could.</em></p>
+<p>I claim that the kind of things we saw around __tls_get_addr is an immediate red flag along the lines of, yes I am looking
+into low-level stuff, but no, nothing good will come out of knowing this particular bit very well in the context that I’m in
+right now; maybe I’ll be forced to learn it sometime, but right now this looks exactly like stuff I should avoid rather than
+stuff I should learn.</p>
+<p>I don’t know how to generalize the principle to make it explicit and easy to follow. All I can say right now is that the next
+section has examples substantiating this feeling; you mainly want to avoid <code>__tls_get_addr</code>, because even people who
+know it very well, because they maintain it and everything related to it, run into problems with it.</p>
+<p>I’ve recently been seeing the expression “anti-intellectualism” used by people criticizing arguments along the lines of “this
+is too complex for me to understand, so this can’t be good.” While I agree that we want some more concrete argument about why
+something isn’t worth understanding than “I don’t get it, and I <em>would </em>get it if it was any good,” I implore not to call
+this “anti-intellectualism,” lest we implicitly crown ourselves as “intellectuals” over the fact that we understand what
+TI_OFFSET_OFFSET is. It’s ridiculous enough that we’re called “knowledge workers,” when the “knowledge” referred to in this
+expression is the knowledge of what TI_OFFSET_OFFSET is.</p>
+
+<p>Like I said, it annoys me to no end that TLS access is slow for variables defined in shared libraries. Readers suggested
+quite a few workarounds, &#34;dirty&#34; to varying degrees:</p>
+<h3 id="inlining-pthread_getspecific">&#34;Inlining&#34; <code>pthread_getspecific</code></h3>
+<p>There&#39;s a pthreads API for allocating &#34;thread-specific keys&#34; which is a form of TLS. Calling <code>pthread_getspecific</code>
+upon every TLS access isn&#39;t any better than calling <code>__tls_get_addr</code>. But <a href="https://x.com/pskocik/status/1891494684863680663">we can &#34;inline&#34; the code of glibc&#39;s implementation</a>, and if we can
+make sure that our key is the first one allocated, it will take just a couple of assembly instructions (loading a pointer from
+<code>%fs</code> with a constant offset, and then loading our data from that pointer):</p>
+<pre>#define tlsReg_ (__extension__( \
+  { char*r; __asm (&#34;mov %%fs:0x10,%0&#34;:&#34;=r&#34;(r)); r; }))
+
+inline void *pxTlsGetLt32_m(pthread_key_t Pk){
+  assert(Pk&lt;32);
+  return *(void**)(tlsReg_+0x310+sizeof(void*[2])*Pk+8);
+}
+void* getKey0(void) {
+  return pxTlsGetLt32_m(0);
+}
+</pre>
+<p><code>getKey0</code> compiles to:</p>
+<pre>  mov  %fs:0x10,%rax
+  mov  0x318(%rax),%rax
+</pre>
+<h3 id="compiling-with--ftls-modelinitial-exec">Compiling with <code>-ftls-model=initial-exec</code></h3>
+<p>It <a href="https://news.ycombinator.com/item?id=43078859">turns out</a> that there&#39;s something called the &#34;<a href="https://maskray.me/blog/2021-02-14-all-about-thread-local-storage#initial-exec-tls-model-executable-preemptible">initial
+exec TLS model</a>, where a TLS access costs you 2 instructions and no function calls:</p>
+<pre>movq <b><i>tls_obj</i></b>@GOTTPOFF(%rip), %rax
+movl %fs:(%rax), %eax
+</pre>
+<p>You can also make just some variables use this model with <code>__attribute((tls_model(&#34;initial-exec&#34;)))</code>, instead of
+compiling everything with <code>-ftls-model=initial-exec</code>, which might be very useful since the space for such variables
+is a scarce resource as we&#39;ll see shortly.</p>
+<p>This method is great if you can <code>LD_PRELOAD</code> your library, or link the executable against it so that it becomes
+<code>DT_NEEDED</code>. Otherwise, this may or may not work at runtime:</p>
+<blockquote>
+<p>the shared object generally needs to be an immediately loaded shared object. The linker sets the DF_STATIC_TLS flag to
+annotate a shared object with initial-exec TLS relocations.</p>
+<p>glibc ld.so reserves some space in static TLS blocks and allows dlopen on such a shared object if its TLS size is small.
+There could be an obscure reason for using such an attribute: general dynamic and local dynamic TLS models are not
+async-signal-safe in glibc. However, other libc implementations may not reserve additional TLS space for dlopen&#39;ed initial-exec
+shared objects, e.g. musl will error.</p>
+</blockquote>
+<h3 id="faster-__tls_get_addr-with--mtls-dialectgnu2">Faster <code>__tls_get_addr</code> with
+<code>-mtls-dialect=gnu2</code></h3>
+<p>It turns out there&#39;s a faster <code>__tls_get_addr</code> which you can opt into using. This is still too much code for my
+taste; but if you&#39;re intereseted in the horrible details, you can read <a href="https://news.ycombinator.com/item?id=43079061">the comment where I found out about this</a>.</p>
+<h2 id="see-also">See also</h2>
+<p>Various compiler and runtime issues make this slow stuff even slower, and it takes a while to get it fixed. If you stay
+within the guidelines above, you should avoid such problems; if you don’t, you might have more problems than described above —
+including both performance and correctness:</p>
+<ul>
+<li><a href="https://gcc.gnu.org/bugzilla/show_bug.cgi?id=81501">mulitple calls to __tls_get_addr() with -fPIC</a> (reported in
+2017, status: NEW as of 2025). Some highlights from 2022:
+<ul>
+<li>“We recently upgraded our toolchain from GCC9 to GCC11, and <strong>we&#39;re seeing <code>__tls_get_addr</code> take up to 10%
+of total runtime</strong> under some workloads, where it was 1-2% before. It seems that some changes to the optimization passes
+in 10 or 11 have significantly increased the impact of this problem.”</li>
+<li>“I&#39;ve shown a workaround I used, which might be useful until GCC handle <code>__tls_get_addr()</code> as returning a
+constant addresses that doesn&#39;t need to be looked up multiple times in a function.“</li>
+<li>“Thanks for the patch! I wonder if it would handle coroutines correctly. <strong>Clang has this open bug <a href="https://github.com/llvm/llvm-project/issues/47179">&#34;Compiler incorrectly caches thread_local address across
+suspend-points&#34;</a> that is related to this optimization</strong>.”</li>
+</ul></li>
+<li><a href="https://sourceware.org/bugzilla/show_bug.cgi?id=19924">TLS performance degradation after dlopen</a> (reported in
+2016; fixed in libc 2.39 in 2023, backported to older libcs up to 2.34 in 2025):
+<ul>
+<li>“we have noticed a performance degradation of TLS access in shared libraries. <b>If another shared library that uses TLS is
+loaded via dlopen, __tls_get_addr takes significant more time</b>. Once that shared library accesses it&#39;s TLS, the performance
+normalizes. We do have a use-case where this is actually really significant.”</li>
+<li>“elf: Fix slow tls access after dlopen [BZ #19924] In short: __tls_get_addr checks the global generation counter and if the
+current dtv is older then _dl_update_slotinfo updates dtv up to the generation of the accessed module. So if the global
+generation is newer than generation of the module then __tls_get_addr keeps hitting the slow dtv update path. The dtv update
+path includes a number of checks to see if any update is needed and this already causes measurable tls access slow down after
+dlopen. It may be possible to detect up-to-date dtv faster. But if there are many modules loaded (&gt; TLS_SLOTINFO_SURPLUS)
+then this requires at least walking the slotinfo list. This patch tries to update the dtv to the global generation instead, so
+after a dlopen the tls access slow path is only hit once. The modules with larger generation than the accessed one were not
+necessarily synchronized before, so additional synchronization is needed.”</li>
+<li>“the fix for <a href="https://sourceware.org/bugzilla/show_bug.cgi?id=19924">bug 19924</a> was to update DTV on tls access
+up to the global gen count so after an independent dlopen the next tls access updates the DTV gen count instead of falling into
+a slow code path over and over again. <strong>this introduced some issues</strong>: update happens now even if the accessed tls
+is in an early loaded library that use static tls (l_tls_offset is set), so such access is no longer as-safe and may alloc. some
+of this was mitigated by an ugly workaround: “elf: Support recursive use of dynamic TLS in interposed malloc.” a possible better
+approach is to expose the gen count of the accessed module directly in the tls_get_addr argument: this is possible on 64bit
+targets if we compress modid and offset into one GOT entry and use the other for the gen count when processing DTPMOD and DTPREL
+relocs. (then the original logic before the 19924 fix would not slow down after a global gencount bump: we can compare the DTV
+gen count to the accessed module gen count. btw we do this with TLSDESC today and thus aarch64 was imho not affected by the
+malloc interposition issue.) however i feel this is dancing around a bad design to use the generation count to deal with dlclose
+and reused modids. so here is a better approach…”</li>
+</ul></li>
+</ul>
+<p>If you’re not quite following some of the above, this sort of makes my point about <code>__tls_get_addr</code> being
+undesirable, though I am not sure how to defend this way of making a point in the general case.</p>
+</div></div>
+  </body>
+</html>
