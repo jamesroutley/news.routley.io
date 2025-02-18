@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://nyanpasu64.gitlab.io/blog/amdgpu-sleep-wake-hang/">Original</a>
+    <h1>I helped fix sleep-wake hangs on Linux with AMD GPUs</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    
+  <div>
+  	
+  	
+  	
+  	<p>I dual-boot my desktop between Windows and Linux. Over the past few years, Linux would often crash when I tried to sleep my computer with high RAM usage. Upon waking it would show a black screen with moving cursor, or enter a &#34;vegetative&#34; state with no image on-screen, only responding to magic SysRq or a hard reset. I traced this behavior to an amdgpu driver power/memory management bug, which took over a year to brainstorm and implement solutions for.</p>
+<p>TL;DR: The bug is <a href="https://gitlab.freedesktop.org/agd5f/linux/-/commit/2965e6355dcdf157b5fafa25a2715f00064da8bf">fixed in agd5f/linux</a>, and the change should be out in stable kernel 6.14.</p>
+<h2 id="diagnosing-the-problem"><a href="#diagnosing-the-problem" aria-hidden="true"><span>🔗</span></a>
+Diagnosing the problem</h2>
+<p>I started debugging this issue in 2023-09. My setup was a Gigabyte B550M DS3H motherboard with AMD RX 570 GPU and 1TB Kingston A2000 NVMe SSD, running Arch Linux with systemd-boot and Linux 6.4.</p>
+<p>The first thing I do after a system crash is to check the journals. For example, <code>journalctl --system -b -1</code> will print system logs from the previous boot (dmesg and system services, excluding logs from my user account&#39;s apps).</p>
+<p>The output showed that some sleep attempts had out-of-memory (OOM) errors in kernel code under <code>amdgpu_device_suspend</code>, and it took one or more failed attempts before the system crashed. Though oftentimes <code>journalctl</code> would print <em>no logs</em> whatsoever of the broken system waking up, terminating at:</p>
+<pre><code><span>Aug 30 12:47:01 ryzen systemd-sleep[41722]: Entering sleep state &#39;suspend&#39;...
+</span><span>Aug 30 12:47:01 ryzen kernel: PM: suspend entry (deep)
+</span></code></pre>
+<p>At one point after my computer attempted to sleep, it entered a &#34;undead&#34; state where the computer woke up enough to show KDE&#39;s lock screen clock updating in real time, but locked up if I tried to log in or interact beyond a REISUB reboot. Terrifyingly, after rebooting the PC and checking the journals, they stopped at <code>Entering sleep state &#39;suspend&#39;...</code> and contained <em>no record</em> of waking up and loading KDE&#39;s lock screen. I concluded that the NVMe storage driver failed to reinitialize during system wakeup, causing the system to freeze and logs to stop being written.</p>
+<p>I suspected that Linux was telling my NVMe drive to enter a power-saving APST mode, but my drive would instead stop responding to requests permanently. The <a href="https://wiki.archlinux.org/title/Solid_state_drive/NVMe#Power_Saving_(APST)">Arch wiki</a> suggested that I disable APST by adding kernel parameter <code>nvme_core.default_ps_max_latency_us=0</code> and enable software IOMMU using <code>iommu=soft</code>, but this did not solve my problem. Later I installed a SSD firmware upgrade that fixed APST handling (bricking not covered by warranty 😉), and upgraded to a 2TB boot SSD, but neither step helped.</p>
+<ul>
+<li>One contributing factor was that systemd would try multiple sleep modes back to back (<a href="https://github.com/systemd/systemd/issues/25151">bug report</a>). If the first sleep attempt failed due to OOM, subsequent attempts would generate noise in system logs and corrupt the kernel further. I turned this off on my system by editing <code>/etc/systemd/sleep.conf</code> and adding <code>SuspendState=mem</code>; this simplified debugging but did not solve the underlying problem.</li>
+<li>I also tried <code>echo 1 &gt; /sys/power/pm_trace</code> to check where suspend failed, which had the side effect of disabling asynchronous suspend (which suspended multiple devices in parallel). I noticed that Linux would recover from amdgpu suspend failures rather than entering a full system hang.
+<ul>
+<li><code>pm_trace</code> stores sleep-wake progress into a computer&#39;s system time (<a href="https://www.kernel.org/doc/Documentation/power/s2ram.rst">docs</a>), so after a failed sleep you can find which operation hung. At one point I rebooted or woke up my computer, only to find that the time was decades off!</li>
+</ul>
+</li>
+</ul>
+<p>Next I enabled the systemd debug shell, which allowed me to run commands on a broken system even when I was unable to unlock KDE or log into a TTY. I added a <code>systemd.debug_shell</code> kernel parameter to my systemd-boot config, though the <a href="https://fedoraproject.org/wiki/Systemd_early_debug-shell">Fedora wiki</a> says you can also run <code>systemctl enable debug-shell</code> to enable it through systemd itself. Afterwards pressing Ctrl-Alt-F9 would spawn a root shell.</p>
+<p>Because the kernel crash sometimes broke the motherboard&#39;s USB controller and keyboards, preventing me from typing into the debug shell, I dug a PS/2 keyboard out of a dusty closet and plugged it into my system (only safe when the PC is off!). This helped me navigate the debug shell, but was largely obsoleted by the serial console I set up later, which doesn&#39;t require a working display output.</p>
+<p>After looking through my crash logs, I noticed that the crashes generally happened in amdgpu&#39;s TTM buffer eviction (<code>amdgpu_device_evict_resources() → amdgpu_ttm_evict_resources()</code>). To learn what this meant and report my findings, I looked on amdgpu&#39;s Gitlab bug tracker for issues related to sleep-wake crashing. I found a <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362">bug report</a> about crashing under high memory usage, which reported that &#34;evict&#34; means copying VRAM to system ram (or system RAM to swap).</p>
+<p>Through some digging, I found that when a desktop enters S3 sleep, the system cuts power to PCIe GPUs, causing their VRAM chips to lose data. To preserve this data, GPU drivers copy VRAM in use to system RAM before the system sleeps, then restore it after the system wakes. However the Linux amdgpu driver has a bug where, if there is not enough free RAM to store all VRAM in use, the system will run out of memory and crash, instead of moving RAM to disk-based swap.</p>
+<ul>
+<li>If Linux OOMs during suspend, it will cancel sleeping and attempt to restart devices. However some drivers may break due to the aborted sleep, or themselves OOM during suspend or resume. This is more likely with asynchronous suspend enabled.</li>
+<li>Alternatively Linux may successfully suspend, but OOM during resume while starting up devices.</li>
+</ul>
+<h2 id="upstream-debugging"><a href="#upstream-debugging" aria-hidden="true"><span>🔗</span></a>
+Upstream debugging</h2>
+<p>I thought that in order to allow swapping to disk, you&#39;d have to evict VRAM to system RAM (while swapping out system RAM if it fills up) <em>before</em> suspending disk-based storage. After we discussed on the bug report, Mario Limonciello <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2096149">suggested</a> that I enable <code>/sys/power/pm_print_times</code> and <code>/sys/power/pm_debug_messages</code> (<a href="https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-power">docs</a>) and check the logs from sleeping. The resulting logs showed that during sleep, the NVMe and amdgpu drivers entered <code>pci_pm_suspend</code> in parallel.</p>
+<p>I started looking for ways to move GPU suspend before SSD suspend, and found a <a href="https://www.kernel.org/doc/html/v6.5/driver-api/device_link.html">mechanism for ordering device suspend</a>. However it appeared built more for synchronizing tightly-coupled peripherals than suspending every GPU before any system disk. Mario <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2097101">instead suggested</a> evicting VRAM during <a href="https://www.kernel.org/doc/html/latest/driver-api/pm/devices.html#entering-system-suspend">Linux suspend&#39;s prepare phase</a> (before disks are suspended), and wrote some kernel patches to move VRAM eviction there.</p>
+<p>As an overview of how the suspend process fits together, I&#39;ve written a flowchart of Linux&#39;s suspend control flow (<a href="https://github.com/torvalds/linux/blob/master/kernel/power/suspend.c">source code</a>, <a href="https://github.com/torvalds/linux/blob/master/drivers/base/power/main.c">drivers</a>):</p>
+<pre data-lang="c"><code data-lang="c"><span>enter_state</span><span>(state) {  </span><span>// kernel/power/suspend.c
+</span><span>    </span><span>suspend_prepare</span><span>(state);  </span><span>// notify drivers
+</span><span>    </span><span>...
+</span><span>    </span><span>pm_restrict_gfp_mask</span><span>();  </span><span>// disable swap
+</span><span>    </span><span>suspend_devices_and_enter</span><span>(state) → </span><span>dpm_suspend_start</span><span>() {  </span><span>// drivers/base/power/main.c
+</span><span>        </span><span>dpm_prepare</span><span>() {
+</span><span>            </span><span>// Call device_prepare() → callback on each device in series.
+</span><span>            </span><span>...</span><span>amdgpu_pmops_prepare</span><span>();
+</span><span>        }
+</span><span>        </span><span>dpm_suspend</span><span>() {
+</span><span>            </span><span>// Call async_suspend() → device_suspend() in parallel,
+</span><span>            </span><span>// and/or device_suspend() → callback in series.
+</span><span>            </span><span>...</span><span>amdgpu_pmops_suspend</span><span>();
+</span><span>        }
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>The patch moved VRAM eviction (and some other large allocations) from <code>dpm_suspend()</code> (when the SSD is being turned off) to <code>dpm_prepare()</code> earlier. This way, if amdgpu runs out of memory while backing up VRAM, it will abort the suspend <em>before</em> entering <code>dpm_suspend()</code> and attempting to suspend other devices. Previously, backing up VRAM during/after suspending other devices could cause them to crash from OOM themselves, or fail to resume from a failed suspend.</p>
+<p>Unfortunately suspending on high RAM usage would <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2111721">still fail to complete</a>, even though the disks were still powered on! The amdgpu developers initially did not think that swap was disabled, but I discovered that the call to <code>pm_restrict_gfp_mask()</code> disabled swap before either <code>dpm_prepare()</code> or <code>dpm_suspend()</code> was called. When backing up VRAM during <code>dpm_prepare()</code>, <code>amdgpu_ttm_evict_resources()</code> often ran out of <a href="https://lore.kernel.org/amd-gfx/20241118200323.16541-1-mario.limonciello@amd.com/T/#u">contiguous</a> memory, causing <code>dpm_prepare()</code> to fail and abandoning the sleep attempt.</p>
+<p>Worse yet, if <code>amdgpu_ttm_evict_resources()</code> managed to fit all VRAM into system RAM, but there was not enough free memory to handle later allocations, then drivers would hit OOM and crash during sleep or wake. This meant that if you used up just enough RAM, you could <em>still</em> crash your system even with this patch. Nonetheless, the amdgpu developers considered Mario&#39;s kernel patch to be an improvement over backing up VRAM during <code>dpm_suspend()</code>, and submitted the patch to kernel review.</p>
+<ul>
+<li>When testing the patch, &#34;daqiu li&#34; <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2220099">reported extremely slow suspend</a> (100 seconds) and suggested the use of <code>__GFP_NORETRY</code> for allocation. I did not experience the issue or how to evaluate the suggestion, and the amdgpu developers did not respond either.</li>
+</ul>
+<hr/>
+<p>Along the way, Mario suggested I could hook up a serial console to my computer to pull logs off the system, even when the display and SSD were down. I found an internal serial header on my motherboard, bought a motherboard-to-DB9-bracket adapter (warning, there&#39;s two layouts of motherboard connector, and the header pin numbering differs from the port pins), and hooked my motherboard up to a serial-to-USB cable I plugged into my always-on server laptop. This allowed my laptop to continually capture data sent over the serial port, acting as a persistent serial console I could check when my PC crashed.</p>
+<p>On my desktop, I set up systemd-boot to pass additional parameters <code>no_console_suspend console=tty0 console=ttyS0,115200 loglevel=8</code> (<a href="https://tldp.org/HOWTO/Remote-Serial-Console-HOWTO/configure-kernel.html">docs</a>) to the kernel. On my laptop, I opened a terminal and ran <code>sudo minicom --device /dev/ttyUSB0 --baudrate 115200</code> to monitor the computer over serial. In addition to saving logs, I could use the serial console to run commands on the system. Text transfer was slower than a direct getty TTY or SSH (a long wall of text could block the terminal for seconds), and it ran into issues with colors and screen size (breaking htop and fish shell completion), but it could often survive a system crash that broke display and networking.</p>
+<h3 id="intermission-debugging-crashes-with-ghidra"><a href="#intermission-debugging-crashes-with-ghidra" aria-hidden="true"><span>🔗</span></a>
+Intermission: Debugging crashes with Ghidra</h3>
+<p>While testing swapping during <code>prepare()</code>, I got my usual OOM errors during or after backing up VRAM, but one crash stood out to me. At one point, amdgpu crashed with error <code>BUG: unable to handle page fault for address: fffffffffffffffc</code>, attempting to dereference a near-null pointer. To me this looked like a state-handling bug caused by failing to test a pointer for null.</p>
+<p>The <a href="https://gist.github.com/nyanpasu64/3dcf924d34983f0cd6bb532cc6e9e7b0">crash log</a> mentioned that the null pointer dereference occurred at <code>dm_resume+0x200</code>, but did not provide a line number corresponding to the source code I had. So I did the natural thing: I saved and extracted the <code>amdgpu.ko</code> kernel module, decompiled it in Ghidra, and mapped the location of the crash in <code>dm_resume</code> to the corresponding lines in the kernel source.</p>
+<p><a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2115049">While looking at the code</a>, I found that the macro <code>for_each_new_crtc_in_state(dm-&gt;cached_state, crtc, new_crtc_state, i)</code> was crashing when it loaded pointer <code>dm-&gt;cached_state</code> into register <code>RSI</code>, then loaded field <code>-&gt;dev = [RSI + 0x8]</code>. The crash dump said that <code>RSI</code> was <code>fffffffffffffff4</code> rather than a valid pointer, then the code tried loading a field at offset 8 and page-faulted at address <code>fffffffffffffffc</code> (= RSI + 8).</p>
+<p>Why was <code>dm-&gt;cached_state</code> storing -12 instead of a pointer? Most likely this happened because earlier during suspend, <code>dm_suspend()</code> assigned <code>dm.cached_state = drm_atomic_helper_suspend(adev_to_drm(adev))</code>. The callee <code>drm_atomic_helper_suspend()</code> could return either a valid pointer, or <code>ERR_PTR(err)</code> which encoded errors as negative pointers. But the caller function assigned the return value directly to a pointer which gets dereferenced upon resume, instead of testing the return value for an error.</p>
+<p>In this case, I think that <code>drm_atomic_helper_suspend()</code> ran out of memory, printed and/or returned <code>-ENOMEM</code> (-12), and the amdgpu suspend code interpreted it as a pointer and unsafely dereferenced it upon waking. Mario <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2116000">fixed this issue</a> by adding code to <a href="https://lore.kernel.org/amd-gfx/20231006185026.5536-6-mario.limonciello@amd.com/">check for a failed return value</a> and abort the suspend instead.</p>
+<h2 id="abandoned-allow-swapping-during-prepare"><a href="#abandoned-allow-swapping-during-prepare" aria-hidden="true"><span>🔗</span></a>
+Abandoned: Allow swapping during prepare()?</h2>
+<p>At this time, high RAM usage still caused sleeping to fail. This happens because amdgpu backs up VRAM during <code>dpm_prepare()</code>, which runs <em>after</em> <code>pm_restrict_gfp_mask()</code> disables swapping to disk. I wanted to fix sleeping under high RAM usage by disabling swap after <code>dpm_prepare()</code> backs up VRAM, but before <code>dpm_suspend()</code> turns off the disk. Both <code>dpm_…()</code> functions were called within <code>dpm_suspend_start()</code>, so this required moving <code>pm_restrict_gfp_mask()</code> deeper into the call hierarchy.</p>
+<pre data-lang="c"><code data-lang="c"><span>enter_state</span><span>()  </span><span>// kernel/power/suspend.c
+</span><span>// removed pm_restrict_gfp_mask() call
+</span><span>
+</span><span>→ </span><span>suspend_devices_and_enter</span><span>() → </span><span>dpm_suspend_start</span><span>(PMSG_SUSPEND) {  </span><span>// drivers/base/power/main.c
+</span><span>    </span><span>dpm_prepare</span><span>() {
+</span><span>        </span><span>// backup VRAM, swap RAM to SSD
+</span><span>    }
+</span><span>    </span><span>pm_restrict_gfp_mask</span><span>();  </span><span>// disable swap
+</span><span>    </span><span>dpm_suspend</span><span>() {
+</span><span>        </span><span>// turn off SSD
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>Unfortunately this posed some practical challenges:</p>
+<ul>
+<li><code>pm_restrict_gfp_mask()</code> is declared in <code>kernel/power/power.h</code> (in the <code>kernel/</code> core folder), and called in <code>kernel/power/suspend.c</code>.</li>
+<li>I wanted to call it in <code>dpm_suspend_start()</code> in file <code>drivers/base/power/main.c</code>, in the <code>drivers/</code> subsystem. <a href="https://github.com/torvalds/linux/blob/master/drivers/base/power/main.c">This file</a> does not include headers from <code>kernel/power/</code>, but only includes <code>&lt;linux/...h&gt;</code> from <code>include/</code>, and <code>&#34;../base.h&#34;</code> etc. from <code>drivers/base/power/</code>.</li>
+</ul>
+<p>As a hack to allow <code>drivers/base/power/main.c</code> to access likely-private kernel core APIs, I edited it and added <code>#include &lt;../kernel/power/power.h&gt;</code> (from <code>include/</code>). If I wanted to upstream my change, I&#39;d have to convince the power management and driver maintainer (<a href="https://github.com/torvalds/linux/blob/master/MAINTAINERS">both files were maintained</a> by Rafael J. Wysocki) that this memory management API should be accessed by the driver subsystem.</p>
+<p>On top of this, there were more correctness challenges to disabling swap <em>during</em> <code>dpm_suspend_start()</code>. For example, <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2115049">hybrid sleep calls</a> <code>pm_restrict_gfp_mask()</code> while saving a system image, then <em>leaves</em> swap disabled and calls <code>suspend_devices_and_enter() → dpm_suspend_start()</code> while expecting the function will not call <code>pm_restrict_gfp_mask()</code> again (which would <a href="https://github.com/torvalds/linux/blob/v6.12/kernel/power/main.c#L35-L50">throw a warning</a> and prevent <code>pm_restore_gfp_mask()</code> from reenabling swap). Hybrid sleep initiated through the less-used <a href="https://docs.kernel.org/power/userland-swsusp.html">userspace ioctl</a> API <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2114607">also leaves swap disabled</a> after saving a system image.</p>
+<p>To &#34;handle&#34; this case, I added a function <code>bool pm_gfp_mask_restricted(void)</code>, and modified <code>dpm_suspend_start()</code> to not call <code>pm_restrict_gfp_mask()</code> if it was already active.</p>
+<ul>
+<li>Oddly <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2115049">hybrid sleep calls</a> <code>dpm_prepare() … dpm_suspend()</code> <em>twice</em>. It calls these functions to power down devices, saves a system image to disk, wakes the devices back up, then enters regular sleep mode through <code>suspend_devices_and_enter()</code>. (It only calls <code>pm_restrict_gfp_mask()</code> and <code>pm_restore_gfp_mask()</code> once.)</li>
+<li>I did not look into how drivers handle hibernation (<code>dpm_prepare(PMSG_FREEZE)</code>) and sleep (<code>dpm_suspend_start(PMSG_SUSPEND) → dpm_prepare(PMSG_SUSPEND)</code>) differently.</li>
+</ul>
+<p>In my testing, this reduced the rate of failed or crashed suspends, but did not fix crashing entirely. After a system lockup I checked my serial console, but found to my dismay I <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2127372">hadn&#39;t restarted my serial logger</a> after I rebooted my laptop, leaving me with no clue about what caused the crash. I decided against trying to upstream an &#34;improvement&#34; to power management, that required fragile changes to core power management infrastructure (outside of the amdgpu driver), and didn&#39;t even fully solve the problem.</p>
+<h3 id="sidenote-corrupted-consoles-on-shutdown"><a href="#sidenote-corrupted-consoles-on-shutdown" aria-hidden="true"><span>🔗</span></a>
+Sidenote: Corrupted consoles on shutdown</h3>
+<p>While shutting down my machine, I&#39;ve been <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2129196">intermittently getting corrupted screens</a> filled with 8x16 blocks of colors. This pattern would fill the space around the shutdown console (which is the resolution of the smallest connected screen), though the console itself was missing since I had redirected it to serial. When this happened, I usually found a kernel error from <code>dc_set_power_state</code> during a previous (successful) sleep attempt, pointing to line <code>ASSERT(dc-&gt;current_state-&gt;stream_count == 0);</code> in the amdgpu driver.</p>
+
+<figure>
+  <a href="https://nyanpasu64.gitlab.io/blog/amdgpu-sleep-wake-hang/PXL_20231010_071642558.jpg"><img src="https://nyanpasu64.gitlab.io/processed_images/PXL_20231010_071642558.ddddf3bec420509f.jpg" alt="Macro photo of colorful glitched patterns on a LCD screen in 8x16 blocks, each made up of horizontal lines."/></a>
+  <figcaption>Close-up photo of 8x16 glitched pattern.</figcaption>
+</figure>
+<p>I&#39;ve reported the bug a few times in the thread, but have not made a separate bug report for this issue (because the symptoms are minor enough to be ignored). Neither I nor the amdgpu maintainers have determined why this happens.</p>
+<h2 id="workaround-evicting-vram-in-userspace"><a href="#workaround-evicting-vram-in-userspace" aria-hidden="true"><span>🔗</span></a>
+Workaround: Evicting VRAM in userspace</h2>
+<p>A year later in 2024-10, I finished a session of SuperTuxKart, closed the game, and put my computer to sleep. When I woke my computer I was greeted by a black screen. I logged into the serial console and ran <code>sudo rmmod -f amdgpu</code> trying to reset the driver, but triggered a kernel panic instead. (I&#39;ve sometimes managed to recover from an amdgpu crash by instead using <code>systemctl suspend</code> to power-cycle the GPU and driver.)</p>
+<p><a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2606387">Reviewing the logs revealed</a> that one failed sleep attempt OOM&#39;d in amdgpu during <code>dpm_prepare()</code>, and the next attempt used up enough memory that during resume, amdgpu&#39;s <code>bw_calcs()</code> crashed when allocating memory. This sent the amdgpu driver into an inconsistent state, resulting in a black screen and a stream of errors in the journal.</p>
+<p>At this point I had the idea to copy NVIDIA&#39;s <a href="https://download.nvidia.com/XFree86/Linux-x86_64/560.35.03/README/powermanagement.html">userspace VRAM backup system</a>. NVIDIA faced the same issue of being unable to save large amounts of VRAM to RAM when swap was disabled, and wrote scripts that systemd runs before/after it tells the Linux kernel to sleep. Prior to sleeping, <code>nvidia-suspend.service</code> writes to <code>/proc/driver/nvidia/suspend</code>, telling the driver to switch to a blank TTY and backup VRAM to a tmpfile. After resuming, <code>nvidia-resume.service</code> tells the driver to restore VRAM from the file and return to the previous session.</p>
+<p>I forked NVIDIA&#39;s system services and built an <a href="https://gitlab.freedesktop.org/nyanpasu64/amdgpu-sleep">amdgpu-sleep</a> package for Arch Linux. Prior to system sleep, my script reads the contents of file <code>/sys/kernel/debug/dri/1/amdgpu_evict_vram</code>, a debugging endpoint that tells amdgpu to save all VRAM into system RAM. This way every time the system tried to sleep, systemd would wait for the GPU&#39;s VRAM to be evicted (moving system RAM into swap if needed) before initiating a kernel suspend.</p>
+<p>This workaround was partly successful. When I slept my computer from the desktop, the script could quickly copy all VRAM to memory (swapping out RAM to make room for VRAM) before entering the kernel to sleep the system. But when I slept my computer with multiple 3D apps running, <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2606387">the apps would continue rendering frames</a> and pulling VRAM back onto the GPU, while the <code>amdgpu_evict_vram</code> callback was trying to move VRAM to system RAM! This tug-of-war livelock continued for over 70 seconds before <code>amdgpu_evict_vram</code> gave up on trying to move all VRAM to system memory, and systemd began the kernel suspend process (which froze userspace processes and <em>successfully</em> evicted VRAM).</p>
+<p>In any case, I left the scripts enabled on my computer, since they caused livelock less often than disabling the scripts caused kernel-level crashes.</p>
+<h2 id="solution-power-management-notifiers"><a href="#solution-power-management-notifiers" aria-hidden="true"><span>🔗</span></a>
+Solution: Power management notifiers</h2>
+<p>In 2024-11, Mario <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2667918">asked users to test a patch</a> that promised to allow evicting while swap was still active. I looked into the <a href="https://lore.kernel.org/amd-gfx/20241118200323.16541-1-mario.limonciello@amd.com/T/#u">patch sources</a> and found that it called a function <code>register_pm_notifier()</code> on a callback struct; this function belongs to Linux&#39;s <a href="https://docs.kernel.org/driver-api/pm/notifiers.html">power management notifier API</a>. The callback in the patch listens to <code>PM_HIBERNATION_PREPARE</code> and <code>PM_SUSPEND_PREPARE</code> messages, and calls <code>amdgpu_device_evict_resources()</code> to evict VRAM.</p>
+<p>When is <code>PM_SUSPEND_PREPARE</code> issued during the suspend process? Reading the code, <code>enter_state() → suspend_prepare()</code> calls <code>pm_notifier_call_chain_robust(PM_SUSPEND_PREPARE, PM_POST_SUSPEND)</code>. This issues <code>PM_SUSPEND_PREPARE</code> to every driver with a notifier callback (including amdgpu), and if any failed it would abort sleep by issuing <code>PM_POST_SUSPEND</code> to any driver that had already prepared for sleep.</p>
+<p>We can revise the flowchart from before:</p>
+<pre data-lang="c"><code data-lang="c"><span>enter_state</span><span>(state) {  </span><span>// kernel/power/suspend.c
+</span><span>    </span><span>suspend_prepare</span><span>(state) {
+</span><span>        </span><span>pm_notifier_call_chain_robust</span><span>(PM_SUSPEND_PREPARE, PM_POST_SUSPEND) {  </span><span>// notify drivers
+</span><span>            </span><span>...</span><span>amdgpu_device_pm_notifier</span><span>() → </span><span>amdgpu_device_evict_resources</span><span>();
+</span><span>        }
+</span><span>    }
+</span><span>    </span><span>...
+</span><span>    </span><span>pm_restrict_gfp_mask</span><span>();  </span><span>// disable swap
+</span><span>    </span><span>suspend_devices_and_enter</span><span>(state) → </span><span>dpm_suspend_start</span><span>() {  </span><span>// drivers/base/power/main.c
+</span><span>        </span><span>dpm_prepare</span><span>()</span><span>...
+</span><span>        </span><span>dpm_suspend</span><span>()</span><span>...
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<p>Evicting VRAM during <code>PM_SUSPEND_PREPARE</code> allows amdgpu to evict VRAM to system RAM <em>before</em> swapping is disabled or disks are frozen. It&#39;s interesting that neither Mario nor the other amdgpu maintainers thought to use this alternative hook until a year after I initially investigated the issue; I was not aware that this notifier API existed until then.</p>
+<p>To test the change, I built a custom kernel with the modified amdgpu driver, as <a href="https://gitlab.freedesktop.org/drm/amd/-/issues/2362#note_2669637">rebuilding only the driver failed</a> unlike last year. After rebooting, I was able to suspend multiple times under high RAM and VRAM usage with no errors. The only issue I noticed was a few seconds of audio looping, as amdgpu tried to back up VRAM <em>before</em> PipeWire or the kernel silenced the speakers (and PipeWire does not configure the ALSA output to stop playing when it runs out of data to be played).</p>
+<p>I do not know that this patch will <em>always</em> fix suspend, since my previous <a href="https://nyanpasu64.gitlab.io/blog/amdgpu-sleep-wake-hang/#abandoned-allow-swapping-during-prepare">&#34;allow swapping during prepare()&#34;</a> patch still hung the system during a sleep attempt. But since this patch was much cleaner and worked in all cases I had tested so far, I thought it was the current best step to fixing the bug. After a few rounds of code review, this change was merged into the amdgpu tree, <em>finally</em> resolving the bug after over a year of attempts.</p>
+<h3 id="sidenote-alternative-userspace-sleep-wake-workarounds-memreserver"><a href="#sidenote-alternative-userspace-sleep-wake-workarounds-memreserver" aria-hidden="true"><span>🔗</span></a>
+Sidenote: Alternative userspace sleep-wake workarounds, <code>memreserver</code></h3>
+<p>Reading the <a href="https://lore.kernel.org/amd-gfx/20241118200323.16541-1-mario.limonciello@amd.com/T/#u">patch message</a> out of curiosity, I found a <a href="https://github.com/ROCm/ROCK-Kernel-Driver/issues/174">separate bug report</a> filed against AMD&#39;s ROCm compute drivers in 2024-10 (my bug report was against 3D graphics). This issue described the same issue (OOM evicting VRAM on suspend), but the replies linked to <em>yet another</em> amdgpu workaround known as <a href="https://git.dolansoft.org/lorenz/memreserver">memreserver</a>, developed from 2020 to 2023. Like my userspace eviction attempt, this program is also a systemd service which runs a userspace program prior to system sleep.</p>
+<p>To make room for VRAM, memreserver allocates <em>system RAM</em> based on used VRAM plus 1 gigabyte, then fills the RAM with 0xFF bytes and <code>mlock</code>s the memory (so none of it is swapped out). Afterwards it quits to free up enough physical RAM to fit allocated VRAM. I have not tested this program&#39;s functionality or performance, but suspect that filling gigabytes of RAM with dummy bytes may be unnecessary or slow (though it&#39;s obviously better than a system crash).</p>
+<h2 id="conclusion"><a href="#conclusion" aria-hidden="true"><span>🔗</span></a>
+Conclusion</h2>
+<p>This took over a year of debugging and multiple attempts by many people to fix. It should be hitting stable Linux kernel 6.14 in 2025 (unless it gets pushed or backported to 6.13), and will be fanning out to distributions as they pick up new kernels in their update cycles.</p>
+
+
+
+
+  </div>
+
+	
+
+  
+
+  </div></div>
+  </body>
+</html>
