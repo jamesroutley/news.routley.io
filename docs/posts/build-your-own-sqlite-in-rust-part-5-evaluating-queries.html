@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://blog.sylver.dev/build-your-own-sqlite-part-5-evaluating-queries">Original</a>
+    <h1>Build your own SQLite in Rust, Part 5: Evaluating queries</h1>
+    
+    <div id="readability-page-1" class="page"><div id="post-content-parent"><div id="post-content-wrapper"><p>In the previous posts, we&#39;ve explored the
+<a target="_blank" href="https://blog.sylver.dev/build-your-own-sqlite-part-1-listing-tables">SQLite file format</a> and built a
+simple <a target="_blank" href="https://blog.sylver.dev/build-your-own-sqlite-part-3-sql-parsing-101">SQL parser</a>. It&#39;s time
+to put these pieces together and implement a query evaluator!
+In this post, we&#39;ll lay the groundwork for evaluating SQL queries and build a
+query evaluator that can handle basic SELECT statements. While our initial implementation
+won&#39;t support filtering, sorting, grouping, or joins yet, it will give us the
+foundation to add these features in future posts.</p>
+<p>As usual, the complete source code for this post is available
+on <a target="_blank" href="https://github.com/geoffreycopin/rqlite/commit/c7dfeeea6956e209ccbd50a727c2b9352c246082">GitHub</a>.</p>
+<h2 id="heading-setting-up-our-test-database">Setting up our test database</h2>
+<p>Before we can evaluate queries, we need a database to query. We&#39;ll start by
+creating a simple database with a single table, <code>table1</code>, with two columns,
+<code>id</code> and <code>value</code>:</p>
+<pre><code>sqlite3 queries_test.db
+sqlite&gt; create table table1(id <span>integer</span>, value text);
+sqlite&gt; insert into table1(id, value) values
+    ...&gt; (1, <span>&#39;11&#39;</span>),
+    ...&gt; (2, <span>&#39;12&#39;</span>),
+    ...&gt; (3, <span>&#39;13&#39;</span>);
+sqlite&gt; .<span>exit</span>
+</code></pre>
+<p>⚠️ You might be tempted to use an existing SQLite database to test your queries,
+but keep in mind that our implementation does not support overflow pages yet,
+so it might not be able to read the data from your database file.</p>
+
+<hr/>
+<p>This section is specific to the Rust implementation. If you&#39;re following along
+with another language, you can safely skip it!</p>
+<hr/>
+<p>Currently, our pager can only be used through an exclusive mutable reference.
+This was fine for our initial use cases, but as we start building more complex
+features, maintaining this restriction will constrain our design.
+We&#39;ll make the pager shareable by wrapping its inner mutable fields in an
+<code>Arc&lt;Mutex&lt;_&gt;&gt;</code> and <code>Arc&lt;RwLock&lt;_&gt;&gt;</code>. This will allow us to effectively clone the pager and
+use it from multiple places without running into borrow checker issues.
+At this stage of the project we could have chosen to use a simple <code>Rc&lt;RefCell&lt;_&gt;&gt;</code>,
+but we&#39;ll eventually need to support concurrent access to the pager, so we&#39;ll
+use thread-safe counterparts from the start.</p>
+<pre><code>// src/pager.rs
+
+<span>- #[derive(Debug, Clone)]</span>
+<span>+ #[derive(Debug)]</span>
+pub struct Pager&lt;I: Read + Seek = std::fs::File&gt; {
+<span>-   input: I,</span>
+<span>+   input: Arc&lt;Mutex&lt;I&gt;&gt;</span>
+    page_size: usize,
+<span>-   pages: HashMap&lt;usize, page::Page&gt;,</span>
+<span>+   pages: Arc&lt;RwLock&lt;HashMap&lt;usize, Arc&lt;page::Page&gt;&gt;&gt;&gt;,</span>
+}
+</code></pre>
+<p>The <code>read_page</code> and <code>load_page</code> methods need to be updated accordingly:</p>
+<pre><code><span>impl</span>&lt;I: Read + Seek&gt; Pager&lt;I&gt; {
+    
+    <span>pub</span> <span><span>fn</span> <span>read_page</span></span>(&amp;<span>self</span>, n: <span>usize</span>) -&gt; anyhow::<span>Result</span>&lt;Arc&lt;page::Page&gt;&gt; {
+        {
+            <span>let</span> read_pages = <span>self</span>
+                .pages
+                .read()
+                .map_err(|_| anyhow!(<span>&#34;failed to acquire pager read lock&#34;</span>))?;
+
+            <span>if</span> <span>let</span> <span>Some</span>(page) = read_pages.get(&amp;n) {
+                <span>return</span> <span>Ok</span>(page.clone());
+            }
+        }
+
+        <span>let</span> <span>mut</span> write_pages = <span>self</span>
+            .pages
+            .write()
+            .map_err(|_| anyhow!(<span>&#34;failed to acquire pager write lock&#34;</span>))?;
+
+        <span>if</span> <span>let</span> <span>Some</span>(page) = write_pages.get(&amp;n) {
+            <span>return</span> <span>Ok</span>(page.clone());
+        }
+
+        <span>let</span> page = <span>self</span>.load_page(n)?;
+        write_pages.insert(n, page.clone());
+        <span>Ok</span>(page)
+    }
+
+    <span><span>fn</span> <span>load_page</span></span>(&amp;<span>self</span>, n: <span>usize</span>) -&gt; anyhow::<span>Result</span>&lt;Arc&lt;page::Page&gt;&gt; {
+        <span>let</span> offset = n.saturating_sub(<span>1</span>) * <span>self</span>.page_size;
+
+        <span>let</span> <span>mut</span> input_guard = <span>self</span>
+            .input
+            .lock()
+            .map_err(|_| anyhow!(<span>&#34;failed to lock pager mutex&#34;</span>))?;
+
+        input_guard
+            .seek(SeekFrom::Start(offset <span>as</span> <span>u64</span>))
+            .context(<span>&#34;seek to page start&#34;</span>)?;
+
+        <span>let</span> <span>mut</span> buffer = <span>vec!</span>[<span>0</span>; <span>self</span>.page_size];
+        input_guard.read_exact(&amp;<span>mut</span> buffer).context(<span>&#34;read page&#34;</span>)?;
+
+        <span>Ok</span>(Arc::new(parse_page(&amp;buffer, n)?))
+    }
+}
+</code></pre>
+<p>Two things to note regarding the <code>read_page</code> method:</p>
+<ul>
+<li>the initial attempt to read the page from the cache is nested in a block to
+limit the scope of the read lock, ensuring that it is released before we try
+to acquire the write lock</li>
+<li>after acquiring the write lock, we check again if the page is already in the
+cache, in case it was inserted in between the two lock acquisitions</li>
+</ul>
+<p>Similarly, we&#39;ll define an owned version of our <code>Value</code> enum that we&#39;ll use
+in the query evaluator:</p>
+<pre><code>
+
+
+
+<span>#[derive(Debug, Clone)]</span>
+<span>pub</span> <span><span>enum</span> <span>OwnedValue</span></span> {
+    Null,
+    <span>String</span>(Rc&lt;<span>String</span>&gt;),
+    Blob(Rc&lt;<span>Vec</span>&lt;<span>u8</span>&gt;&gt;),
+    Int(<span>i64</span>),
+    Float(<span>f64</span>),
+}
+
+<span>impl</span>&lt;<span>&#39;p</span>&gt; <span>From</span>&lt;Value&lt;<span>&#39;p</span>&gt;&gt; <span>for</span> OwnedValue {
+    <span><span>fn</span> <span>from</span></span>(value: Value&lt;<span>&#39;p</span>&gt;) -&gt; <span>Self</span> {
+        <span>match</span> value {
+            Value::Null =&gt; Self::Null,
+            Value::Int(i) =&gt; Self::Int(i),
+            Value::Float(f) =&gt; Self::Float(f),
+            Value::Blob(b) =&gt; Self::Blob(Rc::new(b.into_owned())),
+            Value::<span>String</span>(s) =&gt; Self::<span>String</span>(Rc::new(s.into_owned())),
+        }
+    }
+}
+
+<span>impl</span> std::fmt::Display <span>for</span> OwnedValue {
+    <span><span>fn</span> <span>fmt</span></span>(&amp;<span>self</span>, f: &amp;<span>mut</span> std::fmt::Formatter&lt;<span>&#39;_</span>&gt;) -&gt; std::fmt::<span>Result</span> {
+        <span>match</span> <span>self</span> {
+            OwnedValue::Null =&gt; <span>write!</span>(f, <span>&#34;null&#34;</span>),
+            OwnedValue::<span>String</span>(s) =&gt; s.fmt(f),
+            OwnedValue::Blob(items) =&gt; {
+                <span>write!</span>(
+                    f,
+                    <span>&#34;{}&#34;</span>,
+                    items
+                        .iter()
+                        .filter_map(|&amp;n| <span>char</span>::from_u32(n <span>as</span> <span>u32</span>).filter(<span>char</span>::is_ascii))
+                        .collect::&lt;<span>String</span>&gt;()
+                )
+            }
+            OwnedValue::Int(i) =&gt; i.fmt(f),
+            OwnedValue::Float(x) =&gt; x.fmt(f),
+        }
+    }
+}
+</code></pre>
+<p>Finally, we&#39;ll enrich our <code>Cursor</code> struct with a method that returns the value
+of a field as an <code>OwnedValue</code>:</p>
+<pre><code>
+
+<span>impl</span> Cursor {
+    
+    <span>pub</span> <span><span>fn</span> <span>owned_field</span></span>(&amp;<span>self</span>, n: <span>usize</span>) -&gt; <span>Option</span>&lt;OwnedValue&gt; {
+        <span>self</span>.field(n).map(<span>Into</span>::into)
+    }
+    
+}
+</code></pre>
+<h2 id="heading-evaluating-select-statements">Evaluating <code>SELECT</code> statements</h2>
+<p>Our query engine will be composed of two main components:</p>
+<ul>
+<li>an iterator-like <code>Operator</code> enum that represents nestable operations on the
+database, such as scanning a table or filtering rows. Our initial implementation
+will only contain a <code>SeqScan</code> operator that yields all rows from a table.</li>
+<li>a <code>Planner</code> struct that takes a parsed SQL query and produces an <code>Operator</code> that
+can be evaluated to produce the query result.</li>
+</ul>
+<p>Let&#39;s start by defining the <code>Operator</code> enum:</p>
+<pre><code>
+<span>use</span> anyhow::Context;
+
+<span>use</span> crate::{cursor::Scanner, value::OwnedValue};
+
+<span>#[derive(Debug)]</span>
+<span>pub</span> <span><span>enum</span> <span>Operator</span></span> {
+    SeqScan(SeqScan),
+}
+
+<span>impl</span> Operator {
+    <span>pub</span> <span><span>fn</span> <span>next_row</span></span>(&amp;<span>mut</span> <span>self</span>) -&gt; anyhow::<span>Result</span>&lt;<span>Option</span>&lt;&amp;[OwnedValue]&gt;&gt; {
+        <span>match</span> <span>self</span> {
+            Operator::SeqScan(s) =&gt; s.next_row(),
+        }
+    }
+}
+</code></pre>
+<p>The result of evaluating a query will be obtained by repeatedly calling the
+<code>next_row</code> method on the <code>Operator</code> until it returns <code>None</code>. Each value
+in the returned slice corresponds to a column in the query result.</p>
+<p>The <code>SeqScan</code> struct will be responsible for scanning a table and yielding
+its rows:</p>
+<pre><code>
+
+
+
+<span>#[derive(Debug)]</span>
+<span>pub</span> <span><span>struct</span> <span>SeqScan</span></span> {
+    fields: <span>Vec</span>&lt;<span>usize</span>&gt;,
+    scanner: Scanner,
+    row_buffer: <span>Vec</span>&lt;OwnedValue&gt;,
+}
+
+<span>impl</span> SeqScan {
+    <span>pub</span> <span><span>fn</span> <span>new</span></span>(fields: <span>Vec</span>&lt;<span>usize</span>&gt;, scanner: Scanner) -&gt; <span>Self</span> {
+        <span>let</span> row_buffer = <span>vec!</span>[OwnedValue::Null; fields.len()];
+
+        <span>Self</span> {
+            fields,
+            scanner,
+            row_buffer,
+        }
+    }
+
+    <span><span>fn</span> <span>next_row</span></span>(&amp;<span>mut</span> <span>self</span>) -&gt; anyhow::<span>Result</span>&lt;<span>Option</span>&lt;&amp;[OwnedValue]&gt;&gt; {
+        <span>let</span> <span>Some</span>(record) = <span>self</span>.scanner.next_record()? <span>else</span> {
+            <span>return</span> <span>Ok</span>(<span>None</span>);
+        };
+
+        <span>for</span> (i, &amp;n) <span>in</span> <span>self</span>.fields.iter().enumerate() {
+            <span>self</span>.row_buffer[i] = record.owned_field(n).context(<span>&#34;missing record field&#34;</span>)?;
+        }
+
+        <span>Ok</span>(<span>Some</span>(&amp;<span>self</span>.row_buffer))
+    }
+}
+</code></pre>
+<p>The <code>SeqScan</code> struct is initialized with a list of field indices to read from
+each record and a <code>Scanner</code> that will yield the records for every row in the
+table to be scanned. As the number of fields to read is identical for every row,
+we can preallocate a buffer to store the values of the selected fields.
+The next_row method retrieves the next record from the scanner, extracts
+the requested fields (specified by their indices), and stores them in our buffer.</p>
+<p>Now that we have an <code>Operator</code> to evaluate <code>SELECT</code> statements, let&#39;s move on
+to the <code>Planner</code> struct that will produce the <code>Operator</code> from a parsed SQL query:</p>
+<pre><code>
+
+<span>use</span> anyhow::{bail, Context, <span>Ok</span>};
+
+<span>use</span> crate::{
+    db::Db,
+    sql::ast::{<span>self</span>, SelectFrom},
+};
+
+<span>use</span> super::operator::{Operator, SeqScan};
+
+<span>pub</span> <span><span>struct</span> <span>Planner</span></span>&lt;<span>&#39;d</span>&gt; {
+    db: &amp;<span>&#39;d</span> Db,
+}
+
+<span>impl</span>&lt;<span>&#39;d</span>&gt; Planner&lt;<span>&#39;d</span>&gt; {
+    <span>pub</span> <span><span>fn</span> <span>new</span></span>(db: &amp;<span>&#39;d</span> Db) -&gt; <span>Self</span> {
+        <span>Self</span> { db }
+    }
+
+    <span>pub</span> <span><span>fn</span> <span>compile</span></span>(<span>self</span>, statement: &amp;ast::Statement) -&gt; anyhow::<span>Result</span>&lt;Operator&gt; {
+        <span>match</span> statement {
+            ast::Statement::Select(s) =&gt; <span>self</span>.compile_select(s),
+            stmt =&gt; bail!(<span>&#34;unsupported statement: {stmt:?}&#34;</span>),
+        }
+    }
+}
+</code></pre>
+<p>The <code>Planner</code> struct is initialized with a reference to the database and
+provides a <code>compile</code> method that takes a parsed SQL statement and returns
+the corresponding <code>Operator</code>.
+The <code>compile</code> method dispatches to a specific method for each type of SQL statement.</p>
+<p>Let&#39;s see how to build an <code>Operator</code> for a <code>SELECT</code> statement:</p>
+<pre><code>
+
+
+<span>impl</span>&lt;<span>&#39;d</span>&gt; Planner&lt;<span>&#39;d</span>&gt; {
+    
+
+    <span><span>fn</span> <span>compile_select</span></span>(<span>self</span>, select: &amp;ast::SelectStatement) -&gt; anyhow::<span>Result</span>&lt;Operator&gt; {
+        <span>let</span> SelectFrom::Table(table_name) = &amp;select.core.from;
+
+        <span>let</span> table = <span>self</span>
+            .db
+            .tables_metadata
+            .iter()
+            .find(|m| &amp;m.name == table_name)
+            .with_context(|| <span>format!</span>(<span>&#34;invalid table name: {table_name}&#34;</span>))?;
+
+        <span>let</span> <span>mut</span> columns = <span>Vec</span>::new();
+
+        <span>for</span> res_col <span>in</span> &amp;select.core.result_columns {
+            <span>match</span> res_col {
+                ast::ResultColumn::Star =&gt; {
+                    <span>for</span> i <span>in</span> <span>0</span>..table.columns.len() {
+                        columns.push(i);
+                    }
+                }
+                ast::ResultColumn::Expr(e) =&gt; {
+                    <span>let</span> ast::Expr::Column(col) = &amp;e.expr;
+                    <span>let</span> (index, _) = table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, c)| c.name == col.name)
+                        .with_context(|| <span>format!</span>(<span>&#34;invalid column name: {}&#34;</span>, col.name))?;
+                    columns.push(index);
+                }
+            }
+        }
+
+        <span>Ok</span>(Operator::SeqScan(SeqScan::new(
+            columns,
+            <span>self</span>.db.scanner(table.first_page),
+        )))
+    }
+}
+</code></pre>
+<p>First, we find a table metadata entry that matches the table name in the <code>SELECT</code>
+statement. Then we iterate over the statement&#39;s result columns and build a list of
+field indices to read from each record, either by expanding <code>*</code> to all columns or
+by looking up the column name in the table metadata.</p>
+<p>Finally, we create a <code>SeqScan</code> operator that will scan the entire tabl and yield
+the selected fields for each row.</p>
+<h2 id="heading-query-evaluation-in-the-repl">Query evaluation in the REPL</h2>
+<p>It&#39;s time to put our query evaluator to the test!
+We&#39;ll create a simple function that reads a raw SQL query and evaluates it:</p>
+<pre><code>
+
+
+
+
+<span><span>fn</span> <span>eval_query</span></span>(db: &amp;db::Db, query: &amp;<span>str</span>) -&gt; anyhow::<span>Result</span>&lt;()&gt; {
+    <span>let</span> parsed_query = sql::parse_statement(query, <span>false</span>)?;
+    <span>let</span> <span>mut</span> op = engine::plan::Planner::new(db).compile(&amp;parsed_query)?;
+
+    <span>while</span> <span>let</span> <span>Some</span>(values) = op.next_row()? {
+        <span>let</span> formated = values
+            .iter()
+            .map(<span>ToString</span>::to_string)
+            .collect::&lt;<span>Vec</span>&lt;_&gt;&gt;()
+            .join(<span>&#34;|&#34;</span>);
+
+        <span>println!</span>(<span>&#34;{formated}&#34;</span>);
+    }
+
+    <span>Ok</span>(())
+}
+</code></pre>
+<p>This function creates a pipeline: it parses the SQL query, builds an
+<code>Operator</code> with our Planner, and then repeatedly calls next_row() on the resulting operator
+to retrieve and display each row of the result.</p>
+<p>The final step is to use this function in the REPL loop:</p>
+<pre><code>// src/main.rs
+
+// [...]
+
+ fn cli(mut db: db::Db) -&gt; anyhow::Result&lt;()&gt; {
+     print_flushed(&#34;rqlite&gt; &#34;)?;
+
+     let mut line_buffer = String::new();
+
+     while stdin().lock().read_line(&amp;mut line_buffer).is_ok() {
+         match line_buffer.trim() {
+             &#34;.exit&#34; =&gt; break,
+             &#34;.tables&#34; =&gt; display_tables(&amp;mut db)?,
+<span>+            stmt =&gt; eval_query(&amp;db, stmt)?, </span>
+<span>-            stmt =&gt; match sql::parse_statement(stmt, true) {</span>
+<span>-                Ok(stmt) =&gt; {</span>
+<span>-                    println!(&#34;{:?}&#34;, stmt);</span>
+<span>-                }</span>
+<span>-                Err(e) =&gt; {</span>
+<span>-                    println!(&#34;Error: {}&#34;, e);</span>
+<span>-                }</span>
+<span>-            },</span>
+         }
+
+         print_flushed(&#34;\nrqlite&gt; &#34;)?;
+
+         line_buffer.clear();
+     }
+
+     Ok(())
+ }
+</code></pre>
+<p>Now we can run the REPL and evaluate some simple <code>SELECT</code> statements:</p>
+<pre><code>cargo run -- queries_test.db
+rqlite&gt; select * from table1;
+</code></pre>
+<p>If everything went well, you should see the following output:</p>
+<pre><code>1|11
+2|12
+3|13
+</code></pre>
+<h2 id="heading-conclusion">Conclusion</h2>
+<p>Our small database engine is starting to take shape! We can now parse and evaluate
+simple <code>SELECT</code> queries. But there&#39;s still a lot to cover before we can call it
+a fully functional database engine.
+In the next posts, we&#39;ll discover how to filter rows, read indexes, and implement
+sorting and grouping. </p>
+</div></div></div>
+  </body>
+</html>
