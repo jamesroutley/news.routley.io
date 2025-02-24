@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://kobzol.github.io/rust/2025/02/23/tokio-plus-prctl-equals-nasty-bug.html">Original</a>
+    <h1>Tokio and Prctl = Nasty Bug</h1>
+    
+    <div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>Recently I encountered a bug so cute that I immediately knew that I will want to share it on my blog. It was one of those bugs that even Rust can’t save you from. It occurred in <a href="https://github.com/It4innovations/hyperqueue">HyperQueue</a> (HQ), a distributed task scheduler written in Rust that I work on.</p>
+
+<p>Despite the fact that HyperQueue is a pretty non-trivial distributed application, and it has long been developed mostly only by two people that only have a limited time available for it, it has so far been very reliable, which always fascinates me<sup id="fnref:Rust" role="doc-noteref"><a href="#fn:Rust" rel="footnote">1</a></sup>. But since we have released version <a href="https://github.com/It4innovations/hyperqueue/releases/tag/v0.21.0">0.21.0</a>, we have received several issue reports about a major problem, where tasks spawned by HyperQueue were getting terminated after a few seconds, apparently without any obvious reason. One <a href="https://github.com/It4innovations/hyperqueue/discussions/815">reported issue</a> was even weirder, as tasks were executing normally, but the very last executed task was <em>always</em> failing, no matter what task it was. This was quite unusual to us, as HQ usually works pretty well, and our CI test suite was green, so what gives? Let’s dive in.</p>
+
+<h2 id="origin-of-the-bug">Origin of the bug</h2>
+<p>Luckily, we had a pretty good reproducer from one of our users that has reliably reproduced the bug on my machine. When HyperQueue spawned a task that executed this simple Python function:</p>
+
+<div><div><pre><code><span>def</span> <span>work</span><span>():</span>
+    <span>time</span><span>.</span><span>sleep</span><span>(</span><span>10</span><span>)</span>
+    <span>print</span><span>(</span><span>&#34;hello world&#34;</span><span>)</span>
+</code></pre></div></div>
+
+<p>the task would fail after approximately ten seconds (just before the print), without producing any output. A funny thing was that if I changed the sleep to <code>2</code> seconds, it worked. If I changed it to <code>5</code> seconds, it also worked. But once the sleep time reached <code>10</code> seconds, the task would fail. That was quite… weird, to say the least.</p>
+
+<p>Thanks to this reproducer, I was able to find the commit that introduced this bug using <a href="https://lwn.net/Articles/317154/"><code>git bisect run</code></a> in just a few minutes. The commit was actually created quite some time ago, back in summer of 2024, when I was doing a frankly unhealthy amount of HyperQueue benchmarking for my <a href="https://kobzol.github.io/research/2024/11/12/phd-postmortem.html">PhD</a><sup id="fnref:phd" role="doc-noteref"><a href="#fn:phd" rel="footnote">2</a></sup>, but it was only merged recently, which is why the issues have only started appearing now. The <a href="https://github.com/It4innovations/hyperqueue/commit/b7effa3946162817874f99a661ea87562b10b80f">commit</a> slightly changed the way we spawn tasks (external processes) in HyperQueue:</p>
+
+<div><div><pre><code><span>- let mut child = command.spawn();
+</span><span>+ let mut child = tokio::task::spawn_blocking(move || command.spawn())
++        .await
++        .expect(&#34;Command spawning failed&#34;);
+</span></code></pre></div></div>
+
+<p>The change looks quite innocent! Note that it only changes where the command is spawned (so where the <code>fork</code>/<code>clone</code>/<code>exec</code> syscall is executed), otherwise the process is then polled in the same way as before (<code>spawn</code> doesn’t block until the process finishes, just until it starts executing). Therefore, I was confused as to why it should cause this weird task killing behavior. But first, I should probably explain why I even made this change in the first place.</p>
+
+<p>Spawning processes on Linux sounds like something that is so cheap that you don’t have to worry about it. Well, that is mostly true… until it isn’t <img title=":laughing:" alt=":laughing:" src="https://github.githubassets.com/images/icons/emoji/unicode/1f606.png" height="20" width="20"/>. HyperQueue needs to be able to spawn thousands of processes per second, and do it on HPC clusters and supercomputers that can use quite ancient versions of the Linux kernel and glibc (the <em>C</em> standard library implementation), which means that just the act of spawning a process itself can become a large <a href="https://kobzol.github.io/rust/2024/01/28/process-spawning-performance-in-rust.html">bottleneck</a>.</p>
+
+<p>To achieve concurrency, HyperQueue uses tokio, and more specifically its single-threaded runtime<sup id="fnref:single-threaded" role="doc-noteref"><a href="#fn:single-threaded" rel="footnote">3</a></sup>. But notice that the <a href="https://docs.rs/tokio/latest/tokio/process/struct.Command.html#method.spawn"><code>spawn</code></a> method of tokio’s <a href="https://docs.rs/tokio/latest/tokio/process/struct.Command.html"><code>Command</code></a> is blocking! This makes sense, of course, because there’s not exactly an asynchronous version of <code>fork</code>. If you thus try to spawn a very large number of processes very quickly, the spawning costs will add up, and thus the tokio runtime thread might get blocked and other tasks might starve (I found this with my PhD benchmarking experiments). Well, since spawning a process is a blocking operation, why not offload it to a different (worker) thread using the <a href="https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html"><code>spawn_blocking</code></a> function? I tried that, and it seemed to have a positive effect on HyperQueue’s performance. So that’s how the 
+commit was born.</p>
+
+<p>Funnily enough, this commit was added to HyperQueue in an <em>enormous</em> <a href="https://github.com/It4innovations/hyperqueue/pull/798">pull request</a> that essentially backported most of my benchmarking experiments that I have done over the summer. The PR almost exclusively contained changes only to benchmarks, so it should have been safe to merge without a lot of scrutiny<sup id="fnref:last-words" role="doc-noteref"><a href="#fn:last-words" rel="footnote">4</a></sup>. But it also contained two <em>teeny tiny</em> changes. The PR description that I wrote is quite funny in retrospect:</p>
+
+<blockquote>
+  <p>This backports the benchmarks that I prepared for my PhD thesis back into the HQ repository. Almost all changes are to the benchmarks repository, and they thus shouldn’t need a lot of review. There are a few changes in HQ though: command spawning optimization and the option to disable authentication for benchmarking.</p>
+</blockquote>
+
+<p>Well, guess what, the “command spawning optimization” managed to break HyperQueue’s primary functionality for a bunch of users. That’s what I get for sending <code>+3,458 -601</code> diff pull requests, sigh…</p>
+
+<h2 id="figuring-out-the-cause">Figuring out the cause</h2>
+<p>Now that I knew which commit caused the bug, I “only” had to figure out <em>why</em>. I didn’t understand why moving a blocking operation to a tokio’s threadpool should cause this kind of problem. If there was a deadlock or something like that, then sure, but tasks being randomly killed after approximately ten seconds? That was super weird. I wasn’t used to these kinds of heisenbugs in HyperQueue. Therefore, my first instinct was to blame tokio <img title=":laughing:" alt=":laughing:" src="https://github.githubassets.com/images/icons/emoji/unicode/1f606.png" height="20" width="20"/> I thought that maybe the spawning of the command has to happen on the same thread where the command is then polled for completion, or something like that. But I didn’t find anything related to that in tokio’s issue tracker. And when I created a standalone program outside HQ trying to reproduce this behavior, it worked fine:</p>
+
+<div><div><pre><code><span>use</span> <span>tokio</span><span>::</span><span>process</span><span>::</span><span>Command</span><span>;</span>
+
+<span>#[tokio::main(flavor</span> <span>=</span> <span>&#34;current_thread&#34;</span><span>)]</span>
+<span>async</span> <span>fn</span> <span>main</span><span>()</span> <span>{</span>
+    <span>let</span> <span>mut</span> <span>cmd</span> <span>=</span> <span>Command</span><span>::</span><span>new</span><span>(</span><span>&#34;sleep&#34;</span><span>);</span>
+    <span>cmd</span><span>.arg</span><span>(</span><span>&#34;10&#34;</span><span>);</span>
+
+    <span>let</span> <span>mut</span> <span>child</span> <span>=</span> <span>tokio</span><span>::</span><span>task</span><span>::</span><span>spawn_blocking</span><span>(</span><span>move</span> <span>||</span> <span>{</span>
+        <span>cmd</span><span>.spawn</span><span>()</span><span>.unwrap</span><span>()</span>
+    <span>})</span><span>.await</span><span>.unwrap</span><span>();</span>
+
+    <span>let</span> <span>res</span> <span>=</span> <span>child</span><span>.wait</span><span>()</span><span>.await</span><span>.unwrap</span><span>();</span>
+    <span>assert_eq!</span><span>(</span><span>res</span><span>.code</span><span>(),</span> <span>Some</span><span>(</span><span>0</span><span>));</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>What was also confusing me was the fact that the task did not produce any output, and apparently ended without an exit code. This is how we were checking the exit code of the task process in HQ:</p>
+
+<div><div><pre><code><span>let</span> <span>status_to_result</span> <span>=</span> <span>|</span><span>status</span><span>:</span> <span>ExitStatus</span><span>|</span> <span>{</span>
+    <span>if</span> <span>!</span><span>status</span><span>.success</span><span>()</span> <span>{</span>
+        <span>let</span> <span>code</span> <span>=</span> <span>status</span><span>.code</span><span>()</span><span>.unwrap_or</span><span>(</span><span>-</span><span>1</span><span>);</span>
+        <span>...</span>
+        <span>Err</span><span>(</span><span>tako</span><span>::</span><span>Error</span><span>::</span><span>GenericError</span><span>(</span><span>format!</span><span>(</span>
+            <span>&#34;Program terminated with exit code {code}&#34;</span>
+        <span>)))</span>
+    <span>}</span> <span>else</span> <span>{</span>
+        <span>Ok</span><span>(</span><span>TaskResult</span><span>::</span><span>Finished</span><span>)</span>
+    <span>}</span>
+<span>};</span>
+</code></pre></div></div>
+<p>The exit code was -1, so apparently it was missing. Something was killing our tasks after a few seconds, without them producing any output nor exit code. What could it be? Well, that sounded like a <a href="https://man7.org/linux/man-pages/man7/signal.7.html">signal</a>! At first, I didn’t see how to get information about a signal that could have been sent to the task process from <a href="https://doc.rust-lang.org/std/process/struct.ExitStatus.html"><code>ExitStatus</code></a>, but then I realized that it has to be OS-specific. And indeed, there is <a href="https://doc.rust-lang.org/std/os/unix/process/trait.ExitStatusExt.html"><code>ExitStatusExt</code></a> on Linux, which provides a way to get the <a href="https://doc.rust-lang.org/std/os/unix/process/trait.ExitStatusExt.html#tymethod.signal"><code>signal</code></a> that was received by the spawned process.</p>
+
+<p>And sure enough, after logging the received signal, I found out that the tasks are being killed with <code>SIGTERM</code>. But who (or what) could be sending this signal, and why is it not being sent without <code>spawn_blocking</code>?! Now we get to the fun part.</p>
+
+<p>HyperQueue is essentially a process manager that runs in user space. The user space part provides many advantages, but it also introduces limitations. In particular, it is not always possible for HQ to ensure that when a process that spawns tasks (called <em>worker</em>) quits unexpectedly (e.g. when it receives <code>SIGKILL</code>), its spawned tasks will be cleaned up. Sadly, Linux does not seem to provide any way of implementing perfect structured process management in user space. In other words, when a parent process dies, it is possible for its (grand)children to continue executing. There is a solution for this called <a href="https://man7.org/linux/man-pages/man7/pid_namespaces.7.html">PID namespaces</a>, but it requires elevated privileges, and also seems a bit too heavyweight for HyperQueue.</p>
+
+<p>However, some time ago, I found a partial solution for this problem, which is able to at least clean up direct children (although sadly not grandchildren) when the HQ worker dies. It is called <a href="https://man7.org/linux/man-pages/man2/pr_set_pdeathsig.2const.html"><code>PR_SET_DEATHSIG</code></a>, and we configure it when spawning tasks using the <code>prctl</code> syscall like this<sup id="fnref:unsafe" role="doc-noteref"><a href="#fn:unsafe" rel="footnote">5</a></sup>:</p>
+
+<div><div><pre><code><span>unsafe</span> <span>{</span>
+    <span>command</span><span>.pre_exec</span><span>(||</span> <span>{</span>
+        <span>// Send SIGTERM to this task when the parent (worker) dies.</span>
+        <span>libc</span><span>::</span><span>prctl</span><span>(</span><span>libc</span><span>::</span><span>PR_SET_PDEATHSIG</span><span>,</span> <span>libc</span><span>::</span><span>SIGTERM</span><span>);</span>
+    <span>});</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>You probably realized by now that I’m not talking about <code>PR_SET_PDEATHSIG</code> by accident, and that the <code>SIGTERM</code> signal that we configure to be sent to the task when the worker dies looks like the culprit that has been killing the tasks. And indeed, when I commented out the <code>prctl</code> call, the bug was gone.</p>
+
+<p>But this still doesn’t explain the bug, because the worker doesn’t die. So why is <code>SIGTERM</code> being sent to the task?? Let’s examine the description of <code>PR_SET_PDEATHSIG</code>:</p>
+
+<blockquote>
+  <p>Set the parent-death signal of the calling process to sig (either
+a signal value in the range [1, NSIG - 1], or 0 to clear).  This
+is the signal that the calling process will get when its parent
+dies.</p>
+</blockquote>
+
+<p>Ok, that seems to make sense. When the parent (the worker process) dies, the task receives <code>SIGTERM</code>, that’s what I want. Or, at least that’s what I thought would happen…</p>
+
+<p>…</p>
+
+<p>The problem is the word <em>parent</em>. I automatically assumed that it means the “parent process”. But now that I have examined the very next sentence of the description again, I saw this:</p>
+
+<blockquote>
+  <p>The parent-death signal is sent upon subsequent termination of the
+parent thread and also upon termination of…</p>
+</blockquote>
+
+<p>Wait, did it say <em>thread</em>? Crap. Suddenly, everything clicked – do you see it?</p>
+
+<p>By moving the spawning of the command into a different (tokio worker) thread, suddenly I told the kernel to send <code>SIGTERM</code> to the spawned process when <em>that worker thread</em> dies, instead of when the parent process (or rather its main thread) dies. Perhaps that wouldn’t be an issue on its own, but it looked like the worker thread was being killed after approximately ten seconds of inactivity. Probably tokio reaps these threads in the background periodically when they have no work left to do? I tried to count the number of active threads in my reproducer program using the <a href="https://docs.rs/num_threads/latest/num_threads/"><code>num_threads</code></a> crate:</p>
+
+<div><div><pre><code><span>let</span> <span>mut</span> <span>cmd</span> <span>=</span> <span>Command</span><span>::</span><span>new</span><span>(</span><span>&#34;sleep&#34;</span><span>);</span>
+<span>cmd</span><span>.arg</span><span>(</span><span>&#34;10&#34;</span><span>);</span>
+<span>unsafe</span> <span>{</span>
+    <span>cmd</span><span>.pre_exec</span><span>(||</span> <span>{</span>
+        <span>libc</span><span>::</span><span>prctl</span><span>(</span><span>libc</span><span>::</span><span>PR_SET_PDEATHSIG</span><span>,</span> <span>libc</span><span>::</span><span>SIGTERM</span><span>);</span>
+        <span>Ok</span><span>(())</span>
+    <span>});</span>
+<span>}</span>
+
+<span>let</span> <span>mut</span> <span>child</span> <span>=</span> <span>tokio</span><span>::</span><span>task</span><span>::</span><span>spawn_blocking</span><span>(</span><span>move</span> <span>||</span> <span>{</span>
+    <span>cmd</span><span>.spawn</span><span>()</span><span>.unwrap</span><span>()</span>
+<span>})</span><span>.await</span><span>.unwrap</span><span>();</span>
+<span>eprintln!</span><span>(</span><span>&#34;Thread count: {}&#34;</span><span>,</span> <span>num_threads</span><span>::</span><span>num_threads</span><span>()</span><span>.unwrap</span><span>());</span>
+
+<span>let</span> <span>res</span> <span>=</span> <span>child</span><span>.wait</span><span>()</span><span>.await</span><span>.unwrap</span><span>();</span>
+<span>eprintln!</span><span>(</span><span>&#34;Thread count: {}&#34;</span><span>,</span> <span>num_threads</span><span>::</span><span>num_threads</span><span>()</span><span>.unwrap</span><span>());</span>
+<span>eprintln!</span><span>(</span><span>&#34;{:?}&#34;</span><span>,</span> <span>res</span><span>.signal</span><span>());</span>
+</code></pre></div></div>
+
+<p>and sure enough, it printed this:</p>
+<div><div><pre><code><span>Thread</span> <span>count</span><span>:</span> <span>2</span>
+<span>Thread</span> <span>count</span><span>:</span> <span>1</span>
+<span>Some</span><span>(</span><span>15</span><span>)</span>
+</code></pre></div></div>
+
+<p>So tokio was clearly terminating the worker thread after a few seconds of inactivity, which caused the kernel to terminate the spawned process with <code>SIGTERM</code>. This was also the reason why tasks would actually finish successfully if you submitted more of them (as shown in <a href="https://github.com/It4innovations/hyperqueue/discussions/815">#815</a>), because the worker thread would receive more work to do (more commands to spawn), so it took more time for tokio to terminate it. Only the last task would then fail, because the worker thread had nothing else to do, so it ended and that killed the last task abruptly. Just incredible.</p>
+
+<blockquote>
+  <p>Edit: Someone on <a href="https://www.reddit.com/r/rust/comments/1iwf5sb/comment/medgbbf/?utm_source=share&amp;utm_medium=web3x&amp;utm_name=web3xcss&amp;utm_term=1&amp;utm_content=share_button">Reddit</a>
+sent me a link to a <a href="https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.thread_keep_alive">method</a> that can override the thread keep-alive duration. Its description makes it clear why the tasks were failing after
+exactly 10 seconds <img title=":laughing:" alt=":laughing:" src="https://github.githubassets.com/images/icons/emoji/unicode/1f606.png" height="20" width="20"/> I don’t want to modify this duration to “fix” this bug though. HyperQueue should use as little resources as possible, and idle threads should thus be cleaned up quickly.</p>
+</blockquote>
+
+<p>Therefore, the case was closed. The problem was a very unlucky interaction of us starting a process in a different thread than the main thread, using <code>PR_SET_PDEATHSIG</code> and tokio reaping worker threads in the background. Note that tokio is not to be blamed here, as reaping of idle threads is a reasonable thing to do. This was just one of those unfortunate cases where a combination of several things that otherwise worked well did not in fact work well together.</p>
+
+<h2 id="fixing-the-bug">Fixing the bug</h2>
+<p>This might be a bit disappointing, but I “fixed” the bug simply by <a href="https://github.com/It4innovations/hyperqueue/pull/823">reverting</a> the commit with the task spawning optimization. I don’t want to give up the cleanup functionality offered by <code>PR_SET_PDEATHSIG</code><sup id="fnref:pre-exec" role="doc-noteref"><a href="#fn:pre-exec" rel="footnote">6</a></sup>, and I don’t know how to tell it to only send the signal when the parent process (not thread) dies (if you do, please let me know!), nor how to do achieve this functionality in any other way in user space.</p>
+
+<p>It’s quite sad that our test suite hasn’t caught this bug; apparently there was no test that would execute a task for longer than a few seconds <img title=":laughing:" alt=":laughing:" src="https://github.githubassets.com/images/icons/emoji/unicode/1f606.png" height="20" width="20"/> In general, it’s quite tricky to test something like this<sup id="fnref:tigerbeetle" role="doc-noteref"><a href="#fn:tigerbeetle" rel="footnote">7</a></sup>, but I didn’t want to leave it completely without a regression test, so I at least implemented <a href="https://github.com/It4innovations/hyperqueue/pull/823/commits/9c20bd83cf085c9419fc18c194586b0a9799335e">this</a> test. Yeah, testing if a task can run for <code>20</code> seconds isn’t great, but hey, at least it’s something.</p>
+
+<h2 id="conclusion">Conclusion</h2>
+<p>In the end, it took me probably less than an hour to find, diagnose and fix this bug, so it wasn’t <em>that bad</em>, as far as bughunting stories go. But I found the bug to be sort of beautiful, so I wanted to share it anyway.</p>
+
+<p>I hope that you found this bughunt case interesting, and that you perhaps also learnt something new along the way. If you have any comments, let me know on <a href="https://www.reddit.com/r/rust/comments/1iwf5sb/tokio_prctl_nasty_bug/">Reddit</a>.</p>
+
+
+  </div>
+
+<!---->
+
+  
+</article>
+
+
+
+      </div>
+    </div></div>
+  </body>
+</html>
