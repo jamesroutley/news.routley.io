@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://tanelpoder.com/posts/ebpf-pt-regs-error-on-linux-blame-fred/">Original</a>
+    <h1>When eBPF pt_regs reads return garbage on the latest Linux kernels, blame Fred</h1>
+    
+    <div id="readability-page-1" class="page"><p>
+
+
+<h2>2025-02-28</h2>
+</p><div>
+<p><em><strong>TLDR;</strong> Starting from Linux kernel version 6.9 on x86_64, there’s a new config option <code>CONFIG_X86_FRED</code> enabled and it <a href="https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/thread_info.h#L45">adds 16 bytes</a> to the starting point of a task’s kernel stack area, so you’ll need to account for this extra padding in your “raw” kernel stack &amp; pt_regs lookup code.</em></p>
+<hr/>
+<h3 id="introduction">Introduction</h3>
+<p>I’ve been using Ubuntu 24.04 as my main eBPF development and testing platform without issues since its release. It is shipped with Linux kernel version 6.8.0, but Canonical recently released an optional newer kernel (HWE) version 6.11 for it too. So, naturally I upgraded to the latest version <em>(linux-image-generic-hwe-24.04 -&gt; 6.11.0)</em> and moved on.</p>
+<p>Then, suddenly my <a href="https://0x.tools">0x.tools</a> <strong>xcapture-next</strong> (v3) eBPF prototype started returning garbage values for the current system call and argument samples of its monitored OS threads. No problem when booting up with the old 6.8.0 kernel.</p>
+<blockquote>
+<p>The xcapture-next (v3) tool <em>passively samples</em> other threads’ activity &amp; state by reading their <code>task_struct</code> kernel memory as a decoupled outside observer, without needing to inject <em>any</em> probes or tracepoints into other tasks execution paths. This gives us a pretty good starting point for building a <strong>top for wall-clock time</strong> tool on Linux, without <em>any</em> slowdown for all your other threads in the system (thanks to passive sampling with BPF <em>task iterators</em>). <sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup></p>
+</blockquote>
+<p>By “garbage”, I mean that my eBPF task iterator program that looped through all the other threads’ <strong>task_struct</strong> info and accessed things like <code>task-&gt;stack-&gt;pt_regs-&gt;orig_ax</code> to get the current system call number (if a task was in a system call), suddenly reported that all userspace threads were in a <code>getsockname</code> syscall instead of their usual names seen in previous tests. This was clearly not correct, so I started investigating:</p>
+<pre>$ grep getsockname syscall_x86_64.tbl
+<mark>51</mark>  common  getsockname     sys_getsockname
+</pre>
+<p>The reported syscall’s NR is 51 - I first wondered if my eBPF program hit some memory access violation on the new kernel and the xcapture frontend incorrectly treated that error code as a syscall number (the EACCESS errno is 13 and EFAULT is 14):</p>
+<pre>$ grep 51 include/uapi/asm-generic/errno.h
+#define <mark>EL2HLT</mark>    51  <strong>/* Level 2 halted */</strong>
+</pre>
+<p>Yeah, this doesn’t look like my issue. Errno 51 is something archaic and esoteric and I don’t think it’s used anywhere really - and a grep through Linux source code confirmed that (although some out-of-tree module could still raise it if it wanted to).</p>
+<p>I then changed my eBPF code to use <code>BPF_CORE_READ_INTO</code> macros (instead of <code>BPF_CORE_READ</code>) that return the result/error code and the actual value read as separate variables and it confirmed that I wasn’t hitting any kernel memory reading errors. The memory address I was reading just happened to hold a value of <code>51</code> in it, but only when booting the installation up with the new 6.11 kernel, not with the previous 6.8 kernel on the same system that worked perfectly fine.</p>
+<p>Long story short: On x86_64 platforms, starting from Linux kernel v6.9, there’s a new feature called <strong>FRED</strong> (Flexible Return and Event Delivery system) enabled by default and it affects the kernel stack area init/usage behavior. 16 extra bytes are allocated at the bottom of a task’s kernel-side stack, before the <code>pt_regs</code> structure is allocated and placed after it on syscall entry from userspace. The definition is in <a href="https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/thread_info.h">/arch/x86/include/asm/thread_info.h</a> in kernel source (search for FRED).</p>
+<p>I have 2 kernels installed, 6.8 and 6.11:</p>
+<pre>$ ls -l /boot/config-6.*
+-rw-r--r-- 1 root root 292076 Jan 20 15:47 /boot/config-6.11.0-17-generic
+-rw-r--r-- 1 root root 287562 Jan 17 07:05 /boot/config-6.8.0-53-generic
+</pre>
+<p>When I grep for the <code>CONFIG_X86_FRED</code> variable, 6.8 does not have such a feature flag!</p>
+<pre>$ grep CONFIG_X86_FRED /boot/config-6.*
+/boot/config-<mark>6.11</mark>.0-17-generic:<strong>CONFIG_X86_FRED=y</strong>
+</pre>
+<p>The Linux <a href="https://github.com/torvalds/linux/blob/master/arch/x86/include/asm/thread_info.h#L45">thread_info.h</a> for x86 shows this:</p>
+<pre>...
+#ifdef CONFIG_X86_32
+# ifdef CONFIG_VM86
+#  define TOP_OF_KERNEL_STACK_PADDING 16
+# else
+#  define TOP_OF_KERNEL_STACK_PADDING 8
+# endif
+#else /* x86-64 */
+# ifdef <mark>CONFIG_X86_FRED</mark>
+#  define TOP_OF_KERNEL_STACK_PADDING <strong>(2 * 8)</strong>
+# else
+#  define TOP_OF_KERNEL_STACK_PADDING <strong>0</strong>
+# endif
+#endif
+...
+</pre>
+<p>This flag showed up in v6.9-rc1, so that explains why my previous 6.8 kernel didn’t have this issue, but 6.11 did!</p>
+<h3 id="what-is-fred">What is FRED?</h3>
+<p>What is FRED? It’s basically a further CPU privilege level switching (and returning) optimization in Intel CPUs, somewhat like the evolution from having to raise <code>int 0x80</code> <em>interrupts</em> to just running <code>syscall</code> or <code>sysenter</code> built-in <em>CPU instructions</em> for faster context &amp; privilege level switching to invoke system calls. FRED (on Intel CPUs) brings us two brand new instructions <code>ERETU</code> and <code>ERETS</code>. You can read the entire Intel FRED architecture spec (but I didn’t), the best summary I found is in this article:</p>
+<ul>
+<li><a href="https://www.eejournal.com/article/we-interrupt-this-program/">https://www.eejournal.com/article/we-interrupt-this-program/</a></li>
+</ul>
+<p>Apparently, FRED means that Intel CPUs are moving away from the four CPU privilege levels (ring 0-3) that nobody ever widely used anyway, back to just two - privileged and unprivileged.</p>
+<h3 id="dynamic-fred-detection-implementation-in-my-ebpf-code">Dynamic FRED-detection implementation in my eBPF code</h3>
+<p>It’s not easy to read such compile-time constants or build-time settings from the eBPF kernel-land, so my current (unpublished) code snippet for detecting FRED in xcapture on x86 is roughly following.</p>
+<p>I have defined a custom <strong>fred_info___check</strong> structure in a separate .h file, so that the program would still compile on kernels without knowledge of the actual FRED <strong>fred_info</strong> structure. The triple underscore “___” in the struct name has a special meaning<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup>.</p>
+<pre>struct fred_info<mark>___</mark>check {
+    long unsigned int edata;
+} __attribute__((preserve_access_index));
+</pre>
+<p>And a snippet from the main .bpf.c program code:</p>
+<pre>// Default page size and thread stack size (THREAD_SIZE) configuration
+#define PAGE_SIZE 4096
+#define KASAN_STACK_ORDER 0
+
+#define THREAD_SIZE_ORDER (2 + KASAN_STACK_ORDER)
+#define THREAD_SIZE  (PAGE_SIZE &lt;&lt; THREAD_SIZE_ORDER)
+
+// x86_64 only (CONFIG_X86_FRED)
+#define TOP_OF_KERNEL_STACK_PADDING_FRED (2 * 8)
+
+// The PT_REGS structure is located at the &#34;top&#34; (highest address) of the kernel stack
+static __always_inline struct pt_regs *<strong>get_task_pt_regs</strong>(struct task_struct *task)
+{
+    // will use true=1 and false=0 for regs_addr calculation later on
+    const bool <strong>fred_enabled</strong> = <mark>bpf_core_type_exists(struct fred_info___check)</mark>;
+
+    __u64 stack_base = (__u64) BPF_CORE_READ(task, stack);
+    if (!stack_base)
+        return NULL;
+    
+    __u64 regs_addr = (
+            stack_base
+          + THREAD_SIZE
+          - (<strong>fred_enabled * TOP_OF_KERNEL_STACK_PADDING_FRED</strong>)
+          - sizeof(struct pt_regs)
+    );
+
+    struct pt_regs *regs = (struct pt_regs *) regs_addr;
+
+    return regs;
+}
+</pre>
+<p>I’ll publish the next version of xcapture-next with the full code soon, so you’ll see how the dynamic &amp; direct kernel feature detection works. I’m using a <code>bpf_core_type_exists</code> trick to see if the new kernel structures added by FRED exist in the <em>currently running</em> kernel and decide whether to add extra “padding” to my <code>pt_regs</code> lookup logic based on that.</p>
+<h3 id="a-few-details-worth-remembering">A few details worth remembering</h3>
+<ul>
+<li>FRED is an Intel x86 platform feature. AMD has (or will have) also something similar, but since there’s a single x86 build for both AMD and Intel’s <code>x86_64</code>, then this FRED <em>padding</em> kicks in also on AMD machines.</li>
+<li>Disabling FRED-behavior using <code>fred=off</code> as a kernel boot argument won’t remove this extra struct/padding, as long as <code>CONFIG_X86_FRED</code> is enabled in your kernel <em>build</em> settings and you don’t compile a whole new kernel.</li>
+<li>This should not affect programs that just follow/dereference the standard arguments &amp; structs that the typical eBPF probes present. The built-in bpf_core_* helper functions and corresponding BPF_CORE_* macros should take care of any “surprises” introduced in newer kernel versions and hide that complexity from you.</li>
+<li>The moment you get into the “raw” eBPF progam territory, you will have to deal with any underlying behavior changes and address shifts yourself. In this case I was doing custom (non-BTF) memory address arithmetic on basic unsigned long ints and later “casting” the resulting number to a struct address. eBPF verifier thankfully allowed me to do that, but I should better know what I’m doing - on the given platform and kernel version!</li>
+</ul>
+<p>I hope this article saves a few hours of head-scratching &amp; troubleshooting time for some future eBPF developers turned into web-searchers out there, just like me a week ago :-)</p>
+<p>HN discussion is here:</p>
+<ul>
+<li><a href="https://news.ycombinator.com/item?id=43214576">https://news.ycombinator.com/item?id=43214576</a></li>
+</ul>
+
+
+</div><p><span>
+    <a href="https://tanelpoder.com/about/"><img src="https://tanelpoder.com/files/images/tanelpoder_small.png"/></a>
+  </span>
+  <span>
+    <em>
+  </em></span><em>
+</em></p></div>
+  </body>
+</html>
