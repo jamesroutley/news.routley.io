@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://nullprogram.com/blog/2025/03/06/">Original</a>
+    <h1>A more robust raw OpenBSD syscall demo</h1>
+    
+    <div id="readability-page-1" class="page"><div lang="en">
+<article>
+  
+  <time datetime="2025-03-06">
+    March 06, 2025
+  </time>
+  <p>
+    nullprogram.com/blog/2025/03/06/
+  </p>
+
+  <p>Ted Unangst published <a href="https://flak.tedunangst.com/post/dude-where-are-your-syscalls"><em>dude, where are your syscalls?</em></a> on flak
+yesterday, with a neat demonstration of OpenBSD’s <a href="https://undeadly.org/cgi?action=article;sid=20230222064027">pinsyscall</a>
+security feature, whereby only pre-registered addresses are allowed to
+make system calls. Whether it strengthens or weakens security is <a href="https://isopenbsdsecu.re/mitigations/pinsyscall/">up for
+debate</a>, but regardless it’s an interesting, low-level programming
+challenge. The original demo is fragile for multiple reasons, and requires
+manually locating and entering addresses for each build. In this article I
+show how to fix it. To prove that it’s robust, I ported an entire, real
+application to use raw system calls on OpenBSD.</p>
+
+<p>The original program uses ARM64 assembly. I’m a lot more comfortable with
+x86-64 assembly, plus that’s the hardware I have readily on hand. So the
+assembly language will be different, but all the concepts apply to both
+these architectures. Almost none of these OpenBSD system interfaces are
+formally documented (or stable for that matter), and I had to dig around
+the OpenBSD source tree to figure it out (along with a <a href="https://news.ycombinator.com/item?id=26290723">helpful jart
+nudge</a>). So don’t be afraid to get your hands dirty.</p>
+
+<p>There are lots of subtle problems in the original demo, so let’s go
+through the program piece by piece, starting with the entry point:</p>
+
+<div><div><pre><code><span>void</span>
+<span>start</span><span>()</span>
+<span>{</span>
+        <span>w</span><span>(</span><span>&#34;hello</span><span>\n</span><span>&#34;</span><span>,</span> <span>6</span><span>);</span>
+        <span>x</span><span>();</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>This function is registered as the entry point in the ELF image, so it has
+no caller. <del>That means no return address on the stack, so the stack is
+not aligned for a function.</del>(<strong>Correction</strong>: The stack alignment issue is
+true for x86, but not ARM, so the original demo is fine.) In toy programs
+that goes unnoticed, but compilers generate code assuming the stack is
+aligned. In a real application this is likely to crash deep on the first
+SIMD register spill.</p>
+
+<p>We could fix this with a <a href="https://gcc.gnu.org/onlinedocs/gcc/x86-Function-Attributes.html#index-force_005falign_005farg_005fpointer-function-attribute_002c-x86"><code>force_align_arg_pointer</code></a> attribute, at
+least for architectures that support it, but I prefer to write the entry
+point in assembly. Especially so we can access the command line arguments
+and environment variables, which is necessary in a real application. That
+happens to work the same as it does on Linux, so here’s my old, familiar
+entry point:</p>
+
+<div><div><pre><code><span>asm</span> <span>(</span>
+    <span>&#34;        .globl _start</span><span>\n</span><span>&#34;</span>
+    <span>&#34;_start: mov   %rsp, %rdi</span><span>\n</span><span>&#34;</span>
+    <span>&#34;        call  start</span><span>\n</span><span>&#34;</span>
+<span>);</span>
+</code></pre></div></div>
+
+<p>Per the ABI, the first argument passes through <code>rdi</code>, so I pass a copy of
+the stack pointer, <code>rsp</code>, as it appeared on entry. Entry point arguments
+<code>argc</code>, <code>argv</code>, and <code>envp</code> are all pushed on the stack at <code>rsp</code>, so the
+first real function can retrieve it all from just the stack pointer. The
+original demo won’t use it, though. Using <code>call</code> to pass control pushes a
+return address, which will never be used, and aligns the stack for the
+first real function. I name it <code>_start</code> because that’s what the linker
+expects and so things will go a little smoother, so it’s rather convenient
+that the original didn’t use this name.</p>
+
+<p>Next up, the “write” function:</p>
+
+<div><div><pre><code><span>int</span>
+<span>w</span><span>(</span><span>void</span> <span>*</span><span>what</span><span>,</span> <span>size_t</span> <span>len</span><span>)</span> <span>{</span>
+        <span>__asm</span><span>(</span>
+<span>&#34;       mov x2, x1;&#34;</span>
+<span>&#34;       mov x1, x0;&#34;</span>
+<span>&#34;       mov w0, #1;&#34;</span>
+<span>&#34;       mov x8, #4;&#34;</span>
+<span>&#34;       svc #0;&#34;</span>
+        <span>);</span>
+        <span>return</span> <span>0</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>There are two <a href="https://nullprogram.com/blog/2024/12/20/">serious problems with this assembly block</a>. First, the
+function arguments are not necessarily in those registers by the time
+control reaches the basic assembly block. The function prologue could move
+them around. Even more so if this function was inlined. This is exactly
+the problem <em>extended</em> inline assembly is intended to solve. Second, it
+clobbers a number of registers. Compilers assume this does not happen when
+generating their own code. This sort of assembly falls apart the moment it
+comes into contact with a non-zero optimization level.</p>
+
+<p>Solving this is just a matter of using inline assembly properly:</p>
+
+<div><div><pre><code><span>long</span> <span>w</span><span>(</span><span>void</span> <span>*</span><span>what</span><span>,</span> <span>long</span> <span>len</span><span>)</span>
+<span>{</span>
+    <span>char</span> <span>err</span><span>;</span>
+    <span>long</span> <span>rax</span> <span>=</span> <span>4</span><span>;</span>  <span>// SYS_write</span>
+    <span>asm</span> <span>volatile</span> <span>(</span>
+        <span>&#34;syscall&#34;</span>
+        <span>:</span> <span>&#34;+a&#34;</span><span>(</span><span>rax</span><span>),</span> <span>&#34;+d&#34;</span><span>(</span><span>len</span><span>),</span> <span>&#34;=@ccc&#34;</span><span>(</span><span>err</span><span>)</span>
+        <span>:</span> <span>&#34;D&#34;</span><span>(</span><span>1</span><span>),</span> <span>&#34;S&#34;</span><span>(</span><span>what</span><span>)</span>
+        <span>:</span> <span>&#34;rcx&#34;</span><span>,</span> <span>&#34;r11&#34;</span><span>,</span> <span>&#34;memory&#34;</span>
+    <span>);</span>
+    <span>return</span> <span>err</span> <span>?</span> <span>-</span><span>rax</span> <span>:</span> <span>rax</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>I’ve enhanced it a bit, returning a <a href="https://nullprogram.com/blog/2016/09/23/">Linux-style negative errno</a> on
+error. In the BSD ecosystem, syscall errors are indicated using the carry
+flag, which here is output into <code>err</code> via <code>=@ccc</code>. When set, the return
+value is an errno. Further, the OpenBSD kernel uses both <code>rax</code> and <code>rdx</code>
+for return values, so I’ve also listed <code>rdx</code> as an input+output despite
+not consuming the result. Despite all these changes, this function is not
+yet complete! We’ll get back to it later.</p>
+
+<p>The “exit” function, <code>x</code>, is just fine:</p>
+
+<div><div><pre><code><span>void</span>
+<span>x</span><span>()</span> <span>{</span>
+        <span>__asm</span><span>(</span>
+<span>&#34;       mov x8, #1;&#34;</span>
+<span>&#34;       svc #0;&#34;</span>
+        <span>);</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>It doesn’t set an exit status, so it passes garbage instead, but otherwise
+this works. No inputs, plus clobbers and outputs don’t matter when control
+never returns. In a real application I might write it:</p>
+
+<div><div><pre><code><span>__attribute</span><span>((</span><span>noreturn</span><span>))</span>
+<span>void</span> <span>x</span><span>(</span><span>int</span> <span>status</span><span>)</span>
+<span>{</span>
+    <span>asm</span> <span>volatile</span> <span>(</span><span>&#34;syscall&#34;</span> <span>::</span> <span>&#34;a&#34;</span><span>(</span><span>1</span><span>),</span> <span>&#34;D&#34;</span><span>(</span><span>status</span><span>));</span>
+    <span>__builtin_unreachable</span><span>();</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>This function will need a little additional work later, too.</p>
+
+<p>The <code>ident</code> section is basically fine as-is:</p>
+
+<div><div><pre><code><span>__asm</span><span>(</span><span>&#34; .section </span><span>\&#34;</span><span>.note.openbsd.ident</span><span>\&#34;</span><span>, </span><span>\&#34;</span><span>a</span><span>\&#34;\n</span><span>&#34;</span>
+<span>&#34;       .p2align 2</span><span>\n</span><span>&#34;</span>
+<span>&#34;       .long   8</span><span>\n</span><span>&#34;</span>
+<span>&#34;       .long   4</span><span>\n</span><span>&#34;</span>
+<span>&#34;       .long   1</span><span>\n</span><span>&#34;</span>
+<span>&#34;       .ascii </span><span>\&#34;</span><span>OpenBSD</span><span>\\</span><span>0</span><span>\&#34;\n</span><span>&#34;</span>
+<span>&#34;       .long   0</span><span>\n</span><span>&#34;</span>
+<span>&#34;       .previous</span><span>\n</span><span>&#34;</span><span>);</span>
+</code></pre></div></div>
+
+<p>The compiler assumes the current section remains the same at the end of
+the assembly block, which here is accomplished with <code>.previous</code>. Though it
+clobbers the assembler’s remembered “other” section and so may interfere
+with surrounding code using <code>.previous</code>. Better to use <code>.pushsection</code> and
+<code>.popsection</code> for good stack discipline. There are many such examples in
+the OpenBSD source tree.</p>
+
+<div><div><pre><code><span>asm</span> <span>(</span>
+    <span>&#34;.pushsection .note.openbsd.ident, </span><span>\&#34;</span><span>a</span><span>\&#34;\n</span><span>&#34;</span>
+    <span>&#34;.long  8, 4, 1, 0x6e65704f, 0x00445342, 0</span><span>\n</span><span>&#34;</span>
+    <span>&#34;.popsection</span><span>\n</span><span>&#34;</span>
+<span>);</span>
+</code></pre></div></div>
+
+<p>Now the trickiest part, the pinsyscall table:</p>
+
+<div><div><pre><code><span>struct</span> <span>whats</span> <span>{</span>
+        <span>unsigned</span> <span>int</span> <span>offset</span><span>;</span>
+        <span>unsigned</span> <span>int</span> <span>sysno</span><span>;</span>
+<span>}</span> <span>happening</span><span>[]</span> <span>__attribute__</span><span>((</span><span>section</span><span>(</span><span>&#34;.openbsd.syscalls&#34;</span><span>)))</span> <span>=</span> <span>{</span>
+        <span>{</span> <span>0x104f4</span><span>,</span> <span>4</span> <span>},</span>
+        <span>{</span> <span>0x10530</span><span>,</span> <span>1</span> <span>},</span>
+<span>};</span>
+</code></pre></div></div>
+
+<p>Those offsets — offsets from the beginning of the ELF image — were entered
+manually, and it kind of ruins the whole demo. We don’t have a good way to
+get at those offsets from C, or any high level language. However, we can
+solve that by tweaking the inline assembly with some labels:</p>
+
+<div><div><pre><code><span>__attribute</span><span>((</span><span>noinline</span><span>))</span>
+<span>long</span> <span>w</span><span>(</span><span>void</span> <span>*</span><span>what</span><span>,</span> <span>long</span> <span>len</span><span>)</span>
+<span>{</span>
+    <span>// ...</span>
+    <span>asm</span> <span>volatile</span> <span>(</span>
+        <span>&#34;_w: syscall&#34;</span>
+        <span>// ...</span>
+    <span>);</span>
+    <span>// ...</span>
+<span>}</span>
+
+<span>__attribute</span><span>((</span><span>noinline</span><span>,</span><span>noreturn</span><span>))</span>
+<span>void</span> <span>x</span><span>(</span><span>int</span> <span>status</span><span>)</span>
+<span>{</span>
+    <span>asm</span> <span>volatile</span> <span>(</span>
+        <span>&#34;_x: syscall&#34;</span>
+        <span>// ...</span>
+    <span>);</span>
+    <span>// ...</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Very importantly I’ve added <code>noinline</code> to prevent these functions from
+being inlined into additional copies of the <code>syscall</code> instruction, which
+of course won’t be registered. This also prevents duplicate labels causing
+assembler errors. Once we have the labels, we can use them in an assembly
+block listing the allowed syscall instructions:</p>
+
+<div><div><pre><code><span>asm</span> <span>(</span>
+    <span>&#34;.pushsection .openbsd.syscalls</span><span>\n</span><span>&#34;</span>
+    <span>&#34;.long  _x, 1</span><span>\n</span><span>&#34;</span>
+    <span>&#34;.long  _w, 4</span><span>\n</span><span>&#34;</span>
+    <span>&#34;.popsection</span><span>\n</span><span>&#34;</span>
+<span>);</span>
+</code></pre></div></div>
+
+<p>That lets the linker solve the offsets problem, which is its main job
+after all. With these changes the demo works reliably, even under high
+optimization levels. I suggest these flags:</p>
+
+<div><div><pre><code>$ cc -static -nostdlib -no-pie -o where where.c
+</code></pre></div></div>
+
+<p>Disabling PIE with <code>-no-pie</code> is necessary in real applications or else
+strings won’t work. You can apply more flags to strip it down further, but
+these are the flags generally necessary to compile these sorts of programs
+on at least OpenBSD 7.6.</p>
+
+<p>So, how do I know this stuff works in general? Because I ported <a href="https://nullprogram.com/blog/2023/01/18/">my ultra
+portable pkg-config clone, u-config</a>, to use raw OpenBSD syscalls:
+<strong><a href="https://github.com/skeeto/u-config/blob/openbsd/openbsd_main.c"><code>openbsd_main.c</code></a></strong>. Everything still works at high optimization
+levels.</p>
+
+<div><div><pre><code>$ cc -static -nostartfiles -no-pie -o pkg-config openbsd_main.c libmemory.a
+$ ./pkg-config --cflags --libs libcurl
+-I/usr/local/include -L/usr/local/lib -lcurl
+</code></pre></div></div>
+
+<p>Because the new syscall wrappers behave just like Linux system calls, it
+leverages the <code>linux_noarch.c</code> platform, and the whole port is ~70 lines
+of code. A few more flags (<code>-fno-stack-protector</code>, <code>-Oz</code>, <code>-s</code>, etc.), and
+it squeezes into a slim 21.6K static binary.</p>
+
+<p>Despite making no libc calls, it’s not possible stop compilers from
+fabricating (<a href="https://nullprogram.com/blog/2024/11/10/">hallucinating?</a>) string function calls, so the build
+above depends on external definitions. In the command above, <code>libmemory.a</code>
+comes from <a href="https://github.com/skeeto/w64devkit/blob/master/src/libmemory.c"><code>libmemory.c</code></a> found <a href="https://nullprogram.com/blog/2024/02/05/">in w64devkit</a>. Alternatively,
+<a href="https://flak.tedunangst.com/post/you-dont-link-all-of-libc">and on topic</a>, you could link the OpenBSD libc string functions by
+omitting <code>libmemory.a</code> from the build.</p>
+
+<div><div><pre><code>$ cc -static -nostartfiles -no-pie -o pkg-config openbsd_main.c
+</code></pre></div></div>
+
+<p>Though it pulls in a lot of bloat (~8x size increase), and teasing out the
+necessary objects isn’t trivial.</p>
+
+
+
+  
+  <ol></ol>
+
+  
+
+  <nav>
+  
+    
+  
+  
+  </nav>
+</article>
+
+</div></div>
+  </body>
+</html>
