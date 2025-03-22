@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://maksimkita.com/blog/lock-contention.html">Original</a>
+    <h1>Lock Contention</h1>
+    
+    <div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <h2 id="overview">Overview</h2>
+
+<p>Recently, I revisited <a href="https://www.tinybird.co/blog-posts/clickhouse-lock-contention">Resolving a year-long ClickHouse lock contention</a> post and spoke about it
+at C++ Russia 2025 conference.</p>
+
+<p>I wanted to provide more information about the development process and some technical details that were not covered in the original post.</p>
+
+<h2 id="motivation">Motivation</h2>
+
+<p>In 2022 in Tinybird, there was a huge CPU underutilization in one of our clusters during the high load period.</p>
+
+<p><img src="https://maksimkita.com/images/context_lock_cpu_average.png" alt="CPU underutilization in one of our biggest clusters"/></p>
+
+<p>It was unclear what was the issue. There were no IO/Network/Memory bottlenecks. In ClickHouse all async metrics and query profile events were normal.
+The only unusual thing was that with increased queries throughput, ClickHouse could not handle the load, and CPU usage was very low.</p>
+
+<p>The problem continued for a year and during similar incidents, we could not find any clues.</p>
+
+<p>One year later during a similar incident, we spotted that <code>ContextLockWait</code> async metric periodically increased. <a href="https://clickhouse.com/docs/operations/system-tables/asynchronous_metrics">Async metrics</a> are calculated periodically with some interval and include for example memory usage, and some global metrics. Client can read them using <code>system.asynchronous_metrics</code> table. And one of such metrics is <code>ContextLockWait</code>, it tells you how many threads are waiting for a <code>Context</code> lock.</p>
+
+<p><img src="https://maksimkita.com/images/context_lock_events.png" alt="ContextLockWait async metrics event periodically increased"/></p>
+
+<p>It is normal that during high load such metric can increase because of increased contention on <code>Context</code> lock. But it was very unusual because the normal value of this metric is around <code>0</code>, so I started to investigate the issue from the ClickHouse internals side.</p>
+
+<p>During the incident, I periodically dumped all threads stack traces to understand how many threads were blocked on lock inside <code>Context</code>. It is possible to dump all threads stack traces in ClickHouse using <code>system.stack_trace</code> table and the following query:</p>
+
+<pre>WITH arrayMap(x -&gt; demangle(addressToSymbol(x)), trace) AS all
+SELECT thread_name, thread_id, query_id, arrayStringConcat(all, &#39;\n&#39;) AS res
+FROM <b>system.stack_trace</b> LIMIT 1 FORMAT Vertical;
+
+Row 1:
+──────
+thread_name: clickhouse-serv
+thread_id:   125441
+query_id:
+res:         pthread_cond_wait
+std::__1::condition_variable::wait(std::__1::unique_lock&lt;std::__1::mutex&gt;&amp;)
+BaseDaemon::waitForTerminationRequest()
+DB::Server::main(/*arguments*/)
+Poco::Util::Application::run()
+DB::Server::run()
+Poco::Util::ServerApplication::run(int, char**)
+mainEntryClickHouseServer(int, char**)
+main
+__libc_start_main
+_start
+</pre>
+
+<p>Every 10-15 seconds I dumped all threads stack traces to later check if there were any patterns where threads were spending time. After the incident, I was able to see that most of the threads were blocked on <code>Context</code> class methods that needed to take a <code>Context</code> lock, for example <code>Context::getSettings()</code>.</p>
+
+<p>After that I was almost sure that the problem was in <code>Context</code> lock contention and started to investigate this particular lock.</p>
+
+<h2 id="adding-contextlockwaitmicroseconds">Adding ContextLockWaitMicroseconds</h2>
+
+<p>In ClickHouse there are per query profile events that are defined like this:</p>
+
+<pre>M(<b>GlobalThreadPoolJobs</b>,
+  &#34;Counts the number of jobs that have been pushed to the global thread pool.&#34;,
+  ValueType::Number) \
+
+M(<b>GlobalThreadPoolLockWaitMicroseconds</b>,
+  &#34;Total time threads have spent waiting for locks in the global thread pool.&#34;,
+  ValueType::Microseconds) \
+
+M(<b>GlobalThreadPoolJobWaitTimeMicroseconds</b>,
+  &#34;Measures the elapsed time from when a job is scheduled in the thread pool to when it is picked up
+  for execution by a worker thread. This metric helps identify delays in job processing, indicating
+  the responsiveness of the thread pool to new tasks.&#34;,
+  ValueType::Microseconds) \
+
+M(<b>LocalThreadPoolLockWaitMicroseconds</b>,
+  &#34;Total time threads have spent waiting for locks in the local thread pools.&#34;,
+   ValueType::Microseconds) \
+</pre>
+
+<p>As you can see they can have different types like <code>ValueType::Number</code> or <code>ValueType::Microseconds</code>. We already have a lot of metrics for locks for which we can have heavy contention. For example,
+you can see that there is <code>GlobalThreadPoolLockWaitMicroseconds</code> event that allows you to see how much time threads spend waiting for locks in the global thread pool. Unfortunately,
+for <code>Context</code> lock we did not have a similar metric, we only had <code>ContextLock</code> event that tells you how many times the <code>Context</code> lock was acquired or tried to acquire. It is not enough to
+understand if there is a problem with <code>Context</code> lock contention, because it is expected that query can take this lock many times during query execution to read query settings, query current database, etc. We need a metric that tells us how much time threads in the query spend waiting for a <code>Context</code> lock, similar to the <code>GlobalThreadPoolLockWaitMicroseconds</code> event.</p>
+
+<p>The first step was to add the <code>ContextLockWaitMicroseconds</code> event to profile events in <a href="https://github.com/ClickHouse/ClickHouse/pull/55029">https://github.com/ClickHouse/ClickHouse/pull/55029</a>:</p>
+
+<pre>M(ContextLock,
+    &#34;Number of times the lock of Context was acquired or tried to acquire. This is global lock.&#34;,
+    ValueType::Number) \
+
+M(<b>ContextLockWaitMicroseconds</b>,
+    &#34;Context lock wait time in microseconds&#34;,
+    ValueType::Microseconds) \
+</pre>
+
+<p>During the development of the pull request, I already discovered that the problem was in the <code>Context</code> lock because I was able to reproduce performance issue locally using the <code>ContextLockWaitMicroseconds</code> metric to track the amount of time threads in the query spend waiting for the <code>Context</code> lock.</p>
+
+<p>I took an example query that takes 5 milliseconds to execute:</p>
+<pre>SELECT UserID, count(*) FROM (SELECT * FROM hits_clickbench LIMIT 10) GROUP BY UserID
+0 rows in set. Elapsed: 0.005 sec.
+</pre>
+
+<p>And tried to run 200 such queries concurrently for a couple of minutes:</p>
+<pre>clickhouse-benchmark --query=&#34;SELECT UserID, count(*) FROM (SELECT * FROM hits_clickbench LIMIT 10)
+GROUP BY UserID&#34; --concurrency=200
+</pre>
+
+<p>And checked the results:</p>
+<pre>SELECT quantileExact(0.5)(lock_wait_milliseconds), max(lock_wait_milliseconds) FROM
+(
+    SELECT (ProfileEvents[&#39;ContextLockWaitMicroseconds&#39;] / 1000.0) AS lock_wait_milliseconds
+    FROM system.query_log WHERE lock_wait_milliseconds &gt; 0
+)
+
+┌─<b>quantileExact(0.5)(lock_wait_milliseconds)</b>─┬─<b>max(lock_wait_milliseconds)</b>──┐
+│                                     <b>17.452</b> │                      <b>382.326</b> │
+└────────────────────────────────────────────┴──────────────────────────────┘
+</pre>
+
+<p>As you can see, some queries wait for the <code>Context</code> lock for 382 milliseconds, and the median wait time is 17 milliseconds, which is unacceptable.</p>
+
+<h2 id="context-lock-redesign">Context Lock Redesign</h2>
+
+<p>There are actually two types of <code>Context</code> in ClickHouse:</p>
+
+<ol>
+  <li>
+    <p><code>ContextSharedPart</code> is responsible for storing and providing access to global shared objects that are shared between all sessions and queries, for example: Thread pools,
+Server paths, Global trackers, Clusters information.</p>
+  </li>
+  <li>
+    <p><code>Context</code> is responsible for storing and providing access to query or session-specific objects, for example: query settings, query caches, query current database.</p>
+  </li>
+</ol>
+
+<p>Architecture before redesign looked like this:</p>
+
+<p><img src="https://maksimkita.com/images/context_lock_architecture_before_redesign.svg" alt="ContextLock architecture before redesign"/></p>
+
+<p>The problem was that a single mutex was used for most of the synchronization between <code>Context</code> and <code>ContextSharedPart</code>, even when we worked with objects local to <code>Context</code>. For example, when a thread wants to read local query settings from <code>Context</code>, it needs to lock the <code>ContextSharedPart</code> mutex, which leads to huge contention if there is a high number of low latency queries.</p>
+
+<p>During query execution, ClickHouse can create a lot of Contexts because each subquery in ClickHouse can have unique settings. For example:</p>
+<pre>SELECT id, value
+FROM (
+    SELECT id, value
+    FROM test_table
+    SETTINGS max_threads = 16
+)
+WHERE id &gt; 10
+SETTINGS max_threads = 32
+</pre>
+
+<p>In this example, we want to execute the inner subquery with <code>max_threads = 16</code> and the outer subquery with <code>max_threads = 32</code>. A large number of low latency, concurrent queries with many subqueries will create a lot of Contexts per query, and the problem will become even bigger.</p>
+
+<p>It is actually common to have global <code>Context</code> or <code>ApplicationContext</code> classes in projects and put everything in them. When synchronization is required, it is usually implemented initially with a single mutex. But later, if lock contention becomes an issue, it needs to be redesigned to use a more sophisticated approach.</p>
+
+<p>The idea was to replace a single global mutex with two read-write mutexes <a href="https://en.wikipedia.org/wiki/Readers%E2%80%93writer_lock">readers–writer lock</a>. One global read-write mutex for <code>ContextSharedPart</code> and one local read-write mutex for each <code>Context</code>.</p>
+
+<p>Read-write mutexes are used because we usually do a lot of concurrent reads (for example, read settings or some path) and rarely concurrent writes. For example, for <code>ContextSharedPart</code> object, we could rewrite some fields during configuration hot reload, but it is very rare. For <code>Context</code> object during query execution query current database, query settings are almost never changed after the query is parsed and analyzed.</p>
+
+<p>In many places, I completely got rid of synchronization where it was used for initialization of some objects and used <a href="https://en.cppreference.com/w/cpp/thread/call_once">call_once</a> for objects that are initialized only once.</p>
+
+<p>Context lock redesign was implemented in the scope of the pull request: <a href="https://github.com/ClickHouse/ClickHouse/pull/55121">https://github.com/ClickHouse/ClickHouse/pull/55121</a>.</p>
+
+<p>Here is how the architecture looks after redesign:</p>
+
+<p><img src="https://maksimkita.com/images/context_lock_architecture_after_redesign.svg" alt="ContextLock architecture after redesign"/></p>
+
+<h2 id="thread-safety-analysis">Thread Safety Analysis</h2>
+
+<p>Context lock redesign was conceptually very simple, but it was very hard to implement it correctly without introducing synchronization issues. <code>ContextSharedPart</code> and <code>Context</code> both contain a lot of fields and methods with complex synchronization logic and it was very hard to properly split synchronization between them manually. It was unclear how to be sure that all locks were used properly and that there were no synchronization issues after refactoring.</p>
+
+<p>The solution was to use Clang <a href="https://clang.llvm.org/docs/ThreadSafetyAnalysis.html">Thread Safety Analysis</a> and add necessary annotations to mutexes, fields, and methods of <code>Context</code> and <code>ContextSharedPart</code>. Now I want to explain in detail how this was done and what problems I had.</p>
+
+<p>To use Clang thread safety analysis, compile your code with the <code>-Wthread-safety</code> flag. In production, you need to use <code>-Werror</code> or mark this particular <code>thread-safety</code> warning as an error.</p>
+
+<pre>clang -c -Wthread-safety example.cpp
+</pre>
+
+<p>In Clang thread safety analysis documentation, there is an example of how to use thread safety annotations:</p>
+
+<pre>class BankAccount {
+private:
+    <b>Mutex mu;</b>
+    int   balance <b>GUARDED_BY(mu)</b>;
+
+    void depositImpl(int amount) <b>/* TO FIX: REQUIRES(mu) */</b> {
+        balance += amount;       // WARNING! Cannot write balance without locking mu.
+    }
+
+    void withdrawImpl(int amount) <b>REQUIRES(mu)</b> {
+        balance -= amount;       // OK. Caller must have locked mu.
+    }
+
+public:
+    void withdraw(int amount) {
+        mu.Lock();
+        withdrawImpl(amount);    // OK.  We&#39;ve locked mu.
+        <b>/* TO FIX: mu.unlock() or use std::lock_guard */</b>
+    }                          // WARNING!  Failed to unlock mu.
+
+    void transferFrom(BankAccount&amp; b, int amount) {
+        mu.Lock();
+        <b>/* TO FIX: lock() and unlock() b.mu potentially use std::lock_guard*/</b>
+        b.withdrawImpl(amount);  // WARNING!  Calling withdrawImpl() requires locking b.mu.
+        depositImpl(amount);     // OK.  depositImpl() has no requirements.
+        mu.Unlock();
+    }
+};
+</pre>
+
+<p>I added <code>TO FIX</code> comments to fix warnings in places where you will see warnings after running thread safety analysis. Here are the most important concepts from Clang
+thread safety analysis documentation:</p>
+
+<blockquote>
+  <p>Thread safety analysis provides a way of protecting resources with capabilities.
+A resource is either a data member, or a function/method that provides access to some underlying resource.
+The analysis ensures that the calling thread cannot access the resource (i.e. call the function, or read/write the data) unless it has the capability to do so.</p>
+</blockquote>
+
+<blockquote>
+  <p>A thread may hold a capability either exclusively or shared. An exclusive capability can be held by only one thread at a time,
+while a shared capability can be held by many threads at the same time. This mechanism enforces a multiple-reader, single-writer pattern.
+Write operations to protected data require exclusive access, while read operations require only shared access.</p>
+</blockquote>
+
+<blockquote>
+  <p>Capabilities are associated with named C++ objects which declare specific methods to acquire and release the capability. The name of
+the object serves to identify the capability. The most common example is a mutex. For example, if <code>mu</code> is a mutex,
+then calling <code>mu.Lock()</code> causes the calling thread to acquire the capability to access data that is protected by <code>mu</code>.
+Similarly, calling <code>mu.Unlock()</code> releases that capability.</p>
+</blockquote>
+
+<p>Clang thread safety annotations can be split into three different categories. Here are the most commonly used annotations:</p>
+<ol>
+  <li>For the implementation of capability classes and functions: <code>CAPABILITY(...)</code>, <code>SCOPED_CAPABILITY</code>, <code>ACQUIRE(…)</code>,
+<code>ACQUIRE_SHARED(…)</code>, <code>RELEASE(…)</code>, <code>RELEASE_SHARED(…)</code>, <code>RELEASE_GENERIC(…)</code></li>
+  <li>For protecting fields and methods: <code>GUARDED_BY(...)</code>, <code>PT_GUARDED_BY(...)</code>, <code>REQUIRES(…)</code>, <code>REQUIRES_SHARED(…)</code></li>
+  <li>Utility: <code>NO_THREAD_SAFETY_ANALYSIS</code></li>
+</ol>
+
+<p>Those annotations are very flexible and allow you to combine them in different ways. For example, you can use <code>REQUIRES</code> annotation that takes multiple mutexes:</p>
+
+<pre>Mutex mutex_1, mutex_2;
+int a GUARDED_BY(mutex_1);
+int b GUARDED_BY(mutex_2);
+
+void test() REQUIRES(mutex_1, mutex_2) {
+    a = 0;
+    b = 0;
+}
+</pre>
+
+<p>In the LLVM standard library, all mutex implementations are annotated with thread safety annotations. Example <code>std::mutex</code>:</p>
+
+<pre>class _LIBCPP_TYPE_VIS <b>_LIBCPP_THREAD_SAFETY_ANNOTATION(capability(&#34;mutex&#34;))</b> mutex
+{
+    __libcpp_mutex_t __m_ = _LIBCPP_MUTEX_INITIALIZER;
+
+public:
+    _LIBCPP_INLINE_VISIBILITY
+    _LIBCPP_CONSTEXPR mutex() = default;
+
+    mutex(const mutex&amp;) = delete;
+    mutex&amp; operator=(const mutex&amp;) = delete;
+
+#if defined(_LIBCPP_HAS_TRIVIAL_MUTEX_DESTRUCTION)
+    ~mutex() = default;
+#else
+    ~mutex() _NOEXCEPT;
+#endif
+
+    <b>void lock() _LIBCPP_THREAD_SAFETY_ANNOTATION(acquire_capability())</b>;
+    <b>bool try_lock() _NOEXCEPT _LIBCPP_THREAD_SAFETY_ANNOTATION(try_acquire_capability(true))</b>;
+    <b>void unlock() _NOEXCEPT _LIBCPP_THREAD_SAFETY_ANNOTATION(release_capability())</b>;
+
+    typedef __libcpp_mutex_t* native_handle_type;
+    _LIBCPP_INLINE_VISIBILITY native_handle_type native_handle() {return &amp;__m_;}
+};
+</pre>
+
+<p>Clang thread safety analysis is a great tool for catching synchronization errors in code. However, it can have some problems for production usage out of the box.</p>
+
+<p>ClickHouse has its own implementation of some synchronization primitives, such as the implementation of <code>std::shared_mutex</code>, because the standard library implementation is slow. We also want to have mutexes with additional logic during <code>lock</code>/<code>unlock</code>, such as updating metrics or profile events. In both cases, we do not want to have a lot of duplicated thread safety annotations in all of our mutexes. We want to hide them and have a generic solution.</p>
+
+<p>To solve this problems, I designed <code>SharedMutexHelper</code> template class using <a href="https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern">CRTP pattern</a> that implements <code>SharedMutex</code> standard library requirements <a href="https://en.cppreference.com/w/cpp/named_req/SharedMutex">https://en.cppreference.com/w/cpp/named_req/SharedMutex</a> and adds thread safety annotations.</p>
+
+<pre>template &lt;typename Derived, typename MutexType = SharedMutex&gt;
+class <b>TSA_CAPABILITY(&#34;SharedMutexHelper&#34;)</b> SharedMutexHelper
+{
+    auto &amp; getDerived() { return static_cast&lt;Derived &amp;&gt;(*this); }
+
+public:
+    // Exclusive ownership
+    void <b>lock() TSA_ACQUIRE()</b> { getDerived().lockImpl(); }
+
+    bool <b>try_lock() TSA_TRY_ACQUIRE(true)</b> { getDerived().tryLockImpl(); }
+
+    void <b>unlock() TSA_RELEASE()</b> { getDerived().unlockImpl(); }
+
+    // Shared ownership
+    void <b>lock_shared() TSA_ACQUIRE_SHARED()</b> { getDerived().lockSharedImpl(); }
+
+    bool <b>try_lock_shared() TSA_TRY_ACQUIRE_SHARED(true)</b> { getDerived().tryLockSharedImpl(); }
+
+    void <b>unlock_shared() TSA_RELEASE_SHARED()</b> { getDerived().unlockSharedImpl(); }
+
+protected:
+    /// Default implementations for all *Impl methods.
+    void lockImpl() TSA_NO_THREAD_SAFETY_ANALYSIS { mutex.lock(); }
+
+    ...
+
+    void unlockSharedImpl() TSA_NO_THREAD_SAFETY_ANALYSIS { mutex.unlock_shared(); }
+
+    MutexType mutex;
+};</pre>
+
+<p><code>SharedMutexHelper</code> implements all necessary methods for <code>SharedMutex</code> requirements and, by default, delegates all methods to <code>MutexType</code> implementation. The derived class must subclass <code>SharedMutexHelper</code> and override only the necessary <code>lockImpl</code>, <code>tryLockImpl</code>, <code>unlockImpl</code>, <code>lockSharedImpl</code>, <code>tryLockSharedImpl</code>, and <code>unlockSharedImpl</code> methods.</p>
+
+<p>Here is a concrete implementation of <code>ContextSharedMutex</code>:</p>
+
+<pre>class ContextSharedMutex : public SharedMutexHelper&lt;ContextSharedMutex&gt;
+{
+private:
+    using Base = SharedMutexHelper&lt;ContextSharedMutex, SharedMutex&gt;;
+    friend class SharedMutexHelper&lt;ContextSharedMutex, SharedMutex&gt;;
+
+    void <b>lockImpl</b>()
+    {
+        ProfileEvents::increment(ProfileEvents::ContextLock);
+        CurrentMetrics::Increment increment{CurrentMetrics::ContextLockWait};
+        Stopwatch watch;
+        Base::lockImpl();
+        ProfileEvents::increment(ProfileEvents::ContextLockWaitMicroseconds,
+            watch.elapsedMicroseconds());
+    }
+
+    void <b>lockSharedImpl</b>()
+    {
+        ProfileEvents::increment(ProfileEvents::ContextLock);
+        CurrentMetrics::Increment increment{CurrentMetrics::ContextLockWait};
+        Stopwatch watch;
+        Base::lockSharedImpl();
+        ProfileEvents::increment(ProfileEvents::ContextLockWaitMicroseconds,
+            watch.elapsedMicroseconds());
+    }
+};
+</pre>
+
+<p>As you can see, <code>ContextSharedMutex</code> overrides only <code>lockImpl</code> and <code>lockSharedImpl</code> methods and, in these methods, updates metrics.</p>
+
+<p>Another problem was that in the LLVM standard library, <code>std::shared_lock</code> does not support thread safety analysis. This is probably because this class is movable, and thread safety annotations do not have support for movable locks. For example, <code>std::unique_lock</code> also does not support thread safety analysis.</p>
+
+<p>To solve this issue, I implemented <code>SharedLockGuard</code> analog of <code>std::lock_guard</code>, but for shared mutexes:</p>
+
+<pre>template &lt;typename Mutex&gt;
+class <b>TSA_SCOPED_LOCKABLE</b> SharedLockGuard
+{
+public:
+    explicit SharedLockGuard(Mutex &amp; mutex_) <b>TSA_ACQUIRE_SHARED(mutex_)</b>
+        : mutex(mutex_) { mutex_.lock_shared(); }
+
+    ~SharedLockGuard() <b>TSA_RELEASE()</b> { mutex.unlock_shared(); }
+
+private:
+    Mutex &amp; mutex;
+};
+</pre>
+
+<p>Let’s see an example of thread safety analysis usage in <code>ContextSharedPart</code>. We declare which fields are guarded by <code>ContextSharedMutex</code> mutex.</p>
+
+<pre>struct ContextSharedPart : boost::noncopyable
+{
+    /// For access of most of shared objects.
+    <b>mutable ContextSharedMutex mutex;</b>
+
+    /// Path to the data directory, with a slash at the end.
+    String path <b>TSA_GUARDED_BY(mutex)</b>;
+
+    /// Path to the directory with some control flags for server maintenance.
+    String flags_path <b>TSA_GUARDED_BY(mutex)</b>;
+
+    /// Path to the directory with user provided files, usable by &#39;file&#39; table function.
+    String dictionaries_lib_path <b>TSA_GUARDED_BY(mutex)</b>;
+
+    /// Path to the directory with user provided scripts.
+    String user_scripts_path <b>TSA_GUARDED_BY(mutex)</b>;
+
+    /// Path to the directory with filesystem caches.
+    String filesystem_caches_path <b>TSA_GUARDED_BY(mutex)</b>;
+
+    /// Path to the directory with user provided filesystem caches.
+    String filesystem_cache_user_path <b>TSA_GUARDED_BY(mutex)</b>;
+
+    /// Global configuration settings.
+    ConfigurationPtr config <b>TSA_GUARDED_BY(mutex)</b>;
+};
+</pre>
+
+<p>Then, in <code>ContextSharedPart</code> methods that need to access guarded fields, we use <code>SharedLockGuard</code> for shared access or <code>std::lock_guard</code> for exclusive access:</p>
+
+<pre>String Context::getPath() const
+{
+    SharedLockGuard lock(shared-&gt;mutex);
+    return shared-&gt;path;
+}
+
+String Context::getFlagsPath() const
+{
+    SharedLockGuard lock(shared-&gt;mutex);
+    return shared-&gt;flags_path;
+}
+
+String Context::getUserFilesPath() const
+{
+    SharedLockGuard lock(shared-&gt;mutex);
+    return shared-&gt;user_files_path;
+}
+
+String Context::getDictionariesLibPath() const
+{
+    SharedLockGuard lock(shared-&gt;mutex);
+    return shared-&gt;dictionaries_lib_path;
+}
+
+void Context::setPath(const String &amp; path)
+{
+    std::lock_guard lock(shared-&gt;mutex);
+
+    shared-&gt;path = path;
+
+    if (shared-&gt;tmp_path.empty() &amp;&amp; !shared-&gt;root_temp_data_on_disk)
+        shared-&gt;tmp_path = shared-&gt;path + &#34;tmp/&#34;;
+
+    if (shared-&gt;flags_path.empty())
+        shared-&gt;flags_path = shared-&gt;path + &#34;flags/&#34;;
+
+    if (shared-&gt;user_files_path.empty())
+        shared-&gt;user_files_path = shared-&gt;path + &#34;user_files/&#34;;
+
+    if (shared-&gt;dictionaries_lib_path.empty())
+        shared-&gt;dictionaries_lib_path = shared-&gt;path + &#34;dictionaries_lib/&#34;;
+
+    if (shared-&gt;user_scripts_path.empty())
+        shared-&gt;user_scripts_path = shared-&gt;path + &#34;user_scripts/&#34;;
+}
+</pre>
+
+<p>I implemented thread safety analysis refactoring in this pull request <a href="https://github.com/ClickHouse/ClickHouse/pull/55278">https://github.com/ClickHouse/ClickHouse/pull/55278</a>.</p>
+
+<h2 id="performance-improvements">Performance improvements</h2>
+
+<p>In Tinybird, we had a synthetic benchmark that contained a lot of low latency queries. We ran this benchmark with the old and new ClickHouse version (after <code>Context</code> lock redesign):</p>
+
+<pre>clickhouse benchmark -r --ignore-error \
+--concurrency=500 \
+--timelimit 600 \
+--connect_timeout=20 &lt; queries.txt
+</pre>
+
+<p>And had the following results:</p>
+
+<ol>
+  <li>
+    <p>Before ~200 QPS. After ~600 QPS (<strong>~3x better</strong>).</p>
+  </li>
+  <li>
+    <p>Before CPU utilization of only ~20%. After ~60% (<strong>~3x better</strong>).</p>
+  </li>
+  <li>
+    <p>Before median query time 1s. After ~0.6s (<strong>~2x better</strong>).</p>
+  </li>
+  <li>
+    <p>Before slowest queries took ~75s. After ~6s (<strong>~12x better</strong>).</p>
+  </li>
+</ol>
+
+<p>As you can see in such benchmark, we were not able to utilize ClickHouse to 100% CPU usage because of low concurrency. We were able to fully utilize ClickHouse instance with <code>--concurrency=1000</code> and had
+around ~1000 QPS and ~95-96% CPU utilization.</p>
+
+<p>With more complex production queries, ClickHouse will most likely hit another bottleneck. However, we definitely removed <code>Context</code> lock contention as a potential bottleneck.</p>
+
+<h2 id="conclusion">Conclusion</h2>
+
+<p>Lock contention is a very common source of performance issues in modern high concurrency systems. You can think of it the same way as a CPU/Memory/IO/Network bound, like the LockContention bound.</p>
+
+<p>To detect such issues you can try to use <a href="https://www.brendangregg.com/offcpuanalysis.html">off-cpu analysis</a> and introduce additional application level metrics that will tell you how much time threads spend in different locks.</p>
+
+<p>It is also a good idea to use all available tooling as much as possible, including runtime tools like address/memory/thread/undefined-behavior sanitizers and compile-time tools like Clang thread safety analysis.</p>
+
+  </div>
+</article>
+
+      </div>
+    </div></div>
+  </body>
+</html>
