@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://devblogs.microsoft.com/oldnewthing/20250411-00/?p=111066">Original</a>
+    <h1>The case of the UI thread that hung in a kernel call</h1>
+    
+    <div id="readability-page-1" class="page"><div id="single-wrapper">
+    
+    <article data-clarity-region="article" id="post-111066">
+        <div data-bi-area="body_article" data-bi-id="post_page_body_article">
+            <p>A customer asked for help with a longstanding but low-frequency hang that they have never been able to figure out. From what they could tell, their UI thread was calling into the kernel, and the call simply hung for no apparent reason. Unfortunately, the kernel dump couldn’t show a stack from user mode because the stack had been paged out. (Which makes sense, because a hung thread isn’t using its stack, so once the system is under some memory pressure, that stack gets paged out.)</p>
+<pre>0: kd&gt; !thread 0xffffd18b976ec080 7
+THREAD ffffd18b976ec080  Cid 79a0.7f18  Teb: 0000003d7ca28000
+    Win32Thread: ffffd18b89a8f170 WAIT: (Suspended) KernelMode Non-Alertable
+SuspendCount 1
+    ffffd18b976ec360  NotificationEvent
+Not impersonating
+DeviceMap                 ffffad897944d640
+Owning Process            ffffd18bcf9ec080       Image:         contoso.exe
+Attached Process          N/A            Image:         N/A
+Wait Start TickCount      14112735       Ticks: 1235580 (0:05:21:45.937)
+Context Switch Count      1442664        IdealProcessor: 2             
+UserTime                  00:02:46.015
+KernelTime                00:01:11.515
+
+ nt!KiSwapContext+0x76
+ nt!KiSwapThread+0x928
+ nt!KiCommitThreadWait+0x370
+ nt!KeWaitForSingleObject+0x7a4
+ nt!KiSchedulerApc+0xec
+ nt!KiDeliverApc+0x5f9
+ nt!KiCheckForKernelApcDelivery+0x34
+ nt!MiUnlockAndDereferenceVad+0x8d
+ nt!MmProtectVirtualMemory+0x312
+ nt!NtProtectVirtualMemory+0x1d9
+ nt!KiSystemServiceCopyEnd+0x25 (TrapFrame @ ffff8707`a9bef3a0)
+ ntdll!ZwProtectVirtualMemory+0x14
+ [end of stack trace]
+</pre>
+<p>Although we couldn’t see what the code was doing in user mode, there was something unusual in the information that was present.</p>
+<p>Observe that the offending thread is <i>Suspended</i>. And it appears to have been suspended for over five hours.</p>
+<pre>THREAD ffffd18b976ec080  Cid 79a0.7f18  Teb: 0000003d7ca28000
+    Win32Thread: ffffd18b89a8f170 WAIT: (<span>Suspended</span>) KernelMode Non-Alertable
+SuspendCount 1
+    ffffd18b976ec360  NotificationEvent
+Not impersonating
+DeviceMap                 ffffad897944d640
+Owning Process            ffffd18bcf9ec080       Image:         contoso.exe
+Attached Process          N/A            Image:         N/A
+Wait Start TickCount      14112735       Ticks: 1235580 (<span>0:05:21:45.937</span>)
+</pre>
+<p>Naturally, a suspended UI thread is going to manifest itself as a hang.</p>
+<p>Functions like <code>Suspend­Thread</code> exist primarily for debuggers to use, so we asked them if they had a debugger attached to the process when they captured the kernel dump. They said that they did not.</p>
+<p>So who suspended the thread, and why?</p>
+<p>The customer then realized that they had a watchdog thread which monitors the UI thread for responsiveness, and every so often, it suspends the UI thread, captures a stack trace, and then resumes the UI thread. And in the dump file, they were able to observe their watchdog thread in the middle of its stack trace capturing code. But why was the stack trace capture taking five hours?</p>
+<p>The stack of the watchdog thread looks like this:</p>
+<pre>ntdll!ZwWaitForAlertByThreadId(void)+0x14
+ntdll!RtlpAcquireSRWLockSharedContended+0x15a
+ntdll!RtlpxLookupFunctionTable+0x180
+ntdll!RtlLookupFunctionEntry+0x4d
+contoso!GetStackTrace+0x72
+contoso!GetStackTraceOfUIThread+0x127
+...
+</pre>
+<p>Okay, so we see that the watchdog thread is trying to get a stack trace of the UI thread, but it’s hung inside <code>Rtl­Lookup­Function­Entry</code> which is waiting for a lock.</p>
+<p>You know who I bet holds the lock?</p>
+<p>The UI thread.</p>
+<p>Which is suspended.</p>
+<p>The UI thread is probably trying to dispatch an exception, which means that it is walking the stack looking for an exception handler. But in the middle of this search, it got suspended by the watchdog thread. Then the watchdog thread tries to walk the stack of the UI thread, but it can’t do that yet because the function table is locked by the UI thread’s stack walk.</p>
+<p>This is a practical exam for a previous discussion: <a title="Why you should never suspend a thread" href="https://devblogs.microsoft.com/oldnewthing/20031209-00/?p=41573"> Why you should never suspend a thread</a>.</p>
+<p>Specifically, the title should say “Why you should never suspend a thread <i>in your own process</i>.” Suspending a thread in your own process runs the risk that the thread you suspended was in possession of some resource that the rest of the program needs. In particular, it might possess a resource that is needed by the code which has responsible for eventually resuming the thread. Since it is suspended, it will never get a chance to release those resources, and you end up with a deadlock between the suspended thread and the thread whose job it is to resume that thread.</p>
+<p>If you want to suspend a thread and capture stacks from it, you’ll have to do it from another process, so that you don’t deadlock with the thread you suspended.¹</p>
+<p><b>Bonus chatter</b>: In this kernel stack, you can see evidence that <a title="The SuspendThread function suspends a thread, but it does so asynchronously" href="https://devblogs.microsoft.com/oldnewthing/20150205-00/?p=44743"> the <code>Suspend­Thread</code> operates asynchronously</a>. When the watchdog thread calls <code>Suspend­Thread</code> to suspend the UI thread, the UI thread was in the kernel, in the middle of changing memory protections. The thread does not suspend immediately, but rather waits for the kernel to finish its work, and then before returning to user mode, the kernel does a <code>Check­For­Kernel­Apc­Delivery</code> to see if there were any requests waiting. It picks up the request to suspend, and that is when the thread actually suspends.²</p>
+<p><b>Bonus bonus chatter</b>: “What if the kernel delayed suspending a thread if it held any user-mode locks? Wouldn’t that avoid this problem?” First of all, how would the kernel even know whether a thread held any user-mode locks? There is no reliable signature for a user-mode lock. After all, you can make a user-mode lock out of any byte of memory by using it as a spin lock. Second, even if the kernel somehow could figure out whether a thread held a user-mode lock, you don’t want that to block thread suspension, because that would let a program make itself un-suspendable! Just call <code>AcquireSRWLockShared(some_global_srwlock)</code> and never call the corresponding <code>Release</code> function. Congratulations, the thread perpetually owns the global lock in shared mode and would therefore now be immune from suspension.</p>
+<p>¹ Of course, this also requires that the code that does the suspending does not wait on cross-process resources like semaphores, mutexes, or file locks, because those might be held by the suspended thread.</p>
+<p>² The kernel doesn’t suspend the thread immediately because it might be in possession of internal kernel locks, and suspending a thread while it owns a kernel lock (such as the lock that synchronizes access to the page tables) would result in the kernel itself deadlocking!</p>
+        </div><!-- .entry-content -->
+
+        <!-- AI Disclaimer -->
+            </article>
+    
+</div></div>
+  </body>
+</html>
