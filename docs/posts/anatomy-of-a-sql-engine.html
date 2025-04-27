@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.dolthub.com/blog/2025-04-25-sql-engine-anatomy/">Original</a>
+    <h1>Anatomy of a SQL Engine</h1>
+    
+    <div id="readability-page-1" class="page"><div data-cy="blog-post-text"><p>May marks five years since Dolt <a href="https://www.dolthub.com/blog/2020-05-04-adopting-go-mysql-server/">adopted go-mysql-server</a>. Today we summarize the current state of GMS by walking through a query&#39;s journey from parsing to result spooling.</p>
+<h2 id="overview"><a href="#overview" aria-label="overview permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>Overview</h2>
+<p>SQL engines are the logical layer of a database that sit between client
+and storage. To mutate the database state on behalf of a client, a SQL
+engine performs the following steps:</p>
+<ol>
+<li>
+<p>Parsing</p>
+</li>
+<li>
+<p>Binding</p>
+</li>
+<li>
+<p>Plan Simplification</p>
+</li>
+<li>
+<p>Join Exploration</p>
+</li>
+<li>
+<p>Plan Costing</p>
+</li>
+<li>
+<p>Execution</p>
+</li>
+<li>
+<p>Spooling Results</p>
+</li>
+</ol>
+<p>Most systems also have a variety of execution
+strategies (row vs vector based) and infrastructure layers (run locally
+vs distributed). At the moment Dolt&#39;s engine by default uses row-based
+execution within the local server.</p>
+
+<p>The first thing a SQL Engine does when receiving a query is
+try to form a structured abstract syntax tree (AST). The AST is a rough
+cut of whether the query is well formed. The entrypoint of the parser is
+<a href="https://github.com/dolthub/vitess/blob/d6bc702b989e43b33fbcb8a261ba9cd6a387917e/go/vt/sqlparser/ast.go#L141">here</a>.</p>
+<p>A client driver initializes a query by passing bytes over the network through a server
+listener into a handler command <code>ComHandler</code>. The handler accumulates
+data until reaching a delimiter token (usually <code>;</code>). The string is then split
+into space-delimited tokens and fed into parsing. The diagram below shows the movement from
+bytes to tokens and finally AST nodes:</p>
+<p><span>
+      <a href="https://www.dolthub.com/blog/static/987690e109d9683057aee962328ebfa1/947d2/max-qparse.png" target="_blank" rel="noopener">
+    <span></span>
+  <img alt="parse" title="" src="https://www.dolthub.com/blog/static/987690e109d9683057aee962328ebfa1/ad12c/max-qparse.png" srcset="/blog/static/987690e109d9683057aee962328ebfa1/a48b3/max-qparse.png 214w,
+/blog/static/987690e109d9683057aee962328ebfa1/47730/max-qparse.png 428w,
+/blog/static/987690e109d9683057aee962328ebfa1/ad12c/max-qparse.png 856w,
+/blog/static/987690e109d9683057aee962328ebfa1/7a18f/max-qparse.png 1284w,
+/blog/static/987690e109d9683057aee962328ebfa1/56caf/max-qparse.png 1712w,
+/blog/static/987690e109d9683057aee962328ebfa1/947d2/max-qparse.png 1773w" sizes="(max-width: 856px) 100vw, 856px" loading="lazy" decoding="async"/>
+  </a>
+    </span></p>
+<p>Right recursive parsing is easy to understand and debug because the program is a decision tree that chooses the next path based on the lookahead token. So a right-recursive parser might initially expect a SELECT, and then accumulate select expressions until a FROM token, and so on. This is &#34;right recursive&#34; because when we hit something like a join, we greedily accumulate table tokens and keep moving the parse state deeper. But right-recursive parsers are top-down, which unfortunately uses stack memory proportional to the number of tokens.</p>
+<p>Left-recursive parsers are instead bottom-up and collapse the accumulated stack eagerly when they find a happy pattern. So when we see a join, we&#39;ll fold the join so far before checking for more tables. This keeps the memory usage low at the expense of way more complicated decision making criteria.</p>
+<p>Dolt&#39;s <a href="https://www.dolthub.com/blog/2023-07-28-goyacc-parser-tips-tricks/">Yacc grammar</a> is left-recursive, which is fast to execute even though the shift (add token) reduce (collapse token stack) logic is hard to debug. Yacc lets us do some small formatting in stack collapse (reduce) hooks. The rules below show simplified details of what &#34;left recursive folding&#34; looks like from the engineer/semantic perspective:</p>
+<div data-language="text"><pre><code>table_reference:
+  table_factor
+| join_table
+
+table_factor:
+  aliased_table_name
+  {
+    $$ = $1.(*AliasedTableExpr)
+  }
+| openb table_references closeb
+  {
+    $$ = &amp;ParenTableExpr{Exprs: $2.(TableExprs)}
+  }
+| table_function
+| json_table
+
+join_table:
+  table_reference inner_join table_factor join_condition_opt
+  {
+    $$ = &amp;JoinTableExpr{LeftExpr: $1.(TableExpr), Join: $2.(string), RightExpr: $3.(TableExpr), Condition: $4.(JoinCondition)}
+  }
+
+join_condition_opt:
+%prec JOIN
+  { $$ = JoinCondition{} }
+| join_condition
+  { $$ = $1.(JoinCondition) }
+
+join_condition:
+  ON expression
+  { $$ = JoinCondition{On: tryCastExpr($2)} }
+| USING &#39;(&#39; column_list &#39;)&#39;
+  { $$ = JoinCondition{Using: $3.(Columns)} }
+</code></pre></div>
+<p><code>table_reference</code> is the umbrella expression for the row source, either a tablescan or join. <code>join_table</code> is two or more tables concatenated with JOIN clauses, with the recursive <code>table_reference</code> portion on the left rather than the right. When the head of the stack matches <code>join_table</code>&#39;s definition, we pop those stack components, execute the callback hook, and replace the components with a single <code>*JoinTableExpression</code> on the stack. The join tree itself is right-deep, because the old state will be the left node and new state the right node in recursive calls. The unabridged version of the is <a href="https://github.com/dolthub/vitess/blob/b8d80bc3934116b93274b5356f6fcd99ac74d51c/go/vt/sqlparser/sql.y#L8359">here</a>.</p>
+<p>If parsing succeeds, the output AST is guarenteed to match the structure
+of our Yacc rules. If parsing fails, the client receives an error
+indicating which lookahead token in the query string was invalid.</p>
+
+<p>Query parsing only partially checks if a query is well formed. Fields in the AST still need to be matched to symbols in the current database catalog, in addition to a host of other typing and clause-specific checks. We call this phase &#34;binding&#34; because its core intermediate representation is designed for namespace scoping (<a href="https://github.com/dolthub/go-mysql-server/blob/263d9f2a66e50ca370f3645a4ba3a141668c7a0c/sql/planbuilder/parse.go#L91">code entrypoint is here</a>).</p>
+<p>Binding AST identifiers to catalog symbols is similar to defining and referencing variables in any programming language. Tables and aliases create column variables that column fields reference. There are ~four core objects that we can think about from a row source/sink perspective.</p>
+<p>Table definitions are sources that provide many rows/columns. Table names cannot clash within the same scope (ex: <code>select * from mydb.mytable.xy join xy on x</code>), but are otherwise globally accessible. Subqueries are a special expression that add an extra namespacing layer, but otherwise act like table source: <code>select sq.a from (select x as a from xy) sq</code>.</p>
+<p>Column definitions are sinks that reference a specific column from a row source. A reference in a scope with two otherwise ambiguous column names has to qualify the table to disambiguate its identity. For example, <code>select * from xy a join xy b where x = 2</code> errors because the column reference in the <code>x = 2</code> filter lacks a table qualifier.</p>
+<p>Aliases are scalar sinks and sources, which is somewhat unusual. For each row in a source they output a single value. This means we add column definitions available for referencing, but only at the boundary of the original scope. For example, <code>select x+y as a from xy where a &gt; 2</code> errors because the <code>a</code> definition is defined and created after the filter/projection. The same query with <code>having a &gt; 2</code> is valid because HAVING has access to the second scope with the <code>a</code> alias.</p>
+<p>Scalar subqueries are sources and sinks. They are similar to aliases, but with the added complexity that the subquery scopes all share the parent scope. Multiple scopes add a hierarchy to name binding, but are otherwise intuitive: search the current scope for a name match, and then iterate upwards until finding a scope with an appropriate definition. Common names cannot clash between scopes, only within. <code>select (select a.x from xy b) from xy a</code> is valid because even though the <code>a.x</code> variable is not found within the <code>b</code> scope, the <code>a</code> parent scope provides a binding.</p>
+<p>Common Table Expressions (CTEs) and subquery aliases are simple extensions of the same namespacing rules. Aggregations have fairly <a href="https://dev.mysql.com/doc/refman/8.4/en/group-by-handling.html">specific rules</a> about what combinations of GROUP BY and selection columns are valid, which we will not discuss here.</p>
+<p>The <code>binding</code> phase converts AST nodes into customized
+<a href="https://github.com/dolthub/go-mysql-server">go-mysql-server</a> <code>sql.Node</code>
+plan nodes as outputs.</p>
+
+<p>Simplification regularizes SQL&#39;s rich syntax into a narrow format.
+Ideally all logically equivalent plans would funnel into one common shape.
+The &#34;canonical&#34; form should be the least surprising and fastest to
+execute. In practice, perfect simplification is an aspirational goal
+that has improved over time as workloads grow in complexity. The code
+entrypoint is
+<a href="https://github.com/dolthub/go-mysql-server/blob/4f15584bbf22bdd6ec22653c494c8f6d8529ca61/sql/analyzer/analyzer.go#L505">here</a>.
+The current list of rules are in <a href="https://github.com/dolthub/go-mysql-server/blob/c856028387bc2bd5efc7fbdafc945c9405047f72/sql/analyzer/rules.go">this
+file</a>.</p>
+<p>Plan nodes hold correctness info calculated during binding
+in a format amenable to query transformations. Technically this is our
+third intermediate representation (IR), after ASTs and scope
+hierarchies. Simplifications rules are always triggered because they
+improve query runtime the same way compiler optimizations do dead code
+elimination and expression folding. Some well documented SQL
+simplifications are filter pushing and column pruning, which discard
+unused rows and columns (respectively) as soon as possible during
+execution.</p>
+<p>We have dozens of simplification rules, most of which fit a narrow pattern match =&gt; rearrangement flow. The structure is so standardized that <a href="https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/opt/optgen/lang/doc.go">CockroachDB wrote a DSL specifically for transformations</a>. The rules are simple and change rarely so we do it by hand, but the formalization is interesting for those who want to learn learn more.</p>
+<p>One notable transformation that breaks the mould is subqeuery decorrelation/apply joins. A query like <code>select * from xy where x = (select a from ab)</code> is equivalent to <code>select * from xy join ab on x = a</code>. Collapsing table relations, filters, and projections into a common scope always leads to better join planning and often extra intra-scope simplifications. More formal specifications can be found <a href="https://www.researchgate.net/profile/Mostafa_Elhemali/publication/221213885_Execution_strategies_for_SQL_subqueries/links/584f631308aecb6bd8d02aa4/Execution-strategies-for-SQL-subqueries.pdf?__cf_chl_tk=tZx_Rk8_a3SaAKr1l5X.Ah0PX0UNKi4LDPI7WPNGm.s-1745004422-1.0.1.1-7NXojQt77FAxs6WPUcF6EMlezhtxtiZfkEeTq5xhaJ0">here</a> and <a href="https://subs.emis.de/LNI/Proceedings/Proceedings241/383.pdf">here</a>.</p>
+
+<p>The same expression&#39;s type varies depending on the calling context. For example, an expression in an insert can be cast to the target column type, while a WHERE filter expression might be cast to a boolean. Dolt&#39;s SQL engine is increasingly shifting typing from execution to binding using top-down coercion hints. Typing is usually a separate compiler phase because it shares properties of both binding and simplification. We&#39;re semantically validating the query&#39;s typing consistency and correctness, while simplifying the expressions in a way that offloads work from the execution engine.</p>
+
+<p>A query plan&#39;s simplest form is often the fastest to
+execute. But joins, aggregations, and windows often have several equivalent
+variations whose performance is database dependent.</p>
+<p>Plan exploration has two separable components, search and costing.
+Search enumerates valid join configurations that all produce
+logically equivalent results. Logical variants include order
+rearrangements (<code>A x (B x C) = &gt; (C x A) x B</code>) and operator choice
+(LOOKUP_JOIN vs HASH_JOIN vs ...). Costing estimates the runtime cost of
+specific (physical) plan configurations.</p>
+<h2 id="join-search"><a href="#join-search" aria-label="join search permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>Join Search</h2>
+<p>Within join order exploration there are two strategies. The first iteratively performs valid permutations on the seed plan, memoizing paths to avoid duplicate work. The search terminates when we run out of permutations, or decide we&#39;ve found an optimal plan. The search entrypoint is <a href="https://github.com/dolthub/go-mysql-server/blob/e7b7ae11fed6b66b10ecd1bdeae6b842a3051d91/sql/analyzer/indexed_joins.go#L137">here</a>.</p>
+<p>The top-down backtracking strategy contrasts with bottom-up dynamic
+programming (DP), where we instead iterate every possible join order. First
+we try every two-table join configuration, then every three table combo,
+... etc working our way up to all n-tables.</p>
+<p>Backtracking only visits valid states, but DP needs to detect conflicts
+for all combinations.
+For example, for <code>A LEFT
+JOIN B</code> we would invalidate any order that violates <code>A &lt; B</code>.
+This means backtracking can miss good plans if our
+search doesn&#39;t reach far enough. DP invalidation criteria can be either
+be too broad and reject valid plans, or have holes and accidentally
+accept invalid plans. GMS currently uses the second strategy with a
+<a href="https://15721.courses.cs.cmu.edu/spring2019/papers/23-optimizer2/p493-moerkotte.pdf">DP-Sube</a>
+conflict detector that reaches more rearrangements than backtracking without
+sacrificing correctness.</p>
+<p>Every valid order is expanded beyond the default INNER_JOIN plan to consider LOOKUP_JOIN, HASH_JOIN, and MERGE_JOIN, among others.</p>
+<p>One under-appreciated point worth noting is the intermediate representation used to accumulate explored states (join orders). As a reminder, the DP subproblem optimality conditions are:</p>
+<ol>
+<li>
+<p>Join states can be logically clustered into groups by the results they produce.</p>
+</li>
+<li>
+<p>A join group is always composed of two smaller logical join groups.</p>
+</li>
+</ol>
+<p>There are a variety of words used to describe this problem (hypergraph = graph of graphs, forest = tree of trees), but memo is the most common terminology we saw so we stuck with that. A memo group contains all the search states (join orders) that produce the same result, and so is identified by the bitmap AND of the node id&#39;s in the group. A specific search state is two expression groups and a physical operator, terminating it table source groups.</p>
+<p>The initial memo for <code>select * from join ab, uv, xy where a = u and u = x;</code> is below:</p>
+<div data-language="text"><pre><code>memo:
+├── G1: (tableScan: ab)
+├── G2: (tableScan: uv)
+├── G3: (innerJoin 2 1) (innerJoin 1 2)
+├── G4: (tableScan: xy)
+├── G5: (innerJoin 3 4) (innerJoin 6 1)
+└── G6: (innerJoin 4 2)</code></pre></div>
+<p>Each table gets a logical expression group. Each 2-way join gets and expression group (we link <code>a=x</code> using the transitive property). And they all funnel into the top-level join in <code>G5</code>.</p>
+<p>This organization lets us cache logical properties at the group level, the most notable of which is the lowest cost physical plan. The subproblem optimality motivating the memo happily applies to both join reordering and costing.</p>
+<h2 id="functional-dependencies"><a href="#functional-dependencies" aria-label="functional dependencies permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>Functional Dependencies</h2>
+<p>Exploration can be expensive for 5+ table joins. Fortunately big joins often have star schema shaped primary key (<code>t1 join t2 on pk1 = pk2</code>) connections. If all join operators are connected by &#34;strict keys&#34;, unique and non-null one to one relationships, sorting the tree by table size and connecting plans with LOOKUP_JOIN operators is often effective. The number of output rows (cardinality) is limited to the size of the first/smallest row source. Nick discuses functional dependency analysis for join planning more <a href="https://www.dolthub.com/blog/2023-12-13-functional-dependency-analysis/">here</a>. The functional dependencies code is <a href="https://github.com/dolthub/go-mysql-server/blob/9f1f6200964e129bca9632e031cf5936690b476e/sql/func_deps.go">here</a>.</p>
+<h2 id="ir-intermission"><a href="#ir-intermission" aria-label="ir intermission permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>IR Intermission</h2>
+<p>Here is the the progress we&#39;ve made so far since parsing the AST:</p>
+<p><span>
+      <a href="https://www.dolthub.com/blog/static/c8bd897bc7c1237960822e5411d11fcf/04aae/max-bind-plan.png" target="_blank" rel="noopener">
+    <span></span>
+  <img alt="parse" title="" src="https://www.dolthub.com/blog/static/c8bd897bc7c1237960822e5411d11fcf/ad12c/max-bind-plan.png" srcset="/blog/static/c8bd897bc7c1237960822e5411d11fcf/a48b3/max-bind-plan.png 214w,
+/blog/static/c8bd897bc7c1237960822e5411d11fcf/47730/max-bind-plan.png 428w,
+/blog/static/c8bd897bc7c1237960822e5411d11fcf/ad12c/max-bind-plan.png 856w,
+/blog/static/c8bd897bc7c1237960822e5411d11fcf/7a18f/max-bind-plan.png 1284w,
+/blog/static/c8bd897bc7c1237960822e5411d11fcf/56caf/max-bind-plan.png 1712w,
+/blog/static/c8bd897bc7c1237960822e5411d11fcf/04aae/max-bind-plan.png 2463w" sizes="(max-width: 856px) 100vw, 856px" loading="lazy" decoding="async"/>
+  </a>
+    </span></p>
+<p>The first IR groups column definitions into scopes that help validate and bind field references. The second IR lets us perform structural optimizations on a simplified plan. And the third IR accomodates exploring join reorders in a way that facilitates our next topic, join costing.</p>
+<h2 id="join-costing"><a href="#join-costing" aria-label="join costing permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>Join Costing</h2>
+<p>Join costing identifies the fastest physical plan in every logical
+expression group enumerated during exploration. The coster entrypoint is
+<a href="https://github.com/dolthub/go-mysql-server/blob/e787f4ee5b2842194af9c6091213ad23d3df9a14/sql/memo/coster.go#L57">here</a>.</p>
+<p>We have many blogs that detail join costing (<a href="https://www.dolthub.com/blog/2024-10-24-automatic-stats/">collection of links here</a>). The summary is that schemas and table key distributions affect join cost. <code>A JOIN B</code> might return 10 rows in one database and 10 million rows in another. A 10 row join might use a LOOKUP_JOIN to optimize for latency, while a 10 million row join might use a HASH JOIN to optimize for throughput. We represent index key distributions as histograms. Intersecting histograms roughly approximates both the count and new key distribution of the result relation. The combination of (1) input sizes, (2) result size, (3) operator choice give us (1) the IO work required to pull rows from disk, (2) in-memory overhead of operator specific data structures (ex: hash maps), and (3) the approximate CPU cycles for reading the table sources to produce the result count.</p>
+<p>Here is what the expanded cost tree looks like for our query:</p>
+<div data-language="sql"><pre><code>tmp2<span>/</span>test<span>-</span>branch<span>*</span><span>&gt;</span> <span>select</span> dolt_join_cost<span>(</span><span>&#39;SELECT * FROM xy WHERE EXISTS ( select 1 from uv where u = x )&#39;</span><span>)</span><span>;</span>
+<span>+</span>
+<span>|</span> dolt_join_cost<span>(</span><span>&#39;SELECT * FROM xy WHERE EXISTS (   select 1   from uv   where     u = x )&#39;</span><span>)</span>                                                                                <span>|</span>
+<span>+</span>
+<span>|</span> memo:                                                                                                                                                                     <span>|</span>
+<span>|</span> ├── G1: <span>(</span>tablescan: xy <span>0.0</span><span>)</span><span>*</span>                                                                                                                                              <span>|</span>
+<span>|</span> ├── G2: <span>(</span>tablescan: uv <span>0.0</span><span>)</span><span>*</span>                                                                                                                                              <span>|</span>
+<span>|</span> ├── G3: <span>(</span>lookupjoin <span>1</span> <span>2</span> <span>6.6</span><span>)</span> <span>(</span>lookupjoin <span>6</span> <span>1</span> <span>6.6</span><span>)</span> <span>(</span>project: <span>5</span> <span>0.0</span><span>)</span> <span>(</span>semijoin <span>1</span> <span>2</span> <span>4.0</span><span>)</span><span>*</span>                                                                                    <span>|</span>
+<span>|</span> ├── G4: <span>(</span>project: <span>2</span> <span>0.0</span><span>)</span><span>*</span>                                                                                                                                                 <span>|</span>
+<span>|</span> ├── G5: <span>(</span>hashjoin <span>1</span> <span>4</span> <span>8.0</span><span>)</span> <span>(</span>hashjoin <span>4</span> <span>1</span> <span>8.0</span><span>)</span> <span>(</span>mergejoin <span>1</span> <span>4</span> <span>4.1</span><span>)</span> <span>(</span>mergejoin <span>4</span> <span>1</span> <span>4.1</span><span>)</span> <span>(</span>lookupjoin <span>1</span> <span>4</span> <span>6.6</span><span>)</span> <span>(</span>lookupjoin <span>4</span> <span>1</span> <span>6.6</span><span>)</span> <span>(</span>innerjoin <span>4</span> <span>1</span> <span>5.0</span><span>)</span><span>*</span> <span>(</span>innerjoin <span>1</span> <span>4</span> <span>5.0</span><span>)</span><span>*</span> <span>|</span>
+<span>|</span> └── G6: <span>(</span>project: <span>2</span> <span>0.0</span><span>)</span><span>*</span>                                                                                                                                                 <span>|</span>
+<span>+</span></code></pre></div>
+<p>Each logical expression group (<code>G</code>)&#39;s physical implementation options now have associated costs. For example, the first <code>G3</code> implementation is a LOOKUP_JOIN between <code>G1</code> and <code>G2</code> that we&#39;ve estimated costs 6.6 units. We differentiate between (1) the incremental work a join operator performs with (2) the accumulated cost of a choice and its dependencies. We print the incremental work rather than the accumulated work, though we might improve this function by printing both.</p>
+<p>One note is that Dolt collects deterministic table statistics. Most databases use approximate sketches to (1) expedite refresh time, (2) minimize background work IO overhead, (3) make estimates fast, and (4) make it easier to compose higher order synthetic join estimations. Dolt&#39;s content addressable storage engine makes it somewhat easy for refreshes to only read a fraction of the database (more true for read-heavy workloads). Determinism is also fantastic for predictability. In practice, estimation overhead or higher order estimations have no performance bottlenecks for our Online Analytical Processing (OLAP) workloads.</p>
+<p>When join costing is complete, we&#39;ve discovered the optimal execution
+strategy.</p>
+<h2 id="join-hints"><a href="#join-hints" aria-label="join hints permalink"><svg aria-hidden="true" focusable="false" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path fill-rule="evenodd" d="M4 9h1v1H4c-1.5 0-3-1.69-3-3.5S2.55 3 4 3h4c1.45 0 3 1.69 3 3.5 0 1.41-.91 2.72-2 3.25V8.59c.58-.45 1-1.27 1-2.09C10 5.22 8.98 4 8 4H4c-.98 0-2 1.22-2 2.5S3 9 4 9zm9-3h-1v1h1c1 0 2 1.22 2 2.5S13.98 12 13 12H9c-.98 0-2-1.22-2-2.5 0-.83.42-1.64 1-2.09V6.25c-1.09.53-2 1.84-2 3.25C6 11.31 7.55 13 9 13h4c1.45 0 3-1.69 3-3.5S14.5 6 13 6z"></path></svg></a>Join Hints</h2>
+<p>The coster gives its best effort to satisfy join hints indicated after
+the <code>SELECT</code> token in a query. The
+<a href="https://docs.dolthub.com/sql-reference/sql-support/miscellaneous#join-hints">docs</a>
+go into more detail about hint options and use. The source code is
+<a href="https://github.com/dolthub/go-mysql-server/blob/9a6edfcfab0d2f3a8babb55a3a4e1d431c1a158f/sql/memo/select_hints.go">here</a>. Hints that are
+contradictory or not logically valid are usually ignored.</p>
+
+<p>The final plan needs to be converted into an executable format.</p>
+<p>Dolt&#39;s default row execution format mirrors the plan node format. The plan below will share a volcano iterator of the same shape:</p>
+<div data-language="sql"><pre><code>tmp2<span>/</span>test<span>-</span>branch<span>*</span><span>&gt;</span> <span>explain</span> <span>plan</span> <span>select</span> <span>count</span><span>(</span><span>*</span><span>)</span> <span>from</span> xy <span>join</span> uv <span>on</span> x <span>=</span> u<span>;</span>
+<span>+</span>
+<span>|</span> <span>plan</span>                                   <span>|</span>
+<span>+</span>
+<span>|</span> Project                                <span>|</span>
+<span>|</span>  ├─ <span>columns</span>: <span>[</span><span>count</span><span>(</span><span>1</span><span>)</span><span>]</span>                <span>|</span>
+<span>|</span>  └─ GroupBy                            <span>|</span>
+<span>|</span>      ├─ SelectedExprs<span>(</span><span>COUNT</span><span>(</span><span>1</span><span>)</span><span>)</span>        <span>|</span>
+<span>|</span>      ├─ Grouping<span>(</span><span>)</span>                     <span>|</span>
+<span>|</span>      └─ MergeJoin                      <span>|</span>
+<span>|</span>          ├─ cmp: <span>(</span>xy<span>.</span>x <span>=</span> uv<span>.</span>u<span>)</span>         <span>|</span>
+<span>|</span>          ├─ IndexedTableAccess<span>(</span>xy<span>)</span>     <span>|</span>
+<span>|</span>          │   ├─ <span>index</span>: <span>[</span>xy<span>.</span>x<span>]</span>          <span>|</span>
+<span>|</span>          │   ├─ filters: <span>[</span>{<span>[</span><span>NULL</span><span>,</span> ∞<span>)</span>}<span>]</span> <span>|</span>
+<span>|</span>          │   └─ <span>columns</span>: <span>[</span>x<span>]</span>           <span>|</span>
+<span>|</span>          └─ IndexedTableAccess<span>(</span>uv<span>)</span>     <span>|</span>
+<span>|</span>              ├─ <span>index</span>: <span>[</span>uv<span>.</span>u<span>]</span>          <span>|</span>
+<span>|</span>              ├─ filters: <span>[</span>{<span>[</span><span>NULL</span><span>,</span> ∞<span>)</span>}<span>]</span> <span>|</span>
+<span>|</span>              └─ <span>columns</span>: <span>[</span>u<span>]</span>           <span>|</span>
+<span>+</span></code></pre></div>
+<p>Even when we swap GMS
+iterators with Dolt-customized <code>kvexec</code> iterators(<a href="https://www.dolthub.com/blog/2024-11-25-kv-merge/">example
+here</a>, the abstracted
+iterators operating on the KV layer are still volcano iterators.</p>
+<p><span>
+      <a href="https://www.dolthub.com/blog/static/6845edf2398675fc6b83c695670969e4/22c86/max-sqliter.png" target="_blank" rel="noopener">
+    <span></span>
+  <img alt="parse" title="" src="https://www.dolthub.com/blog/static/6845edf2398675fc6b83c695670969e4/ad12c/max-sqliter.png" srcset="/blog/static/6845edf2398675fc6b83c695670969e4/a48b3/max-sqliter.png 214w,
+/blog/static/6845edf2398675fc6b83c695670969e4/47730/max-sqliter.png 428w,
+/blog/static/6845edf2398675fc6b83c695670969e4/ad12c/max-sqliter.png 856w,
+/blog/static/6845edf2398675fc6b83c695670969e4/22c86/max-sqliter.png 1143w" sizes="(max-width: 856px) 100vw, 856px" loading="lazy" decoding="async"/>
+  </a>
+    </span></p>
+<p>There is one notable pre-iterator conversion. The column references
+created in binding need to be converted from logical identifiers into
+offset-based index accesses. Simplification and join exploration can
+freely move expressions, but execution needs to know where values
+are located at the data layer.<a href="https://github.com/dolthub/go-mysql-server/blob/893a99e13d832aae16bee6eba128ef832319129a/sql/analyzer/fix_exec_indexes.go#L30">This analyzer
+rule</a>
+sets the execution indexes.</p>
+<p>Non-materializing iterators pull from the child iterator and return a row immediately. Materializing iterators have to read a sequence of children before returning. The <code>groupByIter</code> below shows how a GROUP_BY feeds all child rows (<code>i.child.Next</code>) into buffer aggregators (<code>updateBuffers</code>) before returning any rows (<code>evalBuffers</code>) (<a href="https://github.com/dolthub/go-mysql-server/blob/9988aefe97a06e03ff397a76ec48cf1e9d4e7e3e/sql/rowexec/agg.go#L29">source code here</a>):</p>
+<div data-language="go"><pre><code><span>func</span> <span>(</span>i <span>*</span>groupByIter<span>)</span> <span>Next</span><span>(</span>ctx <span>*</span>sql<span>.</span>Context<span>)</span> <span>(</span>sql<span>.</span>Row<span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>for</span> <span>{</span>
+		row<span>,</span> err <span>:=</span> i<span>.</span>child<span>.</span><span>Next</span><span>(</span>ctx<span>)</span>
+		<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+			<span>if</span> err <span>==</span> io<span>.</span>EOF <span>{</span>
+				<span>break</span>
+			<span>}</span>
+			<span>return</span> <span>nil</span><span>,</span> err
+		<span>}</span>
+
+		<span>if</span> err <span>:=</span> <span>updateBuffers</span><span>(</span>ctx<span>,</span> i<span>.</span>buf<span>,</span> row<span>)</span><span>;</span> err <span>!=</span> <span>nil</span> <span>{</span>
+			<span>return</span> <span>nil</span><span>,</span> err
+		<span>}</span>
+	<span>}</span>
+
+	row<span>,</span> err <span>:=</span> <span>evalBuffers</span><span>(</span>ctx<span>,</span> i<span>.</span>buf<span>)</span>
+	<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+		<span>return</span> <span>nil</span><span>,</span> err
+	<span>}</span>
+	<span>return</span> row<span>,</span> <span>nil</span>
+<span>}</span>
+
+<span>func</span> <span>updateBuffers</span><span>(</span>
+	ctx <span>*</span>sql<span>.</span>Context<span>,</span>
+	buffers <span>[</span><span>]</span>sql<span>.</span>AggregationBuffer<span>,</span>
+	row sql<span>.</span>Row<span>,</span>
+<span>)</span> <span>error</span> <span>{</span>
+	<span>for</span> <span>_</span><span>,</span> b <span>:=</span> <span>range</span> buffers <span>{</span>
+		<span>if</span> err <span>:=</span> b<span>.</span><span>Update</span><span>(</span>ctx<span>,</span> row<span>)</span><span>;</span> err <span>!=</span> <span>nil</span> <span>{</span>
+			<span>return</span> err
+		<span>}</span>
+	<span>}</span>
+	<span>return</span> <span>nil</span>
+<span>}</span>
+
+<span>func</span> <span>evalBuffers</span><span>(</span>
+	ctx <span>*</span>sql<span>.</span>Context<span>,</span>
+	buffers <span>[</span><span>]</span>sql<span>.</span>AggregationBuffer<span>,</span>
+<span>)</span> <span>(</span>sql<span>.</span>Row<span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>var</span> row <span>=</span> <span>make</span><span>(</span>sql<span>.</span>Row<span>,</span> <span>len</span><span>(</span>buffers<span>)</span><span>)</span>
+
+	<span>var</span> err <span>error</span>
+	<span>for</span> i<span>,</span> b <span>:=</span> <span>range</span> buffers <span>{</span>
+		row<span>[</span>i<span>]</span><span>,</span> err <span>=</span> b<span>.</span><span>Eval</span><span>(</span>ctx<span>)</span>
+		<span>if</span> err <span>!=</span> <span>nil</span> <span>{</span>
+			<span>return</span> <span>nil</span><span>,</span> err
+		<span>}</span>
+	<span>}</span>
+	<span>return</span> row<span>,</span> <span>nil</span>
+<span>}</span></code></pre></div>
+<p>One wart in our execution runtime is that correlated queries are constructed dynamically at runtime. A correlated subquery is initially still represented as the plan IR during execution. The runtime prepends the scope&#39;s context to table sources in the nested query&#39;s plan before constructing a new iterator. We won&#39;t discuss the details here.</p>
+
+<p>The volcano iterator in the previous stage produces result rows that
+need to be translated to a result format. The main code entrypoint is
+<a href="https://github.com/dolthub/go-mysql-server/blob/d406aced955683d84b9d1b141daa9b40074c8182/server/handler.go#L993">here</a>.</p>
+<p>Reading from storage and writing to network are conceptually similar even if at opposite ends of the query lifecycle. Data moves between storage, runtime, and wire-time formats the same way query plans move through different intermediate representations. Dolt&#39;s tiered storage has various real byte layouts, but we generally refer to all as the Key Value (KV) layer. Rows are represented as byte array key/value pairs in the KV layer. Any table integrator (KV layer) interfaces with GMS through in-memory arrays of Go-native types. And lastly, MySQL&#39;s wire format is completely different than either the KV or SQL formats! Integers, for example, are represented as strings in wire format.</p>
+<p>Batching and buffer reuse help manage throughput and memory churn at each of these interfaces. Cutting out the middleman and converting from KV-&gt;wire layer is an effective optimization for many queries. Queries that return one row are common, and have specialized spooling interfaces that optimize for latency rather than throughput.</p>
+<p>The client protocol collects result bytes until the terminal packet
+is sent, termination the command and freeing the session to start
+another query.</p>
+
+<p>AST are a great intermediate representation for organizing tokenized bytes, but lack the expressivity required for the rest of semantic validation, plan simplification, and join planning. Building additinal IRs for each phase created an organizational and performance problem that only unifying solves. We&#39;ve redistributed most logic on SQL nodes into either the preceding (binding) or following (memo) phases. But closing the gap is still quite a lift, and could involve (1) rewriting all subquery expressions as lateral joins, and (2) representing aliases as <code>SyntheticProject</code> nodes that append one column definition to the tree.</p>
+<p>Golang&#39;s automatic memory management helped us get a fully functioning database off the ground quickly, but memory churn is still a bottleneck. We have improved memory re-use at specific points in the execution lifecycle where memory is short-lived, for example spooling rows over the network, but there is still much more to do. Avoiding heap allocating interface types and reusing execution buffers would improve execution performance. Standardizing and centralizing the memo IR would probably let us reuse memory there as well.</p>
+<p>If you have any questions about Dolt, databases, or Golang performance
+reach out to us on <a href="https://twitter.com/dolthub">Twitter</a>,
+<a href="https://discord.gg/gqr7K4VNKe">Discord</a>, and
+<a href="https://github.com/dolthub/go-mysql-server">GitHub</a>!</p></div></div>
+  </body>
+</html>
