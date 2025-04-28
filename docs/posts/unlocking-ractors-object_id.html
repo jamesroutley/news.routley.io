@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://byroot.github.io/ruby/performance/2025/04/26/unlocking-ractors-object-id.html">Original</a>
+    <h1>Unlocking Ractors: Object_id</h1>
+    
+    <div id="readability-page-1" class="page"><div aria-label="Content">
+      <div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>In <a href="https://byroot.github.io/ruby/performance/2025/02/27/whats-the-deal-with-ractors.html">a previous post about ractors</a>, I explained why I think it’s really unlikely you’d ever be able to run an entire application inside a ractor, but that they could
+still be situationally very useful to move CPU-bound work out of the main thread, and to unlock some parallel algorithm.</p>
+
+<p>But as I mentioned, this is unfortunately not yet viable because there are many known implementation bugs that can lead
+to interpreter crashes, and that while they are supposed to execute in parallel, the Ruby VM still has one true global
+lock that Ractors need to acquire to perform certain operations, making them often perform worse than the equivalent
+single-threaded code.</p>
+
+<p>But things are evolving rapidly.
+Since then, there is now a team of people working on fixing exactly that: tackling known bugs and eliminating or reducing the remaining contention points.</p>
+
+<p>The one example I gave to illustrate this remaining contention, was the <code>fstring_table</code>, which in short is a big internal
+hash table used to deduplicate strings, which Ruby does whenever you use a String as a key in a Hash.
+Because looking into that table while another Ractor is inserting a new entry would result in a crash (or worse),
+until last week Ruby had to acquire the remaining VM lock whenever it touched that table.</p>
+
+<p>But <a href="https://bugs.ruby-lang.org/issues/21268">John Hawthorn recently replaced it with a lock-free Hash-Set</a>, and now this
+contention point is gone. If you re-run the JSON benchmarks from the previous post using the latest Ruby master,
+the Ractor version is now twice as fast as the single-threaded version, instead of being 3 times slower.</p>
+
+<p>This still isn’t perfect though, as the benchmark uses 5 ractors, hence in an ideal world should be almost 5 times faster
+then the single-threaded example, so we still have a lot of work to do to eliminate or reduce the remaining contention
+points.</p>
+
+<p>One of such remaining contention points, that you likely didn’t suspect would be one, is
+<a href="https://docs.ruby-lang.org/en/3.4/Object.html#method-i-object_id">the <code>#object_id</code> method</a>.
+And on my way back from RubyKaigi, I started working on tackling it.</p>
+
+<p>But before we delve into what I plan to do about it, let’s talk about how this method came to be a contention point.</p>
+
+<h2 id="a-little-bit-of-history">A Little Bit Of History</h2>
+
+<p>Up until Ruby 2.6, the <code>#object_id</code> implementation used to be quite trivial:</p>
+
+<div><div><pre><code><span>VALUE</span>
+<span>rb_obj_id</span><span>(</span><span>VALUE</span> <span>obj</span><span>)</span>
+<span>{</span>
+    <span>if</span> <span>(</span><span>STATIC_SYM_P</span><span>(</span><span>obj</span><span>))</span> <span>{</span>
+        <span>return</span> <span>(</span><span>SYM2ID</span><span>(</span><span>obj</span><span>)</span> <span>*</span> <span>sizeof</span><span>(</span><span>RVALUE</span><span>)</span> <span>+</span> <span>(</span><span>4</span> <span>&lt;&lt;</span> <span>2</span><span>))</span> <span>|</span> <span>FIXNUM_FLAG</span><span>;</span>
+    <span>}</span>
+    <span>else</span> <span>if</span> <span>(</span><span>FLONUM_P</span><span>(</span><span>obj</span><span>))</span> <span>{</span>
+      <span>return</span> <span>LL2NUM</span><span>((</span><span>SIGNED_VALUE</span><span>)</span><span>obj</span><span>);</span>
+    <span>}</span>
+    <span>else</span> <span>if</span> <span>(</span><span>SPECIAL_CONST_P</span><span>(</span><span>obj</span><span>))</span> <span>{</span>
+      <span>return</span> <span>LONG2NUM</span><span>((</span><span>SIGNED_VALUE</span><span>)</span><span>obj</span><span>);</span>
+    <span>}</span>
+    <span>return</span> <span>LL2NUM</span><span>((</span><span>SIGNED_VALUE</span><span>)(</span><span>obj</span><span>)</span> <span>/</span> <span>2</span><span>);</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Of course, it’s C so it might be a bit cryptic to the uninitiated, but in short, for the common case of a heap allocated
+object, its <code>object_id</code> would be the address where the object is stored, divided by two.
+So in a way, <code>#object_id</code> used to return you an actual pointer to the object.</p>
+
+<p>This made implementing the lesser-known counterpart of <code>#object_id</code>, <a href="https://docs.ruby-lang.org/en/2.5.0/ObjectSpace.html#method-c-_id2ref"><code>ObjectSpace._id2ref</code></a>,
+just as trivial, multiply the <code>object_id</code> by two, and here you go, you now have a pointer to the corresponding object.</p>
+
+<div><div><pre><code><span>s</span> <span>=</span> <span>&#34;I am a string&#34;</span>
+<span>ObjectSpace</span><span>.</span><span>_id2ref</span><span>(</span><span>s</span><span>.</span><span>object_id</span><span>).</span><span>equal?</span><span>(</span><span>s</span><span>)</span> <span># =&gt; true</span>
+</code></pre></div></div>
+
+<p>But there was actually a major problem with that implementation, which is that the Ruby heap is composed of standard-size slots.
+When an object is no longer referenced, the GC reclaims the object slot and will most likely re-use it for a future object.</p>
+
+<p>Hence if you were to hold onto an <code>object_id</code>, and use <code>ObjectSpace._id2ref</code>, it’s not actually certain the object you get
+back is the one you got the <code>object_id</code> from, it might be a totally different object.</p>
+
+<p>It also meant that if you are holding onto an <code>object_id</code> as a way to know if you’ve already seen a given object,
+you may run into some false positives.</p>
+
+<p>That’s why <a href="https://bugs.ruby-lang.org/issues/15408">in 2018 there was already a feature request to deprecate both <code>#object_id</code> and <code>_id2ref</code></a>.
+Back then Matz agreed to deprecated <code>_id2ref</code> for Ruby 2.7, but pointed out that removing <code>#object_id</code> would be too much of a breaking change,
+and that it is a useful API.
+However, this somehow fell through the cracks, and <code>_id2ref</code> was never formally deprecated, which is <a href="https://github.com/ruby/ruby/pull/13157">something I’d like to
+do for Ruby 3.5</a>.</p>
+
+<p>I’m not certain why <code>_id2ref</code> was added initially, given that <code>git blame</code> points to <a href="https://github.com/ruby/ruby/commit/210367ec889">a commit from 1999 that was generated by cvs2svn</a>.
+But if I had to guess, I’d say it was added for <code>drb</code> which today remains the only significant user of that API in the stdlib, but <a href="https://github.com/ruby/drb/pull/35">even that is about to change</a>.</p>
+
+<h2 id="gc-compaction">GC Compaction</h2>
+
+<p>Regardless of why <code>_id2ref</code> was added, that major flaw in its design became a blocker for Aaron Patterson when <a href="https://bugs.ruby-lang.org/issues/15626">he implemented
+GC compaction in Ruby 2.7</a>.
+Since GC compaction implies that objects can be moved from one slot to another, <code>#object_id</code> could no longer be derived from
+the object address, otherwise, it wouldn’t remain stable.</p>
+
+<p>What Aaron did is conceptually simple:</p>
+
+<div><div><pre><code><span>module</span> <span>Kernel</span>
+  <span>def</span> <span>object_id</span>
+    <span>unless</span> <span>id</span> <span>=</span> <span>ObjectSpace</span><span>::</span><span>OBJ_TO_ID_TABLE</span><span>[</span><span>self</span><span>]</span>
+      <span>id</span> <span>=</span> <span>ObjectSpace</span><span>.</span><span>next_obj_id</span>
+      <span>ObjectSpace</span><span>.</span><span>next_obj_id</span> <span>+=</span> <span>8</span>
+      <span>ObjectSpace</span><span>::</span><span>OBJ_TO_ID_TABLE</span><span>[</span><span>self</span><span>]</span> <span>=</span> <span>id</span>
+      <span>ObjectSpace</span><span>::</span><span>ID_TO_OBJ_TABLE</span><span>[</span><span>id</span><span>]</span> <span>=</span> <span>self</span>
+    <span>end</span>
+    <span>id</span>
+  <span>end</span>
+<span>end</span>
+
+<span>module</span> <span>ObjectSpace</span>
+  <span>def</span> <span>self</span><span>.</span><span>_id2ref</span><span>(</span><span>id</span><span>)</span>
+    <span>ObjectSpace</span><span>::</span><span>ID_TO_OBJ_TABLE</span><span>[</span><span>id</span><span>]</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>In short, Ruby added two internal Hash tables. One of them with objects as keys and IDs as values, and the inverse for the other.
+Whenever you access an object’s ID for the first time, a unique ID is created by incrementing an internal counter,
+and the relation between the object and its ID is stored in the two hash tables.</p>
+
+<p>As a Ruby user, you can observe this change easily by printing some <code>object_id</code>:</p>
+
+<div><div><pre><code><span>p</span> <span>Object</span><span>.</span><span>new</span><span>.</span><span>object_id</span>
+<span>p</span> <span>Object</span><span>.</span><span>new</span><span>.</span><span>object_id</span>
+</code></pre></div></div>
+
+<p>Up to Ruby 2.6, the above code will print some large and seemingly random integers such as <code>50666405449360</code>, whereas on
+Ruby 2.7 onwards, it will print small integers, likely <code>8</code> and <code>16</code>.</p>
+
+<p>This change both solved the historical issue with <code>_id2ref</code> and allowed the GC to keep stable IDs when moving objects from one
+address to the other, but made <code>object_id</code> way more costly than it used to be.</p>
+
+<p>Ruby’s hash-table implementation stores 3 pointer-sized numbers per entry.
+One for the key, one for the value, and one for the hashcode:</p>
+
+<div><div><pre><code><span>struct</span> <span>st_table_entry</span> <span>{</span>
+    <span>st_hash_t</span> <span>hash</span><span>;</span>
+    <span>st_data_t</span> <span>key</span><span>;</span>
+    <span>st_data_t</span> <span>record</span><span>;</span>
+<span>};</span>
+</code></pre></div></div>
+
+<p>And given every <code>object_id</code> is stored in two hash-tables, that makes for a total of <code>48B</code> (plus some change) per <code>object_id</code>.
+That’s quite a lot of memory for just a small number.</p>
+
+<p>In addition, accessing the <code>object_id</code> now requires doing a hash lookup, when before it was a simple division, and whenever
+the GC frees or moves an object that has an ID, it needs to update these two hash-tables.</p>
+
+<p>To be clear, I don’t have any evidence that these two tables cause significant memory or CPU overhead in real-world Ruby applications.
+I’m just saying that <code>#object_id</code> is way more expensive than one might expect.</p>
+
+<h2 id="entering-ractors">Entering Ractors</h2>
+
+<p>Then later on, when Koichi Sasada implemented Ractors since now multiple ractors could attempt to access these two hash-tables
+concurrently, <a href="https://github.com/ruby/ruby/commit/da3438a5045">he had to add a lock around them in <code>#object_id</code></a>, turning
+<code>#object_id</code> in a contention point:</p>
+
+<div><div><pre><code><span>module</span> <span>Kernel</span>
+  <span>def</span> <span>object_id</span>
+    <span>RubyVM</span><span>.</span><span>synchronize</span> <span>do</span>
+      <span>unless</span> <span>id</span> <span>=</span> <span>ObjectSpace</span><span>::</span><span>OBJ_TO_ID_TABLE</span><span>[</span><span>self</span><span>]</span>
+        <span>id</span> <span>=</span> <span>ObjectSpace</span><span>.</span><span>next_obj_id</span>
+        <span>ObjectSpace</span><span>.</span><span>next_obj_id</span> <span>+=</span> <span>8</span>
+        <span>ObjectSpace</span><span>::</span><span>OBJ_TO_ID_TABLE</span><span>[</span><span>self</span><span>]</span> <span>=</span> <span>id</span>
+        <span>ObjectSpace</span><span>::</span><span>ID_TO_OBJ_TABLE</span><span>[</span><span>id</span><span>]</span> <span>=</span> <span>self</span>
+      <span>end</span>
+      <span>id</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+
+<span>module</span> <span>ObjectSpace</span>
+  <span>def</span> <span>self</span><span>.</span><span>_id2ref</span><span>(</span><span>id</span><span>)</span>
+    <span>RubyVM</span><span>.</span><span>synchronize</span> <span>do</span>
+      <span>ObjectSpace</span><span>::</span><span>ID_TO_OBJ_TABLE</span><span>[</span><span>id</span><span>]</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>At this point, you may wonder if it’s really a big deal.
+After all, <code>#object_id</code> is used a bit for debugging, but not so much in actual production code.
+And this is mostly true, but it does come up in real-world code, e.g. <a href="https://github.com/mikel/mail/blob/d1d65b370b109b98e673a934e8b70a0c1f58cc59/lib/mail/message.rb#L1698">in the <code>mail</code> gem</a>,
+<a href="https://github.com/rubocop/rubocop/blob/4a611564c4e1d8ec12a8e45e96490465e5141605/lib/rubocop/cop/variable_force/branch.rb#L129-L131">in <code>rubocop</code></a>,
+and of course <a href="https://github.com/rails/rails/blob/99e27fa586af7db2b5334124a62eb3a464cdffd8/activesupport/lib/active_support/cache/strategy/local_cache.rb#L213-L215">quite a bit in Rails</a>.</p>
+
+<p>But calling <code>Kernel#object_id</code> isn’t the only way you might rely on an object ID.</p>
+
+<p>The <a href="https://docs.ruby-lang.org/en/3.4/Object.html#method-i-hash"><code>Object#hash</code></a> method for example rely on it:</p>
+
+<div><div><pre><code><span>static</span> <span>st_index_t</span>
+<span>objid_hash</span><span>(</span><span>VALUE</span> <span>obj</span><span>)</span>
+<span>{</span>
+    <span>VALUE</span> <span>object_id</span> <span>=</span> <span>rb_obj_id</span><span>(</span><span>obj</span><span>);</span>
+    <span>if</span> <span>(</span><span>!</span><span>FIXNUM_P</span><span>(</span><span>object_id</span><span>))</span>
+        <span>object_id</span> <span>=</span> <span>rb_big_hash</span><span>(</span><span>object_id</span><span>);</span>
+
+    <span>return</span> <span>(</span><span>st_index_t</span><span>)</span><span>st_index_hash</span><span>((</span><span>st_index_t</span><span>)</span><span>NUM2LL</span><span>(</span><span>object_id</span><span>));</span>
+<span>}</span>
+
+<span>VALUE</span>
+<span>rb_obj_hash</span><span>(</span><span>VALUE</span> <span>obj</span><span>)</span>
+<span>{</span>
+    <span>long</span> <span>hnum</span> <span>=</span> <span>any_hash</span><span>(</span><span>obj</span><span>,</span> <span>objid_hash</span><span>);</span>
+    <span>return</span> <span>ST2FIX</span><span>(</span><span>hnum</span><span>);</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Common value classes such as <code>String</code>, <code>Array</code> etc, do define their own <code>#hash</code> method that doesn’t rely on the object ID,
+but all other objects that are compared by identity by default will end up using <code>Object#hash</code>, hence accessing the <code>object_id</code>.</p>
+
+<p>For instance here’s a quite class <code>#hash</code> implementation from one of Rails classes:</p>
+
+<div><div><pre><code><span>#  activerecord/lib/arel/nodes/delete_statement.rb</span>
+  <span>def</span> <span>hash</span>
+    <span>[</span><span>self</span><span>.</span><span>class</span><span>,</span> <span>@relation</span><span>,</span> <span>@wheres</span><span>,</span> <span>@orders</span><span>,</span> <span>@limit</span><span>,</span> <span>@offset</span><span>,</span> <span>@key</span><span>].</span><span>hash</span>
+  <span>end</span>
+</code></pre></div></div>
+
+<p>It absolutely isn’t obvious, but here we’re hashing a <code>Class</code> object, and classes are indexed by identity like a default object:</p>
+
+<div><div><pre><code><span>&gt;&gt;</span> <span>Class</span><span>.</span><span>new</span><span>.</span><span>method</span><span>(</span><span>:hash</span><span>).</span><span>owner</span>
+<span>=&gt;</span> <span>Kernel</span>
+<span>&gt;&gt;</span> <span>Object</span><span>.</span><span>new</span><span>.</span><span>method</span><span>(</span><span>:hash</span><span>).</span><span>owner</span>
+<span>=&gt;</span> <span>Kernel</span>
+</code></pre></div></div>
+
+<p>Hence the above code currently requires to lock the entire virtual machine, just to produce a hashcode.</p>
+
+<h2 id="deoptimization">Deoptimization</h2>
+
+<p>So what could we do to remove or reduce the need to synchronize the entire virtual machine when accessing object IDs?</p>
+
+<p>Well first, given that <code>ObjectSpace._id2ref</code> is very rarely used, and will likely be marked as deprecated soon,
+we can start by optimistically not creating nor updating the <code>id -&gt; object</code> table until someone needs it, which hopefully
+won’t be the case in the vast majority of programs:</p>
+
+<div><div><pre><code><span>module</span> <span>Kernel</span>
+  <span>def</span> <span>object_id</span>
+    <span>RubyVM</span><span>.</span><span>synchronize</span> <span>do</span>
+      <span>unless</span> <span>id</span> <span>=</span> <span>ObjectSpace</span><span>::</span><span>OBJ_TO_ID_TABLE</span><span>[</span><span>self</span><span>]</span>
+        <span>id</span> <span>=</span> <span>ObjectSpace</span><span>.</span><span>next_obj_id</span>
+        <span>ObjectSpace</span><span>.</span><span>next_obj_id</span> <span>+=</span> <span>8</span>
+        <span>ObjectSpace</span><span>::</span><span>OBJ_TO_ID_TABLE</span><span>[</span><span>self</span><span>]</span> <span>=</span> <span>id</span>
+        <span>if</span> <span>defined?</span><span>(</span><span>ObjectSpace</span><span>::</span><span>ID_TO_OBJ_TABLE</span><span>)</span>
+          <span>ObjectSpace</span><span>::</span><span>ID_TO_OBJ_TABLE</span><span>[</span><span>id</span><span>]</span> <span>=</span> <span>self</span>
+        <span>end</span>
+      <span>end</span>
+      <span>id</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+
+<span>module</span> <span>ObjectSpace</span>
+  <span>def</span> <span>self</span><span>.</span><span>_id2ref</span><span>(</span><span>id</span><span>)</span>
+    <span>RubyVM</span><span>.</span><span>synchronize</span> <span>do</span>
+      <span>unless</span> <span>defined?</span><span>(</span><span>ObjectSpace</span><span>::</span><span>ID_TO_OBJ_TABLE</span><span>)</span>
+        <span>ObjectSpace</span><span>::</span><span>ID_TO_OBJ_TABLE</span> <span>=</span> <span>ObjectSpace</span><span>::</span><span>OBJ_TO_ID_TABLE</span><span>.</span><span>invert</span>
+      <span>end</span>
+      <span>ObjectSpace</span><span>::</span><span>ID_TO_OBJ_TABLE</span><span>[</span><span>id</span><span>]</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>This doesn’t remove the lock yet, but assuming your program never calls <code>ObjectSpace._id2ref</code> it removes some work
+from inside the lock, hence it shouldn’t be held as long.
+And even if you don’t use Ractors, it should slightly reduce memory usage as well as remove work for the GC,
+as demonstrated by a micro-benchmark:</p>
+
+<div><div><pre><code>benchmark:
+  baseline: &#34;Object.new&#34;
+  object_id: &#34;Object.new.object_id&#34;
+</code></pre></div></div>
+
+<div><div><pre><code>compare-ruby: ruby 3.5.0dev (2025-04-10T09:44:40Z master 684cfa42d7) +YJIT +PRISM [arm64-darwin24]
+built-ruby: ruby 3.5.0dev (2025-04-10T10:13:43Z lazy-id-to-obj d3aa9626cc) +YJIT +PRISM [arm64-darwin24]
+warming up..
+
+|           |compare-ruby|built-ruby|
+|:----------|-----------:|---------:|
+|baseline   |     26.364M|   25.974M|
+|           |       1.01x|         -|
+|object_id  |     10.293M|   14.202M|
+|           |           -|     1.38x|
+</code></pre></div></div>
+
+<p>As always, when possible, the most efficient way to speed up some code is to not call it if you can avoid it.</p>
+
+<p>If you’re curious to see the actual implementation, <a href="https://github.com/ruby/ruby/pull/13115">you can have a look at the pull request</a>.</p>
+
+<h2 id="inline-storage">Inline Storage</h2>
+
+<p>But while saving a bit of memory and CPU is nice, we’re still not significantly reducing contention, so what else could we do?</p>
+
+<p>The crux of the issue here is that the <code>object_id</code> is stored in a centralized hash table, and as long as it will be the case,
+synchronization will be required, short of implementing a lock-free hash table, but this is quite tricky to do.
+Much trickier than a hash-set John used for the <code>fstring_table</code>.</p>
+
+<p>But more importantly, a centralized data structure to store all the IDs of all objects isn’t great for locality anyway.
+More so, needing to do a hash lookup to access an object’s property is quite costly, when conceptually it should be stored directly
+inside the object.</p>
+
+<p>If you think about it, <code>object_id</code> isn’t very different from an instance variable:</p>
+
+<div><div><pre><code><span>module</span> <span>Kernel</span>
+  <span>def</span> <span>object_id</span>
+    <span>@__object_id</span> <span>||=</span> <span>ObjectSpace</span><span>.</span><span>generate_next_obj_id</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>You’d need the id generation to be thread-safe, which is easily done using an atomic increment operation, but other than that,
+assuming the object isn’t one of the special objects that is accessible from multiple ractors, you can mutate it to store the
+<code>object_id</code> without having to lock the entire VM.</p>
+
+<p>However, as is tradition, nothing is ever that simple.</p>
+
+<h2 id="final-shapes">Final Shapes</h2>
+
+<p>Since Ruby 3.2, objects use shapes to define how their instance variables are stored.</p>
+
+<p>Here again, let’s use some pseudo-Ruby code to illustrate the basics of how they work.</p>
+
+<p>To start, shapes are a tree-like structure. Every shape has a parent (except the root one)
+and 0-N children:</p>
+
+<div><div><pre><code><span>class</span> <span>Shape</span>
+  <span>def</span> <span>initialize</span><span>(</span><span>parent</span><span>,</span> <span>type</span><span>,</span> <span>edge_name</span><span>,</span> <span>next_ivar_index</span><span>)</span>
+    <span>@parent</span> <span>=</span> <span>parent</span>
+    <span>@type</span> <span>=</span> <span>type</span>
+    <span>@edge_name</span> <span>=</span> <span>edge_name</span>
+    <span>@next_ivar_index</span> <span>=</span> <span>next_ivar_index</span>
+    <span>@edges</span> <span>=</span> <span>{}</span>
+  <span>end</span>
+
+  <span>def</span> <span>add_ivar</span><span>(</span><span>ivar_name</span><span>)</span>
+    <span>@edges</span><span>[</span><span>ivar_name</span><span>]</span> <span>||=</span> <span>Shape</span><span>.</span><span>new</span><span>(</span><span>self</span><span>,</span> <span>:ivar</span><span>,</span> <span>ivar_name</span><span>,</span> <span>next_ivar_index</span> <span>+</span> <span>1</span><span>)</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>With this, when the Ruby VM has to execute code such as:</p>
+
+<div><div><pre><code><span>class</span> <span>User</span>
+  <span>def</span> <span>initialize</span><span>(</span><span>name</span><span>,</span> <span>role</span><span>)</span>
+    <span>@name</span> <span>=</span> <span>name</span>
+    <span>@role</span> <span>=</span> <span>role</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>It can compute the object shape on the fly such as:</p>
+
+<div><div><pre><code><span># Allocate the object</span>
+<span>object</span> <span>=</span> <span>new_object</span>
+<span>object</span><span>.</span><span>shape</span> <span>=</span> <span>ROOT_SHAPE</span>
+
+<span># add @name</span>
+<span>next_shape</span> <span>=</span> <span>object</span><span>.</span><span>add_ivar</span><span>(</span><span>:@name</span><span>)</span>
+<span>object</span><span>.</span><span>shape</span> <span>=</span> <span>next_shape</span>
+<span>object</span><span>.</span><span>ivars</span><span>[</span><span>next_shape</span><span>.</span><span>next_ivar_index</span> <span>-</span> <span>1</span><span>]</span> <span>=</span> <span>name</span>
+
+<span># add @role</span>
+<span>next_shape</span> <span>=</span> <span>object</span><span>.</span><span>add_ivar</span><span>(</span><span>:@role</span><span>)</span>
+<span>object</span><span>.</span><span>shape</span> <span>=</span> <span>next_shape</span>
+<span>object</span><span>.</span><span>ivars</span><span>[</span><span>next_shape</span><span>.</span><span>next_ivar_index</span> <span>-</span> <span>1</span><span>]</span> <span>=</span> <span>role</span>
+</code></pre></div></div>
+
+<p>This method may seem surprising, but it’s actually very efficient for various reasons I won’t get into here,
+because I wrote <a href="https://railsatscale.com/2023-10-24-memoization-pattern-and-object-shapes/">another post about it a bit over a year ago</a>,
+go read it if you are curious to know more.</p>
+
+<p>But how instance variables are laid out isn’t the only thing that shapes record. They also keep track of how large an object
+is, hence how many instance variables it can store, as well as whether it has been frozen.</p>
+
+<p>Still in pseudo-Ruby code, it looks like this:</p>
+
+<div><div><pre><code><span>class</span> <span>Shape</span>
+  <span>def</span> <span>add_ivar</span><span>(</span><span>ivar_name</span><span>)</span>
+    <span>if</span> <span>@type</span> <span>==</span> <span>:frozen</span>
+      <span>raise</span> <span>&#34;Can&#39;t modify frozen object&#34;</span>
+    <span>end</span>
+    <span>@edges</span><span>[</span><span>ivar_name</span><span>]</span> <span>||=</span> <span>Shape</span><span>.</span><span>new</span><span>(</span><span>self</span><span>,</span> <span>:ivar</span><span>,</span> <span>ivar_name</span><span>,</span> <span>next_ivar_index</span> <span>+</span> <span>1</span><span>)</span>
+  <span>end</span>
+
+  <span>def</span> <span>freeze</span>
+    <span>@edges</span><span>[</span><span>:__frozen</span><span>]</span> <span>||=</span> <span>Shape</span><span>.</span><span>new</span><span>(</span><span>self</span><span>,</span> <span>:frozen</span><span>,</span> <span>nil</span><span>,</span> <span>next_ivar_index</span><span>)</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>So <code>frozen</code> shapes are final. It is expected that a shape of type <code>frozen</code> won’t ever have any children.</p>
+
+<p>But in the case of <code>object_id</code>, we want to be able to store the id on any object, regardless of whether they are frozen
+or not. So the first step is to modify shapes to allow that, <a href="https://github.com/Shopify/ruby/commit/ca92bbe4f646658f9a420e61089cf5d6e27a5a71">which I did in a relatively simple commit</a>.</p>
+
+<p>But here too there was a bit of a complication. In a few cases, for instance when calling <code>Object#dup</code>, Ruby needs to find
+the unfrozen version of a shape. Previously, since frozen shapes couldn’t possibly have children, it was quite simple:</p>
+
+<div><div><pre><code><span>class</span> <span>Object</span>
+  <span>def</span> <span>dup</span>
+    <span>new_object</span> <span>=</span> <span>self</span><span>.</span><span>class</span><span>.</span><span>allocate</span>
+    <span>if</span> <span>self</span><span>.</span><span>shape</span><span>.</span><span>type</span> <span>==</span> <span>:frozen</span>
+      <span>new_object</span><span>.</span><span>shape</span> <span>=</span> <span>self</span><span>.</span><span>shape</span><span>.</span><span>parent</span>
+    <span>else</span>
+      <span>new_object</span><span>.</span><span>shape</span> <span>=</span> <span>self</span><span>.</span><span>shape</span>
+    <span>end</span>
+    <span># ...</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>Once you allow frozen shapes to have children, this operation becomes more involved, as you now need to go up the tree
+to find the last non-frozen shape, then reapply all the child shapes you wish to carry over.</p>
+
+<p>After this small refactoring was done, I could introduce a new type of shape: <code>SHAPE_OBJ_ID</code>, which behaves very similarly
+to instance variable shapes:</p>
+
+<div><div><pre><code><span>class</span> <span>Shape</span>
+  <span>def</span> <span>object_id</span>
+    <span># First check if there is an OBJ_ID shape in ancestors</span>
+    <span>shape</span> <span>=</span> <span>self</span>
+    <span>while</span> <span>shape</span><span>.</span><span>parent</span>
+      <span>return</span> <span>shape</span> <span>if</span> <span>shape</span><span>.</span><span>type</span> <span>==</span> <span>:obj_id</span>
+      <span>shape</span> <span>=</span> <span>shape</span><span>.</span><span>parent</span>
+    <span>end</span>
+
+    <span># Otherwise create one.</span>
+    <span>@edges</span><span>[</span><span>:__object_id</span><span>]</span> <span>||=</span> <span>Shape</span><span>.</span><span>new</span><span>(</span><span>self</span><span>,</span> <span>:obj_id</span><span>,</span> <span>nil</span><span>,</span> <span>next_ivar_index</span> <span>+</span> <span>1</span><span>)</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>And just like this, we’re now able to reserve some inline space inside any object to store the <code>object_id</code>,
+and in <em>some cases</em> we’re able to access an object’s ID fully lock-free.</p>
+
+<h2 id="lock-free-shapes">Lock Free Shapes</h2>
+
+<p>Why I’m saying <em>in some cases</em> is because there are still a number of limitations.</p>
+
+<p>First, since shapes are mostly immutable, we can access an object’s shape, and all its ancestors without taking a lock.
+However, finding or creating a shape’s child currently still requires synchronizing the VM.
+So even if my patch was to be applied, Ruby would still lock when accessing an object’s ID for the very first time,
+it would only be lock-free on subsequent accesses.</p>
+
+<p>Being able to find or create child shapes in a lock-free way would be useful way beyond the <code>object_id</code> use case, so
+hopefully we’ll get to it in the future, I haven’t yet dedicated much thought to it, but I’m hopeful we can find
+a solution. But even if we can’t do it lock-free, I think we could at least use a dedicated lock for it, so we wouldn’t
+contend with all the other code paths that synchronize the entire VM, only paths that do the same operation.</p>
+
+<p>Then, if the object is potentially shared between ractors, we also still need to acquire the lock before storing the ID,
+as otherwise, concurrent writes may cause a race condition. Given we need to both update the object’s shape and write
+the <code>object_id</code> inside the object, we can’t do it all in an atomic manner.</p>
+
+<p>Finally, not all objects store their instance variables in the same way.</p>
+
+<h2 id="generic-instance-variables">Generic Instance Variables</h2>
+
+<p>As a Rubyist, you likely know that in Ruby everything is an object, but that doesn’t mean all objects are equal.</p>
+
+<p>In the context of instance variables, there are essentially three types of objects: <code>T_OBJECT</code>, <code>T_CLASS/T_MODULE</code> and
+then all the rest.</p>
+
+<p><code>T_OBJECT</code> are your classic objects that inherit from the <code>BasicObject</code> class. Their instance variables are stored
+inline directly inside the object slot, as long as it’s large enough. If it ends up overflowing, then a separated memory
+location is allocated, and instance variables are moved there, the object slot then only contains a pointer to that auxiliary memory.</p>
+
+<p><code>T_CLASS</code> and <code>T_MODULE</code> as their name suggests are all instances of the <code>Class</code> and <code>Module</code> classes. These are much
+larger than regular objects, as they need to keep track of a lot of things, such as their method table, a pointer to the
+parent class, etc:</p>
+
+<div><div><pre><code><span>&gt;&gt;</span> <span>ObjectSpace</span><span>.</span><span>memsize_of</span><span>(</span><span>Object</span><span>.</span><span>new</span><span>)</span>
+<span>=&gt;</span> <span>40</span>
+<span>&gt;&gt;</span> <span>ObjectSpace</span><span>.</span><span>memsize_of</span><span>(</span><span>Class</span><span>.</span><span>new</span><span>)</span>
+<span>=&gt;</span> <span>192</span>
+</code></pre></div></div>
+
+<p>As such, they never store their instance variables inline, they always store them in auxiliary memory, and they have
+dedicated space in their object slot to store the auxiliary memory pointer:</p>
+
+<div><div><pre><code><span># internal/class.h
+</span><span>struct</span> <span>rb_classext_struct</span> <span>{</span>
+    <span>VALUE</span> <span>*</span><span>iv_ptr</span><span>;</span> <span>// iv = instance variable</span>
+    <span>// ...</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>And finally, there are all the other objects, such as <code>T_STRING</code>, <code>T_ARRAY</code>, <code>T_HASH</code>, <code>T_REGEXP</code>, etc.
+None of these have free space in their slot to store inline variables, and not even space to store the auxiliary memory
+pointer.</p>
+
+<p>So what does Ruby do when you do add an instance variable to such objects? Well, it stores it in a Hash-table of course!</p>
+
+<p>In pseudo-Ruby, it would look like this:</p>
+
+<div><div><pre><code><span>module</span> <span>GenericIvarObject</span>
+  <span>class</span> <span>GenericStorage</span>
+    <span>attr_accessor</span> <span>:shape</span>
+    <span>attr_reader</span> <span>:ivars</span>
+
+    <span>def</span> <span>initialize</span>
+      <span>@ivars</span> <span>=</span> <span>[]</span>
+    <span>end</span>
+  <span>end</span>
+
+  <span>def</span> <span>instance_variable_get</span><span>(</span><span>ivar_name</span><span>)</span>
+    <span>store</span> <span>=</span> <span>RubyVM</span><span>.</span><span>synchronize</span> <span>do</span>
+      <span>GENERIC_STORAGE</span><span>[</span><span>self</span><span>]</span> <span>||=</span> <span>GenericStorage</span><span>.</span><span>new</span>
+    <span>end</span>
+
+    <span>if</span> <span>ivar_shape</span> <span>=</span> <span>store</span><span>.</span><span>shape</span><span>.</span><span>find</span><span>(</span><span>ivar_name</span><span>)</span>
+      <span>store</span><span>.</span><span>ivars</span><span>[</span><span>ivar_shape</span><span>.</span><span>next_ivar_index</span> <span>-</span> <span>1</span><span>]</span>
+    <span>end</span>
+  <span>end</span>
+<span>end</span>
+</code></pre></div></div>
+
+<p>As you probably have noticed or even guessed, since this is yet another global hash table, any access needs to be synchronized,
+which means that for objects other than <code>T_OBJECT</code>, <code>T_CLASS</code> and <code>T_MODULE</code>,
+my patch replaces one global synchronized hash with another…</p>
+
+<p>So perhaps for these, keeping the original <code>object -&gt; id</code> table would be preferable, that’s something I still need to figure out.</p>
+
+<h3 id="conclusion">Conclusion</h3>
+
+<p>My patch isn’t finished. I still have to figure out how to best deal with “generic” objects, and probably refine the
+implementation some more, and perhaps it won’t even be merged at all in the end.</p>
+
+<p>But I wanted to share it because explaining something helps me think about the problem,
+and also because while I don’t think <code>object_id</code> is currently the biggest Ractor bottleneck,
+it’s a good showcase of the type of work that needs to be done to make Ractors more parallel.</p>
+
+<p>If you are curious about the patch, here’s <a href="https://github.com/ruby/ruby/compare/master...byroot:ruby:object_id-in-shape-snapshot">what it currently looks like as of this writing</a>.</p>
+
+<p>Similar work will have to be done for other internal tables, such as the symbol table and the various method tables.</p>
+
+
+  </div>
+</article>
+
+      </div>
+    </div></div>
+  </body>
+</html>
