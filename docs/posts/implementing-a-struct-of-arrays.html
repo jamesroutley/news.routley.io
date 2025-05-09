@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://brevzin.github.io/c&#43;&#43;/2025/05/02/soa/">Original</a>
+    <h1>Implementing a Struct of Arrays</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>Recently, I watched Andrew Kelley’s talk on <a href="https://www.youtube.com/watch?v=IroPQ150F6c">Practical Data Oriented Design</a>. It goes into some of the architectural changes he’s been making to the Zig compiler, with pretty significant performance benefit. Would definitely recommend checking out the talk, even if you’re like me and have never written any Zig.</p><p>About halfway through the talk, he shows a way to improve his memory usage by avoiding wasting memory. By turning this structure:</p><pre><code>const Monster = struct {
+    anim : *Animation,
+    kind : Kind,
+
+    const Kind = enum {
+        snake, bat, wolf, dingo, human
+    };
+};
+
+var monsters : ArrayList(Monster) = .{};
+</code></pre><p>into this one:</p><pre><code>var monsters : MultiArrayList(Monster) = .{};
+</code></pre><p><code>ArrayList(Monster)</code> is what we could call <code>std::vector&lt;Monster&gt;</code>, and <code>MultiArrayList(Monster)</code> now stores the <code>anim</code>s and <code>kind</code>s in two separate arrays, instead of one. That is, a struct of arrays instead of an array of structs. But it’s a <em>tiny</em> code change.</p><blockquote><p>One of the interesting things about Zig to me is that types are first class. Rather than having a class template that takes a template type parameter (like <code>std::vector</code> taking <code>T</code>), you write a function that takes a function parameter that is a type. That function then returns a type.</p><p>The implementation of MultiArrayList is <a href="https://github.com/ziglang/zig/blob/master/lib/std/multi_array_list.zig">literally</a></p><pre><code>pub fn MultiArrayList(comptime T: type) type {
+  return struct {
+    // lots of code
+  };
+}
+</code></pre></blockquote><p>The goal of this blog post is to implement the same thing using C++26 Reflection. We’re going to write a <code>SoaVector&lt;T&gt;</code> that instead being a dynamic array of <code>T</code>s has one dynamic array for each non-static data member of <code>T</code>.</p><h2 id="we-start-with-storage"><span>We Start with Storage</span><a href="#we-start-with-storage"><i></i></a></h2><p>For the purposes of this post, we’re going to pick a simple type that has two members of different types. Let’s say… a chess coordinate:</p><pre><code>struct Point {
+    char x;
+    int y;
+};
+</code></pre><p>If we were implementing a simple <code>Vector&lt;Point&gt;</code> our storage would look like</p><pre><code>struct {
+    Point* data;
+    size_t size;
+    size_t capacity;
+};
+</code></pre><p>But we’re writing an <code>SoaVector&lt;Point&gt;</code>, which means we want to store the <code>x</code>s and <code>y</code>s separately. Now, we could be lazy and do this:</p><pre><code>struct {
+    std::vector&lt;char&gt; x;
+    std::vector&lt;int&gt; y;
+};
+</code></pre><p>That would meet the requirements, but it’s not a great approach. These two <code>vector</code>s always have the same size and capacity — no reason to track them independently. It’s not like I’m trying to produce some optimal, production-ready structure in this blog… but let’s not prematurely pessimize either.</p><p>Instead, we want to do this:</p><pre><code>struct {
+    // a pointer for each non-static data member
+    char* x;
+    int* y;
+
+    // and then a size/capacity that apply to all of them
+    size_t size;
+    size_t capacity;
+};
+</code></pre><p>C++26 Reflection doesn’t have a lot on offer when it comes to code generation, but it <em>does</em> have the tools for this. There is a function <code>std::meta::define_aggregate()</code> which lets us… well… define an aggregate. By providing it with the data members we want to generate.</p><p>That, coupled with the ability to query data members, is all we need to begin:</p><pre><code>template &lt;class T&gt;
+struct SoaVector {
+    struct Pointers;
+    consteval {
+        define_aggregate(^^Pointers,
+            nsdms(^^T)
+            | std::views::transform([](std::meta::info member){
+                return data_member_spec(add_pointer(type_of(member)),
+                                        {.name = identifier_of(member)});
+            }));
+    }
+
+    Pointers pointers_ = {};
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+};
+</code></pre><p>Here, <code>nsdms</code> is a convenience helper because the real API is a mouthful:</p><pre><code>consteval auto nsdms(std::meta::info type) -&gt; std::vector&lt;std::meta::info&gt; {
+    return nonstatic_data_members_of(type, std::meta::access_context::current());
+}
+</code></pre><p>And then, for each non-static data member <code>T mem</code> we create a <code>data_member_spec</code> whose type is <code>T*</code> and whose name is <code>mem</code>. I’m choosing to keep the <code>size_</code> and <code>capacity_</code> members separate, both because it’s simpler (why code-gen members I know I need), because it makes for nice symmetry (<code>SoaVector&lt;T&gt;::Pointers</code> and <code>T</code> have the same number of members), and perhaps most importantly it means that I don’t have to worry about the names of any of <code>T</code>’s members and potentially clashing with <code>size_</code> and <code>capacity_</code>.</p><p>We’re off to a nice start.</p><h2 id="lets-add-some-elements"><span>Let’s Add Some Elements</span><a href="#lets-add-some-elements"><i></i></a></h2><p>Of course our storage isn’t particularly interesting just sitting there. The next thing to implement is <code>push_back</code>. The basic contours of <code>push_back</code> for our <code>SoaVector</code> are the same as for a regular <code>Vector</code>, so we start with the skeleton:</p><pre><code>auto push_back(T const&amp; value) -&gt; void {
+    if (size_ == capacity_) {
+        grow(/* some new capacity */);
+    }
+
+    // add this element
+
+    ++size_;
+}
+</code></pre><p>where</p><pre><code>auto grow(size_t new_capacity) -&gt; void {
+    // 1. allocate new storage
+    // 2. copy/move into the new storage
+    // 3. deallocate the old storage
+}
+</code></pre><p>Now, both for simplicity and to limit our focus, I’m not going to worry about things like exception safety, and we’re just going to copy elements.</p><p>We’ll start with <code>grow</code> first, since it’s simpler. And because I’m not worrying about exceptions, we can actually do that sequence of steps for each non-static data member in order</p><pre><code>auto grow(size_t new_capacity) -&gt; void {
+    Pointers new_pointers = {};
+    template for (constexpr auto M : /* ??? */) {
+        // 1. allocate new storage
+        // 2. copy into the new storage
+        // 3. deallocate the old storage
+    }
+
+    pointers_ = new_pointers;
+    capacity_ = new_capacity;
+}
+</code></pre><p>Unfortunately, one of the C++26 limitations is that we can’t just do <code>nsdms(^^Pointers)</code> in the expansion statement. That requires non-transient allocation, which we don’t have. Thankfully, we have a library solution for this in the form of <code>std::define_static_array()</code>. That function creates a static storage array with the contents you pass into it and returns a <code>std::span&lt;T const&gt;</code> into those contents. That <code>std::span</code>, importantly, can be used as a <code>constexpr</code> variable (it just points into <code>static</code> storage)! This is something that’s going to come up repeatedly, so we’ll store that in the class itself:</p><pre data-line="9-10"><code>template &lt;class T&gt;
+struct SoaVector {
+    struct Pointers;
+    consteval { /* ... */ }
+    Pointers pointers_ = {};
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+
+    static constexpr auto mems = define_static_array(nsdms(^^T));
+    static constexpr auto ptr_mems = define_static_array(nsdms(^^Pointers));
+};
+</code></pre><p>Which will allow us to implement <code>grow</code> (with a couple helper functions for convenience):</p><pre><code>auto grow(size_t new_capacity) -&gt; void {
+    Pointers new_pointers = {};
+    template for (constexpr auto M : ptr_mems) {
+        // 1. allocate
+        new_pointers.[:M:] = allocate&lt;[:remove_pointer(type_of(M)):]&gt;(
+            new_capacity);
+        // 2. copy
+        std::uninitialized_copy_n(pointers_.[:M:], size_, new_pointers.[:M:]);
+        // 3. deallocate
+        delete_range(pointers_.[:M:]);
+    }
+    pointers_ = new_pointers;
+    capacity_ = new_capacity;
+}
+
+template &lt;class U&gt;
+auto allocate(size_t cap) -&gt; U* {
+    return std::allocator&lt;U&gt;().allocate(cap);
+}
+
+template &lt;class U&gt;
+auto delete_range(U* ptr) -&gt; void {
+    std::destroy(ptr, ptr + size_);
+    std::allocator&lt;U&gt;().deallocate(ptr, capacity_);
+}
+</code></pre><p>Whenever we allocate memory, we have to remember to clean it up. We’re doing that to the old storage in <code>grow</code> and we have to do it in our destructor too:</p><pre><code>~SoaVector() {
+    template for (constexpr auto M : ptr_mems) {
+        delete_range(pointers_.[:M:]);
+    }
+}
+</code></pre><p>Now that we have our memory (and properly cleaning it up too), let’s go back to <code>push_back</code>. What we need to do is take a <code>T</code> and write each member of that <code>T</code> into the corresponding array. Reading the source member requires looking at a non-static data member of <code>T</code>, while writing the destination member requires looking at a non-static data member of <code>Pointers</code>. We could either loop over the number of members, or we could loop over a <code>zip</code> of the two sets of members.</p><p>I’m going to do the former since clang doesn’t yet implement <code>constexpr</code> structured bindings:</p><pre><code>auto push_back(T const&amp; value) -&gt; void {
+    if (size_ == capacity_) {
+        // some exponential growth
+        grow(std::max(3 * size_ / 2, size_ + 2));
+    }
+
+    template for (constexpr auto I : std::views::iota(0zu, mems.size())) {
+        constexpr auto from = mems[I];
+        constexpr auto to = ptr_mems[I];
+
+        using M = [: type_of(from) :];
+        ::new (pointers_.[: to :] + size_) M(value.[:from:]);
+    }
+
+    ++size_;
+}
+</code></pre><p>That would actually be simpler if I used <code>std::construct_at</code>, since I wouldn’t need to determine <code>M</code>. But in general I prefer placement new (especially since that’ll be <code>constexpr</code> in C++26 too) since it can do all kinds of initialization.</p><p>So far so good. If I just make everything <code>public</code> for <a href="https://godbolt.org/z/GfWYTMn5v">easy debugging</a>:</p><pre><code>struct Point {
+    char x;
+    int y;
+};
+
+int main() {
+    SoaVector&lt;Point&gt; v;
+    v.push_back(Point{.x=&#39;e&#39;, .y=4});
+    v.push_back(Point{.x=&#39;f&#39;, .y=7});
+
+    std::println(&#34;x={}&#34;, std::span(v.pointers_.x, v.size_)); // x=[&#39;e&#39;, &#39;f&#39;]
+    std::println(&#34;y={}&#34;, std::span(v.pointers_.y, v.size_)); // y=[4, 7]
+}
+</code></pre><h2 id="reading-those-elements"><span>Reading Those Elements</span><a href="#reading-those-elements"><i></i></a></h2><p>Now indexing is where things get really interesting. Because what do we return? For the purposes of this blog, we’re going to do things two different ways:</p><ul><li>the <code>const</code> indexing operator is just going to return a <code>Point</code>, by value.</li><li>the mutable indexing operator is going to return a view into a <code>Point</code> — a new <code>PointRef</code> type.</li></ul><p>What I mean by <code>PointRef</code> is:</p><pre><code>struct PointRef {
+    char&amp; x;
+    int&amp; y;
+
+    auto operator=(Point const&amp;) const -&gt; void; // assigns through
+};
+</code></pre><p>The point (sorry) here isn’t to argue that this is the absolutely correct way to implement <code>SoaVector&lt;T&gt;</code>. Maybe you think the <code>const</code> indexing operator should return a version of <code>PointRef</code> that has <code>const&amp;</code>s. Maybe you think there shouldn’t even be an indexing operator. I don’t know what the right answer is. But doing it this way should show how it’s possible to do whatever it is you want to do.</p><p>But before we go further, let’s add some more debuggability to this project (copying from <a href="https://brevzin.github.io/c++/2024/09/30/annotations/#pretty-printing-a-struct">this earlier post</a>):</p><pre data-line="1"><code>struct [[=derive&lt;Debug&gt;]] Point {
+    char x;
+    int y;
+};
+</code></pre><p>Now we can actually print our <code>Point</code>s. Much better!</p><h3 id="indexing-into-a-value"><span>Indexing into a Value</span><a href="#indexing-into-a-value"><i></i></a></h3><p>The first thing we’ll do is write</p><pre><code>auto operator[](size_t idx) const -&gt; T;
+</code></pre><p>That’ll get us to the point where we can both <code>push_back</code> <code>Point</code>s into our <code>SoaVector</code> and then read <code>Point</code>s back out successfully. That’s really the bare minimum to be able to claim that we’ve actually implemented a struct-of-arrays vector.</p><p>Now, so far, we’ve seen several examples where we need to iterate one member at a time. We allocated/deallocated one member at a time, we wrote one member at a time. But reading we can’t really do one member at a time. Well, we <em>could</em> — emitting the equivalent of:</p><pre><code>auto operator[](size_t idx) const -&gt; Point {
+    Point p;
+    p.x = pointers_.x[idx];
+    p.y = pointers_.y[idx];
+    return p;
+}
+</code></pre><p>And for this <code>Point</code> type, that’s perfectly fine. But let’s try for something better. We want to emit:</p><pre><code>auto operator[](size_t idx) const -&gt; Point {
+    return Point{pointers_.x[idx], pointers_.y[idx]};
+}
+</code></pre><p>The only way in C++26 to do this is to expand a pack. We can get that pack by using the <code>index_sequence</code> trick as usual. Or we can get that pack by doing something reflection-specific. Let’s just do the latter, for the sake of doing the latter:</p><pre><code>auto operator[](size_t idx) const -&gt; T {
+    return [: expand_all(ptr_mems) :] &gt;&gt; [this, idx]&lt;auto... M&gt;{
+        return T{pointers_.[:M:][idx]...};
+    };
+}
+</code></pre><p>And with that, we have both <code>push_back</code> and <code>operator[]</code> <a href="https://godbolt.org/z/od3Kq6683">working</a>:</p><pre><code>struct [[=derive&lt;Debug&gt;]] Point {
+    char x;
+    int y;
+};
+
+int main() {
+    SoaVector&lt;Point&gt; v;
+    v.push_back(Point{.x=&#39;e&#39;, .y=4});
+    v.push_back(Point{.x=&#39;f&#39;, .y=7});
+
+    std::println(&#34;v[0]={}&#34;, v[0]); // v[0]=Point{.x=&#39;e&#39;, .y=4}
+    std::println(&#34;v[1]={}&#34;, v[1]); // v[1]=Point{.x=&#39;f&#39;, .y=7}
+}
+</code></pre><h3 id="indexing-into-a-reference"><span>Indexing into a Reference</span><a href="#indexing-into-a-reference"><i></i></a></h3><p>Let’s take the next step. We don’t want to just read <code>v[0]</code>, we want to be able to write into it. We want to make <code>v[0] = Point{.x=&#39;a&#39;, .y=8}</code> work. How do we do it?</p><p>To start with, we need to generate a new type. But now, we don’t just want to emit:</p><pre><code>struct PointRef {
+    char&amp; x;
+    int&amp; y;
+};
+</code></pre><p>We also wanted an assignment operator and a conversion operator. <code>std::meta::define_aggregate()</code> doesn’t have the ability to generate member functions — only non-static data members. But that’s no matter, we can generate those members and then add those member functions in a derived class:</p><pre data-line="5,9-10,18,20-22"><code>template &lt;class T&gt;
+struct SoaVector {
+private:
+    struct Pointers;
+    struct RefBase;
+    consteval {
+        define_aggregate(^^Pointers,
+            transform_members(^^T, std::meta::add_pointer));
+        define_aggregate(^^RefBase,
+            transform_members(^^T, std::meta::add_lvalue_reference));
+    }
+    Pointers pointers_ = {};
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+
+    static constexpr auto mems = define_static_array(nsdms(^^T));
+    static constexpr auto ptr_mems = define_static_array(nsdms(^^Pointers));
+    static constexpr auto ref_mems = define_static_array(nsdms(^^RefBase));
+
+    struct Ref : RefBase {
+        auto operator=(T const&amp; value) const -&gt; void;
+    };
+};
+</code></pre><p>The logic for the assignment operator is the same as what we saw in <code>push_back</code>, except we’re writing through reference members instead of indexed pointer ones:</p><pre><code>struct Ref : RefBase {
+    auto operator=(T const&amp; value) const -&gt; void {
+        template for (constexpr auto I : std::views::iota(0zu, mems.size())) {
+            this-&gt;[:ref_mems[I]:] = value.[:mems[I]:];
+        }
+    }
+};
+</code></pre><p>And that’s… basically it. The index operator that returns a <code>Ref</code> looks nearly the same as the one that returns the <code>T</code>, we’re just initializing a different thing:</p><pre><code>auto operator[](size_t idx) -&gt; Ref {
+    return [: expand_all(ptr_mems) :] &gt;&gt; [this, idx]&lt;auto... M&gt;{
+        return Ref{pointers_.[:M:][idx]...};
+    };
+}
+
+auto operator[](size_t idx) const -&gt; T {
+    return [: expand_all(ptr_mems) :] &gt;&gt; [this, idx]&lt;auto... M&gt;{
+        return T{pointers_.[:M:][idx]...};
+    };
+}
+</code></pre><p>Which gives us:</p><pre><code>struct [[=derive&lt;Debug&gt;]] Point {
+    char x;
+    int y;
+};
+
+int main() {
+    SoaVector&lt;Point&gt; v;
+    v.push_back(Point{.x=&#39;e&#39;, .y=4});
+    v.push_back(Point{.x=&#39;f&#39;, .y=7});
+
+    v[0] = Point{.x=&#39;a&#39;, .y=8};
+
+    std::println(&#34;v[0]={}&#34;, std::as_const(v)[0]); // v[0]=Point{.x=&#39;a&#39;, .y=8}
+    std::println(&#34;v[1]={}&#34;, std::as_const(v)[1]); // v[1]=Point{.x=&#39;f&#39;, .y=7}
+}
+</code></pre><p>Which is pretty sweet.</p><h3 id="formatting-the-reference"><span>Formatting the Reference</span><a href="#formatting-the-reference"><i></i></a></h3><p>Well, okay. It feels a bit incomplete right. We should be able to just print <code>v[0]</code> and not have to print <code>std::as_const(v)[0]</code>! Thankfully, annotations help us out there too. We just have to use them:</p><pre data-line="5,15"><code>template &lt;class T&gt;
+struct SoaVector {
+private:
+    struct Pointers;
+    struct [[=derive&lt;Debug&gt;]] RefBase;
+    consteval { /* ... */ }
+    Pointers pointers_ = {};
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+
+    static constexpr auto mems = define_static_array(nsdms(^^T));
+    static constexpr auto ptr_mems = define_static_array(nsdms(^^Pointers));
+    static constexpr auto ref_mems = define_static_array(nsdms(^^RefBase));
+
+    struct [[=derive&lt;Debug&gt;]] Ref : RefBase {
+        // ...
+    };
+};
+</code></pre><p>Annotations are <em>so</em> cool.</p><p>Anyway, that’s great, since it lets us just print <code>v[0]</code> instead of <code>std::as_const(v)[0]</code>. But it doesn’t quite print it <a href="https://godbolt.org/z/eKKdroTbM">the way I’d like</a>:</p><pre><code>v[0]=Ref{RefBase{.x=&#39;a&#39;, .y=8}}
+v[1]=Ref{RefBase{.x=&#39;f&#39;, .y=7}}
+</code></pre><p>What if we just, at the point of formatting, forced the conversion to <code>Point</code>? That requires two things. First, we need to add such a conversion. That’s no problem, we’ve already done that twice:</p><pre data-line="8-12"><code>struct [[=derive&lt;Debug&gt;]] Ref : RefBase {
+    auto operator=(T const&amp; value) const -&gt; void {
+        template for (constexpr auto I : std::views::iota(0zu, mems.size())) {
+            this-&gt;[:ref_mems[I]:] = value.[:mems[I]:];
+        }
+    }
+
+    operator T() const {
+        return [: expand_all(ref_mems) :] &gt;&gt; [this]&lt;auto... M&gt;{
+            return T{this-&gt;[:M:]...};
+        };
+    }
+};
+</code></pre><p>And then we add some more functionality to our little formatting annotation library. Right now we just have <code>derive&lt;Debug&gt;</code>. We could add some more information there — add <em>which</em> type we want to format as. Let’s do something like this. We’ll add a new annotation type:</p><pre><code>struct format_as { std::meta::info type; };
+</code></pre><p>Which we’ll add to <code>Ref</code> (and then remove the <code>derive&lt;Debug&gt;</code> from <code>RefBase</code> as no longer necessary):</p><pre data-line="5,13"><code>template &lt;class T&gt;
+struct SoaVector {
+private:
+    struct Pointers;
+    struct RefBase;
+    consteval { /* ... */; }
+    Pointers pointers_ = {};
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+
+    // ...
+
+    struct [[=derive&lt;Debug&gt;, =format_as{^^T}]] Ref : RefBase {
+        // ...
+    };
+};
+</code></pre><p>Now we have to teach our annotation-based formatter to look for this other annotation. First, we determine what type we’re formatting as. That’s the <code>format_as</code> type, if present:</p><pre><code>consteval auto format_type(std::meta::info type) -&gt; std::meta::info {
+    auto as = annotations_of(type, ^^format_as);
+    if (not as.empty()) {
+        return extract&lt;format_as&gt;(as[0]).type;
+    } else {
+        return type;
+    }
+}
+</code></pre><p>If we find an annotation of type <code>format_as</code>, <code>as[0]</code> will still be of type <code>std::meta::info</code> — so we need <code>extract&lt;format_as&gt;()</code> to actually pull out a <code>format_as</code> value.</p><blockquote><p>One of the advantages of the value-based reflection model is that a lot of Reflection functions are just that — functions.</p></blockquote><p>And once we have this function, the simplest change we can make is to change our formatter to inherit from a different class template:</p><pre data-line="11-12"><code>template &lt;class T&gt;
+struct derive_formatter {
+    constexpr auto parse(auto&amp; ctx) { return ctx.begin(); }
+
+    auto format(T const&amp;, auto&amp; ctx) const {
+        // all as before
+    }
+};
+
+template &lt;class T&gt; requires (has_annotation(^^T, derive&lt;Debug&gt;))
+struct std::formatter&lt;T&gt;
+    : derive_formatter&lt;[: format_type(^^T) :]&gt;
+{ };
+</code></pre><p>And we’re done. <code>std::formatter&lt;Point&gt;</code> and <code>std::formatter&lt;SoaVector&lt;Point&gt;::Ref&gt;</code> both inherit from <code>derive_formatter&lt;Point&gt;</code>, whose <code>format()</code> takes a <code>Point const&amp;</code>. For <code>Ref</code>, that implicit conversion just happens on the way in.</p><h2 id="a-working-implementation"><span>A Working Implementation</span><a href="#a-working-implementation"><i></i></a></h2><p>And with all that said and done, let’s look at <a href="https://godbolt.org/z/jjTEWdY6d">this program</a>:</p><pre><code>struct [[=derive&lt;Debug&gt;]] Point {
+    char x;
+    int y;
+};
+
+int main() {
+    SoaVector&lt;Point&gt; v;
+    v.push_back(Point{.x=&#39;e&#39;, .y=4});
+    v.push_back(Point{.x=&#39;f&#39;, .y=7});
+
+    v[0] = Point{.x=&#39;a&#39;, .y=8};
+
+    std::println(&#34;v[0]={}&#34;, v[0]); // v[0]=Point{.x=&#39;a&#39;, .y=8}
+    std::println(&#34;v[1]={}&#34;, v[1]); // v[1]=Point{.x=&#39;f&#39;, .y=7}
+}
+</code></pre><p>We’re taking an arbitrary type, creating a struct of vectors out of each element, supporting pushing elements into it (handling the piece-wise split ourselves), reading elements out of it (ditto), and even supporting proxy references that print like the original type.</p><p>The complete implementation of <code>SoaVector</code> here was less than 100 lines of code, plus a few other short helpers. Just pasting the actual implementation:</p><pre><code>template &lt;class T&gt;
+struct SoaVector {
+private:
+    struct Pointers;
+    struct RefBase;
+    consteval {
+        define_aggregate(
+            ^^Pointers,
+            transform_members(^^T, std::meta::add_pointer));
+        define_aggregate(
+            ^^RefBase,
+            transform_members(^^T, std::meta::add_lvalue_reference));
+    }
+    Pointers pointers_ = {};
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+
+    static constexpr auto mems = define_static_array(nsdms(^^T));
+    static constexpr auto ptr_mems = define_static_array(nsdms(^^Pointers));
+    static constexpr auto ref_mems = define_static_array(nsdms(^^RefBase));
+
+    struct [[=derive&lt;Debug&gt;, =format_as{^^T}]] Ref : RefBase {
+        auto operator=(T const&amp; value) const -&gt; void {
+            template for (constexpr auto I :
+                          std::views::iota(0zu, mems.size())) {
+                this-&gt;[:ref_mems[I]:] = value.[:mems[I]:];
+            }
+        }
+
+        operator T() const {
+            return [: expand_all(ref_mems) :] &gt;&gt; [this]&lt;auto... M&gt;{
+                return T{this-&gt;[:M:]...};
+            };
+        }
+    };
+
+    auto grow(size_t new_capacity) -&gt; void {
+        Pointers new_pointers = {};
+        template for (constexpr auto M : ptr_mems) {
+            new_pointers.[:M:] = alloc&lt;[:remove_pointer(type_of(M)):]&gt;(
+                new_capacity);
+            std::uninitialized_copy_n(pointers_.[:M:],
+                                      size_,
+                                      new_pointers.[:M:]);
+            delete_range(pointers_.[:M:]);
+        }
+        pointers_ = new_pointers;
+        capacity_ = new_capacity;
+    }
+
+    template &lt;class U&gt;
+    auto alloc(size_t cap) -&gt; U* {
+        return std::allocator&lt;U&gt;().allocate(cap);
+    }
+
+    template &lt;class U&gt;
+    auto delete_range(U* ptr) -&gt; void {
+        std::destroy(ptr, ptr + size_);
+        std::allocator&lt;U&gt;().deallocate(ptr, capacity_);
+    }
+
+public:
+    SoaVector() = default;
+    ~SoaVector() {
+        template for (constexpr auto M : ptr_mems) {
+            delete_range(pointers_.[:M:]);
+        }
+    }
+
+    auto push_back(T const&amp; value) -&gt; void {
+        if (size_ == capacity_) {
+            grow(std::max(3 * size_ / 2, size_ + 2));
+        }
+
+        template for (constexpr auto I :
+                      std::views::iota(0zu, mems.size())) {
+            constexpr auto from = mems[I];
+            constexpr auto to = ptr_mems[I];
+
+            using M = [: type_of(from) :];
+            ::new (pointers_.[: to :] + size_) M(value.[:from:]);
+        }
+
+        ++size_;
+    }
+
+    auto operator[](size_t idx) -&gt; Ref {
+        return [: expand_all(ptr_mems) :] &gt;&gt; [this, idx]&lt;auto... M&gt;{
+            return Ref{pointers_.[:M:][idx]...};
+        };
+    }
+
+    auto operator[](size_t idx) const -&gt; T {
+        return [: expand_all(ptr_mems) :] &gt;&gt; [this, idx]&lt;auto... M&gt;{
+            return T{pointers_.[:M:][idx]...};
+        };
+    }
+};
+</code></pre><p>Of course this is still just <code>push_back</code> and two overloads of <code>operator[]</code>, I didn’t even add iterator support or any of the other functions you’d probably want. But this was basically already the hard part. Once we can do this, we’ve demonstrated that we can do everything.</p><p>For instance, you might want to be able to have <code>v.fields().x</code> give you a <code>std::span&lt;char&gt;</code> (or <code>std::span&lt;char const&gt;</code>) — just the <code>x</code>s. I’d manually done that earlier just to be able to test the implementation, but that’s actually a useful thing to want. Doing so is just another round of generating a type and then populating it.</p><p>Needless to say, I’m <em>very</em> excited about Reflection.</p><h2 id="comparison-with-zig"><span>Comparison with Zig</span><a href="#comparison-with-zig"><i></i></a></h2><p>I’ve written in this blog about Rust a number of times. And while I don’t know Rust very well at all, I have at least read the Rust Programming Language, written a number of small Rust programs, read blogs, watched talks, and talked to Rust people about Rust things.</p><p>I can’t say <em>any</em> of that about Zig. The only Zig talk I’ve ever watched is the one I linked to above (and that one arguably is less a Zig talk and more a “Practical Data-Oriented Design” talk that is somewhat language-agnostic). I haven’t read any Zig books or blogs, written any programs, nothing like that. I have browsed through the docs. Sort of. So I am not exactly in a great position to give a proper comparison to the Zig implementation here. I apologize in advance for all the egregious errors.</p><p>The <a href="https://github.com/ziglang/zig/blob/master/lib/std/multi_array_list.zig">Zig implementation</a> of <code>MultiArrayList</code> does an extra optimization that I didn’t think about: it does a single allocation — and then chunks that allocation up. Its layout is simply:</p><pre><code>pub fn MultiArrayList(comptime T: type) type {
+    return struct {
+        bytes: [*]align(@alignOf(T)) u8 = undefined,
+        len: usize = 0,
+        capacity: usize = 0,
+        // ...
+    };
+}
+</code></pre><blockquote><p>Coming from C/C++, Zig declaration syntax is a bit jarring — but it has a lot going for it. Declarations always read in one direction, there’s no spiraling. Here, <code>bytes</code> is a many-item pointer (<code>[*]</code>) to an unknown number of suitably-aligned (<code>@alignof(T)</code>) <code>u8</code>, initialized to <code>undefined</code>. Zig also differentiates between a many-item pointer (<code>[*]T</code>) and a single-item pointer (<code>*T</code>).</p></blockquote><p>Now, whereas I created the struct <code>Pointers</code> (which had a <code>char*</code> and an <code>int*</code> for the two fields), the Zig implementation doesn’t do that. Instead, when it chunks up its single allocation, it still keeps everything in <code>u8</code> space:</p><pre><code>pub const Slice = struct {
+    ptrs: [fields.len][*]u8,
+    len: usize,
+    capacity: usize,
+};
+</code></pre><p><code>ptrs</code> is an array of many-item pointers to <code>u8</code>, one pointer for each field.</p><p>Eventually though, we need to go back to type-space. Before I walk through any of the code, there is one type being generated that is worth talking about:</p><pre><code>pub const Field = meta.FieldEnum(T);
+</code></pre><p><code>meta.FieldEnum()</code> is a Zig function that takes a type and returns an <code>enum</code> (roughly a C++ <code>enum class</code>) with an enumerator for each member. So if we had:</p><pre><code>const Point = struct {
+    x : c_char,
+    y : i32
+};
+</code></pre><p>then <code>meta.FieldEnum(Point)</code> would produce <code>enum { x, y }</code>.</p><blockquote><p>One of the things I <em>really</em> like about Zig is that, because types are first-class, you can just have functions that take types and return types. One of the parts of C++26 reflection that I dislike is our approach to generating types. Right now, I have to write:</p><pre><code>struct Pointers;
+consteval {
+    define_aggregate(^^Pointers,
+                     transform_members(^^T, std::meta::add_pointer));
+}
+</code></pre><p>When <em>really</em> the meaning and intent here is more akin to:</p><pre><code>struct Pointers = transform_members(^^T, std::meta::add_pointer);
+</code></pre><p>Zig gets me the latter. Even if I wanted to write <code>AddPointers&lt;T&gt;</code>, the only way to implement that is by doing one further layer of indirection:</p><pre><code>template &lt;class T&gt;
+struct AddPointersImpl {
+    struct type;
+    consteval { transform_members(^^type, std::meta::add_pointer); }
+};
+
+template &lt;class T&gt;
+using AddPointers = AddPointersImpl&lt;T&gt;::type;
+</code></pre></blockquote><p>Also, let’s look at how <code>FieldEnum</code> <a href="https://github.com/ziglang/zig/blob/master/lib/std/meta.zig">actually works</a>:</p><pre><code>pub fn FieldEnum(comptime T: type) type {
+    const field_infos = fields(T); // basically, @typeInfo(T).fields
+
+    if (field_infos.len == 0) {
+        // skipping for brevity
+    }
+
+    if (@typeInfo(T) == .@&#34;union&#34;) {
+        // skipping for brevity
+    }
+
+    var decls = [_]std.builtin.Type.Declaration{};
+
+    var enumFields: [field_infos.len]std.builtin.Type.EnumField = undefined;
+    inline for (field_infos, 0..) |field, i| {
+        enumFields[i] = .{
+            .name = field.name ++ &#34;&#34;,
+            .value = i,
+        };
+    }
+
+    return @Type(.{
+        .@&#34;enum&#34; = .{
+            .tag_type = std.math.IntFittingRange(0, field_infos.len - 1),
+            .fields = &amp;enumFields,
+            .decls = &amp;decls,
+            .is_exhaustive = true,
+        },
+    });
+}
+</code></pre><p>This is pretty similar in spirit to how <code>std::meta::define_aggregate()</code> works, the primary difference being that we’re <em>returning</em> a new type rather than taking as a parameter the type we’re defining. An equivalent <code>std::meta::define_enum()</code> should be a fairly straightforward extension.</p><p>Moving on. Eventually Zig has to get from a bunch of <code>u8</code>s to specific types. We have <code>items()</code> for that:</p><pre data-line="4"><code>// for our Point example, this was enum { x, y }
+pub const Field = meta.FieldEnum(T);
+
+pub fn items(self: Slice, comptime field: Field) []FieldType(field) {
+    const F = FieldType(field);
+    if (self.capacity == 0) {
+        return &amp;[_]F{};
+    }
+    const byte_ptr = self.ptrs[@intFromEnum(field)];
+    const casted_ptr: [*]F = if (@sizeOf(F) == 0)
+        undefined
+    else
+        @ptrCast(@alignCast(byte_ptr));
+    return casted_ptr[0..self.len];
+}
+</code></pre><p>There’s a lot of interesting stuff going on in the highlighted line so I wanted to call it out:</p><ul><li><code>field</code> is a <code>comptime</code> function parameter. This is what C++ would call <code>constexpr</code> function parameters. We already saw a few cases with passing a <em>type</em> as a function parameter, this is now passing an <code>enum</code>.</li><li>This returns <code>[]FieldType(field)</code>. The type <code>[]T</code> (a slice) is what C++ would spell <code>std::span&lt;T&gt;</code>, it’s basically many-item pointer and a length. Other languages have a slice type too — Rust spells it <code>[T]</code> and D spells it <code>T[]</code>. Anywhere you put the <code>T</code> is valid in some language.</li><li>The specific type <code>FieldType(field)</code> is shorter convenience for <code>@FieldType(T, @tagName(field))</code>. The <code>@</code> functions are all Zig builtins. I’m guessing <code>@FieldType</code> is capitalized because it’s a type, while <code>@tagName</code> is a value.</li></ul><p>For the call <code>self.items(Field.x)</code> (or simply <code>self.items(.x)</code> as a nice shorthand), we’d look up the return type as <code>@FieldType(Point, @tagName(Field.x))</code> which is <code>@FieldType(Point, &#34;x&#34;)</code> which is <code>c_char</code>. So this returns a <code>[]c_char</code> (or <code>std::span&lt;char&gt;</code>).</p><p>The enum here is used two ways — its name maps back to the original field to gets its type, and its <em>index</em> is used to pick which byte array we’re accessing — that’s <code>self.ptrs[@intFromEnum(field)]</code> (where <code>@intFromEnum</code> is just an explicit cast from <code>enum</code> to <code>int</code>).</p><p>Lastly, let’s actually get an element. What does that look like? I’m simplifying the implementation slightly to only care about the <code>struct</code> case:</p><pre><code>pub fn get(self: Slice, index: usize) T {
+    var result: T = undefined;
+    inline for (fields, 0..) |field_info, i| {
+        @field(result, field_info.name) =
+            self.items(@as(Field, @enumFromInt(i)))[index];
+    }
+    return result;
+}
+</code></pre><p>One nice thing Zig has going for it is that, as a C language, you can just construct an <code>undefined</code> object and then piece-wise assign the members. Can’t do that in C++, so this function was always going to be simpler in Zig than in C++. The <code>@as(Field, @enumfromInt(i))</code> part is taking the <code>int</code> iteration index and casting it to our <code>Field</code> enum. <code>inline for</code> is semantically equivalent to C++’s <code>template for</code>.</p><p>But other than that, this implementation isn’t actually all that different than what we’d do in C++. Copying the member-at-a-time approach, the C++ implementation is:</p><pre><code>auto operator[](size_t index) const -&gt; T {
+    T result;
+    template for (constexpr auto I : views::iota(0zu, mems.size())) {
+        result.[:mems[I]:] = pointers_.[:pmems[I]:][index];
+    }
+    return result;
+}
+</code></pre><p>It’s interesting that while <em>syntactic</em> choices are quite different, the semantics are remarkably similar between the two approaches to reflection. While the Zig language is still very foreign to me, a lot of the implementation I nevertheless found familiar — because it wasn’t all that different from what I just did.</p><p>But there are a few choices Zig makes that I really like, that I wanted to specifically note:</p><ul><li>As already mentioned, the ability to “initialize” types in the same way that you could initialize other values. This may prove difficult in C++ for a number of reasons, but I think it’s worth considering — especially as we’ll want to pursue more code generation utilities.</li><li><code>constexpr</code> function parameters make for nice syntax, since you don’t have different syntax choices for different “kinds” of parameters.</li><li>Being able to implicitly name enumerators. I don’t know what Zig calls this feature, but basically the fact that this works:<pre><code>const Color = enum { red, green, blue };
+
+pub fn takes_color(c: Color) void { _ = c; }
+
+pub fn main() void {
+    takes_color(.red); // ok, implicitly Color.red
+}
+</code></pre><p>which is what allows this syntax to work:</p><pre><code>var list : std.MultiArrayList(Point) = .{};
+var xs : []c_char = list.items(.x);
+var y0 : i32      = list.items(.y)[0];
+</code></pre><p>After all, is <code>f(.x)</code> all that different to support than <code>f({.x=1})</code> which already works? The best I can come up with in C++ right now is <a href="https://godbolt.org/z/M3cncEWre">this syntax</a>, using the proposed <a href="https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2025/p2781r8.html"><code>std::constant_wrapper</code></a>:</p><pre><code>std::println(&#34;xs={}&#34;, v.items(std::cw&lt;&#34;x&#34;&gt;)); // xs=[&#39;a&#39;, &#39;f&#39;]
+std::println(&#34;ys={}&#34;, v.items(std::cw&lt;&#34;y&#34;&gt;)); // ys=[8, 7]
+</code></pre><p>One of the reasons this is reasonable in Zig is that <code>.red</code> is short-hand for <code>Color.red</code>. But in C++, the qualified name for the enumerator isn’t <code>Color.red</code>, we’d spell it <code>Color::red</code> instead. Having <code>.red</code> be short-hand for a completely different syntax might be a hard sell. And <code>::red</code> already has meaning. We’ll see.</p></li></ul><p>That all said, I will simply repeat how I ended the previous section: I’m very excited about Reflection in C++.</p></div></div>
+  </body>
+</html>
