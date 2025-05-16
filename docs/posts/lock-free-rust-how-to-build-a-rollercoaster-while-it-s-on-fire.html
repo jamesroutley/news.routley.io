@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://yeet.cx/blog/lock-free-rust/">Original</a>
+    <h1>Lock-Free Rust: How to Build a Rollercoaster While It&#39;s on Fire</h1>
+    
+    <div id="readability-page-1" class="page"><section>
+            <blockquote>
+<p><em>“Every stitch in that flag was a commitment to thread safety without locks. <code>std::atomic</code> was the needle.”</em></p>
+<p>— Betsy Ross, Federalist Papers, Draft 29 (suppressed), 1782</p>
+</blockquote>
+<p>Buckle your seatbelts, grab a helmet, and say goodbye to your loved ones because over the next few minutes, I am going to teach you more about lock-free data structures in Rust than any human being should reasonably know without a psychiatric evaluation.</p>
+<p>So sit down, shut up, and pretend you understand memory ordering, because thread safety is just a social construct and <code>Ordering::Relaxed</code> is just denial with extra steps.</p>
+<h2 id="tl-dr">TL;DR</h2>
+<p>We’re building <code>LockFreeArray&lt;T, N&gt;</code>, a fixed-size, lock-free array for storing heap-allocated values. It uses atomics and a freelist to insert and take values across threads <strong>without locks</strong>. You’ll learn:</p>
+<ul>
+<li>How <code>AtomicPtr</code>, <code>AtomicUsize</code>, and <code>compare_exchange</code> work.</li>
+<li>Why memory ordering matters (and how to screw it up).</li>
+<li>Where this kind of thing is useful (task slots, freelists, fixed-resource pools).</li>
+<li>And why it&#39;s generally a terrible idea unless you&#39;re very desperate or very clever.</li>
+</ul>
+<p>If you enjoy the read and want to see more content like this please check out our product <a href="https://yeet.cx">yeet</a>
+or our <a href="https://yeet.cx/play">sandbox</a>. Thank you.</p>
+<h2 id="lock-free-the-decathlon-of-danger">Lock-Free: The Decathlon of Danger</h2>
+<p>Lock-free programming exists for the same reason people free solo climb cliffs without ropes: it’s fast, it’s elegant, and it absolutely will kill you if you do it wrong. Here at <a href="https://yeet.cx">yeet</a>, we have become masters in this. Specifically when it comes to building high-performance priority queues for real-time streaming of high volume events from BPF ring buffers.</p>
+<p>With <code>Mutex&lt;T&gt;</code> and <code>RwLock&lt;T&gt;</code>, you get warm, fuzzy guarantees — mutual exclusion, fairness, and the comfort of compile-time safety at the expense of speed. On the other hand, with lock-free, you get speed — but it&#39;s entirely on you to keep it safe. No waiting, no blocking, no help.</p>
+<p>It’s the difference between riding a rollercoaster and building one mid-air while it’s on fire — and you’re also the passenger.</p>
+<p><img src="https://yeet.cx/blog/lock-free-rust/mr-bones-wild-ride.jpg" alt="Mr. Bones Wild Ride"/></p>
+<p>Congratulations — if you’re still reading, you’ve officially decided to ignore your therapist, ghost the borrow checker, and raw-dog concurrency.</p>
+<h2 id="meet-the-atomics">Meet The Atomics</h2>
+<p>You don’t need all of them — just the dangerous few:</p>
+<p><strong><code>AtomicPtr&lt;T&gt;</code></strong></p>
+<p>Think raw pointers, but in a shared haunted house. You can pass ownership between threads, but if you screw up, the ghost of undefined behavior will visit you at runtime.</p>
+<p><strong><code>AtomicUsize</code></strong></p>
+<p>Used for indexing and freelist linkage. It’s a plain old number, except it’s watched 24 / 7 by the CPU’s race condition alarm.</p>
+<p><strong><code>Ordering::{Acquire, Release, AcqRel, Relaxed}</code></strong></p>
+<p>These decide <em>when</em> other threads can see your changes. Use the wrong one and your writes arrive out of order, like sending a cake before the oven’s even preheated.</p>
+<p>That’s it. Three tools. Infinite ways to wake up in a hospital wrapped in unsafe.</p>
+<p><img src="https://yeet.cx/blog/lock-free-rust/ouch.gif" alt="Ouch"/></p>
+<h2 id="lock-free-arrays-index-at-your-own-risk"><strong>Lock-Free Arrays: Index at Your Own Risk</strong></h2>
+<p>This isn’t your friendly neighborhood <code>Vec&lt;T&gt;</code>. This is <code>Vec&lt;Violence&gt;</code>.</p>
+<p>No resizing. No bounds checks. No cozy locks to hold your hand when the threads start racing. Just raw pointers, atomics, and the kind of confidence that comes from skimming half the docs, pounding gas station coffee, and whispering <em>“how hard could it be?”</em></p>
+<p>We’ll call it <code>LockFreeArray&lt;T, N&gt;</code></p>
+<p><em>Think of it as a fixed-size concurrent slot buffer — useful for task pools, on-demand workers, or resource slots that can’t afford a lock.</em></p>
+<p>It has three methods:</p>
+<p><code>new()</code></p>
+<p>Initializes the array and sets up a freelist of available slots.</p>
+<p><code>try_insert(value: T) -&gt; Result&lt;usize, T&gt;</code></p>
+<p>Tries to place a value in an empty slot. On success, returns the index. On failure, returns your value back, gently but firmly.</p>
+<p><code>take(index: usize) -&gt; Option&lt;T&gt;</code></p>
+<p>Removes and returns the value <code>T</code> at the given <code>index</code>. If it’s already empty, returns <code>None</code>.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>use </span><span>std::array;
+</span><span>use </span><span>std::ptr;
+</span><span>use </span><span>std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+</span><span>
+</span><span>/// Index tagging to solve the ABA problem.
+</span><span>fn </span><span>pack</span><span>(</span><span>index</span><span>: </span><span>usize</span><span>, </span><span>tag</span><span>: </span><span>usize</span><span>) -&gt; </span><span>usize </span><span>{
+</span><span>    (tag &lt;&lt; </span><span>32</span><span>) | index
+</span><span>}
+</span><span>
+</span><span>/// Index tagging to solve the ABA problem.
+</span><span>fn </span><span>unpack</span><span>(</span><span>value</span><span>: </span><span>usize</span><span>) -&gt; (</span><span>usize</span><span>, </span><span>usize</span><span>) {
+</span><span>    </span><span>let</span><span> index = value &amp; </span><span>0xFFFF_FFFF</span><span>;
+</span><span>    </span><span>let</span><span> tag = value &gt;&gt; </span><span>32</span><span>;
+</span><span>    (index, tag)
+</span><span>}
+</span><span>
+</span><span>pub struct </span><span>LockFreeArray&lt;T: Send + Sync, </span><span>const</span><span> N: </span><span>usize</span><span>&gt; {
+</span><span>    </span><span>slots</span><span>: [AtomicPtr&lt;T&gt;; N],
+</span><span>    </span><span>freelist_head</span><span>: AtomicUsize, </span><span>// stores (tag &lt;&lt; 32) | index
+</span><span>    </span><span>next</span><span>: [AtomicUsize; N],
+</span><span>}
+</span><span>
+</span><span>impl</span><span>&lt;T: Send + Sync, </span><span>const</span><span> N: </span><span>usize</span><span>&gt; LockFreeArray&lt;T, N&gt; {
+</span><span>    </span><span>pub fn </span><span>new</span><span>() -&gt; </span><span>Self </span><span>{
+</span><span>        </span><span>let</span><span> slots = array::from_fn(|_| AtomicPtr::new(ptr::null_mut()));
+</span><span>        </span><span>let</span><span> next = array::from_fn(|</span><span>i</span><span>| AtomicUsize::new(</span><span>if</span><span> i + </span><span>1 </span><span>&lt; N { i + </span><span>1 </span><span>} </span><span>else </span><span>{ N }));
+</span><span>
+</span><span>        </span><span>Self </span><span>{
+</span><span>            slots,
+</span><span>            freelist_head: AtomicUsize::new(</span><span>pack</span><span>(</span><span>0</span><span>, </span><span>0</span><span>)),
+</span><span>            next,
+</span><span>        }
+</span><span>    }
+</span><span>
+</span><span>    </span><span>pub fn </span><span>try_insert</span><span>(&amp;</span><span>self</span><span>, </span><span>value</span><span>: T) -&gt; Result&lt;</span><span>usize</span><span>, T&gt; {
+</span><span>        </span><span>let</span><span> boxed = Box::into_raw(Box::new(value));
+</span><span>
+</span><span>        </span><span>loop </span><span>{
+</span><span>            </span><span>let</span><span> old = </span><span>self</span><span>.freelist_head.</span><span>load</span><span>(Ordering::Acquire);
+</span><span>            </span><span>let </span><span>(head, tag) = </span><span>unpack</span><span>(old);
+</span><span>
+</span><span>            </span><span>if</span><span> head == N {
+</span><span>                </span><span>let</span><span> value = </span><span>unsafe </span><span>{ *Box::from_raw(boxed) };
+</span><span>                </span><span>return </span><span>Err(value);
+</span><span>            }
+</span><span>
+</span><span>            </span><span>let</span><span> next_index = </span><span>self</span><span>.next[head].</span><span>load</span><span>(Ordering::Relaxed);
+</span><span>            </span><span>let</span><span> new = </span><span>pack</span><span>(next_index, tag.</span><span>wrapping_add</span><span>(</span><span>1</span><span>));
+</span><span>
+</span><span>            </span><span>if </span><span>self
+</span><span>                .freelist_head
+</span><span>                .</span><span>compare_exchange</span><span>(old, new, Ordering::AcqRel, Ordering::Relaxed)
+</span><span>                .</span><span>is_ok</span><span>()
+</span><span>            {
+</span><span>                </span><span>self</span><span>.slots[head].</span><span>store</span><span>(boxed, Ordering::Release);
+</span><span>                </span><span>return </span><span>Ok(head);
+</span><span>            }
+</span><span>            </span><span>// Retry if compare_exchange failed
+</span><span>        }
+</span><span>    }
+</span><span>
+</span><span>    </span><span>pub fn </span><span>take</span><span>(&amp;</span><span>self</span><span>, </span><span>index</span><span>: </span><span>usize</span><span>) -&gt; Option&lt;T&gt; {
+</span><span>        </span><span>if</span><span> index &gt;= N {
+</span><span>            </span><span>return </span><span>None;
+</span><span>        }
+</span><span>
+</span><span>        </span><span>let</span><span> ptr = </span><span>self</span><span>.slots[index].</span><span>swap</span><span>(ptr::null_mut(), Ordering::AcqRel);
+</span><span>        </span><span>if</span><span> ptr.</span><span>is_null</span><span>() {
+</span><span>            </span><span>return </span><span>None;
+</span><span>        }
+</span><span>
+</span><span>        </span><span>let</span><span> value = </span><span>unsafe </span><span>{ *Box::from_raw(ptr) };
+</span><span>
+</span><span>        </span><span>loop </span><span>{
+</span><span>            </span><span>let</span><span> old = </span><span>self</span><span>.freelist_head.</span><span>load</span><span>(Ordering::Acquire);
+</span><span>            </span><span>let </span><span>(head, tag) = </span><span>unpack</span><span>(old);
+</span><span>
+</span><span>            </span><span>self</span><span>.next[index].</span><span>store</span><span>(head, Ordering::Relaxed);
+</span><span>            </span><span>let</span><span> new = </span><span>pack</span><span>(index, tag.</span><span>wrapping_add</span><span>(</span><span>1</span><span>));
+</span><span>
+</span><span>            </span><span>if </span><span>self
+</span><span>                .freelist_head
+</span><span>                .</span><span>compare_exchange</span><span>(old, new, Ordering::AcqRel, Ordering::Relaxed)
+</span><span>                .</span><span>is_ok</span><span>()
+</span><span>            {
+</span><span>                </span><span>break</span><span>;
+</span><span>            }
+</span><span>        }
+</span><span>
+</span><span>        Some(value)
+</span><span>    }
+</span><span>}
+</span></code></pre>
+<h2 id="memory-safety-is-a-suggestion"><strong>Memory Safety Is a Suggestion</strong></h2>
+<p>Congratulations — you now own a <code>LockFreeArray&lt;T, N&gt;</code> that can insert and remove values across threads <strong>without ever acquiring a lock</strong>. You’re living the dream.</p>
+<p>At this point, you’re probably wondering:</p>
+<p><em>“Why would any rational person build something this unstable on purpose?”</em></p>
+<p>Two words: <strong>cash money.</strong></p>
+<p>Lock-free data structures aren’t just a flex — they’re <strong>fast</strong>. Like <em>“your CPU cache is crying but your latency is legendary”</em> fast.</p>
+<p><img src="https://yeet.cx/blog/lock-free-rust/cash-money.gif" alt="Cash Money"/></p>
+<p>To illustrate this here is some performance benchmarks obtained using the code in the appendix:</p>
+<pre data-lang="rust"><code data-lang="rust"><span>Running </span><span>10</span><span> trials of producer-consumer workloads
+</span><span>Producers: </span><span>6</span><span>, Consumers: </span><span>2</span><span>, Array Size: </span><span>100
+</span><span>------------------------------------------------------
+</span><span>Trial        LockFreeArray (ms)  Mutex&lt;Vec&lt;Option&lt;T&gt;&gt;&gt; (ms)       Diff (%)
+</span><span>1                       297.616                  2347.711          87.32</span><span>%
+</span><span>2                       298.942                  1872.945          84.04</span><span>%
+</span><span>3                       273.726                  1861.038          85.29</span><span>%
+</span><span>4                       334.799                  1494.331          77.60</span><span>%
+</span><span>5                       324.014                  2206.664          85.32</span><span>%
+</span><span>6                       307.311                  2199.226          86.03</span><span>%
+</span><span>7                       316.705                  1297.407          75.59</span><span>%
+</span><span>8                       299.890                  1973.732          84.81</span><span>%
+</span><span>9                       323.294                  1633.112          80.20</span><span>%
+</span><span>10                      375.024                  2627.307          85.73</span><span>%
+</span><span>
+</span><span>Mean                    </span><span>315.132                  1951.347          83.19</span><span>%
+</span><span>Std Dev                  </span><span>25.882                   386.424           3.77</span><span>%
+</span><span>
+</span><span>🏁 Winner: LockFreeArray (faster by </span><span>83.19</span><span>% on average)
+</span></code></pre>
+<p>This is the exact kind of speed we need to achieve in our <a href="https://yeet.cx">product</a></p>
+<h2 id="the-freelist-a-poor-man-s-allocator"><strong>The Freelist: A Poor Man’s Allocator</strong></h2>
+<p>At the heart of this design is a <strong>freelist</strong> — an internal linked list of available slots. Rather than scanning for empty indices every time, we pop indices off the <strong>freelist</strong> and push them back when we <code>take()</code>. It’s like if <code>Vec&lt;T&gt;</code> had a back alley cousin that said:</p>
+<p><em>“No resizing. No bounds checks. Just vibes.”</em></p>
+<p>Each <code>slot</code> in <code>slots: [AtomicPtr&lt;T&gt;; N]</code> holds a pointer to a heap-allocated <code>T</code> or <code>NULL</code></p>
+<p>If the value is <code>NULL</code>, the slot is free. If it’s non-null (like <code>*T</code>), the slot is occupied.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>slots: [AtomicPtr&lt;T&gt;; N]
+</span><span>
+</span><span>   [</span><span>0</span><span>]      [</span><span>1</span><span>]      [</span><span>2</span><span>]      [</span><span>3</span><span>]      [</span><span>4</span><span>]
+</span><span>+--------+--------+--------+--------+--------+
+</span><span>| ptr    | ptr    | </span><span>NULL   </span><span>| </span><span>NULL   </span><span>| </span><span>NULL   </span><span>|
+</span><span>+--------+--------+--------+--------+--------+
+</span><span>    |        |
+</span><span>    |        |
+</span><span>    |        |
+</span><span>    v        V
+</span><span> [&#34;</span><span>apple</span><span>&#34;] [&#34;</span><span>banana</span><span>&#34;]
+</span></code></pre>
+<p>The <code>next: [AtomicUsize; N]</code> array builds the linked list. Each index points to the next.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>next: [AtomicUsize; N] (freelist linkage between slots)
+</span><span>
+</span><span>   [</span><span>0</span><span>]     [</span><span>1</span><span>]     [</span><span>2</span><span>]     [</span><span>3</span><span>]     [</span><span>4</span><span>]
+</span><span>+-------+-------+-------+-------+-------+
+</span><span>|   </span><span>1   </span><span>|   </span><span>2   </span><span>|   </span><span>3   </span><span>|   </span><span>4   </span><span>|   </span><span>5   </span><span>|
+</span><span>+-------+-------+-------+-------+-------+
+</span><span>    ^
+</span><span>    |
+</span><span>freelist_head
+</span></code></pre>
+<p><code>freelist_head: AtomicUsize</code> is the head of that list, so new inserts take <code>slots[1]</code> first.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>freelist walk:
+</span><span>   [</span><span>1</span><span>] -&gt; [</span><span>2</span><span>] -&gt; [</span><span>3</span><span>] -&gt; [</span><span>4</span><span>] -&gt; END
+</span></code></pre>
+<h2 id="has-science-gone-too-far"><strong>Has Science Gone Too Far?</strong></h2>
+<p>At this point, if you’re thinking <em>“this seems like a bad idea,”</em> congratulations — your survival instincts are still functional.</p>
+<p>But here you are.</p>
+<p>You’ve written a memory allocator using raw pointers, bypassed every lock in the standard library, and now your freelist is a tiny, unsupervised thread rave where ownership rules are just polite suggestions.</p>
+<p><img src="https://yeet.cx/blog/lock-free-rust/has-science-gone-too-far.webp" alt="Has Science Gone Too Far?"/></p>
+<p>You are no longer writing Rust. You are <strong>summoning Rust</strong>.</p>
+<p>And the borrow checker? He left hours ago. He saw the <code>AtomicPtr&lt;T&gt;</code> , dropped his clipboard and booked it.</p>
+<h2 id="try-insert-a-deep-dive-into-danger"><strong><code>try_insert</code>: A Deep Dive Into Danger</strong></h2>
+<p>Here’s the core logic, annotated for maximum clarity <em>and anxiety</em>:</p>
+<p><strong>Step 1: Box the value</strong></p>
+<pre data-lang="rust"><code data-lang="rust"><span>pub fn </span><span>try_insert</span><span>(&amp;</span><span>self</span><span>, </span><span>value</span><span>: T) -&gt; Result&lt;</span><span>usize</span><span>, T&gt; {
+</span><span>    </span><span>let</span><span> boxed = Box::into_raw(Box::new(value));
+</span></code></pre>
+<p>We take your nice, innocent <code>T</code> and throw it onto the heap using <code>Box::new()</code>.</p>
+<p>Why? Because passing raw pointers between threads is like duct-taping fireworks to a Roomba, handing it a steak knife, and yelling “go fix the router!” — it’s technically motion, but it’s definitely not progress.</p>
+<p>We use <code>Box::into_raw()</code> to strip the safety rails off and turn it into a naked pointer. At this point, the compiler is sweating, the borrow checker has fled the scene, and <strong>you are solely responsible</strong> for making sure this thing gets freed.</p>
+<p><em><strong>And guess what?</strong></em> If you mess up and don’t <code>Box::from_raw()</code> it later?</p>
+<p>🥳 <strong>Congratulations, you just leaked memory.</strong> <em>And possibly your sanity.</em></p>
+<p><img src="https://yeet.cx/blog/lock-free-rust/leo-clap.gif" alt="Leo Clap"/></p>
+<p><strong>Step 2: Grab the head of the freelist</strong></p>
+<pre data-lang="rust"><code data-lang="rust"><span>    </span><span>loop </span><span>{
+</span><span>        </span><span>let</span><span> old = </span><span>self</span><span>.freelist_head.</span><span>load</span><span>(Ordering::Acquire);
+</span><span>        </span><span>let </span><span>(head, tag) = </span><span>unpack</span><span>(old); </span><span>// Unpack tagged index to defend against ABA.
+</span><span>
+</span><span>        </span><span>if</span><span> head == N {
+</span><span>            </span><span>// Reclaim value from Box, avoid leak
+</span><span>            </span><span>let</span><span> value = </span><span>unsafe </span><span>{ *Box::from_raw(boxed) };
+</span><span>            </span><span>return </span><span>Err(value);
+</span><span>        }
+</span><span>        ...
+</span><span>    }
+</span></code></pre>
+<p>We use <code>Ordering::Acquire</code> to read the <code>freelist_head</code> and make sure all reads <em><strong>after</strong></em> this can’t be reordered <em><strong>before</strong></em> it.</p>
+<p>If the head is <code>N</code>, that means the list is empty — no available slots. Therefore we safely deallocate our boxed value, return <code>Err(value)</code> and cry.</p>
+<p><strong>Step 3: Peek at the next node and attempt to claim the slot.</strong></p>
+<pre data-lang="rust"><code data-lang="rust"><span>            ...
+</span><span>            </span><span>let</span><span> next_index = </span><span>self</span><span>.next[head].</span><span>load</span><span>(Ordering::Relaxed);
+</span><span>            </span><span>let</span><span> new = </span><span>pack</span><span>(next_index, tag.</span><span>wrapping_add</span><span>(</span><span>1</span><span>)); </span><span>// Pack tagged index to defend against ABA.
+</span><span>
+</span><span>            </span><span>if </span><span>self
+</span><span>                .freelist_head
+</span><span>                .</span><span>compare_exchange</span><span>(old, new, Ordering::AcqRel, Ordering::Relaxed)
+</span><span>                .</span><span>is_ok</span><span>()
+</span><span>            {
+</span><span>                </span><span>self</span><span>.slots[head].</span><span>store</span><span>(boxed, Ordering::Release);
+</span><span>                </span><span>return </span><span>Ok(head);
+</span><span>            }
+</span><span>
+</span><span>            </span><span>// Retry if compare_exchange failed
+</span><span>            ...
+</span></code></pre>
+<p><code>next_index</code> tells us what the next freelist head <em>should be</em> if we succeed.</p>
+<p>We don’t need strict ordering here; we’re just reading a number.</p>
+<p>Now for the money shot: <code>compare_exchange</code> the crown jewel of atomic operations.</p>
+<p>Using <code>compare_exchange</code> is like trying to rent a Craigslist apartment <strong>but only if</strong>:</p>
+<ul>
+<li>The place doesn’t reek of cigarettes.</li>
+<li>The bed doesn’t have more tenants than the lease.</li>
+<li>And the landlord isn’t already in a knife fight with a guy named Jeff who paid in expired Chuck E. Cheese tokens.</li>
+</ul>
+<p>You show up with a suitcase, ready to move in — but only if everything is <em><strong>exactly</strong></em> as you saw in the blurry iPhone 4 photos.</p>
+<p>If anything’s off? No deal. You walk, dignity mostly intact.</p>
+<p>That’s <code>compare_exchange</code>: It’s <em><strong>hope with a contingency clause.</strong></em></p>
+<p><em>“Hey, I just read that the <code>freelist_head</code> is at index <code>head</code>. If no other thread has changed that value in the meantime, I want to replace it with <code>next_index</code>.”</em></p>
+<p>NOTE: In this snippet we ignore the <a href="https://en.wikipedia.org/wiki/ABA_problem">ABA problem</a> to focus on <code>Ordering</code> semantics.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>let</span><span> head = </span><span>self</span><span>.freelist_head.</span><span>load</span><span>(Ordering::Acquire);
+</span><span>let</span><span> next_index = </span><span>self</span><span>.next[head].</span><span>load</span><span>(Ordering::Relaxed);
+</span><span>
+</span><span>if </span><span>self
+</span><span>    .freelist_head
+</span><span>    .</span><span>compare_exchange</span><span>(head, next_index, Ordering::AcqRel, Ordering::Relaxed)
+</span><span>    .</span><span>is_ok</span><span>()
+</span><span>{
+</span><span>    </span><span>self</span><span>.slots[head].</span><span>store</span><span>(boxed, Ordering::Release);
+</span><span>    </span><span>return </span><span>Ok(head);
+</span><span>}
+</span></code></pre>
+<p>By choosing <code>Ordering::AcqRel</code> for <code>compare_exchange</code>, you’re telling the CPU:</p>
+<p><em>“I’m locking in both sides of this Craigslist deal — I won’t move out until I know the new place is mine, and I won’t move in unless the last guy’s weird anime posters are definitely gone all in one atomic handshake.”</em></p>
+<p><strong>When compare_exchange succeeds:</strong></p>
+<ul>
+<li>The <code>freelist_head</code> still points to <code>head</code> (no other thread modified it).</li>
+<li>You win the race.</li>
+<li>The freelist head is updated to <code>next_index</code>.</li>
+<li>You store your boxed pointer in <code>self.slots[head]</code>.</li>
+<li>Return <code>Ok(head)</code>.</li>
+</ul>
+<pre data-lang="rust"><code data-lang="rust"><span>Initial state:
+</span><span>
+</span><span>freelist_head = </span><span>1
+</span><span>next[</span><span>1</span><span>] = </span><span>3
+</span><span>
+</span><span>Thread A: reads head = </span><span>1</span><span>, next_index = </span><span>3
+</span><span>Thread A: </span><span>compare_exchange</span><span>(</span><span>1 </span><span>-&gt; </span><span>3</span><span>) ✅ succeeds
+</span><span>
+</span><span>freelist_head = </span><span>3
+</span></code></pre>
+<p><strong>When compare_exchange fails:</strong></p>
+<ul>
+<li>Another thread beat you to it and already updated freelist_head.</li>
+<li>The value at freelist_head no longer matches what <em>you</em> saw.</li>
+<li>The atomic op fails.</li>
+<li>You loop and try again.</li>
+</ul>
+<pre data-lang="rust"><code data-lang="rust"><span>Initial state:
+</span><span>freelist_head = </span><span>1
+</span><span>
+</span><span>Thread A: reads head = </span><span>1
+</span><span>Thread B: steals it and sets freelist_head = </span><span>3
+</span><span>Thread A: </span><span>compare_exchange</span><span>(</span><span>1 </span><span>-&gt; </span><span>3</span><span>) ❌ fails
+</span><span>Thread A: retries
+</span></code></pre>
+<p><strong>What if you used <code>Ordering::Relaxed</code> instead of <code>Ordering::AcqRel</code>?</strong></p>
+<pre data-lang="rust"><code data-lang="rust"><span>// BAD IDEA: Using Relaxed for everything
+</span><span>self</span><span>.freelist_head.</span><span>compare_exchange</span><span>(head, next_index, Ordering::Relaxed, Ordering::Relaxed)
+</span></code></pre>
+<p>That’s like saying:</p>
+<p><em>“I’ll move into the craigslist apartment as long as it looks roughly like the place I saw online. I don’t need to check if the previous tenant left. Or flushed. Or took the tarantula with them.”</em></p>
+<p>Now imagine this scenario:</p>
+<ul>
+<li>You <em>successfully</em> <code>compare_exchange</code> and claim a slot.</li>
+<li>Because of relaxed ordering, the CPU <strong>delays writing your pointer</strong> into <code>slots[head]</code> until <em>after</em> another thread has already inserted and taken that slot again.</li>
+<li>That thread now gets a <strong>non-null slot</strong>, reads your not-yet-written data (maybe still zeroed or garbage).</li>
+<li>You both think you own the slot.</li>
+</ul>
+<p><strong>Welcome to data races, memory corruption, and undefined behavior!</strong></p>
+<pre data-lang="rust"><code data-lang="rust"><span>Thread A                         Thread B
+</span><span>--------                         --------
+</span><span>load freelist_head = </span><span>1</span><span>           load freelist_head = </span><span>1
+</span><span>load next[</span><span>1</span><span>] = </span><span>3</span><span>                 load next[</span><span>1</span><span>] = </span><span>3
+</span><span>compare_exchange succeeds        compare_exchange fails (good!)
+</span><span>[</span><span>RELAXED</span><span>] store pointer...       load slots[</span><span>1</span><span>] → still </span><span>NULL</span><span>! 😱
+</span><span>                                 think it</span><span>&#39;s</span><span> empty — takes it again
+</span></code></pre>
+<p>Because <code>Thread A</code> didn’t <strong>guarantee the write to slots[1] happened before</strong> other threads could see the freelist head change, <code>Thread B</code> gets in too early.</p>
+<p>That’s why <code>compare_exchange</code> needs to be <code>Ordering::AcqRel</code>:</p>
+<ul>
+<li><strong><code>Ordering::Acquire</code></strong> ensures that if you <em><strong>see</strong></em> a value, all earlier writes leading to it are visible.</li>
+<li><strong><code>Ordering::Release</code></strong> ensures that <em><strong>your writes</strong></em> are visible <em><strong>before</strong></em> others see the updated value.</li>
+</ul>
+<p><strong>Step 4: Store the Pointer and Vanish Like a Legend</strong></p>
+<pre data-lang="rust"><code data-lang="rust"><span>    </span><span>self</span><span>.slots[head].</span><span>store</span><span>(boxed, Ordering::Release);
+</span><span>    </span><span>return </span><span>Ok(head);
+</span></code></pre>
+<p>You’ve navigated the <code>compare_exchange</code> like a raccoon disarming a bear trap to get a single Cheeto — reckless, improbable, but undeniably effective.</p>
+<p>You’ve claimed the slot!</p>
+<p>Now it’s time to <strong>store your boxed pointer</strong> so other threads can see it — but <em><strong>only</strong></em> after everything else you did is safely locked in.</p>
+<p>This is where <code>Ordering::Release</code> comes in. It’s like saying:</p>
+<p><em>“I’ve moved into the Craigslist apartment. I wiped down the counters, cleaned the fridge, and hung up a motivational cat poster. And only <strong>now</strong> do I list the room as occupied.”</em></p>
+<p>Without <code>Ordering::Release</code>, the CPU might <strong>reorder your writes</strong>, listing the room as available <em><strong>before</strong></em> you even moved your stuff in. That’s how roommates get duplicated, threads read garbage, and your program segfaults.</p>
+<h2 id="take-reclaiming-memory-one-slot-at-a-time"><strong><code>take</code>:  Reclaiming Memory, One Slot at a Time</strong></h2>
+<p>Where <code>try_insert</code> is a high-stakes land grab, <code>take</code> is the cleanup crew: It clears out a slot, reclaims memory, and sticks the index back on the freelist — no locks, no nonsense.</p>
+<p>NOTE: In this snippet we ignore the <a href="https://en.wikipedia.org/wiki/ABA_problem">ABA problem</a> to focus on <code>Ordering</code> semantics.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>pub fn </span><span>take</span><span>(&amp;</span><span>self</span><span>, </span><span>index</span><span>: </span><span>usize</span><span>) -&gt; Option&lt;T&gt; {
+</span><span>    </span><span>if</span><span> index &gt;= N {
+</span><span>        </span><span>return </span><span>None;
+</span><span>    }
+</span><span>
+</span><span>    </span><span>let</span><span> ptr = </span><span>self</span><span>.slots[index].</span><span>swap</span><span>(ptr::null_mut(), Ordering::AcqRel);
+</span><span>    </span><span>if</span><span> ptr.</span><span>is_null</span><span>() {
+</span><span>        </span><span>return </span><span>None;
+</span><span>    }
+</span><span>
+</span><span>    </span><span>let</span><span> value = </span><span>unsafe </span><span>{ *Box::from_raw(ptr) };
+</span><span>
+</span><span>    </span><span>loop </span><span>{
+</span><span>        </span><span>let</span><span> head = </span><span>self</span><span>.freelist_head.</span><span>load</span><span>(Ordering::Acquire);
+</span><span>        </span><span>self</span><span>.next[index].</span><span>store</span><span>(head, Ordering::Relaxed);
+</span><span>        </span><span>if </span><span>self
+</span><span>            .freelist_head
+</span><span>            .</span><span>compare_exchange</span><span>(head, index, Ordering::AcqRel, Ordering::Relaxed)
+</span><span>            .</span><span>is_ok</span><span>()
+</span><span>        {
+</span><span>            </span><span>break</span><span>;
+</span><span>        }
+</span><span>    }
+</span><span>
+</span><span>    Some(value)
+</span><span>}
+</span></code></pre>
+<p>The swap guarantees exclusive access. The <code>unsafe</code> block reclaims ownership. The loop shoves the index back onto the freelist like a toaster full of bees — loud, reckless, and somehow still legal.</p>
+<p>Using <code>Ordering::Acquire</code> on that <code>load</code> is like cracking open a suspicious Craigslist apartment door <strong>only after checking the peephole, listening for weird sounds, and texting your friend your location, just in case.</strong></p>
+<p>You’re saying:</p>
+<p>“I’ll open this door — but I <strong>need to know everything behind it is exactly where it’s supposed to be</strong> before I take a single step inside.”</p>
+<p>In CPU-land, this means:</p>
+<p><strong>All the memory writes that happened before the other thread released the freelist head are now guaranteed to be visible to you.</strong></p>
+<p>So if another thread <strong>added an index to the freelist</strong>, and used <code>Ordering::Release</code> to do it, your <code>Ordering::Acquire</code> makes sure you <strong>see the fully updated next pointer</strong> — not some haunted half-write from an alternate timeline where the thread gave up halfway through and started a podcast.</p>
+<p>In short:</p>
+<p><code>Ordering::Acquire</code> = <em>“I’m not touching anything until I know it’s safe.”</em></p>
+<p><code>Ordering::Release</code> = <em>“I’m done. It’s safe. You may now enter.”</em></p>
+<p>Now for the <code>compare_exchange</code> on the <code>freelist_head</code> we choose <code>Ordering::AcqRel</code></p>
+<p><strong>Back to the Craigslist analogy:</strong></p>
+<p><code>Ordering::AcqRel</code> is like handing your keys to the next tenant — <em>but only</em> after you:</p>
+<ul>
+<li>Removed your three-year collection of monster energy drink cans.</li>
+<li>Disarmed the cursed Roomba in the hallway.</li>
+<li>Wrote a sticky note that says “back to normal, mostly.”</li>
+</ul>
+<p>Only then do you update the listing to say: <em>“Spot’s open. Come on in.”</em></p>
+<p>If you didn’t use <code>Ordering::AcqRel</code>? It’s like screaming “ALL YOURS!” out the window <em><strong>while</strong></em> you’re halfway down the fire escape.</p>
+<p><strong>With <code>Ordering::AcqRel</code></strong></p>
+<pre data-lang="rust"><code data-lang="rust"><span>Thread A:     load freelist_head = </span><span>1
+</span><span>              load next[</span><span>1</span><span>] = </span><span>2
+</span><span>              </span><span>compare_exchange</span><span>(</span><span>1</span><span> → </span><span>2</span><span>) ✅ succeeds (AcqRel)
+</span><span>              store ptr to slots[</span><span>1</span><span>] (Release)
+</span><span>
+</span><span>Thread B:     load freelist_head = </span><span>2 </span><span>(sees updated head)
+</span><span>              load next[</span><span>2</span><span>] = ...
+</span><span>              </span><span>compare_exchange</span><span>(</span><span>2</span><span> → ...) ✅ safe, slot[</span><span>1</span><span>] is fully written
+</span></code></pre>
+<p><strong>With <code>Ordering::Relaxed</code></strong></p>
+<pre data-lang="rust"><code data-lang="rust"><span>
+</span><span>Thread A:     load freelist_head = </span><span>1
+</span><span>              load next[</span><span>1</span><span>] = </span><span>2
+</span><span>              </span><span>compare_exchange</span><span>(</span><span>1</span><span> → </span><span>2</span><span>) ✅ succeeds (Relaxed)
+</span><span>              store ptr to slots[</span><span>1</span><span>] ← </span><span>DELAYED </span><span>(write not visible yet)
+</span><span>
+</span><span>Thread B:     load freelist_head = </span><span>2 </span><span>(sees update too soon!)
+</span><span>              loads slots[</span><span>1</span><span>] → still </span><span>NULL</span><span>!
+</span><span>              thinks it</span><span>&#39;s</span><span> free — tries to insert again ❌
+</span><span>
+</span><span>💀 </span><span>DOUBLE ALLOC </span><span>/ </span><span>USE AFTER FREE</span><span> 💀
+</span></code></pre>
+<h2 id="conclusion-you-re-in-too-deep-and-it-s-beautiful"><strong>Conclusion: You’re in Too Deep, and It’s Beautiful</strong></h2>
+<p>You’ve stared into the abyss of lock-free programming, and instead of blinking, you <strong>atomically swapped your sanity for a pointer and marched forward</strong>.</p>
+<p>You’ve built your own thread-safe array out of nothing but raw pointers, atomics, and vibes. You didn’t just avoid the <code>Mutex&lt;T&gt;</code> — you left it crying in a corner while your freelist did donuts in the parking lot.</p>
+<p>You now understand:</p>
+<ul>
+<li>Why <code>compare_exchange</code> is the trust fall of systems programming.</li>
+<li>How memory ordering is a terrifying choose-your-own-adventure baked into the CPU.</li>
+<li>And why <code>Ordering::Relaxed</code> should come not only with a warning label, but a tetanus shot.</li>
+</ul>
+<p>Well, you could:</p>
+<ul>
+<li>Build a high-performance concurrent queue.</li>
+<li>Write a lock-free stack and impress exactly 1.5 people.</li>
+<li>Or start a band called ”<code>AtomicPtr&lt;T&gt;</code> and the Race Conditions.”</li>
+</ul>
+<p>But most importantly, you’ve learned that <strong>lock-free doesn’t mean worry-free</strong>. It’s a knife fight in a phone booth with physics and compilers — and you’re the one holding the spoon.</p>
+<p>If you enjoyed this article or want to see the power of lock free data structures done right, please check out our <a href="https://yeet.cx">product</a>.</p>
+<p><strong>👀 SPECIAL OFFER: In honor of the raccoon: <a href="https://yeet.cx/login">The next 100 sign ups</a> with <code>yeet</code> installs will win a limited edition T-Shirt.</strong></p>
+<p><strong>Update: 11:46 AM CST -- 77 remaining</strong></p>
+<h2 id="appendix">Appendix</h2>
+<p><strong>Benchmarking Code</strong></p>
+<pre data-lang="rust"><code data-lang="rust"><span>use </span><span>std::sync::{Arc, Mutex};
+</span><span>use </span><span>std::thread;
+</span><span>use </span><span>std::time::{Duration, Instant};
+</span><span>
+</span><span>mod </span><span>lockfree;
+</span><span>use </span><span>lockfree::LockFreeArray;
+</span><span>
+</span><span>const </span><span>ARRAY_SIZE</span><span>: </span><span>usize </span><span>= </span><span>100</span><span>;
+</span><span>const </span><span>PRODUCERS</span><span>: </span><span>usize </span><span>= </span><span>6</span><span>;
+</span><span>const </span><span>CONSUMERS</span><span>: </span><span>usize </span><span>= </span><span>2</span><span>;
+</span><span>const </span><span>OPS_PER_PRODUCER</span><span>: </span><span>usize </span><span>= </span><span>100_000</span><span>;
+</span><span>const </span><span>TRIALS</span><span>: </span><span>usize </span><span>= </span><span>10</span><span>;
+</span><span>
+</span><span>fn </span><span>run_lockfree_trial</span><span>() -&gt; Duration {
+</span><span>    </span><span>let</span><span> array = Arc::new(Box::new(LockFreeArray::&lt;</span><span>usize</span><span>, ARRAY_SIZE&gt;::new()));
+</span><span>    </span><span>let mut</span><span> handles = Vec::new();
+</span><span>
+</span><span>    </span><span>let</span><span> start = Instant::now();
+</span><span>
+</span><span>    </span><span>for </span><span>_ in </span><span>0</span><span>..</span><span>PRODUCERS </span><span>{
+</span><span>        </span><span>let</span><span> array = Arc::clone(&amp;array);
+</span><span>        handles.</span><span>push</span><span>(thread::spawn(</span><span>move </span><span>|| {
+</span><span>            </span><span>for</span><span> i in </span><span>0</span><span>..</span><span>OPS_PER_PRODUCER </span><span>{
+</span><span>                </span><span>while</span><span> array.</span><span>try_insert</span><span>(i).</span><span>is_err</span><span>() {
+</span><span>                    std::hint::spin_loop();
+</span><span>                }
+</span><span>            }
+</span><span>        }));
+</span><span>    }
+</span><span>
+</span><span>    </span><span>for </span><span>_ in </span><span>0</span><span>..</span><span>CONSUMERS </span><span>{
+</span><span>        </span><span>let</span><span> array = Arc::clone(&amp;array);
+</span><span>        handles.</span><span>push</span><span>(thread::spawn(</span><span>move </span><span>|| </span><span>loop </span><span>{
+</span><span>            </span><span>for</span><span> i in </span><span>0</span><span>..</span><span>ARRAY_SIZE </span><span>{
+</span><span>                </span><span>let </span><span>_ = array.</span><span>take</span><span>(i);
+</span><span>            }
+</span><span>        }));
+</span><span>    }
+</span><span>
+</span><span>    </span><span>for</span><span> handle in handles.</span><span>into_iter</span><span>().</span><span>take</span><span>(</span><span>PRODUCERS</span><span>) {
+</span><span>        handle.</span><span>join</span><span>().</span><span>unwrap</span><span>();
+</span><span>    }
+</span><span>
+</span><span>    Duration::from_secs_f64(start.</span><span>elapsed</span><span>().</span><span>as_secs_f64</span><span>())
+</span><span>}
+</span><span>
+</span><span>fn </span><span>run_mutex_trial</span><span>() -&gt; Duration {
+</span><span>    </span><span>let</span><span> vec = Arc::new(Mutex::new(vec![None; </span><span>ARRAY_SIZE</span><span>]));
+</span><span>    </span><span>let mut</span><span> handles = Vec::new();
+</span><span>
+</span><span>    </span><span>let</span><span> start = Instant::now();
+</span><span>
+</span><span>    </span><span>for </span><span>_ in </span><span>0</span><span>..</span><span>PRODUCERS </span><span>{
+</span><span>        </span><span>let</span><span> vec = Arc::clone(&amp;vec);
+</span><span>        handles.</span><span>push</span><span>(thread::spawn(</span><span>move </span><span>|| {
+</span><span>            </span><span>for</span><span> i in </span><span>0</span><span>..</span><span>OPS_PER_PRODUCER </span><span>{
+</span><span>                </span><span>loop </span><span>{
+</span><span>                    </span><span>let mut</span><span> guard = vec.</span><span>lock</span><span>().</span><span>unwrap</span><span>();
+</span><span>                    </span><span>if let </span><span>Some(pos) = guard.</span><span>iter_mut</span><span>().</span><span>position</span><span>(|</span><span>v</span><span>| v.</span><span>is_none</span><span>()) {
+</span><span>                        guard[pos] = Some(i);
+</span><span>                        </span><span>break</span><span>;
+</span><span>                    }
+</span><span>                }
+</span><span>            }
+</span><span>        }));
+</span><span>    }
+</span><span>
+</span><span>    </span><span>for </span><span>_ in </span><span>0</span><span>..</span><span>CONSUMERS </span><span>{
+</span><span>        </span><span>let</span><span> vec = Arc::clone(&amp;vec);
+</span><span>        handles.</span><span>push</span><span>(thread::spawn(</span><span>move </span><span>|| </span><span>loop </span><span>{
+</span><span>            </span><span>let mut</span><span> guard = vec.</span><span>lock</span><span>().</span><span>unwrap</span><span>();
+</span><span>            </span><span>for</span><span> val in guard.</span><span>iter_mut</span><span>() {
+</span><span>                </span><span>let </span><span>_ = val.</span><span>take</span><span>();
+</span><span>            }
+</span><span>        }));
+</span><span>    }
+</span><span>
+</span><span>    </span><span>for</span><span> handle in handles.</span><span>into_iter</span><span>().</span><span>take</span><span>(</span><span>PRODUCERS</span><span>) {
+</span><span>        handle.</span><span>join</span><span>().</span><span>unwrap</span><span>();
+</span><span>    }
+</span><span>
+</span><span>    Duration::from_secs_f64(start.</span><span>elapsed</span><span>().</span><span>as_secs_f64</span><span>())
+</span><span>}
+</span><span>
+</span><span>fn </span><span>summarize_trials</span><span>(</span><span>lockfree</span><span>: &amp;[Duration], </span><span>mutex</span><span>: &amp;[Duration]) {
+</span><span>    </span><span>let</span><span> lf_times: Vec&lt;</span><span>f64</span><span>&gt; = lockfree.</span><span>iter</span><span>().</span><span>map</span><span>(|</span><span>d</span><span>| d.</span><span>as_secs_f64</span><span>() * </span><span>1000.0</span><span>).</span><span>collect</span><span>();
+</span><span>    </span><span>let</span><span> mx_times: Vec&lt;</span><span>f64</span><span>&gt; = mutex.</span><span>iter</span><span>().</span><span>map</span><span>(|</span><span>d</span><span>| d.</span><span>as_secs_f64</span><span>() * </span><span>1000.0</span><span>).</span><span>collect</span><span>();
+</span><span>
+</span><span>    </span><span>let</span><span> percent_diffs: Vec&lt;</span><span>f64</span><span>&gt; = mx_times
+</span><span>        .</span><span>iter</span><span>()
+</span><span>        .</span><span>zip</span><span>(&amp;lf_times)
+</span><span>        .</span><span>map</span><span>(|(</span><span>m</span><span>, </span><span>l</span><span>)| ((m - l) / m) * </span><span>100.0</span><span>)
+</span><span>        .</span><span>collect</span><span>();
+</span><span>
+</span><span>    println!(
+</span><span>        &#34;</span><span>{:&lt;10} {:&gt;20} {:&gt;25} {:&gt;15}</span><span>&#34;,
+</span><span>        &#34;</span><span>Trial</span><span>&#34;, &#34;</span><span>LockFreeArray (ms)</span><span>&#34;, &#34;</span><span>Mutex&lt;Vec&lt;Option&lt;T&gt;&gt;&gt; (ms)</span><span>&#34;, &#34;</span><span>Diff (%)</span><span>&#34;
+</span><span>    );
+</span><span>    </span><span>for </span><span>(i, ((lf, mx), diff)) in lf_times
+</span><span>        .</span><span>iter</span><span>()
+</span><span>        .</span><span>zip</span><span>(&amp;mx_times)
+</span><span>        .</span><span>zip</span><span>(&amp;percent_diffs)
+</span><span>        .</span><span>enumerate</span><span>()
+</span><span>    {
+</span><span>        println!(&#34;</span><span>{:&lt;10} {:&gt;20.3} {:&gt;25.3} {:&gt;14.2}%</span><span>&#34;, i + </span><span>1</span><span>, lf, mx, diff);
+</span><span>    }
+</span><span>
+</span><span>    </span><span>let</span><span> mean_lf = </span><span>mean</span><span>(&amp;lf_times);
+</span><span>    </span><span>let</span><span> mean_mx = </span><span>mean</span><span>(&amp;mx_times);
+</span><span>    </span><span>let</span><span> mean_diff = </span><span>mean</span><span>(&amp;percent_diffs);
+</span><span>
+</span><span>    </span><span>let</span><span> std_lf = </span><span>std_dev</span><span>(&amp;lf_times, mean_lf);
+</span><span>    </span><span>let</span><span> std_mx = </span><span>std_dev</span><span>(&amp;mx_times, mean_mx);
+</span><span>    </span><span>let</span><span> std_diff = </span><span>std_dev</span><span>(&amp;percent_diffs, mean_diff);
+</span><span>
+</span><span>    println!(
+</span><span>        &#34;</span><span>{:&lt;10} {:&gt;20.3} {:&gt;25.3} {:&gt;14.2}%</span><span>&#34;,
+</span><span>        &#34;</span><span>Mean</span><span>&#34;, mean_lf, mean_mx, mean_diff
+</span><span>    );
+</span><span>    println!(
+</span><span>        &#34;</span><span>{:&lt;10} {:&gt;20.3} {:&gt;25.3} {:&gt;14.2}%</span><span>&#34;,
+</span><span>        &#34;</span><span>Std Dev</span><span>&#34;, std_lf, std_mx, std_diff
+</span><span>    );
+</span><span>    println!();
+</span><span>
+</span><span>    </span><span>if</span><span> mean_lf &lt; mean_mx {
+</span><span>        println!(
+</span><span>            &#34;</span><span>🏁 Winner: LockFreeArray (faster by </span><span>{:.2}</span><span>% on average)</span><span>&#34;,
+</span><span>            mean_diff
+</span><span>        );
+</span><span>    } </span><span>else </span><span>{
+</span><span>        println!(
+</span><span>            &#34;</span><span>🏁 Winner: Mutex&lt;Vec&lt;Option&lt;T&gt;&gt;&gt; (faster by </span><span>{:.2}</span><span>% on average)</span><span>&#34;,
+</span><span>            -mean_diff
+</span><span>        );
+</span><span>    }
+</span><span>}
+</span><span>
+</span><span>fn </span><span>mean</span><span>(</span><span>data</span><span>: &amp;[</span><span>f64</span><span>]) -&gt; </span><span>f64 </span><span>{
+</span><span>    data.</span><span>iter</span><span>().sum::&lt;</span><span>f64</span><span>&gt;() / data.</span><span>len</span><span>() as </span><span>f64
+</span><span>}
+</span><span>
+</span><span>fn </span><span>std_dev</span><span>(</span><span>data</span><span>: &amp;[</span><span>f64</span><span>], </span><span>mean</span><span>: </span><span>f64</span><span>) -&gt; </span><span>f64 </span><span>{
+</span><span>    </span><span>let</span><span> variance = data.</span><span>iter</span><span>().</span><span>map</span><span>(|</span><span>v</span><span>| (*v - mean).</span><span>powi</span><span>(</span><span>2</span><span>)).sum::&lt;</span><span>f64</span><span>&gt;() / data.</span><span>len</span><span>() as </span><span>f64</span><span>;
+</span><span>    variance.</span><span>sqrt</span><span>()
+</span><span>}
+</span><span>
+</span><span>fn </span><span>main</span><span>() {
+</span><span>    println!(&#34;</span><span>Running </span><span>{TRIALS}</span><span> trials of producer-consumer workloads</span><span>&#34;);
+</span><span>    println!(&#34;</span><span>Producers: </span><span>{PRODUCERS}</span><span>, Consumers: </span><span>{CONSUMERS}</span><span>, Array Size: </span><span>{ARRAY_SIZE}</span><span>&#34;);
+</span><span>    println!(&#34;</span><span>------------------------------------------------------</span><span>&#34;);
+</span><span>
+</span><span>    </span><span>let mut</span><span> lockfree_times = Vec::new();
+</span><span>    </span><span>let mut</span><span> mutex_times = Vec::new();
+</span><span>
+</span><span>    </span><span>for </span><span>_ in </span><span>0</span><span>..</span><span>TRIALS </span><span>{
+</span><span>        lockfree_times.</span><span>push</span><span>(</span><span>run_lockfree_trial</span><span>());
+</span><span>    }
+</span><span>
+</span><span>    </span><span>for </span><span>_ in </span><span>0</span><span>..</span><span>TRIALS </span><span>{
+</span><span>        mutex_times.</span><span>push</span><span>(</span><span>run_mutex_trial</span><span>());
+</span><span>    }
+</span><span>
+</span><span>    </span><span>summarize_trials</span><span>(&amp;lockfree_times, &amp;mutex_times);
+</span><span>}
+</span></code></pre>
+
+        </section></div>
+  </body>
+</html>
