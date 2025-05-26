@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://wingolog.org/archives/2025/05/22/whippet-lab-notebook-guile-heuristics-and-heap-growth">Original</a>
+    <h1>Whippet GC notes on Guile, heuristics, and heap growth</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>Greets all!  Another brief note today.  I have gotten Guile working with
+one of the <a href="https://arxiv.org/abs/2503.16971">Nofl</a>-based collectors, specifically the
+one that scans all edges conservatively (<a href="https://github.com/wingo/whippet/blob/main/doc/collector-mmc.md#conservative-heap-scanning"><tt>heap-conservative-mmc</tt> /
+<tt>heap-conservative-parallel-mmc</tt></a>).  Hurrah!</p><p>It was a pleasant surprise how easy it was to switch—from the user’s
+point of view, you just pass <tt>--with-gc=heap-conservative-parallel-mmc</tt>
+to Guile’s build (on the <tt>wip-whippet</tt> branch); when developing I also pass <tt>--with-gc-debug</tt>, and I
+had a couple bugs to fix—but, but, there are still some issues.  Today’s
+note thinks through the ones related to heap sizing heuristics.</p><h3>growable heaps</h3><p>Whippet has <a href="https://wingolog.org/archives/2023/01/27/three-approaches-to-heap-sizing">three heap sizing
+strategies</a>:
+fixed, growable, and adaptive
+(<a href="https://marisa.moe/balancer.html">MemBalancer</a>).  The adaptive policy
+is the one I would like in the long term; it will grow the heap for processes with a high allocation rate, and shrink when they go
+idle.  However I won’t really be able to test heap shrinking until I get
+precise tracing of heap edges, which will allow me to evacuate sparse
+blocks.</p><p>So for now, Guile uses the growable policy, which attempts to size the
+heap so it is at least as large as the live data size, times some
+multiplier.  The multiplier currently defaults to 1.75×, but can be set
+on the command line via the <tt>GUILE_GC_OPTIONS</tt> environment variable.
+For example to set an initial heap size of 10 megabytes and a 4×
+multiplier, you would set
+<tt>GUILE_GC_OPTIONS=heap-size-multiplier=4,heap-size=10M</tt>.</p><p>Anyway, I have run into problems!  The fundamental issue is
+fragmentation.  Consider a 10MB growable heap with a 2× multiplier,
+consisting of a sequence of 16-byte objects followed by 16-byte holes.
+You go to allocate a 32-byte object.  This is a small object (8192 bytes
+or less), and so it goes in the Nofl space.  A Nofl mutator holds on to
+a block from the list of sweepable blocks, and will sequentially scan
+that block to find holes.  However, each hole is only 16 bytes, so we
+can’t fit our 32-byte object: we finish with the current block, grab
+another one, repeat until no blocks are left and we cause GC.  GC runs,
+and after collection we have an opportunity to grow the heap: but the
+heap size is already twice the live object size, so the heuristics say
+we’re all good, no resize needed, leading to the same sweep again,
+leading to a livelock.</p><p>I actually ran into this case during Guile’s bootstrap, while allocating
+a 7072-byte vector.  So it’s a thing that needs fixing!</p><h3>observations</h3><p>The root of the problem is fragmentation.  One way to solve the problem
+is to remove fragmentation; using a semi-space collector comprehensively
+resolves the issue,
+<a href="https://wingolog.org/archives/2024/07/10/copying-collectors-with-block-structured-heaps-are-unreliable">modulo
+any block-level fragmentation</a>.</p><p>However, let’s say you have to live with fragmentation, for example
+because your heap has ambiguous edges that need to be traced conservatively.  What can we do?
+Raising the heap multiplier is an effective mitigation, as it increases
+the average hole size, but for it to be a comprehensive solution in
+e.g. the case of 16-byte live objects equally interspersed with holes,
+you would need a multiplier of 512× to ensure that the largest 8192-byte
+“small” objects will find a hole.  I could live with 2× or something,
+but 512× is too much.</p><p>We could consider changing the heap organization entirely.  For example,
+most mark-sweep collectors (BDW-GC included) partition the heap into
+blocks whose allocations are of the same size, so you might have some
+blocks that only hold 16-byte allocations.  It is theoretically possible
+to run into the same issue, though, if each block only has one live
+object, and the necessary multiplier that would “allow” for more empty
+blocks to be allocated is of the same order (256× for 4096-byte blocks
+each with a single 16-byte allocation, or even 4096× if your blocks are
+page-sized and you have 64kB pages).</p><p>My conclusion is that practically speaking, if you can’t deal with
+fragmentation, then it is impossible to just rely on a heap multiplier
+to size your heap.  It is certainly an error to live-lock the process,
+hoping that some other thread mutates the graph in such a way to free up
+a suitable hole.  At the same time, if you have configured your heap to
+be growable at run-time, it would be bad policy to fail an allocation,
+just because you calculated that the heap is big enough already.</p><p>It’s a shame, because we lose a mooring on reality: “how big will my
+heap get” becomes an unanswerable question because the heap might grow
+in response to fragmentation, which is not deterministic if there are
+threads around, and so we can’t reliably compare performance between
+different configurations.  Ah well.  If reliability is a goal, I think
+one needs to allow for evacuation, one way or another.</p><h3>for nofl?</h3><p>In this concrete case, I am still working on a solution.  It’s going to
+be heuristic, which is a bit of a disappointment, but here we are.</p><p>My initial thought has two parts.  Firstly, if the heap is growable but
+cannot defragment, then we need to reserve some empty blocks after each
+collection, even if reserving them would grow the heap beyond the
+configured heap size multiplier.  In that way we will always be able to
+allocate into the Nofl space after a collection, because there will
+always be some empty blocks.  How many empties?  Who knows.  Currently
+Nofl blocks are 64 kB, and the largest “small object” is 8kB.  I’ll
+probably try some constant multiplier of the heap size.</p><p>The second thought is that searching through the entire heap for a hole
+is a silly way for the mutator to spend its time.  Immix will reserve a
+block for <i>overflow allocation</i>: if a medium-sized allocation (more than
+256B and less than 8192B) fails because no hole in the current block is
+big enough—note that Immix’s holes have 128B granularity—then the
+allocation goes to a dedicated <i>overflow block</i>, which is taken from the
+empty block set.  This reduces fragmentation (holes which were not used
+for allocation because they were too small).</p><p>Nofl should probably do the same, but given its finer granularity, it
+might be better to sweep over a variable number of blocks, for example
+based on the logarithm of the allocation size; one could instead sweep
+over <tt>clz(min-size)–clz(size)</tt> blocks before taking from the empty block list, which would at least bound the
+sweeping work of any given allocation.</p><h3>fin</h3><p>Welp, just wanted to get this out of my head.  So far, my experience
+with this Nofl-based heap configuration is mostly colored by live-locks,
+and otherwise its implementation of a growable heap sizing policy seems
+to be more tight-fisted regarding memory allocation than BDW-GC’s
+implementation.  I am optimistic though that I will be able to get
+precise tracing sometime soon, as measured in development time; the
+problem as always is fragmentation, in that I don’t have a hole in my
+calendar at the moment.  Until then, sweep on Wayne, cons on Garth,
+onwards and upwards!</p></div></div>
+  </body>
+</html>
