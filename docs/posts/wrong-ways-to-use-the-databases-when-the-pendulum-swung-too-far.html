@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.luu.io/posts/2025-database-pendulum">Original</a>
+    <h1>Wrong ways to use the databases, when the pendulum swung too far</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    <p>
+<em>Disclaimer: This story took place when I was a junior developer for a previous employer ages ago. Some details might be fuzzy, and goes without saying this is entirely from my own POV so take everything here with humor and a grain of salt.</em> </p>
+<p>
+<em>I like to share these stories, because I believe learning what <strong>not</strong> to do is just as valuable as learning what to do.</em></p>
+<h2>
+The setup</h2>
+<p>
+The team I joined was part of a larger org. This org inherited a highly critical pipeline from an offshore team. When I say critical, I mean the-entire-company-bottom-line-and-financials-depended-on-them critical. I guess the company just wanted to move that particularly branch of development back to the US. These systems were complex with a lot of business rules and many moving parts, multiple large code bases, and definitely ancient.</p>
+<p>
+The development experience wasn’t great either. Even though there were separate codebases, the projects were somehow setup in a way that changing one small file required building almost the entire thing (which took about 15-30 minutes). The build process also depended on the underlying operating system components, thus development had to happen inside a VM. Each VM had a “dev” version of the entire pipeline deployed, that’s the only way one could exercise the code while under development. Then one would have to know which DDL files they needed to copy from the build output to the local “dev” deployment and restart all the right Windows services in order to test their changes.</p>
+<p>
+Tests were flaky, outages all the time, random hidden undocumented features everywhere. Things were… quirkly, to say the least. One particular quirk that’s the main character of this story is the databases–the main source of the outages, as I could remember.</p>
+<h2>
+The pendulum swung left: the old database</h2>
+<p>
+All the data for this pipeline was spread across multiple SQL Server databases, across different servers. That wasn’t the problem. The problem was that a lot of business logic was baked into pages and pages of stored procedures, with joint after joint after joint that would put Snoop to shame. Why was it written that way? Nobody knew. Perhaps some small part of the original team got tired of the bad development process, and it was quicker to just update stored procedures than having to wait for half an hour for compilation.</p>
+<blockquote>
+  <p>
+Thinking back, the data wasn’t modeled badly either. Even more than a decade later, I still think that the domain is pretty complex, and the data was modeled as well as anyone could have.  </p>
+</blockquote>
+<p>
+This little quirk meant a few things:</p>
+<ol>
+  <li>
+Many critical APIs call would spend most of its CPU time inside the finite database servers. New APIs, or updating existing APIs meant you were hogging the DB/CPU time from every one else.  </li>
+  <li>
+API latency was at the mercy of the Query Planner. Any slight change in data statistics or business logic would cause the a different Query Plan to be picked, which drastically changed the execution time, and usually caused timeouts. A hash join suddenly became a full table scan across billions of rows without any warning.  </li>
+  <li>
+The cherry on top of all that was the entire pipeline, from stored procedure to managed and native code, heavily used <a href="https://en.wikipedia.org/wiki/Microsoft_Distributed_Transaction_Coordinator">MSDTC</a>–which was brital and proned to deadlocks.  </li>
+</ol>
+<p>
+All of this tanked the pipeline reliability. Downtime was largely due to deadlocks, or some query timing out, which had been running just fine minutes earlier.</p>
+<p>
+To this org’s credit, they put a lot of time and effort into improving things, and made a lot of progress, but a rewrite was inevitable.</p>
+<p>
+<em><strong>Interlude:</strong> I will refrain from discussing whether a rewrite was truly necessary. I didn’t know all the details then, and I don’t know all the details now. But we can discuss the design choices of the rewrite.</em></p>
+<h2>
+The pendulum swung right: the new design</h2>
+<p>
+Perhaps due to the scars from the existing database issues, “the architects” decided they wanted nothing to do with relational databases, nor stored procedure, nor query plans. They wanted everything to be written into simple primitive Key-Value stores for their new design.</p>
+<p>
+Each instance of these key value stores provided exactly 4 and only 4 operations: Read one key, Insert one key/value pair, Update key/value pair, Delete one key. No transactions, no batching, nothing else.</p>
+<p>
+For some products, that’s perfectly fine, but not for this pipeline. And here comes a chain of “fun” events, one influenced by a previous decision:</p>
+<h3>
+The data schema</h3>
+<p>
+The data for this domain is highly relational, but perhaps modeling things the right way, it could still work with a KV store. Instead of modeling things in a relational manner, one could write nested documents, and embed the child elements inside the parent document. So to get the items related to a parent object, one just loads the entire document for the parent object, no need for fancy joints.</p>
+<p>
+The documents were serialized to JSON and stored as the value inside the KV.</p>
+<h3>
+The IO operations</h3>
+<p>
+Modeling data this way caused the parent documents to get pretty big, in to the double-tripple Kilobytes territory. But that was OK, perhaps a decent document database could alleviate this?</p>
+<p>
+Nope! We didn’t have a decent document database. You see, latest and greatest database technology sanctioned by the parent company was SQL Server (2008 or 2010?). We didn’t have something like MongoDB where one could issue a command to <code>{&#34;$set&#34;: {&#34;parent.child1.child2&#34;: 100}}</code>.</p>
+<p>
+What that meant was in order to perform patial update a small child field, one would need read the entire document, deserialize, make that small change in code, then write the entire document string back to the database. This was a lot of wasted IO, hundreds of KBs every time. At their scale, the latency added up.</p>
+<h3>
+Optimizing the IO operations</h3>
+<p>
+To alleviate the issue, we started experimenting with compression. Instead of just writing plain JSON strings, we Gzip’d them when writing to the database, and decompressed when reading—trading off CPU to minimize what got sent over the wires. That helped a little bit.</p>
+<p>
+What that meant was we couldn’t use our usual tooling to inspect the data anymore. So “the architects” commissioned a new project to write database tooling that could handle compressed data.</p>
+<h3>
+No batching, no transactions, but checkpoints instead</h3>
+<p>
+The primitive KV databases strictly sticking to the four single-key IO operations meant APIs which affected multiple documents could not perform atomic writes. Remember: transactions meant deadlocks. Batching meant complex queries :)</p>
+<p>
+This wasn’t anything new, because we couldn’t always expect the APIs to operate within the same database server or the same shard. And sometimes, the APIs needed to interact with 3rd-party services anyway. In lieu of MSDTC, some sort of idempotency mechanism was always needed.</p>
+<p>
+Due to the lack of atomic same-shard writes, in combination with the need for cross-service idempotency, “the architects” commissioned an entire checkpointing system to “help” with this issue.</p>
+<p>
+The checkpoint system worked like this: every time we needed to perform a write, we would generate a UUID, store this UUID into a “checkpoint” for the current flow. When writing a document into the KV store, the document should include this UUID so that if the checkpoint got retried, we would load the document and realize the write operation already went through and the retry was no-op. If the checkpoint step itself failed, then the retry would just resume from a previous checkpoint, and so-on.</p>
+<p>
+Logically, that was… fine. In practice, writes into the same database which previously required 5 IO round trips, now required almost double the number of trips for the extra checkpointing operations, and even more round trips to always have to read back the document to look for the checkpoint before writing. This did not help with the latency issue that we tried so deperately to curb down.</p>
+<h2>
+Wrapping up</h2>
+<p>
+I left the team shortly after this whole rewrite process started, but stayed just long enough to see some of these “fun” decisions. The company is still standing and seems to be doing well financially, so I guess things turned out well enough, or maybe some of the technical decisions started trending more reasonable.</p>
+<p>
+I have talked to a few old colleagues from this team, but never asked how things turned out. Most of them have moved on to other teams or other companies anyway.</p>
+<p>
+It’s been more than a decade now, though always fun to look back at lessons learned along the way.</p>
+
+</div></div>
+  </body>
+</html>
