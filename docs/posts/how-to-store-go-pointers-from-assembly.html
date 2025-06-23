@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://mazzo.li/posts/go-asm-pointers.html">Original</a>
+    <h1>How to store Go pointers from assembly</h1>
+    
+    <div id="readability-page-1" class="page"><div id="wrapper">
+
+
+
+<p>The standard Go toolchain comes with <a href="https://go.dev/doc/asm">an assembler</a> out of the box. Said assembler is highly idiosyncratic, using syntax inherited from Plan 9 and choosing its own names for platform-specific instructions and registers. But it’s great to have it readily available.</p>
+<p>More mundanely, Go comes with a garbage collector. This post explains how to make these two components play nice, if we want to manipulate Go pointers from our assembly.</p>
+<h2 id="preamble-gos-gc-write-barriers">Preamble: Go’s GC write barriers <a href="#preamble-gos-gc-write-barriers">#</a></h2>
+<p>Go’s garbage collector strives to minimize long pauses, which calls for concurrent garbage collection: the garbage is picked up while your code is running. Even if you’re not a garbage collection expert you would have recognized this as a tricky problem. As the Go GC is marking reachable objects, new objects might become reachable due to code running alongside the GC.</p>
+<div>
+<p>A common technique deployed to address this problem consists of instrumenting all pointer stores to inform the GC that the destination is now being pointed to.<a href="#fn1" id="fnref1" role="doc-noteref"><sup>1</sup></a> This instrumentation will augment all assignments with a bit of code informing the GC of the new reference. Or more concretely code like</p>
+
+<p>will become more like</p>
+
+</div>
+
+<div>
+<p>Where <code>add_to_gc_queue(y)</code> makes it so that <code>y</code> will be picked up by the GC even if <code>x</code> had already been examined. The widget above is often called a “write barrier” in the context of garbage collection.<a href="#fn2" id="fnref2" role="doc-noteref"><sup>2</sup></a></p>
+<p>As you can imagine this instrumentation has a cost, a cost that is particularly dear when it comes to the very common task of storing pointers in stack variables. So Go chooses to <em>not</em> instrument stores where the receiver of the store is on the stack. Instead until Go 1.8, the GC stopped the world before collection, taking care to re-scan stacks for goroutines which had run after the time they had been first examined. This ensured that no new stack references would … go undetected.</p>
+</div>
+
+<p>This final stack rescanning procedure could often take uncomfortably long, and therefore Go switched to a broader write barrier, which roughly consists of adding both the old and the new reference to the GC queue:</p>
+<div id="cb3"><pre><code><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>add_to_gc_queue<span>(*</span>x<span>)</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>add_to_gc_queue<span>(</span>y<span>)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span>*</span>x <span>=</span> y</span></code></pre></div>
+<p>Above we have <code>x</code> to be a pointer to a pointer to highlight that the receiver of the pointer itself lives on the heap, rather than on the stack.</p>
+<p><a href="https://github.com/golang/proposal/blob/master/design/17503-eliminate-rescan.md">The details are fiddly</a>, but involving both the old and new pointer let the Go developers remove the final stack-scanning, decreasing the duration of stop-the-world pauses by two orders of magnitude.</p>
+<h2 id="the-problem">The problem <a href="#the-problem">#</a></h2>
+<div>
+<p>When the Go compiler generates code, it automatically instruments all the relevant stores. However, fun awaits when we want to perform some pointer stores ourselves.</p>
+<p>As a motivating example, consider a concurrent hash table storing key-value pairs together:</p>
+<div id="cb4"><pre><code><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span>type</span> slot <span>struct</span> <span>{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  key   <span>uint64</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  value <span>*</span>entry</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>We might want to leverage 128-bit atomic load/stores – which are not available directly in Go – by writing our get/put functions in assembly.<a href="#fn3" id="fnref3" role="doc-noteref"><sup>3</sup></a> However we face a challenge: when writing to a <code>slot</code> from assembly, we need to inform Go’s GC of the store that just happened, or else pay the cost of rare and hard-to-debug faults, given that we’re breaking invariants central to the correctness of Go’s garbage collection.</p>
+<p>In practice, the assembly for a store not happening on the stack <a href="https://godbolt.org/z/nbqeo3rGv">looks like this:</a></p>
+</div>
+
+<pre><code>  // We&#39;re storing the pointer contained in BX into the memory
+  // pointed to by AX:
+  //
+  //     *AX = BX
+  //
+  // First, check if GC is currently active, i.e. if we need to
+  // even bother informing the GC of our store.
+  CMPL    runtime.writeBarrier(SB), $0
+  // If it is _not_ active, just jump to the store
+  // directly.
+  JEQ     doStore
+  // Otherwise, ask the GC to give us space for two pointers
+  // in the store buffer, the data structure recording stores
+  // happening while GC is taking place. `gcWriteBarrier2`
+  // returns where to store the pointers in R11.
+  CALL    runtime.gcWriteBarrier2(SB)
+  // Move the new pointer into the first location.
+  MOVQ    BX, (R11)
+  // Move the previous pointer *AX in the second location.
+  MOVQ    (AX), CX
+  MOVQ    CX, 8(R11)
+doStore:
+  // *AX = BX
+  MOVQ    BX, (AX)</code></pre>
+<p>All we need to do is replicate this widget in our own assembly, replacing the scalar store above with our wider store for our concurrent hash map.</p>
+<p>The problem is that somewhat understandably the Go designers really don’t want you to do that, and they therefore started <a href="https://github.com/golang/go/issues/67401">forbidding linking to runtime symbols.</a> This is to avoid having libraries relying on runtime internals, and being henceforth unable to change them.</p>
+<p>Fortunately, they <a href="https://github.com/golang/go/blob/49cdf0c42e320dfed044baa551610f081eafb781/src/runtime/stubs.go#L407-L416">whitelisted functions which were previously referenced by popular Go packages</a>, and it just so happened that a <a href="https://github.com/bytedance/sonic/blob/de4f017fca6448580003b6cc661bed8fded68d1d/internal/rt/gcwb.go#L28-L32">single package</a> used exactly the symbols we need.</p>
+<p>To link to them, you must blacklist future Go versions:</p>
+<div id="cb6"><pre><code><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span>//go:build go1.21 &amp;&amp; !go1.26</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span>package</span> foo</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span>//go:linkname gcWriteBarrier2 runtime.gcWriteBarrier2</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span>func</span> gcWriteBarrier2<span>()</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span>//go:linkname runtimeWriteBarrier runtime.writeBarrier</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span>var</span> runtimeWriteBarrier <span>uintptr</span></span></code></pre></div>
+<p>Presumably the plan is to eventually completely phase out these functions too. But in the meantime, you can hand-craft write barriers with abandon.</p>
+<h2 id="bonus-allocating-aligned-memory-in-go">Bonus: allocating aligned memory in Go <a href="#bonus-allocating-aligned-memory-in-go">#</a></h2>
+<p>While investigating the above, a more fundamental problem arose: allocating our <code>slot</code>s to be 128-bit aligned, to be able to use AVX instructions on them. Go makes this surprisingly tricky. Allocating a <code>[]byte</code> and using <a href="https://pkg.go.dev/unsafe#Slice"><code>unsafe.Slice()</code></a> to create an aligned <code>[]slot</code> from it is doomed to fail, since the Go runtime identifies allocated regions by their original type, and therefore will be blind to the pointers in our array of slots.</p>
+<p>Regrettably, there seem to be no “blessed” ways of doing this, but after a few experiments <a href="https://www.corsix.org/">Peter Cawley</a> produced this devious bit of code to bend Go’s malloc to our will:</p>
+<div id="cb7"><pre><code><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span>type</span> slot <span>struct</span> <span>{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  key   <span>uint64</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  value <span>*</span>entry</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span>}</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span>type</span> slotShifted <span>struct</span> <span>{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>  entry <span>*</span>entry</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>  key   <span>uint64</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span>}</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span>// Allocate slots so that they&#39;re 16-byte aligned.</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span>func</span> allocateSlots<span>(</span>capacity <span>int</span><span>)</span> <span>(</span>slots <span>[]</span>slot<span>)</span> <span>{</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>  candidate <span>:=</span> <span>make</span><span>([]</span>slot<span>,</span> capacity<span>)</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>  <span>if</span> <span>(</span><span>uintptr</span><span>(</span>unsafe<span>.</span>Pointer<span>(&amp;</span>candidate<span>[</span><span>0</span><span>]))</span> <span>&amp;</span> <span>15</span><span>)</span> <span>==</span> <span>0</span> <span>{</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    <span>// This is exactly what we want.</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    slots <span>=</span> candidate</span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span>return</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>  candidateShifted <span>:=</span> <span>make</span><span>([]</span>slotShifted<span>,</span> capacity<span>+</span><span>1</span><span>)</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>  <span>if</span> <span>(</span><span>uintptr</span><span>(</span>unsafe<span>.</span>Pointer<span>(&amp;</span>candidateShifted<span>[</span><span>0</span><span>]))</span> <span>&amp;</span> <span>15</span><span>)</span> <span>==</span> <span>8</span> <span>{</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    <span>// This can be made to work; throw away the first 8 bytes and</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    <span>// last 8 bytes of candidateShifted.</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    slots <span>=</span> unsafe<span>.</span>Slice<span>((*</span>slot<span>)(</span>unsafe<span>.</span>Pointer<span>(</span><span>uintptr</span><span>(</span>unsafe<span>.</span>Pointer<span>(&amp;</span>candidateShifted<span>[</span><span>0</span><span>]))+</span><span>8</span><span>)),</span> capacity<span>)</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    <span>return</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>  <span>// This can happen if adding 1 to capacity pushes us up a size class,</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>  <span>// and the new size class has a malloc header whereas the old size</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>  <span>// class does not.</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>  candidate <span>=</span> <span>make</span><span>([]</span>slot<span>,</span> capacity<span>+</span><span>1</span><span>)</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>  <span>if</span> <span>(</span><span>uintptr</span><span>(</span>unsafe<span>.</span>Pointer<span>(&amp;</span>candidate<span>[</span><span>0</span><span>]))</span> <span>&amp;</span> <span>15</span><span>)</span> <span>==</span> <span>0</span> <span>{</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>    <span>// This is what we want, albeit one element too big, so throw</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    <span>// away the extra element.</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a>    slots <span>=</span> candidate<span>[</span><span>0</span><span>:</span>capacity<span>:</span>capacity<span>]</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a>    <span>return</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>  <span>}</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>  <span>panic</span><span>(</span><span>&#34;could not allocate slots&#34;</span><span>)</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>Note that while the runtime tracks where pointers are based on Go’s type system, it does not care about the precise source of pointers, making the above trick viable. There are surely other ways to do this, but the above is possibly the cutest.</p>
+<h2 id="acknowledgements">Acknowledgements <a href="#acknowledgements">#</a></h2>
+<p>Many thanks to everybody I nerd-sniped by bringing up this topic, and to <a href="https://www.corsix.org/">Peter Cawley</a> and Samir Jindel in particular.</p>
+
+
+
+
+
+
+</div></div>
+  </body>
+</html>
