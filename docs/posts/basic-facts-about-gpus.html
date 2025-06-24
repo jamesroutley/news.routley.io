@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://damek.github.io/random/basic-facts-about-gpus/">Original</a>
+    <h1>Basic Facts about GPUs</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+
+      
+
+
+
+<p>
+  last updated:
+  <time>2025-06-18</time>
+</p>
+
+
+<p>I’ve been trying to get a better sense of how GPUs work. I’ve read a lot online, but the following posts were particularly helpful:</p>
+<ol>
+  <li><a href="https://horace.io/brrr_intro.html" target="_blank">Making Deep Learning Go Brrrr From First Principles</a></li>
+  <li><a href="https://www.thonking.ai/p/what-shapes-do-matrix-multiplications" target="_blank">What Shapes Do Matrix Multiplications Like?</a></li>
+  <li><a href="https://siboehm.com/articles/22/CUDA-MMM" target="_blank">How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog</a></li>
+</ol>
+
+<p>This post collects various facts I learned from these resources.</p>
+
+<p>Acknowledgements: Thanks to <a href="https://afmck.in/" target="_blank">Alex McKinney</a> for comments on <a href="https://docs.nvidia.com/cuda/ampere-compatibility-guide/#independent-thread-scheduling-compatibility" target="_blank">independent thread scheduling</a>.</p>
+
+<p><strong>Table of Contents</strong></p>
+
+<ul>
+  <li><a href="#compute-and-memory-hierarchy">Compute and memory hierarchy</a></li>
+  <li><a href="#the-two-performance-regimes">Two Performance Regimes: Memory-Bound and Compute-Bound</a></li>
+  <li><a href="#the-third-regime-overhead">The Third Regime: Overhead</a></li>
+  <li><a href="#two-basic-strategies-for-increasing-performance-fusion-and-tiling">Two basic strategies for increasing performance: Fusion and Tiling</a>
+    <ul>
+      <li><a href="#operator-fusion">Operator Fusion</a></li>
+      <li><a href="#tiling-strategy-for-compute-bound-kernels">Tiling: Strategy for Compute-Bound Kernels</a>
+        <ul>
+          <li><a href="#the-coalesced-load-hbm-to-sram">The Coalesced Load: HBM to SRAM</a></li>
+          <li><a href="#synchronization">Synchronization</a></li>
+          <li><a href="#the-on-chip-hardware-banks-and-warps">The On-Chip Hardware: Banks and Warps</a></li>
+          <li><a href="#the-bank-conflict-problem">The Bank Conflict Problem</a></li>
+          <li><a href="#the-on-chip-compute-phase-increasing-arithmetic-intensity">The On-Chip Compute Phase: Increasing Arithmetic Intensity</a></li>
+        </ul>
+      </li>
+    </ul>
+  </li>
+  <li><a href="#additional-performance-considerations">Additional Performance Considerations</a>
+    <ul>
+      <li><a href="#occupancy-and-latency-hiding">Occupancy and Latency Hiding</a></li>
+      <li><a href="#avoiding-thread-divergence">Avoiding Thread Divergence</a></li>
+      <li><a href="#quantization">Quantization</a></li>
+    </ul>
+  </li>
+</ul>
+
+<h2 id="compute-and-memory-hierarchy">Compute and memory hierarchy</h2>
+
+<p>A GPU’s design creates an imbalance since it can compute much faster than it can access its main memory. An NVIDIA A100 GPU, for example, can perform 19.5 trillion 32-bit floating-point operations per second (TFLOPS), but its memory bandwidth is only about 1.5 terabytes per second (TB/s). In the time it takes to read a single 4-byte number, the GPU could have performed over 50 calculations.</p>
+
+<p>Below is a diagram of the compute and memory hierarchy for an NVIDIA A100 GPU. The numbers I quote for flops/s and TB/s are exclusive to A100s.</p>
+
+<div><div><pre><code>+---------------------------------------------------------------------------------+
+|                               Global Memory (VRAM)                              |
+|                            (~40 GB, ~1.5 TB/s on A100)                          |
++----------------------------------------+----------------------------------------+
+                                         | (Slow off-chip bus)
++----------------------------------------v----------------------------------------+
+|                            Streaming Multiprocessor (SM)                        |
+|                     (1 of 108 SMs on an A100, each ~(19.5/108) TFLOPS)          |
+|                           (2048 threads, 64 warps, 32 blocks)                   |
+| +-----------------------------------------------------------------------------+ |
+| |                        Shared Memory (SRAM) / L1 Cache                        |
+| |                    (~192 KB on-chip workbench, 19.5 TB/s)                     |
+| +-----------------------------------------------------------------------------+ |
+| |                        Register File (~256 KB, ? TB/s)                        |
+| +-----------------------------------------------------------------------------+ |
+| |                                                                             | |
+| |                //-- A &#34;Block&#34; of threads runs on one SM --//                | |
+| | +--------------------------+ +------------------------+                     | |
+| | |      Warp 0 (32 thr)     | |      Warp 1 (32 thr)   | ... (up to 32 warps)| |
+| | | +----------------------+ | +----------------------+ |                     | |
+| | | | Thread 0 Registers   | | | Thread 32 Registers  | |                     | |
+| | | | [reg0: float]        | | | [reg0: float]        | |                     | |
+| | | | [reg1: float] ...    | | | [reg1: float] ...    | |                     | |
+| | | +----------------------+ | +----------------------+ |                     | |
+| | +--------------------------+ +------------------------+                     | |
+| |                                                                             | |
++---------------------------------------------------------------------------------+
+</code></pre></div></div>
+
+<p>This diagram shows the performance hierarchy.<sup id="fnref:0" role="doc-noteref"><a href="#fn:0" rel="footnote">1</a></sup> <strong>Global Memory (VRAM)</strong> is the large, slow, off-chip memory pool where all data initially lives. A <strong>Streaming Multiprocessor (SM)</strong> is the GPU’s unit of computation. To work, it must fetch data over the slow bus. To mitigate this, each SM has fast, on-chip <strong>Shared Memory</strong> (SRAM) with a bandwidth of 19.5 TB/s.<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">2</a></sup> Programmers use this as a manually-managed cache.</p>
+
+<p>A <strong>thread</strong> is the smallest unit of execution. Each thread has a private set of <strong>Registers</strong> to hold values for immediate computation, with access speeds over ?? TB/s.<sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">3</a></sup> The hardware groups threads into <strong>Warps</strong> of 32. This post analyzes performance using the simplified model of <strong>lockstep execution</strong>, where all 32 threads in a warp execute the same instruction at the same time.<sup id="fnref:10" role="doc-noteref"><a href="#fn:10" rel="footnote">4</a></sup> On an A100, an SM has an upper limit of 64 warps. A programmer groups threads into a <strong>Block</strong>, a grid of threads that is guaranteed to run on a single SM. A block can be one, two, or three-dimensional. For simplicity, this post will focus on square two-dimensional blocks of <code>BLOCK_DIM x BLOCK_DIM</code> threads, where the total number of threads cannot exceed the hardware limit of 1024. All threads in a block share access to the same on-chip Shared Memory.</p>
+
+<h2 id="the-two-performance-regimes">The Two Performance Regimes</h2>
+
+<p>We analyze the performance of a <strong>kernel</strong>, which is a function launched by the host (CPU) to be executed in parallel by many GPU threads. A kernel’s performance is limited by either its memory bandwidth or its compute throughput. These two limits define the performance regimes.</p>
+
+<p>An operation is <strong>memory-bound</strong> if its runtime is dictated by the speed of transferring data from Global Memory to the SM. For an operation like element-wise addition <code>y = x + 1</code>, the SM performs a trivial number of FLOPs for each element it reads. The SM spends most of its time idle, waiting for data.</p>
+
+<p>An operation is <strong>compute-bound</strong> if its runtime is dictated by the SM’s arithmetic speed. A large matrix multiplication is the canonical example. Once data is loaded into the SM, a massive number of computations are performed. The memory bus is idle while the SM is busy.</p>
+
+<p><strong>Arithmetic Intensity (AI)</strong> is the formal metric that determines the regime. It is the ratio of work to memory traffic.</p>
+
+<p><code>Arithmetic Intensity = Total FLOPs / Total Bytes Accessed</code></p>
+
+<p>For the Roofline model, <code>Total Bytes Accessed</code> specifically counts the data transferred between Global Memory (HBM) and the on-chip SM. This is because the model evaluates a kernel’s performance against the primary bottleneck: the slow off-chip memory bus. On-chip traffic, such as from Shared Memory to registers, is not included in this calculation.</p>
+
+<p>The Roofline Model plots a kernel’s achievable performance (in FLOPs per second) against its AI. The two “roofs” are the hard physical limits of the GPU.</p>
+
+<div><div><pre><code>  ^ Performance (TFLOPS)
+  |                                        
+  | Memory-Bound Region ¦ Compute-Bound Region
+  |                     ¦
+  |                    /¦----------------------  &lt;-- Peak Compute (~19.5 TFLOPS)
+  |                   / ¦
+  |                  /  ¦
+  | Peak Global     /&lt;--¦------ Inefficient Compute Roof (e.g., using scalar ops, transcendental functions)
+  | Mem BW (~1.5   /    ¦
+  | TB/s)         /     ¦
+  |              /      ¦
+  +---------------------¦---------------------------&gt; Arithmetic Intensity (FLOPs/Byte)
+                        ^
+                        ¦
+                  Hardware Ridge Point (~13)
+
+</code></pre></div></div>
+
+<p>The performance of a kernel is determined as follows:</p>
+<ul>
+  <li>When memory-bound, the SMs are stalled waiting for data. The runtime is the time it takes to move that data: <code>Runtime = Bytes_Accessed / Memory_Bandwidth</code>. The kernel’s performance is therefore <code>Performance = Total_FLOPs / Runtime = AI * Memory_Bandwidth</code>. On the log-log plot, this is the diagonal line.</li>
+  <li>When compute-bound, the SMs are fully utilized. The performance is limited by their peak arithmetic throughput: <code>Performance = Peak_Compute_FLOPs</code>. This is the horizontal line.</li>
+</ul>
+
+<p>A kernel’s actual performance is the minimum of these two values. The <strong>ridge point</strong> is the AI where the two performance ceilings intersect. For the A100, this is <code>19.5 TFLOPS / 1.5 TB/s ≈ 13 FLOPs/Byte</code>. A kernel must exceed this AI to become compute-bound.  A kernel with AI lower than 13 operates in the memory-bound region; a kernel with AI higher than 13 operates in the compute-bound region. The goal of optimization is to increase AI to move the kernel’s operating point to the right, pushing its performance up until it hits the compute roof.</p>
+
+<p>The “Peak Compute” roof of 19.5 TFLOPS is an ideal, achievable only with highly optimized instructions like Tensor Core matrix multiplications and high enough power limits. An operation can be compute-bound but still perform far below this peak. For example, a kernel with high AI that is dominated by scalar arithmetic or complex transcendental functions (<code>sin</code>, <code>exp</code>) will be limited by the throughput of those specific, slower instructions. This creates a lower effective “roof” for that kernel, as shown in the diagram. Increasing AI is necessary, but not sufficient; the FLOPs must also be efficient.</p>
+
+<p>The primary strategy to increase AI is to maximize the reuse of data once it has been loaded into the SM’s fast on-chip memory. The following is a simplified model where a thread reads data from Global Memory directly into its private registers. This analysis calculates the <em>minimum required</em> data transfer; actual memory traffic depends on access patterns, which we will discuss later.</p>
+
+<p>Consider computing <code>C = A@B</code>, where all matrices are <code>N x N</code> and use 4-byte floats.</p>
+
+<p><strong>Strategy 1: One thread computes one element <code>C[i,j]</code></strong></p>
+<ul>
+  <li><strong>FLOPs:</strong> To compute <code>C[i,j]</code>, the thread performs N multiply-add operations. This is <code>2*N</code> FLOPs.</li>
+  <li><strong>Bytes Accessed:</strong> The thread must read row <code>i</code> of A (N floats) and column <code>j</code> of B (N floats). This is a total of <code>2*N</code> floats, or <code>8*N</code> bytes.</li>
+  <li><strong>Arithmetic Intensity:</strong> <code>(2*N FLOPs) / (8*N Bytes) = 0.25 FLOPs/Byte</code>.</li>
+</ul>
+
+<p>This AI is low. The kernel will be memory-bound.</p>
+
+<p><strong>Strategy 2: One thread computes a <code>2x2</code> tile of C</strong>
+To compute a <code>2x2</code> tile (<code>C[i,j]</code>, <code>C[i,j+1]</code>, <code>C[i+1,j]</code>, <code>C[i+1,j+1]</code>), the thread must perform the computation for all four elements.</p>
+<ul>
+  <li><strong>FLOPs:</strong> <code>4 elements * 2*N FLOPs/element = 8*N</code> FLOPs.</li>
+  <li><strong>Bytes Accessed:</strong> The thread must read two rows from A (<code>A[i,:]</code>, <code>A[i+1,:]</code>) and two columns from B (<code>B[:,j]</code>, <code>B[:,j+1]</code>). This is <code>2*N + 2*N = 4*N</code> floats, or <code>16*N</code> bytes.</li>
+  <li><strong>Arithmetic Intensity:</strong> <code>(8*N FLOPs) / (16*N Bytes) = 0.5 FLOPs/Byte</code>.</li>
+</ul>
+
+<p>These AI values are far below the A100’s ridge point of ~13 FLOPs/Byte. This simple register-only model is insufficient to make matrix multiplication compute-bound.<sup id="fnref:3" role="doc-noteref"><a href="#fn:3" rel="footnote">5</a></sup> The key to achieving high AI is for threads within a block to cooperate by loading a much larger tile of A and B into the shared, on-chip SRAM. By working together on this shared data, a block of 1024 threads can achieve an AI greater than 13. We will detail the mechanics of this in the section on Shared Memory.</p>
+
+<h2 id="the-third-regime-overhead">The Third Regime: Overhead</h2>
+
+<p>Performance can also be limited by host-side overhead. This is time the CPU (the host) spends preparing work for the GPU, for example, in the Python interpreter or a framework’s dispatch system.</p>
+
+<p>An application is overhead-bound if its GPU kernels are too small or numerous. The GPU executes each small task quickly and then waits, idle, for the CPU to issue the next command. The runtime is dominated by the CPU’s inability to feed the GPU fast enough.</p>
+
+<p>Modern frameworks use asynchronous execution to mitigate this. The host can queue a stream of commands for the GPU without waiting for each one to complete. If the individual GPU operations are sufficiently large, the host can “run ahead,” and the overhead of launching one kernel is hidden by the execution of the previous one.</p>
+
+<p>For the remainder of this post, we assume our kernels are large enough that overhead is not the primary limiter, and focus instead on memory and compute.<sup id="fnref:4" role="doc-noteref"><a href="#fn:4" rel="footnote">6</a></sup></p>
+
+<h2 id="two-basic-strategies-for-increasing-performance-fusion-and-tiling">Two basic strategies for increasing performance: Fusion and Tiling</h2>
+
+<p>With the kernel large enough to make launch overhead negligible, performance is governed by the two physical limits of the GPU: memory bandwidth and compute throughput. Increasing the performance of a kernel, therefore, means pushing its operating point on the Roofline model up and to the right. There are two basic strategies for achieving this.</p>
+
+<ul>
+  <li>For a sequence of individually memory-bound operations, the strategy is to <strong>fuse</strong> them into a single kernel to eliminate intermediate memory traffic.</li>
+  <li>For a single, complex operation with high potential arithmetic intensity (like matrix multiplication), the strategy is to use <strong>tiling</strong> to maximize data reuse within the SM’s fast memory.</li>
+</ul>
+
+<p>We will address each strategy in turn.</p>
+
+<h3 id="operator-fusion">Operator Fusion</h3>
+
+<p>Chains of simple operations like <code>y = relu(x + 1)</code> are common. Each operation (<code>add</code>, <code>relu</code>) has a very low arithmetic intensity and is memory-bound. Executing them as separate, sequential GPU kernels is inefficient. The primary strategy to optimize these sequences is <strong>operator fusion</strong>.</p>
+
+<p>The problem is the intermediate memory traffic. Consider the unfused execution of <code>y = relu(x + 1)</code>:</p>
+
+<ol>
+  <li><strong>Kernel 1 (<code>add</code>):</strong> Reads the entire tensor <code>x</code> from global memory. Computes <code>tmp = x + 1</code>. Writes the entire intermediate tensor <code>tmp</code> back to global memory.</li>
+  <li><strong>Kernel 2 (<code>relu</code>):</strong> Reads the entire tensor <code>tmp</code> from global memory. Computes <code>y = relu(tmp)</code>. Writes the final tensor <code>y</code> back to global memory.</li>
+</ol>
+
+<p>This approach is wasteful. It involves two separate kernel launch overheads and forces a round-trip to slow global memory for the intermediate <code>tmp</code> tensor.</p>
+
+<p>Fusion combines these steps into a single, more efficient GPU kernel. A JIT compiler like Triton or <code>torch.compile</code>’s Inductor backend can perform this transformation automatically.</p>
+
+<p>In the fused kernel:</p>
+<ol>
+  <li>A single thread reads one element of <code>x</code> from global memory into its private registers.</li>
+  <li>It performs all computations, i.e., <code>tmp = x + 1</code>, then <code>y = relu(tmp)</code>, entirely within those fast registers.</li>
+  <li>It writes only the final result <code>y</code> back to global memory.</li>
+</ol>
+
+<div><div><pre><code><span># Unfused (Conceptual)
+</span><span>def</span> <span>unfused_add_relu</span><span>(</span><span>x</span><span>):</span>
+    <span>tmp</span> <span>=</span> <span>torch</span><span>.</span><span>add</span><span>(</span><span>x</span><span>,</span> <span>1</span><span>)</span> <span># Reads x from HBM, writes tmp to HBM
+</span>    <span>y</span> <span>=</span> <span>torch</span><span>.</span><span>relu</span><span>(</span><span>tmp</span><span>)</span>   <span># Reads tmp from HBM, writes y to HBM
+</span>    <span>return</span> <span>y</span>
+
+<span># Fused (Conceptual)
+</span><span>@</span><span>torch</span><span>.</span><span>compile</span>
+<span>def</span> <span>fused_add_relu</span><span>(</span><span>x</span><span>):</span>
+    <span># The compiler fuses these into one kernel.
+</span>    <span># The intermediate result of x+1 never touches HBM.
+</span>    <span>return</span> <span>torch</span><span>.</span><span>relu</span><span>(</span><span>x</span> <span>+</span> <span>1</span><span>)</span>
+</code></pre></div></div>
+
+<p>The intermediate tensor <code>tmp</code> becomes ephemeral, never materializing in global memory. This cuts the memory traffic in half (one read of <code>x</code>, one write of <code>y</code>) and eliminates the launch overhead of the second kernel.</p>
+
+<h3 id="tiling-strategy-for-compute-bound-kernels">Tiling: Strategy for Compute-Bound Kernels</h3>
+
+<p>Our register-only model for <code>C=A@B</code> yielded an arithmetic intensity of 0.25 FLOPs/Byte, far below the A100’s ridge point of ~13. This is because a single thread reads <code>2*N</code> values to perform <code>2*N</code> FLOPs; the data is used once and then discarded. To increase data reuse and become compute-bound, threads within a block must cooperate to load large tiles of the input matrices into the SM’s fast, on-chip Shared Memory.</p>
+
+<p>The logic of this cooperation is based on decomposing the matrix product. The calculation for a single element <code>C[i,j]</code> is a sum over the <code>k</code> dimension: <code>C[i,j] = sum_k A[i,k] B[k,j]</code>. This sum can be partitioned into a sum of partial sums over tiles. For square tiles, the inner <code>k</code> dimension is broken into tiles of size <code>BLOCK_DIM</code>, matching the outer dimensions. The formula becomes:`</p><p>
+
+\[C[i,j] = \sum_{t=0}^{\text{NUM_K_TILES}-1} \left( \sum_{k=t \cdot \text{BLOCK_DIM}}^{(t+1) \cdot \text{BLOCK_DIM} - 1} A[i,k] B[k,j] \right)\]
+
+</p><p>The tiling algorithm computes one term from the outer sum (one partial product) per iteration. A block of threads computes one output <code>C_tile</code> by iterating through the <code>k</code> dimension, loading tiles of A and B, computing their product on-chip, and accumulating the result. This is achieved with a three-phase pattern: <strong>Load, Synchronize, and Compute</strong>.</p>
+
+<div><div><pre><code><span># Conceptual algorithm for one thread block computing one output tile, C_tile.
+# C_tile corresponds to, e.g., C[block_row_start:end, block_col_start:end].
+</span>
+<span># Each thread in the block holds a piece of C_tile in its registers. Initialize to zero.
+</span><span>thread_private_C_accumulator</span> <span>=</span> <span>zeros</span><span>(...)</span>
+
+<span># Loop over tiles of A and B along the k-dimension.
+# Each iteration computes one partial product from the sum above.
+</span><span>for</span> <span>k_tile_idx</span> <span>in</span> <span>range</span><span>(</span><span>NUM_K_TILES</span><span>):</span>
+    <span># Phase 1: Load
+</span>    <span># All threads in the block cooperate to load one tile of A and one tile of B
+</span>    <span># from slow Global Memory into fast Shared Memory.
+</span>    <span>A_tile</span> <span>=</span> <span>load_A_tile_from_global_mem</span><span>(</span><span>k_tile_idx</span><span>)</span>
+    <span>B_tile</span> <span>=</span> <span>load_B_tile_from_global_mem</span><span>(</span><span>k_tile_idx</span><span>)</span>
+
+    <span># Phase 2: Synchronize
+</span>    <span># Wait for all threads to finish loading before any thread starts computing.
+</span>    <span># This ensures A_tile and B_tile are fully populated.
+</span>    <span>__syncthreads</span><span>()</span>
+
+    <span># Phase 3: Compute
+</span>    <span># Each thread computes its piece of the on-chip matmul.
+</span>    <span># The data in A_tile and B_tile is reused extensively from Shared Memory.
+</span>    <span>thread_private_C_accumulator</span> <span>+=</span> <span>on_chip_matmul_piece</span><span>(</span><span>A_tile</span><span>,</span> <span>B_tile</span><span>)</span>
+
+    <span># Wait for all threads to finish computing before loading the next tile.
+</span>    <span>__syncthreads</span><span>()</span>
+
+<span># After the loop, write the final accumulated result to Global Memory.
+</span><span>write_C_tile_to_global_mem</span><span>(</span><span>thread_private_C_accumulator</span><span>)</span>
+</code></pre></div></div>
+
+<p>We now examine the mechanics of the three-phase <strong>Load, Synchronize, Compute</strong> pattern.</p>
+
+<h3 id="the-coalesced-load-hbm-to-sram">The Coalesced Load: HBM to SRAM</h3>
+
+<p>The first phase loads tiles of A and B from slow global memory (HBM) into fast on-chip Shared Memory (SRAM). The goal is to perform this transfer with the maximum possible memory bandwidth. This requires <strong>coalesced memory access</strong>. A memory access is coalesced when all 32 threads in a warp access a single, contiguous 128-byte block of HBM in one transaction.</p>
+
+<p>To achieve this, the kernel maps thread indices to memory addresses. For a <code>BLOCK_DIM x BLOCK_DIM</code> block of threads loading a data tile of the same size, a common mapping is for thread <code>(tx, ty)</code> to be responsible for loading <code>A[global_row + ty, global_k + tx]</code> into <code>A_tile[ty, tx]</code> in Shared Memory. In this example, <code>BLOCK_DIM</code> is 32.</p>
+
+<p>Consider a single warp of threads where <code>ty</code> is fixed and <code>tx</code> ranges from 0 to 31.</p>
+<ul>
+  <li>Thread <code>(0, ty)</code> reads <code>A[global_row + ty, global_k + 0]</code>.</li>
+  <li>Thread <code>(1, ty)</code> reads <code>A[global_row + ty, global_k + 1]</code>.</li>
+  <li>…</li>
+  <li>Thread <code>(31, ty)</code> reads <code>A[global_row + ty, global_k + 31]</code>.</li>
+</ul>
+
+<p>Assuming row-major storage, these threads access 32 consecutive 4-byte floats, a contiguous 128-byte segment. This is a perfect coalesced read. The entire <code>32x32</code> tile is loaded in 32 such coalesced reads, one for each warp in the block.</p>
+
+<div><div><pre><code>   Thread Block (32x32)          Global Memory (HBM)
+                                 (One row of A&#39;s tile)
+   +--------------------+
+   | Warp 0 (ty=0)      | ----&gt; [A_ij, A_i,j+1, ..., A_i,j+31]  (128 bytes)
+   | (tx = 0..31)       |       (One coalesced memory transaction)
+   +--------------------+
+   | Warp 1 (ty=1)      | ----&gt; [A_i+1,j, ..., A_i+1,j+31] (128 bytes)
+   +--------------------+
+   | ...                |
+   +--------------------+
+   | Warp 31 (ty=31)    | ----&gt; [A_i+31,j, ..., A_i+31,j+31] (128 bytes)
+   +--------------------+
+</code></pre></div></div>
+
+<p>This load can be made more efficient with <strong>vectorized access</strong>. The physical memory transaction for a coalesced read fetches the full 128 bytes from HBM regardless. The difference is how the SM requests this data.</p>
+
+<p>With scalar loads, the warp must issue 32 separate 32-bit load instructions. With vectorized loads, it issues only 8 wider 128-bit load instructions. This is more efficient because the SM has a limited number of instruction issue slots per clock cycle. Requesting the data with 8 wide instructions consumes fewer of these hardware resources than requesting it with 32 narrow instructions. This ensures the memory controller is kept busy with a continuous stream of full-width requests, increasing the <em>utilized</em> memory bandwidth by reducing SM-side bottlenecks.</p>
+
+<p>Vectorized access is enabled by casting pointers in device code (e.g., from <code>float*</code> to <code>float4*</code>), promising the compiler that the memory is aligned to the vector size.</p>
+
+<p>The efficiency of these vectorized loads relies on <strong>memory alignment</strong>. A single <code>float4</code> instruction loads a 16-byte vector. For a matrix of 4-byte floats, this vector contains 4 elements. The hardware executes this instruction efficiently only if the memory address is a multiple of 16. This means the matrix’s inner dimension <code>K</code> (the number of columns) must be a multiple of 4. If <code>K</code> is not a multiple of 4, the rows become misaligned with the 16-byte memory segments.</p>
+
+<p>Consider a matrix of 4-byte floats and a memory system with 16-byte segments.</p>
+<ul>
+  <li><strong>Aligned (K=8, a multiple of 4):</strong>
+    <div><div><pre><code>Memory: |&lt;--- 16B ---&gt;|&lt;--- 16B ---&gt;|
+        [Seg 0       ][Seg 1       ]
+Row 0:  [e0 e1 e2 e3 | e4 e5 e6 e7]  (A float4 load for e0-e3 is aligned)
+Row 1:  [e0 e1 e2 e3 | e4 e5 e6 e7]  (A float4 load for e0-e3 is aligned)
+</code></pre></div>    </div>
+  </li>
+  <li><strong>Unaligned (K=7):</strong>
+    <div><div><pre><code>Memory: |&lt;--- 16B ---&gt;|&lt;--- 16B ---&gt;|&lt;--- 16B ---&gt;|
+        [Seg 0       ][Seg 1       ][Seg 2       ]
+Row 0:  [e0 e1 e2 e3 e4 e5 e6]
+Row 1:                      [e0 e1 e2 e3 e4 e5 e6] (A float4 load for Row 1&#39;s e0-e3 spans Seg 0 and Seg 1)
+</code></pre></div>    </div>
+    <p>This misalignment forces the hardware to issue more complex, slower load operations, reducing memory bandwidth.<sup id="fnref:karpathy" role="doc-noteref"><a href="#fn:karpathy" rel="footnote">7</a></sup></p>
+  </li>
+</ul>
+
+<p><strong>Important:</strong> This row-wise strategy provides coalesced access for matrix A. For matrix B, the required access patterns are in opposition.</p>
+<ol>
+  <li><strong>HBM Requirement:</strong> To maintain coalescing, the B tile must be read from HBM row-by-row.</li>
+  <li><strong>Compute Requirement:</strong> The matrix multiplication itself requires access to columns of the B tile.</li>
+</ol>
+
+<p>Loading columns directly from a row-major matrix is an uncoalesced, strided access that serializes HBM transactions. The solution is therefore to load the B tile using coalesced row-reads, but then rearrange the data as it is written into Shared Memory. The structure of this rearrangement is dictated by the physical, banked architecture of Shared Memory.</p>
+
+<h3 id="synchronization">Synchronization</h3>
+
+<p>The <code>__syncthreads()</code> call acts as a barrier. No thread in the block proceeds until all threads have reached this point. This ensures the <code>A_tile</code> and <code>B_tile</code> are fully loaded into Shared Memory before the compute phase begins.<sup id="fnref:sync" role="doc-noteref"><a href="#fn:sync" rel="footnote">8</a></sup>:</p>
+
+<h3 id="the-on-chip-hardware-banks-and-warps">The On-Chip Hardware: Banks and Warps</h3>
+
+<p>Shared Memory is a physical resource located on the Streaming Multiprocessor (SM). When a thread block is scheduled to run on an SM, it is allocated a portion of that SM’s total Shared Memory for its exclusive use.</p>
+
+<p>The Shared Memory is physically partitioned into 32 independent memory modules of equal size, called <strong>banks</strong>. These banks can service memory requests in parallel. This number is not arbitrary; it is matched to the <strong>warp size</strong>. Recall that a warp consists of 32 threads that execute instructions in lockstep, and it is the fundamental unit of memory access. The 32 banks are designed to serve, in parallel, the 32 memory requests from a single warp in one clock cycle, provided those requests target different banks.</p>
+
+<p>Addresses, representing 4-byte words, are interleaved across the banks.</p>
+<div><div><pre><code>bank 0:  [word 0, word 32, word 64, ...]
+bank 1:  [word 1, word 33, word 65, ...]
+...
+bank 31: [word 31, word 63, word 95, ...]
+</code></pre></div></div>
+<p>The bank for a given word address is determined by <code>bank_id = address % 32</code>.</p>
+
+<h3 id="the-bank-conflict-problem">The Bank Conflict Problem</h3>
+
+<p>To achieve the full bandwidth of Shared Memory, the 32 threads of a warp must access words that fall into 32 different banks. A <strong>bank conflict</strong> occurs when multiple threads access different addresses that map to the same bank. The hardware resolves this by serializing the requests, reducing bandwidth. A <strong>broadcast</strong>, where all threads read the <em>same</em> address, is a fast, conflict-free operation.</p>
+
+<p>This creates a problem for matrix multiplication. Consider a <code>BLOCK_DIM x BLOCK_DIM</code> tile stored in Shared Memory in a row-major layout, where <code>BLOCK_DIM=32</code>. The address of <code>tile[row, col]</code> is <code>row * 32 + col</code>.</p>
+<ul>
+  <li><strong>Row Access (A_tile):</strong> A warp accesses <code>A_tile[fixed_row, t]</code> for <code>t = 0..31</code>. The addresses are <code>fixed_row * 32 + t</code>. The bank for each thread <code>t</code> is <code>(fixed_row * 32 + t) % 32 = t % 32</code>. Since <code>t</code> is unique for each thread, the threads access 32 unique banks. This is a conflict-free, full-bandwidth access.</li>
+  <li><strong>Column Access (B_tile):</strong> A warp accesses <code>B_tile[t, fixed_col]</code> for <code>t = 0..31</code>. The addresses are <code>t * 32 + fixed_col</code>. The bank for each thread <code>t</code> is <code>(t * 32 + fixed_col) % 32 = fixed_col % 32</code>. All 32 threads target the same bank. This causes a 32-way bank conflict, serializing the memory access.</li>
+</ul>
+
+<p>The solution is to store the <code>B_tile</code> in a transposed layout within Shared Memory.</p>
+<div><div><pre><code><span># Action for thread (tx, ty) during the load phase
+# A is loaded directly, B is loaded and transposed on-the-fly
+</span><span>A_tile</span><span>[</span><span>ty</span><span>,</span> <span>tx</span><span>]</span> <span>=</span> <span>A_global</span><span>[</span><span>global_row</span> <span>+</span> <span>ty</span><span>,</span> <span>global_k</span> <span>+</span> <span>tx</span><span>]</span>
+<span>B_tile</span><span>[</span><span>tx</span><span>,</span> <span>ty</span><span>]</span> <span>=</span> <span>B_global</span><span>[</span><span>global_k</span> <span>+</span> <span>ty</span><span>,</span> <span>global_j</span> <span>+</span> <span>tx</span><span>]</span> <span># Indices are swapped
+</span></code></pre></div></div>
+<p>This “load-and-transpose” maneuver alters the on-chip computation. The calculation for an element of the partial product is no longer a dot product between a row of <code>A_tile</code> and a column of <code>B_tile</code>. Instead, using the transposed on-chip <code>B_tile</code>, the formula becomes:</p><p>
+
+\[C_{\text{partial}}[i,j] = \sum_{k} A_{\text{tile}}[i,k] \cdot B_{\text{tile}}[j,k]\]
+
+</p><p>In this formulation, a warp of threads computing different <code>j</code> values for a fixed <code>i</code> will access a row from <code>A_tile</code> and a row from the on-chip <code>B_tile</code>. Both are conflict-free access patterns. This single strategy solves both the HBM coalescing requirement and the SRAM bank conflict problem.</p>
+
+<div><div><pre><code>   Load-and-Transpose Operation (Thread tx, ty)
+   Reads row-wise from HBM, writes column-wise to SRAM
+
+   Global Memory (HBM)                Shared Memory (SRAM)
+   +-------------------------+        +-----------------------+
+   | B[k_base+ty, j_base+tx] | -----&gt; |      B_tile[tx, ty]   |
+   +-------------------------+        +-----------------------+
+
+   Result: HBM reads are coalesced, SRAM reads are conflict-free.
+</code></pre></div></div>
+
+<h3 id="e-the-on-chip-compute-phase-increasing-arithmetic-intensity">E. The On-Chip Compute Phase: Increasing Arithmetic Intensity</h3>
+
+<p>With data staged in Shared Memory, the block performs the computation. The goal is to maximize data reuse from this fast on-chip memory. We will analyze two strategies for structuring this on-chip computation.</p>
+
+<p><strong>Strategy 1: One thread computes one output</strong></p>
+
+<p>The simplest approach maps one output element to one thread. A <code>BLOCK_DIM x BLOCK_DIM</code> thread block computes a <code>TILE_DIM x TILE_DIM</code> data tile, where <code>BLOCK_DIM</code> and <code>TILE_DIM</code> are equal. This strategy is conceptually similar to <strong>Kernel 3</strong> in <a href="https://siboehm.com/articles/22/CUDA-MMM" target="_blank">Boehm’s post</a>, which introduces Shared Memory caching.<sup id="fnref:5" role="doc-noteref"><a href="#fn:5" rel="footnote">9</a></sup> The hardware limit of 1024 threads per block constrains <code>BLOCK_DIM</code> to be at most 32. Thread <code>(tx, ty)</code> is responsible for a single output element <code>C_partial[ty, tx]</code>.</p>
+
+<div><div><pre><code><span># Action for a single thread (tx, ty) where BLOCK_DIM = TILE_DIM
+</span><span>c_accumulator</span> <span>=</span> <span>0.0</span>
+<span>for</span> <span>k</span> <span>in</span> <span>range</span><span>(</span><span>TILE_DIM</span><span>):</span>
+    <span>c_accumulator</span> <span>+=</span> <span>A_tile</span><span>[</span><span>ty</span><span>,</span> <span>k</span><span>]</span> <span>*</span> <span>B_tile</span><span>[</span><span>tx</span><span>,</span> <span>k</span><span>]</span>
+</code></pre></div></div>
+
+<p>The arithmetic intensity for this strategy is <code>TILE_DIM / 4</code>.</p>
+<ul>
+  <li><strong>Total FLOPs:</strong> The block performs <code>2 * TILE_DIM^3</code> FLOPs.</li>
+  <li><strong>Total Bytes Accessed (HBM):</strong> The block loads two data tiles, totaling <code>8 * TILE_DIM^2</code> bytes.</li>
+  <li><strong>Arithmetic Intensity (AI):</strong> <code>(2 * TILE_DIM^3) / (8 * TILE_DIM^2) = TILE_DIM / 4</code> FLOPs/Byte.</li>
+</ul>
+
+<p>With <code>TILE_DIM</code> limited to 32, the maximum AI is <code>32 / 4 = 8</code>. This is insufficient to cross the A100’s ridge point of ~13. The kernel remains memory-bound.</p>
+
+<p><strong>Strategy 2: One thread computes multiple outputs</strong></p>
+
+<p>To increase AI, we must increase <code>TILE_DIM</code> without increasing the number of threads. This requires decoupling the data tile size from the thread block size. We assign more work to each thread. This strategy corresponds to the goal of <strong>Kernel 5</strong> in <a href="https://siboehm.com/articles/22/CUDA-MMM" target="_blank">Boehm’s post.</a></p>
+
+<p>A <code>16x16</code> thread block (<code>BLOCK_DIM = 16</code>, 256 threads) can compute a <code>64x64</code> data tile (<code>TILE_DIM = 64</code>). Each thread now computes a <code>4x4</code> sub-tile of the output. This requires <code>TILE_DIM=64</code> to not exceed Shared Memory capacity.<sup id="fnref:6" role="doc-noteref"><a href="#fn:6" rel="footnote">10</a></sup></p>
+
+<div><div><pre><code><span># A thread computes a 4x4 output sub-tile
+# TILE_DIM = 64, BLOCK_DIM = 16
+</span><span>c_regs</span> <span>=</span> <span>[[</span><span>0.0</span><span>]</span> <span>*</span> <span>4</span> <span>for</span> <span>_</span> <span>in</span> <span>range</span><span>(</span><span>4</span><span>)]</span>
+<span>a_regs</span> <span>=</span> <span>[</span><span>0.0</span><span>]</span> <span>*</span> <span>4</span>
+<span>b_regs</span> <span>=</span> <span>[</span><span>0.0</span><span>]</span> <span>*</span> <span>4</span>
+
+<span>for</span> <span>k</span> <span>in</span> <span>range</span><span>(</span><span>TILE_DIM</span><span>):</span>
+    <span># Load a sliver of A_tile and B_tile into registers
+</span>    <span>for</span> <span>i</span> <span>in</span> <span>range</span><span>(</span><span>4</span><span>):</span> <span>a_regs</span><span>[</span><span>i</span><span>]</span> <span>=</span> <span>A_tile</span><span>[</span><span>thread_row</span><span>*</span><span>4</span> <span>+</span> <span>i</span><span>,</span> <span>k</span><span>]</span>
+    <span>for</span> <span>j</span> <span>in</span> <span>range</span><span>(</span><span>4</span><span>):</span> <span>b_regs</span><span>[</span><span>j</span><span>]</span> <span>=</span> <span>B_tile</span><span>[</span><span>thread_col</span><span>*</span><span>4</span> <span>+</span> <span>j</span><span>,</span> <span>k</span><span>]</span>
+
+    <span># Compute outer product in registers, accumulating into c_regs
+</span>    <span>for</span> <span>i</span> <span>in</span> <span>range</span><span>(</span><span>4</span><span>):</span>
+        <span>for</span> <span>j</span> <span>in</span> <span>range</span><span>(</span><span>4</span><span>):</span>
+            <span>c_regs</span><span>[</span><span>i</span><span>][</span><span>j</span><span>]</span> <span>+=</span> <span>a_regs</span><span>[</span><span>i</span><span>]</span> <span>*</span> <span>b_regs</span><span>[</span><span>j</span><span>]</span>
+</code></pre></div></div>
+<p>The AI calculation remains <code>TILE_DIM / 4</code>. With <code>TILE_DIM = 64</code>, the AI is <code>64 / 4 = 16</code> FLOPs/Byte. This exceeds the A100’s ridge point. The kernel is now <strong>compute-bound</strong>.</p>
+
+<p>A compute-bound kernel’s runtime is limited by the SM’s arithmetic throughput. This does not guarantee high absolute performance. A kernel can be compute-bound but still be slow if its FLOPs are inefficient (e.g., using scalar FP32 math instead of specialized hardware like Tensor Cores<sup id="fnref:7" role="doc-noteref"><a href="#fn:7" rel="footnote">11</a></sup>) or if the GPU operates below its peak clock speed due to power limits.</p>
+
+<p>The inner loop in the code above can be further optimized. A thread loads four separate <code>float</code> values from <code>A_tile</code> into <code>a_regs</code>. It can instead issue a single instruction to load a 16-byte <code>float4</code> vector. This vectorized load from Shared Memory reduces the number of instructions issued for on-chip data movement, improving the efficiency of the compute phase. This corresponds to the on-chip vectorization refinement used in <strong>Kernel 6</strong> of <a href="https://siboehm.com/articles/22/CUDA-MMM" target="_blank">Boehm’s post.</a></p>
+
+<p><strong>A Final Consideration: Tile Quantization</strong></p>
+
+<p>If matrix dimensions are not multiples of the tile size, the kernel launches extra blocks that perform wasted computation.</p>
+
+<p>To cover an <code>M x N</code> matrix with <code>TILE_M x TILE_N</code> tiles, the GPU launches a grid of <code>ceil(M/TILE_M) x ceil(N/TILE_N)</code> thread blocks. Tiling a 65x65 matrix with 32x32 tiles requires a <code>ceil(65/32) x ceil(65/32)</code> = 3x3 grid of blocks. The kernel’s logic is fixed; each block is programmed to perform the arithmetic for a full 32x32 tile.</p>
+
+<div><div><pre><code>      Columns 0-31      Columns 32-63     Columns 64-95
+    +-----------------+-----------------+-----------------+
+R 0 |                 |                 |                 |
+o-31|   Block 0,0     |   Block 0,1     |   Block 0,2     |
+w   | (Full work)     | (Full work)     | (Wasted work)   |
+s   |                 |                 |                 |
+    +-----------------+-----------------+-----------------+
+R 32|                 |                 |                 |
+o-63|   Block 1,0     |   Block 1,1     |   Block 1,2     |
+w   | (Full work)     | (Full work)     | (Wasted work)   |
+s   |                 |                 |                 |
+    +-----------------+-----------------+-----------------+
+R 64|                 |                 |                 |
+o-95|   Block 2,0     |   Block 2,1     |   Block 2,2     |
+w   | (Wasted work)   | (Wasted work)   | (Wasted work)   |
+s   |                 |                 |                 |
+    +-----------------+-----------------+-----------------+
+</code></pre></div></div>
+<p><a href="https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html#tile-quant" target="_blank">According to NVIDIA</a>, “While libraries ensure that invalid memory accesses are not performed by any of the tiles, all tiles will perform the same amount of math.” My understanding of why this happens (I’m happy to be corrected): Boundary blocks perform wasted work because the kernel explicitly pads the data. Threads assigned to load elements from outside the matrix bounds are prevented from doing so by a guard condition. Instead, they write zero to their location in the on-chip Shared Memory tile. The arithmetic loops are not shortened. The kernel’s logic is uniform across the tile. All threads in a warp execute the same multiply-add instructions. A thread whose data corresponds to a padded zero still executes the instruction; it just performs a useless computation, such as <code>C += A * 0</code>. The hardware resources are used, but the  work is discarded.</p>
+
+<h2 id="additional-performance-considerations">Additional Performance Considerations</h2>
+
+<p>We have made our kernel compute-bound. Its performance is now limited by the speed of its on-chip arithmetic. However, the kernel can still be made faster by managing additional aspects of the hardware. The following are three such considerations. There are others, but I’m not quite advanced enough to write about them, yet. See <a href="https://siboehm.com/articles/22/CUDA-MMM" target="_blank">Boehm’s post</a> for others.</p>
+
+<h3 id="occupancy-and-latency-hiding">Occupancy and Latency Hiding</h3>
+
+<p>A warp <strong>stalls</strong> when it executes a long-latency instruction, such as a read from Global Memory. It cannot execute its next instruction until the data arrives, which can take hundreds of clock cycles. During this time, the SM’s compute units would be idle if the stalled warp were the only work available.</p>
+
+<p>The SM hides this latency by executing other work. It can hold multiple thread blocks concurrently, creating a pool of resident warps. When one warp stalls, the SM’s hardware scheduler instantly switches to a different warp from this pool that is ready to run. This mechanism is called <strong>latency hiding</strong>.</p>
+
+<div><div><pre><code>+-------------------------------------------------------------------+
+| Streaming Multiprocessor (SM)                                     |
+|                                                                   |
+|  [Block A]              [Block B]                                 |
+|   - Warp A1 (Ready)      - Warp B1 (Ready)                        |
+|   - Warp A2 (Stalled -&gt; waiting on HBM)                           |
+|        |                  |                                       |
+|        +------------------v------------------+                    |
+|           [ Pool of Ready-to-Run Warps ]                          |
+|           [ A1, B1 ]                                              |
+|                           |                                       |
+|                   +-------v-------+                               |
+|                   | SM Scheduler  | --&gt; [Execute instructions]    |
+|                   +---------------+                               |
+|                                                                   |
++-------------------------------------------------------------------+
+</code></pre></div></div>
+<p><strong>Occupancy</strong> is the ratio of active warps on an SM to the maximum number it can support. High occupancy gives the scheduler a larger pool of warps to choose from. This increases the likelihood that it can find a ready warp to execute at any given cycle, keeping the compute units active.</p>
+
+<p>This leads to a trade-off between the resources used per block and the number of blocks that can reside on an SM. The two extremes can be visualized as follows:</p>
+
+<div><div><pre><code>+------------------------------------+ +----------------------------------------------+
+| SM with High AI, Low Occupancy     | | SM with Low AI, High Occupancy               |
+|                                    | |                                              |
+| +--------------------------------+ | | +----------+ +-----------+     +-----------+ |
+| | Block 0 (uses 64KB SMEM)       | | | | Block 0  | | Block 1   | ... | Block N   | |
+| | TILE_DIM=128 -&gt; High AI        | | | | (8KB SMEM) | (8KB SMEM)|     | (8KB SMEM)| |
+| +--------------------------------+ | | +----------+ +-----------+     +-----------+ |
+|                                    | |                                              |
+| --&gt; Low # of resident blocks.      | | --&gt; High # of resident blocks.               |
+| --&gt; Small pool of warps for        | | --&gt; Large pool of warps for                  |
+|     latency hiding.                | |     latency hiding.                          |
++------------------------------------+ +----------------------------------------------+
+</code></pre></div></div>
+<p>We tune the kernel’s resource usage to balance the benefit of high AI against the necessity of sufficient occupancy. The primary levers for this tuning are the thread block dimensions (<code>BLOCK_DIM</code>), the amount of Shared Memory allocated per block (determined by <code>TILE_DIM</code>), and the number of registers used per thread.<sup id="fnref:9" role="doc-noteref"><a href="#fn:9" rel="footnote">12</a></sup></p>
+
+<h3 id="avoiding-thread-divergence">Avoiding Thread Divergence</h3>
+
+<p>A conditional branch (<code>if-else</code>) where threads in a warp disagree on the outcome causes <strong>thread divergence</strong>.<sup id="fnref:12" role="doc-noteref"><a href="#fn:12" rel="footnote">13</a></sup> When this occurs, the hardware resolves the divergence by executing the different code paths serially. First, threads that take the <code>if</code> path execute it while the others are inactive. Then, the roles are reversed for the <code>else</code> path.</p>
+
+<div><div><pre><code><span># A warp of 32 threads encounters an `if` statement:
+</span><span>if</span> <span>(</span><span>thread_id</span> <span>&lt;</span> <span>16</span><span>)</span> 
+    <span># Path A
+</span><span>else</span> 
+    <span># Path B
+</span>
+<span>Execution</span> <span>Timeline</span><span>:</span>
+
+<span>Time</span> <span>-&gt;</span>
+<span>+------------------------------------------------------------------+</span>
+<span>|</span> <span>Warp</span> <span>Execution</span>                                                   <span>|</span>
+<span>|</span>                                                                  <span>|</span>
+<span>|</span>  <span>Cycle</span> <span>1</span><span>:</span> <span>Path</span> <span>A</span> <span>is</span> <span>executed</span><span>.</span>                                    <span>|</span>
+<span>|</span>   <span>-</span> <span>Threads</span> <span>0</span><span>-</span><span>15</span><span>:</span>  <span>Active</span><span>,</span> <span>execute</span> <span>Path</span> <span>A</span> <span>code</span><span>.</span>                  <span>|</span>
+<span>|</span>   <span>-</span> <span>Threads</span> <span>16</span><span>-</span><span>31</span><span>:</span> <span>Inactive</span><span>,</span> <span>masked</span> <span>off</span><span>.</span>                         <span>|</span>
+<span>|</span>                                                                  <span>|</span>
+<span>|</span>  <span>Cycle</span> <span>2</span><span>:</span> <span>Path</span> <span>B</span> <span>is</span> <span>executed</span><span>.</span>                                    <span>|</span>
+<span>|</span>   <span>-</span> <span>Threads</span> <span>0</span><span>-</span><span>15</span><span>:</span>  <span>Inactive</span><span>,</span> <span>masked</span> <span>off</span><span>.</span>                         <span>|</span>
+<span>|</span>   <span>-</span> <span>Threads</span> <span>16</span><span>-</span><span>31</span><span>:</span> <span>Active</span><span>,</span> <span>execute</span> <span>Path</span> <span>B</span> <span>code</span><span>.</span>                  <span>|</span>
+<span>|</span>                                                                  <span>|</span>
+<span>|</span> <span>Result</span><span>:</span> <span>Two</span> <span>cycles</span> <span>are</span> <span>required</span> <span>instead</span> <span>of</span> <span>one</span><span>.</span>                  <span>|</span>
+<span>|</span>         <span>Effective</span> <span>throughput</span> <span>is</span> <span>halved</span><span>.</span>                          <span>|</span>
+<span>+------------------------------------------------------------------+</span>
+</code></pre></div></div>
+<p>This serialization doubles the execution time of the divergent code, halving the warp’s effective throughput. We avoid this cost by writing branchless code in performance-critical sections, using primitives like <code>min</code> and <code>max</code> instead of <code>if-else</code>.</p>
+
+<h3 id="quantization">Quantization</h3>
+
+<p>Quantization reduces precision of elements of our tensor, from, say FP32 to FP16 or BFP16. This has two effects. First, it reduces the memory needed to store each element, for example, by 2. Thus, we can transfer twice as many elements per second from global memory to shared memory. This increases AI by 2.</p>
+
+<p>Second, GPUs, such as the A100, can operate faster on lower precision elements. For example, on an A100, 312 TFLOPS are achievable for certain FP16 operations, whereas FP32 operations are limited to 19.5 TFLOPS. Thus, theoretically we can speedup computation by a factor of 16.</p>
+
+<p>Quantization can therefore move us up and to the right on the Roofline plot.</p>
+
+<hr/>
+
+
+
+
+  
+                   
+  
+  
+          
+  
+  
+  
+  
+  
+  
+    
+
+
+      
+
+    </div></div>
+  </body>
+</html>
