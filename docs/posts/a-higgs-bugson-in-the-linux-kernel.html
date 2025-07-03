@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://blog.janestreet.com/a-higgs-bugson-in-the-linux-kernel/">Original</a>
+    <h1>A Higgs-Bugson in the Linux Kernel</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+            <p>We recently ran across a strange higgs-bugson that manifested itself in a critical system that stores and distributes the firm’s trading activity data, called Gord. (A <a href="https://en.wikipedia.org/wiki/Heisenbug#Related_terms">higgs-bugson</a> is a bug that is reported in practice but difficult to reproduce, named for the <a href="https://en.wikipedia.org/wiki/Search_for_the_Higgs_boson">Higgs boson</a>, a particle which was theorized in the 1960s but only found in 2013.) In this post I’ll walk you through the process I took to debug it. I tried to write down relevant details as they came up, so see if you can guess what the bug is while reading along.</p>
+
+<h2 id="some-useful-background-information-about-nfs-with-kerberos">Some useful background information about NFS with Kerberos</h2>
+
+<p>The NFS (“Network File System”) protocol is designed to access a regular POSIX filesystem over the network. The default security story of NFSv3, which is what we’re using here, is roughly “no security” on an untrusted network: the server only checks whether or not the client is connected from a ”privileged” port number (i.e. less than 1024). If the client says it’s connecting on behalf of a particular user, the server just trusts the client. What could go wrong?</p>
+
+<p>The other security option for NFS is Kerberos. When used with NFS, Kerberos cryptographically verifies the identity of the user accessing the file.</p>
+
+<h2 id="whats-the-bug">What’s the bug?</h2>
+
+<p><img src="https://blog.janestreet.com/a-higgs-bugson-in-the-linux-kernel/file_copy_fail.apng" alt="animation: file copy going halfway before failing with permission denied"/></p>
+
+<p>Gord often does large file copies to ship data around. These copies would very rarely fail with <code>-EACCES (Permission denied)</code> despite the permissions being correctly set on the filesystem. Although retries were possible, it would be sad to lose progress copying these files. Also, strange errors in data storage are scary! It’s possible that spurious errors could indicate a larger issue.</p>
+
+<p>There was no obvious pattern in these copies failing. Even identical jobs running simultaneously didn’t necessarily fail together. We did have one clue: if we switched Kerberos off in the dev environment (because the error sounded auth related), the copies never failed.</p>
+
+<p>So, maybe something was wrong with the Kerberos credentials?</p>
+
+<h2 id="how-does-the-kernel-get-your-kerberos-credentials">How does the kernel get your Kerberos credentials?</h2>
+
+<p><img src="https://blog.janestreet.com/a-higgs-bugson-in-the-linux-kernel/nfs_cred_flow.svg" alt="diagram of kerberized nfs flow, explained again below"/></p>
+
+<p>In a typical userspace program making use of Kerberos, libkrb5 will parse some environment variables or a config file to find the location of a Kerberos credentials cache. However, applications using NFS don’t need to link libkrb5 or otherwise know anything about Kerberos. They just do normal file I/O syscalls (open, read, write, etc) as if they were accessing a local filesystem. So what’s going on?</p>
+
+<p>It turns out the kernel gets credentials via a root userspace daemon called <code>rpc_gssd</code>. When your application does its first I/O syscall to a file on NFS, the kernel writes to a file on a special mountpoint to communicate with <code>rpc_gssd</code>. (Fun fact: this mountpoint, <code>rpc_pipefs</code>, is an entirely separate filesystem implementation in the Linux kernel, just like <code>ext4</code> or <code>nfs</code> itself.)</p>
+
+<p>Making some simplifications, the rpc_gssd program grabs the user’s credentials, constructs the right Kerberos service ticket, and writes to the rpc_pipefs again with the result. This involves an API called GSSAPI (“Generic Security Services API”), which you’ll see mentioned throughout this post.</p>
+
+<p>Looking at the rpc_gssd logs around the time of the bug, I noticed that the kernel hadn’t requested credentials for a while. The most recently requested credential should also have been fresh for another few hours. So, this was a dead end.</p>
+
+<h2 id="trying-to-reproduce-the-bug">Trying to reproduce the bug</h2>
+
+<p><img src="https://blog.janestreet.com/a-higgs-bugson-in-the-linux-kernel/slow_write_trickle.apng" alt="command showing slow trickle of writes to nfs"/></p>
+
+<p>I decided to try my luck by running a slow trickle of writes over the weekend. It seemed like the issue would be key-related somehow, so having a long-running process would force key expiry and plausibly reproduce the bug.</p>
+
+<p>Checking back in on Monday, none of the dozen boxes I ran this on failed. This wasn’t too surprising, because the issue was pretty rare in production.</p>
+
+<p>I then generated some large (~200GB) random files, put them on a test NFS mount, and started copying them to another test NFS mount in a loop on even more boxes. Once again, none of these copies failed.</p>
+
+<p>At this point I was surprised I hadn’t seen the issue. To make sure I wasn’t just getting extremely unlucky, I decided to scale up the number of copies running in parallel.</p>
+
+<p>I was worried about wasting bandwidth and impacting other users, so I thought a bit about how to make the test a bit more lightweight. One easy win would be to copy from a local disk to NFS instead of from NFS to NFS. However, I had already requested boxes with tiny disks. Fortunately, I had a cool trick in mind.</p>
+
+<h2 id="writing-a-filesystem">Writing a filesystem</h2>
+
+<p>I decided to create a filesystem that contains large random files, but fits entirely in memory on small test machines. Here’s the idea: Instead of storing actual file content, I’d use a noise function (or hash function) to generate consistent random bytes on demand.</p>
+
+<p>This turns out to be fairly straightforward. There’s a Rust crate called <code>fuser</code> that provides a nicely typed implementation of FUSE (“Filesystem in USErspace”). Around 20 minutes later (with some assistance from Claude), I had a fake filesystem that “contained” some large files to copy from.</p>
+
+<p>This ultimately did take less time than it would have taken to use larger boxes, but felt slightly yak-shavy before I was sure this would work. I don’t think I would have attempted this trick if I didn’t have an AI assistant to write most of the filesystem for me.</p>
+
+<div><pre><code><span>impl</span> <span>Filesystem</span> <span>for</span> <span>RandomFs</span> <span>{</span>
+    <span>// ... removed some short functions that return metadata</span>
+
+    <span>fn</span> <span>read</span><span>(</span>
+        <span>&amp;</span><span>mut</span> <span>self</span><span>,</span>
+        <span>ino</span><span>:</span> <span>u64</span><span>,</span>
+        <span>offset</span><span>:</span> <span>i64</span><span>,</span>
+        <span>size</span><span>:</span> <span>u32</span><span>,</span>
+        <span>reply</span><span>:</span> <span>ReplyData</span><span>,</span>
+        <span>// .. removed some unused arguments</span>
+    <span>)</span> <span>{</span>
+        <span>let</span> <span>data</span> <span>=</span> <span>self</span><span>.generate_random_data</span><span>(</span><span>ino</span><span>,</span> <span>offset</span><span>,</span> <span>size</span><span>);</span>
+        <span>reply</span><span>.data</span><span>(</span><span>&amp;</span><span>data</span><span>);</span>
+    <span>}</span>
+<span>}</span>
+</code></pre>
+</div>
+
+<h2 id="inserting-arbitrary-code-into-the-linux-kernel-at-runtime">Inserting arbitrary code into the Linux kernel at runtime</h2>
+
+<p>The next thing I wanted to do was collect some debug information. If the reproducer <em>did</em> work, I would want to see the kernel stack traces for the syscall that was returning EACCES. I needed to be prepared for this beforehand, because I expected the bug to take a while to show up.</p>
+
+<p>There’s a Linux kernel subsystem called “eBPF”, which stands for “extended Berkeley Packet Filter”. As you might imagine, it’s supposed to let you filter network packets. However, it has since eaten the world and now lets you insert ~any code you want at the start or end of basically any function in the Linux kernel at runtime. This is fine. Everything’s going to be ok. Don’t worry about it!</p>
+
+<p>There’s a handy tool called <code>bpftrace</code> that can quickly print arguments and return values of kernel functions (among other things). I wrote a bpftrace script that instrumented a few interesting-looking functions, something like this:</p>
+
+<div><pre><code><span>fexit:auth_rpcgss:</span><span>gss_cred_init</span> <span>{</span>
+   <span>// If it was going to return -13 (EACCES)...
+</span>    <span>if</span> <span>((</span><span>int64</span><span>)</span><span>retval</span> <span>==</span> <span>-</span><span>13</span><span>)</span> <span>{</span>
+        <span>// Print out the kernel call stack at this time (will tell us what called this function).
+</span>        <span>printf</span><span>(</span><span>&#34;gss_cred_init returned -13</span><span>\n</span><span>===backtrace===</span><span>\n</span><span>%s===end_backtrace===</span><span>\n</span><span>&#34;</span><span>,</span> <span>kstack</span><span>);</span>
+    <span>}</span>
+<span>}</span>
+</code></pre>
+</div>
+
+<p>The example above looks at the gss_cred_init function, and prints out the kernel stack trace if it returns an EACCES error. This is a very simple example, but definitely check out the <a href="https://github.com/bpftrace/bpftrace/blob/master/man/adoc/bpftrace.adoc">bpftrace manual</a> for other functionality.</p>
+
+<h2 id="back-to-reproducing-the-issue">Back to reproducing the issue</h2>
+
+<p>The test setup was as follows:</p>
+
+<ul>
+  <li>Some jobs that run rsync processes to copy from the FUSE filesystem to a test NFS server.</li>
+  <li>A bpftrace script that watches for <code>-EACCES</code> being returned from relevant kernel functions.</li>
+  <li>A way to take a packet capture (PCAP) of just the time surrounding a returned <code>-EACCES</code>.</li>
+</ul>
+
+<p>And… It worked! <code>-EACCES</code>! Weirdly, <em>a third</em> of my test boxes failed at the same time? That never happened in production. Usually only one or two Gord jobs would fail at a time. One bpftrace message stood out: “<code>gss_validate returned -13 (GSS_S_BAD_SIG)</code>”.</p>
+
+<p>Bad signature??? What? Of all the things that would make sense, this made sense the least. Was the server returning a bad signature? Was the client failing to verify it correctly? Was there memory corruption somewhere? Keep in mind all of this software is written in C, so almost anything is possible. Even <a href="https://en.wikipedia.org/wiki/Undefined_behavior">nasal demons</a>. If this <em>was</em> memory corruption, maybe I found a security vulnerability?</p>
+
+<p>I peeked at the packet capture of the bug in Wireshark and did not see any obvious signs of corruption. Other interesting things I noticed were:</p>
+
+<ul>
+  <li>There were a lot of retransmissions at the NFS level. The test NFS server I was using was small and probably got overloaded.</li>
+  <li>TCP frames were being split up and reassembled.</li>
+  <li>Again: A third of my jobs failed together, which was unexpected given what I saw in production.</li>
+</ul>
+
+<p>I didn’t have any good guesses based on the above. Maybe I could try to generate the signature myself to compare it with what’s in the packet? I knew Wireshark could decrypt Kerberos requests in network packets given the user’s Kerberos password, which was enough to grab the signature key (GSS token). All I needed to do was write a program to compute the signature given that token. Seems simple enough in theory, but how exactly do you do that?</p>
+
+<h2 id="kerberized-nfs-packet-format">Kerberized NFS packet format</h2>
+
+<p><img src="https://blog.janestreet.com/a-higgs-bugson-in-the-linux-kernel/nfs_packet_format.png" alt="nfs packet format diagram, key details highlighted below"/></p>
+
+<p>An NFS request looks something like this. Some interesting things to call out here are:</p>
+
+<ul>
+  <li>There’s an XID, which matches responses to requests. A client can have multiple requests in flight, and the server can respond to them out of order, so an ID is necessary.</li>
+  <li>The credentials field specifies which GSS context the RPC request is associated with, and includes an incrementing sequence number (“GSS sequence number”). Note that this is a separate sequence number from the XID.</li>
+</ul>
+
+<p>In the request, the checksum is the HMAC of roughly all the data in the request header, using the shared GSS key. In the response, the checksum is the HMAC of the GSS sequence number from the request.</p>
+
+<p>An HMAC is a “Hash-based Message Authentication Code” – it allows someone with knowledge of the key to verify that someone else with the same key created the checksum.</p>
+
+<h2 id="writing-a-wireshark-plugin">Writing a Wireshark plugin</h2>
+
+<p>The next thing I did was write a Wireshark plugin to compute the checksums of replies.</p>
+
+<p>While writing the Wireshark plugin I ran into a problem: there were retransmissions in my PCAP, so how do I figure out which of the retransmitted requests corresponds to a response? This was throwaway code for debugging, so I decided to make a big shared-mutable hashmap containing a map from XIDs to GSS sequence numbers. I updated the hashmap whenever Wireshark processed a frame containing an NFS request, assuming it would process them in order.</p>
+
+<p>Then, I loaded up my packet capture and browsed to the response with an XID that failed verification.</p>
+
+<p>&gt; Checksum Matched</p>
+
+<p>Okay. So the checksum in the packet is correct. Why did the kernel think it wasn’t? I clicked back to the request in the PCAP to take a look. Annoyingly, there were two requests with the same XID, meaning that a retransmission was involved. I then clicked back to the response.</p>
+
+<p>&gt; Checksum Mismatch</p>
+
+<p>Huh. Was my Wireshark plugin buggy?</p>
+
+<p>(At this point I think you should have all the information you need to guess what the bug is. It might be fun to think through this. When you’re ready, read on.)</p>
+
+<h2 id="the-bug-finally-clicks">The bug finally clicks</h2>
+
+<p>Remember how I wasn’t sure which request to use to get the GSS sequence number from? It turns out the kernel has the exact same bug!</p>
+
+<p>SunRPC matches responses to requests via their XIDs, so if the server is overloaded and takes a while to respond, the NFS client might retransmit the request. The checksum field in the response is an HMAC over the <em>request’s</em> GSS sequence number. Note that this is <em>not</em> the XID, and is <em>not</em> included in the response. When the kernel retransmits a request with the same XID, it uses a new sequence number and updates the GSS sequence number it has recorded. If the kernel then receives the response that was associated with the old GSS sequence number, checksum validation fails. If this happens 3x in a row, <code>-EACCES</code> is returned to userspace.</p>
+
+<p><img src="https://blog.janestreet.com/a-higgs-bugson-in-the-linux-kernel/nfs_sequence_mismatch.png" alt="step-by-step repro diagram of the bug"/></p>
+
+<p>This is <em>almost</em> self-fulfilling because each failure creates another retry. It is not guaranteed, however: you can still get lucky with timing and avoid the bug.</p>
+
+<p>Basically, the only reason I was able to reproduce the bug is because I was using a tiny test NFS server, causing latencies in the hundreds of seconds. If I had kept going with low-load testing, I probably would have had to use another method to find the bug.</p>
+
+<p>A quick read of some kernel source code confirmed that what I thought was happening <em>could</em> happen, but to be sure, I decided to write a lightweight reproducer that works by delaying packets.</p>
+
+<h2 id="becoming-a-human-firewall">Becoming a human firewall</h2>
+
+<p>There’s a kernel facility called NFQUEUE which allows you to use a userspace process for packet filtering. This is probably intended for security use cases, but what I did was hook it up to a Python script where I can individually look at packets and press <code>y</code> to let them through after enough time has passed to trigger the bug. Basically, I could manually simulate high latency by being a very very slow human firewall.</p>
+
+<p>Then it was a matter of writing a little more glue code, and I had a fully automatic reproduction script.</p>
+
+<h2 id="fixing-the-bug">Fixing the bug</h2>
+
+<p>At this point I reported my findings to my team, who quickly noticed that the RFC actually does mention this case.</p>
+
+<blockquote>
+  <p>“Then when it receives a response with a matching RPC transaction identifier, it can compute the checksum of each sequence number in the cache to try to match the checksum in the reply’s verifier.” - RFC2203 5.3.3.1. (Page 13)</p>
+</blockquote>
+
+<p>The Linux kernel does not actually implement this cache as suggested by the RFC, so I wrote a kernel patch to add this functionality and mailed it off upstream. I also learned that the FreeBSD kernel actually already implements this, so this is new-to-Linux but not new-to-NFS.</p>
+
+<p>More importantly, though, all that this cache does is increase the amount of retries needed to hit a bad interleaving. The fundamental problem is that a sequence number mismatch should not cause an immediate retransmission, which makes the problem self-fulfilling. So, I wrote a second kernel patch to not retransmit if a bad checksum is seen.</p>
+
+<p>This feels principled, since a checksum mismatch suggests network tampering, so it makes sense to treat it as if we didn’t receive a message at all. The normal timeout logic can take care of retransmission in the unlikely case that one is needed. As final verification, I applied these patches and made sure that the test copy jobs and the Python reproducer no longer failed.</p>
+
+<p>Both of these patches are now upstream and will be available in Linux 6.16.</p>
+
+        </div><p>Nikhil joined Jane Street in 2024 after graduating from the University of
+California, Berkeley. He enjoys working on low-level systems and performance
+problems.
+</p></div>
+  </body>
+</html>
