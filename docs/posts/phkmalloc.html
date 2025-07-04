@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://phk.freebsd.dk/sagas/phkmalloc/">Original</a>
+    <h1>phkmalloc</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      <div>
+        <div>
+          <div role="main">
+            
+  <section id="phkmalloc">
+<span id="bikeshed"></span>
+<p>Jason Evans laid
+<a href="https://jasone.github.io/2025/06/12/jemalloc-postmortem/">jemalloc</a>
+to rest yesterday, and gave a kind shoutout to my malloc, aka.
+“phkmalloc”, and it occured to me, that I should write that story down.</p>
+<p>I wrote a little bit about it in my article for the
+<a href="https://freebsdfoundation.org/wp-content/uploads/2023/06/kamp_yorkshire.pdf">30 year aniversary issue of the FreeBSD Journal</a>
+but there is more to it than that.</p>
+<section id="why">
+<h2>Why<a href="#why" title="Permalink to this heading">¶</a></h2>
+<p>In FreeBSD we inherited Chris Kingsley’s malloc implementation from
+BSD, it worked, and we had much larger fish to fry, so we paid it
+no attention.</p>
+<p>During 1994 and 1995, RAM prices went through the roof, and therefore,
+conciously or subconciously, efficient use of RAM became a concern.</p>
+<p>In my case it became a huge concern, because my machine only had
+4MB RAM and being release engineer, I ran GCC a lot.</p>
+<p>My system paged more than I thought it should, and in particular
+I noticed a very distinct burst of disk-activity whenever GCC
+terminated.</p>
+<p>The “death-rattle” was even more prominent with Tcl and Tk programs.</p>
+<p>That made no sense to me, why would things page when the program
+was freeing things prior to termination ?</p>
+<p>The “canonical” malloc implementation, the malloc implementation to
+start all malloc implementations, is in chapter 8.7 in The C
+Programming Language, and as all code in that book it is simple and
+elegant:  A linked list holds the free blocks of memory, and that
+is pretty much it.</p>
+<p>If you are up for a challenge:  Go read chapter 8.7 now, and see if
+you can predict what comes next :-)</p>
+</section>
+<section id="the-problem">
+<h2>The problem<a href="#the-problem" title="Permalink to this heading">¶</a></h2>
+<p>K&amp;R’s malloc was written on a swapping system, probably a PDP-11,
+where either the entire process is in memory or the process does
+not run.</p>
+<p>In the meantime we had gotten Virtual Memory, where pages may or
+may not be in RAM when you need them, but the kernel handles that,
+so from a programmes point of view, the only difference is that
+sometimes a memory access causes disk activity.</p>
+<p>Chris Kingsley’s malloc starts with this comment:</p>
+<div><div><pre><span></span>/*
+ * malloc.c (Caltech) 2/21/82
+ * Chris Kingsley, kingsley@cit-20.
+ *
+ * This is a very fast storage allocator.  It allocates blocks of a small
+ * number of different sizes, and keeps free lists of each size.  Blocks that
+ * don&#39;t exactly fit are passed up to the next larger size.  In this
+ * implementation, the available sizes are 2^n-4 (or 2^n-10) bytes long.
+ * This is designed for use in a virtual memory environment.
+ */
+</pre></div>
+</div>
+<p>So clearly he had thought about the swap/paging thing, and yet,
+performance felt less than stellar and there was that death-rattle
+phenomena.</p>
+<p>The first things I did was to hack a version of the malloc, to log
+all calls to malloc(3), free(3) and realloc(3) to a file and tried
+to make sense of the, for the time, vast amount of data that produced.</p>
+<p>It was pretty obvious from my PostScript plots, that performance
+was far from stellar, and even more obvious that the death-rattle
+was associated with freeing a lot of memory.</p>
+<p>Why would <em>freeing</em> memory cause the kernel to page things in and
+out ?</p>
+<p>To <code><span>free(3)</span></code> a block of memory, you have to walk the free-list to
+find the right place to insert it, and the linked list is stored
+in the first couple of words of all the free chunks.</p>
+<p>Worst case, to free a chunk of memory, we have to read the first
+couple of words of all the memory not currently use.  The death-rattle
+was the kernel paging all the memory the process explicitly did not
+use, into RAM, so the process could mark even more memory as
+explicitly not used.</p>
+<p>I may have exclaimed “Duh!” at this point.</p>
+</section>
+<section id="the-fix-es">
+<h2>The fix(es)<a href="#the-fix-es" title="Permalink to this heading">¶</a></h2>
+<p>I went to work fixing this, and my first hack was brutal:  Whenever
+a chunk was to be freed, I would chop a small struct from front of
+the first free chunk on the free list:</p>
+<div><div><pre><span></span>struct free_chunk {
+        struct free_chunk       *next;
+        struct free_chunk       *prev;
+        void                    *chunk;
+        size_t                  length;
+};
+</pre></div>
+</div>
+<p>And put that structure on the free list, so that I would never have
+to touch the actual free memory again, unless it was reallocated.</p>
+<p>That nearly eliminated the death-rattle, and things ran markedly faster.</p>
+<p>Calling <code><span>free(3)</span></code> with only a pointer, and no size, means malloc
+implementations need some “trick” to remember how big that chunk
+was when it was allocated.</p>
+<p>K&amp;R malloc, and every other malloc, hides that in a small struct
+right before the chunks:</p>
+<div><div><pre><span></span>free(ap)  /* put block ap in free list */
+char *ap:
+{
+     register HEADER *p, *q;
+
+     p = (HEADER *)ap -1;  /* point to header */
+     […]
+</pre></div>
+</div>
+<p>That bugged me, because it meant that a chunk of memory which had
+been unused for a long time (in VM-traffic terms) before the process
+calls <code><span>free(3)</span></code> still get paged into RAM just to mark it unused.</p>
+<p>That reminded me of a trick I had seen on a very old and very strange
+computer, which needed to keep track of stuff on the drum memory.</p>
+</section>
+<section id="biting-the-bullet">
+<h2>Biting the bullet<a href="#biting-the-bullet" title="Permalink to this heading">¶</a></h2>
+<p>So I blew away all of Chris’ code and started from scratch.</p>
+<p>Along the way I collected a lot of data and plotted it on
+my inkjet printer, and one of those plots still have a
+place in my heart and on my wall, I call it “Towers of
+Barad-dûr”:</p>
+<a href="https://brian.abelson.live/log/2025/_images/barad_dur.png"><img alt="../../_images/barad_dur.png" src="https://brian.abelson.live/log/2025/_images/barad_dur.png"/>
+</a>
+<p>I will not recount the resulting architecture, you can find
+that in the paper I wrote for the “FreeNix” track of the
+USEnix Annual Technical Conference in 1998 in New Orleans:</p>
+<p><a href="https://papers.freebsd.org/1998/phk-malloc/">Malloc(3) revisited</a></p>
+<p>Messing up with <code><span>malloc(3)/free(3)/realloc(3)</span></code> was a very well known
+problem, and there were several malloc implementations were written
+explicitly to catch that sort of trouble, but clearly not enough
+people used them, usually because all the checking made them slow.</p>
+<p>Because I kept the “metadata” away from the chunks themselves, and
+because I used a binary “buddy” layout for sub-page-sized allocations,
+I could detect some of the most common mistakes.</p>
+<p>First I thought “We’re not having any of that” and made phkmalloc
+<code><span>abort(2)</span></code> on any wrong usage.  Next time I rebooted my laptop
+<code><span>fsck(8)</span></code> aborted, and left me in single user mode until I could
+fix things with a floppy disk.</p>
+<p>So I changed the logic to detect the problems, spit out a
+warning but do nothing when <code><span>free(3)</span></code> was passed bad pointers.</p>
+<p>But I wanted to be able to control that at run time, but how
+do you run time configure <code><span>malloc(3)</span></code> ?
+An environment variable was obvious, but how do you set the system
+wide default ?
+It may also sound obvious to have a configuration file, but calling
+<code><span>open(2)/read(2)/close(2)</span></code> and doing a bunch of string parsing
+in all programs seemed excessive, and I was not even sure that it
+would be possible, because, by definition, <code><span>malloc(3)</span></code> was not
+working yet.</p>
+<p>A symbolic link does not <em>have</em> to point to something
+in the filesystem, it is essentially just a very tiny text-file:</p>
+<div><div><pre><span></span>ln -sf A /etc/malloc.conf
+</pre></div>
+</div>
+<p>tells phkmalloc to call <code><span>abort(2)</span></code> at the first sign of trouble.</p>
+<p>Later more flags were added: <code><span>J</span></code> for ‘fill with junk’, <code><span>Z</span></code>
+for “fill with zeros” and so on.</p>
+<p>Reasonable people who’s opinions I respect, have called this
+hack anything from “brilliant” to “an afront to all morals”.
+I think it is OK.</p>
+</section>
+<section id="rubber-road-road-rubber">
+<h2>Rubber - Road, Road - Rubber<a href="#rubber-road-road-rubber" title="Permalink to this heading">¶</a></h2>
+<p>When I got to a point where I felt performance was sufficiently
+improved, not only over Chris’ malloc, but also over the
+GNU-malloc which we used as a bandaid in some corners, I
+committed “phkmalloc” in the middle of september 1995:</p>
+<div><div><pre><span></span>``phkmalloc&#39;&#39;
+Performance is comparable to gnumalloc if you have sufficient RAM, and
+it screams around it if you don&#39;t.
+Compiled with &#34;EXTRA_SANITY&#34; until further notice.
+see malloc.3 for more details.
+</pre></div>
+</div>
+<p>Lots of positive feedback on the speedup, but also trouble reports.</p>
+<p>I want to credit the band at this point: Instead of blaming phkmalloc,
+demanding a backout, people went to work, even if things could be
+pretty obscure.</p>
+<p>For instance John Dyson:</p>
+<div><div><pre><span></span>These changes fix a bug in the clustering code that I made worse when adding
+support for EXT2FS.  Note that the Sig-11 problems appear to be caused by
+this, but there is still probably an underlying VM problem that let this
+clustering bug cause vnode objects to appear to be corrupted.
+
+The direct manifestation of this bug would have been severely mis-read
+files.  It is possible that processes would Sig-11 on very damaged
+input files and might explain the mysterious differences in system
+behaviour when phk&#39;s malloc is being used.
+</pre></div>
+</div>
+<p>Or later the same day Bill (“Wild Bill Ethernet”) Paul:</p>
+<div><div><pre><span></span>phkmalloc strikes!
+
+#ifdef out a number of calls to free() left over from the original
+GNU ypserv implementation. As near as I can tell, the Berkeley DB
+package does its own garbage collection, hence the caller doesn&#39;t
+have to worry about free()ing the memory returned in the DBT
+structures during lookups (I&#39;m still not 1005 sure about this:
+the DB code is very hard to follow. I must use dynamically
+allocated memory since you can retreive arbitrarily large records
+from a database, but I&#39;m not sure where it ends up letting go
+of it). This was not true with GDBM; you had
+to do your own garbage collection.
+
+The general rule is that if you allocate memory inside an RPC
+service routine, you have to free() it the next time the routine is
+called since the underlying XDR routines won&#39;t do it for you.
+But if the DB package does this itself, then we don&#39;t need to do
+it in the main program.
+
+Note that with the original malloc(), there were never any errors
+flagged. phkmalloc complained quite loudly.
+</pre></div>
+</div>
+<p>I would be wrong to say that “all Hell broke loose”, but maybe Heck
+had a cat-flap, and we would need to get to the bottom of this,
+before our next release, which lead to one of my all-time favorite
+commit message punch-lines:</p>
+<div><div><pre><span></span>phkmalloc/2
+&#34;zero&#39; and &#39;junk&#39; options to help find and diagnose malloc abuse.
+EXTRA_SANITY defaults &#34;junk&#34; to on.
+[…]
+
+SANITY is not an option anymore. (!!)
+</pre></div>
+</div>
+<p>And then it just went on, and on and on:</p>
+<div><div><pre><span></span>Avoid bogus free() of a junk pointer.
+/bin/sh corruption caused by non-zeroed malloc() in libedit
+Another use of un-cleared returns from malloc squashed...
+Two uninitialised variables were causing a phkmalloc warning
+Phkmalloc strikes again.
+Remove one bogus free(result) (from _havemaster()) that slipped by me.
+I suppose this means we can chalk up another victory for phkmalloc. :)
+Fix some long-standing malloc bugs in the package handling code
+&#34;zero&#39; and &#39;junk&#39; options to help find and diagnose malloc abuse.
+[…]
+</pre></div>
+</div>
+<p>I gradually made phkmalloc more and more picky, until we got to the
+point where it was downright hostile in -current, at a small
+performance cost.</p>
+</section>
+<section id="cybersomething-or-other">
+<h2>Cybersomething-or-other<a href="#cybersomething-or-other" title="Permalink to this heading">¶</a></h2>
+<p>Because the metadata about chunks were not right next to the chunks,
+phkmalloc was very resistent to trivial variations of buffer-overflow
+attacks, resulting in a number of “linux, solaris, …  are vulnerable,
+but FreeBSD is not.” incidents, which caused some people to mistakenly
+think that phkmalloc could <em>never</em> be compromised.</p>
+<p>Of course phkmalloc could be comproposed!</p>
+<p>If the program can be brought to color outside the lines, the program
+is unsafe.  Period!</p>
+<p>But it can be easier or harder to figure out <em>how</em> to exploit those
+mistakes.</p>
+<p>In January 2003 Stefan Esser found a <a href="https://lwn.net/Articles/20926/">double-free in CVS</a>, which was trivial to exploit
+on pretty much all platforms, but the advisory does not mention any
+of the three BSD’s, which had all adopted phkmalloc by then,
+because the proof-of-concept exploit did not work.</p>
+<p>Four months later, somebody known to the world only as “BBP” spent
+55 slides at blackhat,
+<a href="http://www.ouah.org/BSD-heap-smashing.txt">and a wall of text</a>
+to show how it was in fact possible to craft
+an exploit to get through the CVS-hole, also with phkmalloc.</p>
+<p>Good for him and hat-tip from me: At least now two people knew how
+phkmalloc worked :-)</p>
+<p>But gaining people months to patch CVS, rather than mere hours is
+a huge win in my book, and I still count phkmalloc is my major
+contribution to improving cybersecurty, even if it was not yet
+called that.</p>
+</section>
+<section id="kirk-s-mustache-old-man-river">
+<h2>Kirk’s mustache &amp; Old man river<a href="#kirk-s-mustache-old-man-river" title="Permalink to this heading">¶</a></h2>
+<p>Presenting phkmalloc at USEnix ATC 1998 was an adventure in itself,
+with most of my worries focused on slide 20 of my presentation,
+where I basically told many of the unix.gods, which unaccountably
+attended my talk, that their code sucked:</p>
+<img alt="../../_images/slide20.png" src="https://brian.abelson.live/log/2025/_images/slide20.png"/>
+<p>I had absolutely <em>no</em> idea how that would go down, but I could see
+no other way to drive home the point, that <code><span>malloc(3)</span></code> usage bugs were
+real, and a real problem.  But being in the good old days where slides
+were real slides etc, I figured I could always skip that slide during
+the presentation, if that seemed prudent.</p>
+<p>My brain does neither faces nor names very well, and I had never
+met most of the people in the packed audience before, but there
+were no way to miss Kirk Mckusic’s Mustache™:  Center front
+row, or to mangle metaphors terminally:  Right in my face.</p>
+<p>I had his <code><span>fsck(_ffs)</span></code> at the top of the list, because it was literally
+the “first kill” for phkmalloc, so I decided that I would skip that
+slide, and only, reluctantly, put it up, if somebody asked a relevant
+question.</p>
+<p>But when I got to that slide in the talk, I was running high on
+100% adrenalin, slapped the slide on the projector, and started
+saying something about how everybody was making malloc mistakes,
+but I dont think anybody heard it for the laughter in the room.</p>
+<p>I did not exactly expect to be peltered with rotten tomatoes, but
+I did absolutely not expect unix.gods be laughing and teasing each
+other for having their programs on my list.   My well-meaning
+moralizing was 100% surplus to requirements:  Everybody
+in that room had been there, done that, and knew the malloc(3) API
+was dangerous.</p>
+<p>In retrospect:  Why else would the have been there ?</p>
+<p>I cannot remember any of the questions or who asked them:  I was
+too shell-shocked, and after the final applause died down, I was
+totally flat.  I left the bustle of the conference venue, walked
+out in the blazing sun, followed Canal Street down to the river,
+found a small park and for the first (and only) time in my life, I
+stood at the banks of the Mississippi river.</p>
+<p>Ten years previously, I had done sound for an amateur production
+of Show Boat in hometown (Slagelse, Denmark), and my first real
+girlfriend was one of the girls from the chorus, so I couldn’t
+help but sing “Old man river” to myself:</p>
+<div><div><pre><span></span>Man sku&#39; være gamle Mississippi,
+drive langsomt i det grønne land,
+drive under alle årets himle,
+le a&#39; kiv og kævl og tidens tand.
+
+Floden driver, til alle tider,
+[…]
+</pre></div>
+</div>
+<p>While I stood there singing, a posh elderly black gentleman
+edged up to me, and asked in a slightly worried tone: “I can hear
+what you’re singing, but I cant understand <em>any</em> of the words ?”
+I told him that I was singing in Danish, and hastily disclaimed
+that I had not even thought about if that song would be considered
+an insult it modern society.
+“Naah, that’s OK” he answered, “I was just worried about my hearing
+because I couldn’t understand the words.”  We chatted for a bit,
+and I went back to the conference, sunburned and drenched in sweat.</p>
+<p>In retrospect, it is obvious that Kirk must have known what was comming:
+He had reviewed the fix to fsck himself.</p>
+<p>Having gotten to know him afterwards, it would not even surprise
+me, if he had gently pulled USEnix strings, to put me to beard-to-beard
+with him that day:  He was at least on the governing board of USEnix,
+possibly even its chairman.</p>
+<p>On the last day of the conference somebody, it may have been Eric,
+half apologizing told me that if I had been on the main track, I
+would have received the “Best Paper” award, but for political reasons
+the FreeNix track was off limits.</p>
+<p>No need to apologize:  I did not even know the award existed, and
+it would never meant as much to me, as spending an hour over breakfast,
+chatting with Dennis Ritchie about device nodes and timekeeping
+in early UNIX kernels, and receiving his blessing for my DEVFS.</p>
+</section>
+<section id="your-membership-should-you-accept-it">
+<h2>Your membership, should you accept it…<a href="#your-membership-should-you-accept-it" title="Permalink to this heading">¶</a></h2>
+<p>The USEnix presentation kind of marked the apogee of phkmalloc.</p>
+<p>By that time we had found and fixed who knows how many malloc
+mistakes it had detected, not only in FreeBSD but also in the ports
+collection - I had long since stopped keeping track.</p>
+<p>It had also been adopted by a lot of other projects, and I
+regularly received emails along the lines of “somebody told
+me to use phkmalloc and it immediately spotted the bug we
+have been chasing for ${long_time}” etc.</p>
+<p>But multi-threading and multi-CPU systems were rapidly becoming a
+thing, and the tightly knit data structures of phkmalloc left no
+other option than to slap one big mutex around all of it, which
+were OK one or two CPUs, but became a performance problem from 4
+cores and upwards.</p>
+<p>RAM had also become a LOT cheaper, so some of the “bit-pinching”
+where also not warranted any more.</p>
+<p>Jason tackled that in jemalloc, and I was happy to hand the job of
+malloc maintainer in FreeBSD over to him, and I am just as happy
+to induct him into the secret society of retired malloc maintainers
+now.</p>
+<p>(Your laminated membership card will arrive in the mail in 12 to 18 weeks.)</p>
+<p><cite>phk</cite></p>
+</section>
+</section>
+
+
+            
+          </div>
+        </div>
+      </div>
+      
+      
+    </div></div>
+  </body>
+</html>
