@@ -1,0 +1,1096 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://sailor.li/asyncio">Original</a>
+    <h1>Asyncio: A library with too many sharp corners</h1>
+    
+    <div id="readability-page-1" class="page"><div id="post-text">
+            
+<figure>
+    <img src="https://sailor.li/static/tulip.avif" alt="Red garden tulip (Tulipa gesneriana)" height="600" width="800"/>
+    <figcaption>
+        A red garden tulip. Photo
+        <a href="https://www.inaturalist.org/observations/152938179">by my friend Jamie.</a>
+    </figcaption>
+</figure>
+
+<p>
+    One of the headliner features of Python 3.4 (released in 2014) was a new library in the standard
+    library: <code>asyncio</code>, provisionally introduced for feedback as an import of the
+    external <code>tulip</code> library. In Python 3.5 (released in 2015), <code>async</code> and
+    <code>await</code> were added as keywords to the language specifically for usage with
+    asynchronous libraries, replacing the usage of <code>yield from</code>. The
+    <code>asyncio</code> module was also made non-provisional in this release, heralding an entire
+    new ecosystem of asynchronous libraries in the Python world.
+</p>
+<p>
+    But <code>asyncio</code> has so many sharp corners and design issues it is far too difficult to
+    use, bordering on being fundamentally broken. Some of these were only realised in hindsight
+    because other languages (Kotlin, Swift) and libraries did what <code>asyncio</code> does
+    significantly better; but most of these issues were bad at release and it is baffling how the
+    library made it out of provisional status with such glaring flaws.
+</p>
+
+<p>
+        I mention the <a href="https://python-trio.readthedocs.io/">Trio</a> library a lot in this
+        post, but there&#39;s also the
+        <a href="https://anyio.readthedocs.io/en/stable/">AnyIO</a> library that implements
+        Trio-like semantics on top of <code>asyncio</code>, fixing most of the issues described here
+        whilst retaining a level of compatibility with regular <code>asyncio</code>
+        libraries.
+    </p>
+
+<h4>Contents</h4>
+<ol>
+    <li>
+        <a href="#major-1">Major Problem #1: Cancellation is broken</a>
+    </li>
+    <li>
+        <a href="#major-2">Major Problem #2: Task was destroyed but it is pending!</a>
+    </li>
+    <li>
+        <a href="#major-3">Major Problem #3: I/O has pointless landmines</a>
+    </li>
+    <li>
+        <a href="#major-4">Major Problem #4: <code>asyncio.Queue</code> is difficult to use</a>
+    </li>
+    <li>
+        <a href="#other">Other, less major problems</a>
+    </li>
+</ol>
+
+<h2 id="major-1">Major Problem #1: Cancellation is broken</h2>
+<p>
+    In the traditional model of concurrent programming using threads, there is no clean way to do
+    cancellation. In the standard <code>pthreads</code> model, the only way to do cancellation is to
+    brutally murder a thread using <code>pthread_kill</code>, which is nearly always a bad idea
+    because anything the thread was using (such as locks) will be in an unknown and inconsistent
+    state if the thread was killed in the middle of an operation. If you want a better mechanism,
+    you need to implement it yourself by constantly polling a shared state object in-between doing
+    work, using a loop like so:
+</p>
+
+<pre data-snippet="01/thread_cancels.py"><code>cancelled = threading.Event()
+
+def t1():
+    while not cancelled.is_set():
+        do_work()
+
+def main():
+    threading.Thread(target=t1).start()
+    # ... do something inbetween
+    cancelled.set()</code></pre>
+
+<p>
+    This is unergonomic and error-prone as only threads that opt-in to this cancellation mechanism
+    can be cancelled and only when they explicitly check if they are cancelled. Some languages (i.e.
+    Java) make this a bit better by having a <code>Thread.interrupt()</code> method that handles
+    dealing with communicating the interrupted state, with most standard library functions such as
+    <code>Object.wait()</code> automatically checking for the interrupted state. (This still falls
+    victim to the other issues described here.)
+</p>
+<p>
+    <code>asyncio</code> is an asynchronous runtime and is responsible for its own scheduling of its
+    own tasks, instead of the kernel. When an <code>asyncio</code> task needs to interact with the
+    system, it asks the event loop to suspend it until an operation is complete whereupon the task
+    will be rescheduled and will run again in the next tick of the event loop. Threads do the same,
+    but with system calls, and the user application has no control over the kernel&#39;s scheduler
+    beyond tweaking some tuning parameters.
+</p>
+<p>
+    This scheduling mechanism is reused to implement cancellation. When a task is cancelled, any
+    pending operation that the event loop was performing for a task is cancelled, and instead the
+    call raises a <code>CancelledError</code>. Unlike threads tasks no longer need to check if they
+    have been cancelled; every single time a call drops into the event loop the runtime itself
+    checks for cancellation. Conceptually, you can imagine every <code>await</code> as a
+    <em>cancellation point</em>:
+</p>
+
+<pre data-snippet="01/cancel_points.py"><code>async def something(stream: SomeLibraryStream):
+    while True:
+        result = await stream.read()  # Cancellation point
+        parsed = do_parse(result)     # *not* a cancellation point</code></pre>
+
+<p>From this, we can derive a conceptual model of how tasks and cancellations interact:</p>
+<ol>
+    <li>Tasks run until an <code>await</code>, at which point they suspend.</li>
+    <li>Something else calls <code>task.cancel()</code>, which reschedules the task again.</li>
+    <li>The function that was being <code>await</code>-ed now raises <code>Cancelled</code>.</li>
+    <li>
+        This exception propagates backwards, unwinding through all functions in the call stack and
+        cleaning up as it goes.
+    </li>
+</ol>
+
+<p>
+    This avoids both problems with threads: tasks can be externally killed without worrying about
+    resources not being torn down, and end-user tasks don&#39;t need to constantly check if they&#39;ve been
+    cancelled because the event loop does it for you.
+</p>
+
+<h3 id="but-that-s-not-how-it-works">But that&#39;s not how it works</h3>
+<p>
+    Consider this function below that returns a resource wrapped in an asynchronous context manager.
+    When the user is done, it needs to clean up some resources (say, a server needs a clean close).
+    This cleanup should be done regardless of if the code running inside the context manager was
+    successful or not, so it&#39;s ran inside a <code>finally</code> block:
+</p>
+
+<pre data-snippet="01/not_irc.py"><code>@asynccontextmanager
+async def connect_to_server(ip: str, *, port: int = 6767) -&gt; AsyncIterator[Sock]:
+    sock = await connect_socket(ip, port)
+
+    async with sock:
+        await sock.send(b&#34;IDENTIFY ident :bar\r\nNICKNAME :gquuuuuux)\r\n&#34;)
+        try:
+            yield sock
+        finally:
+            await sock.send(b&#34;QUIT :died to some small fry&#34;)</code></pre>
+
+<p>
+    In this case, let&#39;s say <code>.send()</code> waits for some form of acknowledgement message.
+    There&#39;s also another task that is spawned somewhere, and it&#39;s sending a
+    <code>PING</code> message to the server every few seconds and expecting a
+    <code>PONG</code> message. If the client goes too long without receiving a <code>PONG</code>, it
+    cancels the task inside the context manager and exits itself.
+</p>
+<p>What happens if the server does stop responding, and the task is cancelled? Let&#39;s see:</p>
+<ol>
+    <li>
+        <p>
+            First, any code in the user function running inside the asynchronous context manager is
+            cancelled with a <code>CancelledException</code> bubbling upwards.
+        </p>
+    </li>
+    <li>
+        <p>
+            Next, the <code>yield sock</code> expression raises a <code>CancelledException</code>,
+            and control flows into the <code>finally</code> block.
+        </p>
+    </li>
+    <li>
+        <p>
+            The code enters the <code>sock.send()</code> function, which re-enters the event loop.
+            The event loop completely forgets that the task was cancelled and is entirely happy to
+            deadlock the application forever waiting for the server to respond to the
+            <code>.send()</code> (which will never happen).
+        </p>
+    </li>
+</ol>
+<p>
+    This is because cancellations in <code>asyncio</code> are <em>edge-triggered</em>, not
+    <em>level-triggered</em>. These concepts are mostly used in the world of electronics, but are
+    also applicable to certain types of programming too; an <em>edge-triggered</em> event only fires
+    <strong>once</strong> when the state changes. In this case, it&#39;s
+    <code>Task.cancel()</code> firing a cancellation error exactly once. This is the opposite
+    behaviour to <em>level-triggered</em> cancellations, where cancelling a task will cause
+    <strong><em>all</em></strong> calls to the event loop to raise a
+    <code>CancelledException</code>, forever.
+</p>
+<p>
+    Here&#39;s a more practical example that you can run directly on your computer to see this
+    behaviour.
+</p>
+
+<pre data-snippet="01/slept_5s.py"><code>import asyncio
+
+event = asyncio.Event()
+
+async def fn():
+    try:
+        event.set()
+        await asyncio.sleep(60)
+    finally:
+        await asyncio.sleep(5)
+        print(&#34;slept for 5s&#34;)
+
+async def main():
+    task = asyncio.create_task(fn())
+    await event.wait()
+    task.cancel()
+    await asyncio.sleep(10)
+
+asyncio.run(main())</code></pre>
+
+<p>
+    When you run this, the first <code>sleep(60)</code> will be cancelled, and then the program will
+    sleep for five more seconds before printing a <code>slept for 5s</code> message because the
+    cancellation disappeared.
+</p>
+<p>
+    This is absolutely 100% the wrong behaviour and it makes cancellations dangerous when it can be
+    swallowed or covered up at any point.
+</p>
+<ul>
+    <li>
+        <p>
+            Using a bare <code>except:</code>? Swallows cancellations. People will lie and say that
+            they don&#39;t write these, but people do use bare <code>excepts</code>. Even if
+            <em>you</em> don&#39;t, do you know that every other library doesn&#39;t?
+        </p>
+    </li>
+    <li>
+        <p>
+            Doing cleanup in <code>__aexit__</code>? Can deadlock waiting for something that will
+            never happen, swallowing the cancellation.
+        </p>
+    </li>
+    <li>
+        <p>Doing cleanup in <code>try/finally</code>? See above.</p>
+    </li>
+</ul>
+
+<h3 id="it-could-be-better">It could be better</h3>
+<p>
+    Graceful asynchronous cleanup is intrinsically a difficult problem; if an operation blocks for
+    too long, what do you do? If you adopt a rigid rule of <em>always</em> trying to be graceful you
+    risk running into deadlocks if the operation never returns. If you simply avoid doing anything
+    gracefully and just sever connections and open files with a machete you can end up with
+    half-written data or some very unhappy servers on the other end. It doesn&#39;t really matter in the
+    <code>asyncio</code> world, because the library doesn&#39;t give you any tools to implement this.
+</p>
+<p>
+    The <a href="https://github.com/python-trio/trio">Trio</a> library takes the opposite approach;
+    all cancellations are <em>level-triggered</em>. Let&#39;s port the sleeping example above to use
+    Trio instead:
+</p>
+
+<pre data-snippet="01/trio_example.py"><code>import trio
+
+event = trio.Event()
+
+async def task():
+    try:
+        event.set()
+        await trio.sleep(60)
+    finally:
+        await trio.sleep(5)
+        print(&#34;slept for 5s&#34;)
+
+async def main():
+    async with trio.open_nursery() as n:
+        n.start_soon(task)
+        await event.wait()
+        n.cancel_scope.cancel()
+        await trio.sleep(10)  # Not needed, but for parity with the previous example.
+
+trio.run(main)</code></pre>
+
+<p>
+    Running this will produce... no output. It won&#39;t wait either, because anything that could wait
+    has been cancelled. If you add a <code>print()</code> between the <code>event.wait</code> and
+    the <code>cancel_scope.cancel()</code>, that will print something too, so it&#39;s not exiting early
+    because it&#39;s not running anything.
+</p>
+<p>
+    This then asks a question: How do you do graceful cleanup? With shielded cancel scopes and
+    timeouts. I&#39;ll replace the finally block above with one of those:
+</p>
+
+<pre data-snippet="01/trio_cleanup.py"><code>    finally:
+        with trio.move_on_after(1, shield=True):
+            await trio.sleep(5)
+        print(&#34;slept for 1s?&#34;)
+        await trio.sleep(5)
+        print(&#34;slept for 5s?&#34;)</code></pre>
+
+<p>
+    Running this will print <code>slept for 1s?</code>, but nothing more. The code running inside
+    the context manager ignored the outside cancellation, but was re-cancelled after a second
+    anyway. This once again nets you the best of both worlds: cancellations aren&#39;t swallowed unless
+    you explicitly opt-in. Remember the Zen of Python: Explicit is better than implicit.
+</p>
+
+<h2 id="major-2">Major Problem #2: Task was destroyed but it is pending!</h2>
+
+<p>
+    If you&#39;ve ever used an asyncio application, you&#39;ve probably seen that message pop up before. As
+    an example, if I Ctrl-C
+    <a href="https://wiki.gentoo.org/wiki/Portage">portage</a> too quickly, it spits out a few of
+    those errors. Why? Because <code>asyncio</code> does <em>not</em> keep strong references to
+    tasks. Quoting the official documentation:
+</p>
+<blockquote>
+    <p>Important</p>
+    <p>
+        Save a reference to the result of this function, to avoid a task disappearing mid-execution.
+        The event loop only keeps weak references to tasks. A task that isn’t referenced elsewhere
+        may get garbage collected at any time, even before it’s done. For reliable “fire-and-forget”
+        background tasks, gather them in a collection:
+    </p>
+</blockquote>
+
+<p>Let&#39;s take some example code:</p>
+
+<pre data-snippet="02/has_bug_1.py"><code>import asyncio, gc
+
+
+async def expose_bugs():
+    while True:
+        await asyncio.sleep(0.5)
+        # Simulate doing work that would have the GC fire.
+        gc.collect()
+
+
+async def has_bug():
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    await fut
+
+
+async def main():
+    t = asyncio.create_task(expose_bugs())
+    asyncio.create_task(has_bug())
+    await asyncio.sleep(5)
+
+
+asyncio.run(main())</code></pre>
+
+<p>
+    If you run this, it will print a warning to stderr about how <code>has_bug</code> was destroyed
+    when it was pending. <code>has_bug</code> has no strong references to it, so when the GC runs
+    the weak reference the event loop holds is removed and the task is dropped on the floor.
+    Goodbye, <code>has_bug</code>.
+</p>
+<p>
+    This is very obviously insane behaviour, but it can somewhat be avoided by
+    <em>always</em> holding references to spawned tasks (similarly to how you can avoid segmentation
+    faults by always doing bounds checking). But it gets worse. There&#39;s a set of helper functions
+    that are used for corralling tasks around: <code>wait_for</code>, <code>gather</code>, or
+    <code>shield</code>; these can all cause a function being waited on to be dropped on the floor
+    because they internally spawn said function as a task and wait on <em>that</em> instead:
+</p>
+
+<pre data-snippet="02/has_bug_worse.py"><code>import asyncio, gc
+
+
+async def expose_bugs():
+    while True:
+        await asyncio.sleep(0.5)
+        # Simulate doing work that would have the GC fire.
+        gc.collect()
+
+
+async def has_bug():
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    await fut
+
+
+async def shield_task():
+    await asyncio.shield(has_bug())
+
+
+async def main():
+    t1 = asyncio.create_task(expose_bugs())
+    t2 = asyncio.create_task(shield_task())
+    # scheduling pass
+    await asyncio.sleep(1)
+    t2.cancel()
+    await asyncio.sleep(2)
+
+
+asyncio.run(main())</code></pre>
+
+<p>
+    When <code>t2</code> is cancelled, the outer <code>await asyncio.shield(...)</code> call is
+    cancelled. The cancellation doesn&#39;t propagate through into <code>has_bug</code> because of the
+    shielding, and the outer task still has a strong reference in the form of <code>t2</code>. But
+    <code>has_bug</code>&#39;s task has no strong references to it; the only reference was in the local
+    variables of the <code>shield()</code> functions. The next time the event loop ticks,
+    <code>gc.collect()</code> is called, which drops the <code>has_bug</code> task entirely.
+</p>
+<p>
+    You might try to avoid this by doing <code>create_task</code> explicitly as this will keep a
+    strong reference to the <code>has_bug()</code> task in the local variables of the cancelled
+    generator coroutine for <code>shield_task</code>, like so:
+</p>
+
+<pre data-snippet="02/shield_fix?.py"><code>async def shield_task():
+    inner = asyncio.create_task(has_bug())
+    await asyncio.shield(inner)</code></pre>
+
+<p>
+    But this only works all the while the handle to <code>t2</code> lives inside
+    <code>main()</code>. If that handle gets dropped, then the inner <code>has_bug</code> will
+    <em>also</em> get dropped! Adding a <code>del t2</code> after the <code>t2.cancel()</code> will
+    expose this immediately. Good luck tracking this through a web of classes and tasks.
+</p>
+
+<h2 id="major-3">Major Problem #3: I/O has pointless landmines</h2>
+<p>
+    The underlying API for performing network I/O is the ever-venerable BSD socket API. Python
+    exposes a nice object-based API for working with sockets; let&#39;s look at some code that opens a
+    connection on a socket and sends some data.
+</p>
+
+<pre data-snippet="03/sockets_sync.py"><code>s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+s.connect((&#34;2001:708:40:2001::11ba&#34;, 6667))
+s.send(b&#34;USER abc 0 0 :def\r\nNICK :gquuuuuux\r\n&#34;)
+motd = s.recv(4096)
+s.shutdown(socket.SHUT_RDWR)  # Graceful close, send an EOF
+s.close()</code></pre>
+
+<p>
+    This is pretty bare-bones, but it&#39;s easy to see how the code flows: top to bottom. It&#39;s a set of
+    linear statements:
+</p>
+<ol>
+    <li>Create the socket with the appropriate options.</li>
+    <li>Connect it to an address directly.</li>
+    <li>Send some data from a socket.</li>
+    <li>Receive some data from the socket.</li>
+    <li>Shut it down and close the socket.</li>
+</ol>
+<p>
+    This all happens in order; it&#39;s simple to follow. Trio offers an asynchronous version of this,
+    so let&#39;s rewrite the code to be identical with Trio sockets:
+</p>
+
+<pre data-snippet="03/sockets_async.py"><code>s = trio.socket.socket(socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+await s.connect((&#34;2001:708:40:2001::11ba&#34;, 6667))
+await s.send(b&#34;USER abc 0 0 :def\r\nNICK :gquuuuuux\r\n&#34;)
+motd = s.recv(4096)
+s.shutdown(socket.SHUT_RDWR)  # Graceful close, schedules an EOF
+s.close()</code></pre>
+
+<p>
+    The code is almost identical, with some <code>await</code> statements introduced before every
+    function that would normally block. Again, the control flow is simple; it flows from top to
+    bottom in a linear fashion. Let&#39;s look at <code>asyncio</code>&#39;s version of sockets, which are
+    called protocols:
+</p>
+
+<pre data-snippet="03/protocols_wtf.py"><code>import asyncio
+
+
+class IdentifyProtocol(asyncio.Protocol):
+    def __init__(self, message: bytes, motd_future: asyncio.Future):
+        self.message = message 
+        self.motd = motd_future
+
+    def connection_made(self, transport: asyncio.WriteTransport):
+        transport.write(self.message.encode())
+
+    def data_received(self, data: bytes):
+        self.motd.set_result(data)
+
+    def connection_lost(self, exc: BaseException):
+        ...
+
+
+fut = loop.create_future()
+transport, protocol = await loop.create_connection(
+    partial(EchoClientProtocol, b&#34;USER abc 0 0 :def\r\nNICK :gquuuuuux\r\n&#34;, fut),
+    &#34;2001:708:40:2001::11ba&#34;, 
+    6667,
+)
+
+motd = await protocol.motd</code></pre>
+
+<p>
+    Unlike regular BSD sockets or Trio&#39;s socket wrappers, <code>asyncio</code> uses
+    <em>callbacks</em> - synchronous ones, at that - to implement the low-level I/O primitives. The
+    control flow here jumps around a lot:
+</p>
+<ol>
+    <li>
+        <p>
+            <code>create_connection</code> is equivalent to <code>socket.socket</code> +
+            <code>socket.connect</code>. Okay. You don&#39;t get to set socket options (at least it sets
+            <code>TCP_NODELAY</code>) and it doesn&#39;t work for anything other than regular
+            AF_INET/AF_INET6 sockets.
+        </p>
+        <p>
+            It returns a tuple of <code>(write transport, protocol instance)</code>; the former can
+            be used to send further data (synchronously).
+        </p>
+    </li>
+    <li>
+        <p>
+            When the socket is opened, it jumps into my class and calls (synchronously)
+            <code>connection_made</code>, providing a &#34;transport&#34; which I can call the
+            (synchronous) <code>write</code> method on to send my authentication method.
+        </p>
+        <p>
+            There&#39;s no way to wait for this to be sent as <code>WriteTransport.write</code> is
+            synchronous. It&#39;ll get sent at some point in the future. Maybe. If you want to let
+            somebody know that you&#39;ve sent the message, you&#39;ll need to implement that yourself too.
+        </p>
+    </li>
+    <li>
+        <p>
+            After some time, the server will respond; the event loop calls (synchronously)
+            <code>data_received</code>, providing the received data. If you want to do something
+            with this data (asynchronously), you need to pass it to the outside world yourself using
+            futures or queues. In this case, I&#39;ve implemented it with a regular <code>Future</code>;
+            I haven&#39;t even thought about how to swap the future out in a non-error prone way for
+            future reads yet.
+        </p>
+    </li>
+    <li>
+        <p>
+            The outside world now reads the data from the future. That&#39;s three separate places I&#39;ve
+            had to deal with the data, versus a single place with a linear order for sockets.
+        </p>
+    </li>
+</ol>
+<p>
+    The biggest difference between raw sockets and protocols is that protocols have their incoming
+    data <em>pushed in</em> to you. If you want to simply <em>wait</em> for data to arrive, you need
+    to implement that yourself! This is only a basic protocol; more complex protocols require more
+    implementing more complicated synchronisation mechanisms manually to communicate between the
+    entirely synchronous protocol callbacks leading to a mess of either
+    <code>create_task</code> everywhere or manually shuffling futures/events around.
+</p>
+<p>
+    Why is it like this? Because Twisted was like this. But Twisted existed in a world before
+    <code>yield from</code> or <code>await</code>, so it has an excuse. <code>asyncio</code> copied
+    it in a world <em>with</em> <code>yield from</code> and <code>await</code>, so it has no excuse.
+</p>
+
+<p>
+        And no, the answer is also not &#34;because Windows doesn&#39;t support a Unix-style
+        <code>select()</code> API properly&#34;. If you want <code>select()</code> semantics on
+        Windows, use <code>\Device\Afd</code> like
+        <a href="https://notgull.net/device-afd/">everyone else</a> does (and by everyone else, I
+        mean the entire Javascript and Rust ecosystem).
+    </p>
+
+<h3 id="that-s-not-fair">That&#39;s not fair</h3>
+<p>
+    That&#39;s true. It&#39;s rare that you&#39;ll actually interact with protocols; they are a weird
+    implementation detail of <code>asyncio</code>&#39;s event loop mechanisms. The same goes for Trio
+    sockets, but at least for sockets you can use them for esoteric mechanisms like
+    <code>AF_NETLINK</code> or <code>SOCK_RAW</code> whilst still retaining the nice asynchronous
+    API. (You can implement those socket types on <code>asyncio</code> with the even lower level
+    APIs of <code>add_{reader|writer}</code>, but that&#39;s not a topic for today).
+</p>
+<p>
+    Instead most <code>asyncio</code> and Trio programs will use <em>streams</em>, a high-level
+    generic API that treats network connections as nothing more than a stream of bytes. Here&#39;s how
+    the previous socket example would be written using Trio&#39;s streams:
+</p>
+
+<pre data-snippet="03/trio_libera.py"><code>async with trio.open_tcp_stream(&#34;irc.libera.chat&#34;, port=6667) as stream:
+    # type: trio.SocketStream
+    await stream.send_all(b&#34;USER abc 0 0 :def\r\nNICK :gquuuuuux\r\n&#34;)</code></pre>
+
+<p>
+    This is very simple; the returned stream works as an asynchronous context manager that
+    automatically closes the socket when done, regardless of if the inner code succeeds or fails.
+    The <code>send_all</code> method will automatically retry when the underlying socket returns a
+    partial write, so the user doesn&#39;t need to implement retry logic for partial writes by hand.
+</p>
+
+<p>Here&#39;s how you do it in <code>asyncio</code>:</p>
+
+<pre data-snippet="03/asyncio_libera.py"><code>reader, writer = await asyncio.open_connection(&#34;irc.libera.chat&#34;, port=6667)
+try:
+    writer.write(b&#34;USER abc 0 0 :def\r\nNICK :gquuuuuux\r\n&#34;)
+    await writer.drain()
+finally:
+    writer.close()
+    await writer.wait_closed()</code></pre>
+
+<p>This is similar to the Trio example with two major differences:</p>
+<ul>
+    <li>
+        <code>writer.write</code> is <em>synchronous</em> and does not actually perform a full write
+        unless <code>drain()</code> is called.
+    </li>
+    <li>
+        <p>
+            <code>writer.close</code> does not actually perform a close, only schedules it, and you
+            need to use <code>wait_closed</code> to ensure the stream is closed.
+        </p>
+        <p>
+            Also, <code>wait_closed</code> will block if the <code>drain</code> method is cancelled.
+            The cancellation issues are everywhere.
+        </p>
+    </li>
+</ul>
+<p>
+    The <code>write</code>/<code>drain</code> pair exists entirely as a footgun for anyone who
+    forgets to call <code>drain</code>. Data may get written in the background if you don&#39;t call
+    <code>drain()</code>, but if you&#39;re in a tight loop with lots of data to write and no other
+    <code>await</code> calls, it will buffer <em>all</em> of that data into the stream&#39;s internal
+    buffer without sending it. Even if you do have the writer task rescheduled, the buffer may still
+    fill up anyway if data is being written faster than the background writer can empty it. This is
+    stupid!
+</p>
+<p>
+    It&#39;s a not too dissimilar situation with <code>close</code>/<code>wait_closed</code>;
+    <code>close()</code> schedules a close and <code>wait_closed</code> waits for that close to
+    actually be sent. What happens if <code>wait_closed</code> is cancelled?
+    <code>asyncio</code> doesn&#39;t really define the semantics for this, unlike the
+    <code>Trio</code> world which very explicitly does. In the Trio world, all closeable objects
+    follow the <code>AsyncResource</code> ABC, which defines an <em>idempotent</em>
+    <code>aclose</code> method that <em>must always succeed</em>.
+</p>
+<p>
+    So what happens for protocols such as TLS that need a graceful goodbye message sent? Trio&#39;s SSL
+    helpers will try and send a graceful close, and if that times out the stream will be severed by
+    force instead. The end-user doesn&#39;t need to know anything about this; they can call
+    <code>aclose</code> on a resource to close it and not worry about if it will be cancelled or if
+    the resource is actually closed.
+</p>
+
+<h2 id="major-4">Major Problem #4: <code>asyncio.Queue</code> is difficult to use</h2>
+<p>
+    I have two tasks: a producer (that makes messages) and a consumer (that eats messages). Here
+    they are:
+</p>
+
+<pre data-snippet="04/csp_take_1.py"><code>async def producer():
+    while True:
+        message = await do_some_networking_thing()
+        # i don&#39;t know how to send a message...
+
+async def consumer():
+    while True:
+        message = # i don&#39;t know how to receive a message...
+        await eat(message)</code></pre>
+
+<p>
+    How do I get messages between them? I could use a <code>Future</code>, but that would only work
+    exactly once and both of these functions are running in a loop. I could find a way to ferry
+    <code>Future</code> instances between them, but if I could do that I would use the ferry to
+    communicate the messages instead.
+</p>
+<p>
+    The solution is an <code>asyncio.Queue</code>, which is the asynchronous version of
+    <code>queue.Queue</code> (which is the Python version of
+    <code>java.util.concurrent.ArrayBlockingQueue</code>). Let&#39;s pass a queue to both functions:
+</p>
+
+<pre data-snippet="04/csp_take_2.py"><code>async def producer(queue: asyncio.Queue):
+    while True:
+        message = await do_some_networking_thing()
+        await queue.put(message)
+
+async def consumer(queue: asyncio.Queue):
+    while True:
+        message = await queue.get()
+        await eat(message)
+
+async def main():
+    queue = asyncio.Queue()
+    t1 = asyncio.create_task(producer(queue))
+    t2 = asyncio.create_task(consumer(queue))
+
+    while True:
+        await asyncio.sleep(99999999)
+
+asyncio.run(main())</code></pre>
+
+<p>
+    This will have the producer loop forever creating items and putting them in the queue, and the
+    consumer will loop forever reading items from thee queue and doing something with them. This is
+    a very common pattern which is similar to <em>communicating sequential processes</em>. But what
+    happens if <code>consumer</code> throws an exception in <code>eat</code>? Let&#39;s go over the
+    control flow:
+</p>
+<ol>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li><code>consumer</code> receives an item and calls <code>eat</code>.</li>
+    <li>
+        <code>eat</code> raises an exception and the consumer task dies. For the sake of
+        understanding, this exception is a transient external exception and is not related to either
+        the code or the item being consumed.
+    </li>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li>Your system locks up as the out-of-memory killer fails to run.</li>
+</ol>
+<p>
+    This is because the consumer exerts no <em>backpressure</em> on the producer; the producer will
+    gladly keep sending items into the queue forever that nobody is listening to. I can add some
+    backpressure by using <code>asyncio.Queue(maxsize=1)</code>, which changes the control flow like
+    so:
+</p>
+<ol>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li><code>consumer</code> receives an item and calls <code>eat</code>.</li>
+    <li><code>eat</code> raises an exception and the consumer task dies.</li>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li>
+        <code>producer</code> produces an item, tries sending it to the queue, but blocks forever
+        because there&#39;s nobody reading from the queue.
+    </li>
+</ol>
+
+<p>
+    That&#39;s a little bit better in the sense it won&#39;t leak memory forever, but instead it
+    will lock up forever because the producer has no way of knowing that the consumer isn&#39;t
+    listening anymore. In Python 3.13 the <code>Queue.shutdown</code> method was added which lets
+    one (or both) sides know that the queue is closed and can&#39;t accept (or receive) any new
+    items. Let&#39;s adjust the code to use that:
+</p>
+
+<p>
+        If you&#39;re stuck on Python 3.12 or earlier, there&#39;s no <code>Queue.shutdown</code>
+        available.
+    </p>
+
+<pre data-snippet="04/csp_take_3.py"><code>async def consumer(queue: asyncio.Queue):
+    while True:
+        message = await queue.get()
+
+        try:
+            await eat(message)
+        except:
+            queue.shutdown()
+            raise</code></pre>
+
+<p>Now the control flow goes as follows:</p>
+<ol>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li><code>consumer</code> receives an item and calls <code>eat</code>.</li>
+    <li><code>eat</code> raises an exception and the consumer task dies.</li>
+    <li>
+        <code>producer</code> produces an item and tries sending it to the queue, but fails because
+        the queue is shut down.
+    </li>
+</ol>
+<p>
+    Except... that&#39;s not true. There&#39;s a race condition going on between steps three and
+    four; if <code>producer</code> puts an item into the queue before the consumer task is killed,
+    then the item that was sent to the queue remains there forever. There&#39;s a pair of methods,
+    <code>join()</code> and <code>task_done</code> that can solve this, meaning my code now looks
+    like this:
+</p>
+
+<pre data-snippet="04/csp_take_4.py"><code>async def producer(queue: asyncio.Queue):
+    while True:
+        message = await do_some_networking_thing()
+        await queue.put(message)
+        await queue.join()
+
+async def consumer(queue: asyncio.Queue):
+    while True:
+        try:
+            message = await queue.get()
+            await eat(queue)
+        except:
+            queue.shutdown(immediate=True)
+            raise
+        else:
+            queue.task_done()</code></pre>
+
+<p>And the control flow goes as follows:</p>
+<ol>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li><code>producer</code> begins blocking until the consumer calls <code>task_done</code>.</li>
+    <li><code>consumer</code> receives an item and calls <code>eat</code>.</li>
+    <li>
+        <code>eat</code> raises an exception and the consumer task dies. The queue is shut down.
+    </li>
+    <li>
+        <code>queue.join</code> wakes up because I passed <code>immediate=True</code>. If I
+        didn&#39;t pass that, it would block forever instead.
+    </li>
+    <li>
+        <code>producer</code> produces an item and tries sending it to the queue, but
+        <code>put</code> fails because the queue is shut down.
+    </li>
+</ol>
+<p>
+    This eliminates the race condition entirely. This isn&#39;t a very useful pattern because with
+    one consumer and one producer it can be generalised into just calling the consumer function from
+    the producer. It would be more useful if I add a second consumer, assuming consumers are slower
+    than the producer:
+</p>
+<ol>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li><code>producer</code> begins blocking until the consumer calls <code>task_done</code>.</li>
+    <li>Consumer task 1 receives an item and calls <code>eat</code>.</li>
+    <li>
+        Consumer task 2 sits there idly because the producer can&#39;t do anything until the first
+        consumer task has finished.
+    </li>
+    <li>Consumer task 1 has an exception, and shuts down the queue.</li>
+    <li>Consumer task 2 has an exception because the queue was closed.</li>
+    <li>Everything explodes in a fiery mess of exceptions.</li>
+</ol>
+<p>
+    To fix this, consumer task 1 won&#39;t shut down the queue but will restart itself, perhaps from
+    an external supervisor.
+</p>
+
+<pre data-snippet="04/csp_take_6.py"><code>async def consumer(queue: asyncio.Queue):
+    while True:
+        try:
+            message = await queue.get()
+            await eat(queue)
+        except Exception:
+            logger.exception()
+            return
+        else:
+            queue.task_done()</code></pre>
+
+<p>Let&#39;s look at the control flow for a final time:</p>
+<ol>
+    <li><code>producer</code> produces an item and sends it to the queue.</li>
+    <li><code>producer</code> begins blocking until the consumer calls <code>task_done</code>.</li>
+    <li>Consumer task 1 receives an item and calls <code>eat</code>.</li>
+    <li>
+        Consumer task 2 sits there idly because the producer can&#39;t do anything until the first
+        consumer task has finished.
+    </li>
+    <li>Consumer task 1 has an exception, and returns.</li>
+    <li>Consumer task 2 remains blocking on <code>get</code>.</li>
+    <li><code>producer</code> continues blocking on <code>join</code>.</li>
+    <li>The freshly rebooted consumer task 1 starts blocking on <code>get</code></li>
+</ol>
+<p>
+    This could be fixed by making the first consumer task try and re-insert an item on an exception,
+    but what happens if the second task has had an error? Deadlocks. At this point, I give up and
+    pull in an AMQP server instead of dealing with in-library queues.
+</p>
+
+<h3 id="it-doesn-t-have-to-be-this-way">It doesn&#39;t have to be this way</h3>
+<p>What I&#39;m really looking for is a combination of the following:</p>
+<ul>
+    <li>
+        A queue that blocks until a receiver has retrieved the item (aka, automatic
+        <code>.join()</code>).
+    </li>
+    <li>
+        A queue that can be <em>cloned</em> and <em>independently closed</em> without affecting
+        other consumers.
+    </li>
+</ul>
+<p>
+    Trio&#39;s channels implement these behaviours. Let&#39;s re-write the consumer/producer pattern
+    to use channels:
+</p>
+
+<pre data-snippet="04/csp_take_trio.py"><code>async def producer(channel: trio.MemorySendChannel[Message]):
+    async with channel:
+        while True:
+            message: Message = await do_some_networking_thing()
+            await channel.send(message)
+
+
+async def consumer(channel: trio.MemoryReceiveChannel[Message]):
+    async with channel:
+        while True:
+            result = await channel.receive()
+
+            try:
+                await do_something(result)
+            except Exception:
+                logger.exception()
+                return
+            
+
+async def main():
+    send, receive = trio.open_memory_channel[Message](max_buffer_size=0)
+
+    async with trio.open_nursery() as n:
+        for _ in range(5):
+            consumer_channel = receive.clone()
+            n.start_soon(partial(consumer, consumer_channel))
+
+        n.start_soon(partial(producer, send))</code></pre>
+
+<p>
+    Trio channels with a buffer size of zero act as <em>transfer queues</em>, a name coined by
+    <a href="https://docs.oracle.com/en/java/javase/24/docs/api/java.base/java/util/concurrent/TransferQueue.html">Java 7</a>
+    (released in 2011 (!!)), where the sender always waits for a receiver to take a message from the
+    channel. Each receiver gets its own unique <em>clone</em> of the channel that can be
+    independently cloned and messages are sent from the sender channel in a round-robin fashion.
+    These clones can be independently closed without affecting the other cloned channels; only once
+    the final receive channel is closed will the sending channel begin raising errors.
+    <code>TransferQueue</code> was created four solid years before <code>asyncio</code> existed. I
+    really see no excuse for this behaviour to have existed when <code>asyncio</code> was being
+    developed.
+</p>
+<p>
+    The only problem this doesn&#39;t solve is that if the consumer has an error after receiving an
+    object, that object stays unprocessed. This is a problem with both implementations and channels
+    don&#39;t (yet) fix this; but there&#39;s nothing in the conceptual model that would prevent
+    some form of <code>RetryingChannel</code> class that blocks the producer until an item is
+    <em>eventually</em> processed. The same can&#39;t really be said of Queues, which will
+    <em>always</em> buffer at least one item no matter what you do.
+</p>
+<p>
+    A more detailed look at all the issues with backpressure can be read
+    <a href="https://vorpus.org/blog/some-thoughts-on-asynchronous-api-design-in-a-post-asyncawait-world/">in this post</a>
+    by the Trio creator.
+</p>
+
+<h2 id="less-major-problems-a-collection">Less Major Problems, a collection</h2>
+<p>
+    Whilst those four areas are some of the worst parts of <code>asyncio</code>, there&#39;s a lot
+    of minor warts that make it unpleasant to use everywhere else.
+</p>
+<h3 id="threads-are-stupid">Threads are stupid</h3>
+<p>
+    It is an inevitability that asynchronous code needs to use threads for computationally intensive
+    code or for libraries that still use blocking I/O. <code>asyncio</code> offers two APIs for
+    this:
+</p>
+<ul>
+    <li>
+        <p>
+            <code>asyncio.to_thread</code> which propagates context variables correctly to worker
+            threads but doesn&#39;t let you specify the
+            <code>concurrent.futures.ThreadPoolExecutor</code> to use.
+        </p>
+    </li>
+    <li>
+        <p>
+            <code>loop.run_in_executor</code> which <em>doesn&#39;t</em> propagate context variables
+            but does let you specify the <code>ThreadPoolExecutor</code> to use; you need to wrap
+            every function you&#39;re passing in a <code>Context.run</code> call.
+        </p>
+    </li>
+</ul>
+<p>
+    This trade-off is very niche but it also doesn&#39;t really need to exist. The more important
+    problem with threads comes from calling back into the event loop from a thread; cancellation
+    does not propagate properly! Take this example:
+</p>
+
+<pre data-snippet="05/threads_suck.py"><code>import asyncio
+from functools import partial
+
+
+async def coro():
+    await asyncio.sleep(5)
+    print(&#34;as if i would be cancelled!&#34;)
+
+
+def in_thread(loop: asyncio.AbstractEventLoop):
+    fut = asyncio.run_coroutine_threadsafe(coro(), loop)
+    fut.result()
+
+
+async def main():
+    t = asyncio.create_task(asyncio.to_thread(partial(in_thread, asyncio.get_running_loop())))
+    await asyncio.sleep(0)
+    t.cancel()
+    await asyncio.sleep(7)
+
+
+asyncio.run(main())</code></pre>
+
+<p>
+    Running this will print <code>as if i would be cancelled!</code> because cancelling the
+    <code>to_thread</code> task will not cancel the synchronous task running on the event loop.
+    Let&#39;s look at how Trio does it:
+</p>
+
+<pre data-snippet="05/threads_cool.py"><code>from functools import partial
+
+import trio
+import trio.from_thread
+import trio.to_thread
+
+
+async def async_task():
+    await trio.sleep(5)
+    print(&#34;looks like I survived being cancelled&#34;)
+    return 1
+
+
+def sync_task():
+    try:
+        ret = trio.from_thread.run(async_task)
+    except BaseException as e:
+        print(&#34;raised&#34;, e)
+    else:
+        print(&#34;returned&#34;, ret)
+
+
+async def main():
+    async with trio.open_nursery() as group:
+        group.start_soon(partial(trio.to_thread.run_sync, sync_task))
+        await trio.sleep(1)
+        group.cancel_scope.cancel()
+
+
+trio.run(main)</code></pre>
+
+<p>
+    Cancelling the outer cancel scope will cancel the inner task and this code will print
+    <code>raised Cancelled</code> as the exception (correctly) propagates outwards into the
+    <code>sync_task</code> function.
+</p>
+
+<h3 id="other">Other, minor problems</h3>
+<ul>
+    <li>
+        <p>
+            <code>asyncio</code>&#39;s Unix signal API consists entirely of
+            <code>loop.add_signal_handler</code>, which takes a callback and schedules it on the
+            event loop when a single signal is received; and <code>loop.remove_signal_handler</code>
+            which rips out a handler for the specific signal manually. Compare this to Trio&#39;s
+            <a href="https://trio.readthedocs.io/en/stable/reference-io.html#trio.open_signal_receiver"><code>open_signal_receiver</code></a>
+            API which lets you listen to multiple signals with one object, uses an asynchronous
+            context manager to ensure that the handler is cleaned up, and is an iterator instead of
+            a callback so the control flow is linear and easier to follow.
+        </p>
+    </li>
+    <li>
+        <p>
+            Eager tasks were a performance optimisation that was added where
+            <code>create_task</code> forces a task to run up to the first suspension point, as
+            opposed to lazy tasks where they will not run until the next tick of the event loop.
+        </p>
+        <p>
+            Unfortunately, they were broken on release (<a href="https://github.com/python/cpython/issues/128550">1</a>, <a href="https://github.com/python/cpython/issues/128588">2</a>) when interacting
+            with <code>TaskGroup</code>, and libraries often depend on the explicit semantics of
+            lazy tasks that have existed up to the present day.
+        </p>
+    </li>
+    <li>
+        <p>
+            Speaking of <code>TaskGroup</code>s, they are a mechanism to enforce
+            <a href="https://vorpus.org/blog/notes-on-structured-concurrency-or-go-statement-considered-harmful/">structured concurrency</a>
+            in an <code>asyncio</code> world. But due to <code>asyncio</code>&#39;s lack of
+            block-based cancellation - it only supports cancellation of single tasks - there&#39;s
+            no way to cancel entire task groups. You have to cancel the task running the
+            <code>TaskGroup</code> instead, which doesn&#39;t work if you only want to cancel a
+            nested <code>TaskGroup</code> and not the root one.
+        </p>
+        <p>
+            Trio does not have this issue because it has <em>scope cancellation</em> instead. Code running
+            inside a <code>CancelScope</code> context manager can be cancelled independently,
+            regardless of how nested it is inside a task, instead of needing the entire task 
+            to be cancelled at the very top level.
+        </p>
+    </li>
+</ul>
+<h2 id="conclusion">Conclusion</h2>
+<p>
+    <code>asyncio</code> is not a good library. It is constantly full of sharp edges everywhere with
+    implementation details leaking and poorly designed APIs forcing end users into odd code patterns
+    to avoid fundamental flaws in the interfaces.
+</p>
+<p>
+    Trio fixes nearly every single issue in this post. AnyIO implements Trio-like semantics on top
+    of <code>asyncio</code>, whilst still letting you use most parts of libraries designed for <code>asyncio</code>.
+</p>
+
+
+        </div></div>
+  </body>
+</html>
