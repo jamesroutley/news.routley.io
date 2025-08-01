@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://mayhul.com/posts/scheduled-tasks/">Original</a>
+    <h1>Replacing cron jobs with a centralized task scheduler</h1>
+    
+    <div id="readability-page-1" class="page"><div>  <p>At Heartbeat, we have a lot of different tasks that need to run at a particular time. Users can create draft posts or events that get published at a certain time. Event reminders need to be sent at a certain number of hours before an event. Automated workflows can be set up that send emails or direct messages after a delay.</p>
+<p>For the longest time, all of these tasks were managed by a variety of cron scripts. We had <code>createScheduledPosts.ts</code> that would run every 15 minutes, scan our table of scheduled posts and create any that needed to be published. <code>sendEventReminders.ts</code> would run every single minute, scan our table of events, and send any notifications that needed to be sent out. And so on.</p>
+<p>Each of these cron jobs would need to be managed independently. Whenever a new feature was added that involved running tasks in the future, a new cron job would be created. If one of the scripts started erroring, I’d need to figure out why, fix it and then figure out a way to retroactively run the tasks that were missed while the script was broken. Sometimes, we’d get reports from customers that a certain task that was supposed to run did not. I’d painstakingly dig into the logs &amp; code, trying to figure out why a particular event reminder did not get sent on time. The first couple times this happened, I’d usually discover that we lacked the logs to even properly diagnose the issue. All I would be able to do is add some more logs and hope that I’d find the problem the next time. Once the logs were in place, I’d uncover some bug caused by timezones, improper error handling or who knows what else.</p>
+<p>Eventually, I came to my senses and realized that all of these various cron jobs were doing the same thing. And rather than have 10 different cron jobs each implementing their own half-baked version of a task scheduler, we should just have a robust, centralized system for scheduling tasks.</p>
+<p>The way it works is we have a single database table called <code>ScheduledTasks</code> with the following schema:</p>
+<pre tabindex="0"><code><span><span>enum ScheduledTaskStatus {</span></span>
+<span><span>	QUEUED</span></span>
+<span><span>	EXECUTING</span></span>
+<span><span>	COMPLETED</span></span>
+<span><span>}</span></span>
+<span><span></span></span>
+<span><span>model ScheduledTask {</span></span>
+<span><span>	id                               String @id</span></span>
+<span><span>	communityID                      String</span></span>
+<span><span>	createdAt                        DateTime</span></span>
+<span><span>	lastStatusUpdate                 DateTime</span></span>
+<span><span>	timestamp                        DateTime</span></span>
+<span><span>	status                           ScheduledTaskStatus</span></span>
+<span><span>	expectedExecutionTimeInMinutes   Int</span></span>
+<span><span>	expirationInMinutes              Int?</span></span>
+<span><span>	priority                         Int</span></span>
+<span><span>	payload                          Json</span></span>
+<span><span>	message                          String?</span></span>
+<span><span></span></span>
+<span><span>	@@index([status, timestamp])</span></span>
+<span><span>}</span></span></code></pre>
+<p><code>payload</code> is a discriminated union that contains each type of task we have. For example:</p>
+<pre tabindex="0"><code><span><span>type</span><span> ScheduledTaskPayload</span><span> =</span></span>
+<span><span>	|</span><span> {</span></span>
+<span><span>			type</span><span>:</span><span> &#34;</span><span>PUBLISH_EVENT</span><span>&#34;</span><span>;</span></span>
+<span><span>			eventID</span><span>:</span><span> EventID</span><span>;</span></span>
+<span><span>	  }</span></span>
+<span><span>	|</span><span> {</span></span>
+<span><span>			type</span><span>:</span><span> &#34;</span><span>PUBLISH_SCHEDULED_POST</span><span>&#34;</span><span>;</span></span>
+<span><span>			scheduledPostID</span><span>:</span><span> ScheduledPostID</span><span>;</span></span>
+<span><span>	  }</span></span>
+<span><span>	|</span><span> {</span></span>
+<span><span>			type</span><span>:</span><span> &#34;</span><span>SEND_EVENT_REMINDER</span><span>&#34;</span><span>;</span></span>
+<span><span>			eventID</span><span>:</span><span> EventID</span><span>;</span></span>
+<span><span>	  }</span></span>
+<span><span>	|</span><span> {</span></span>
+<span><span>			type</span><span>:</span><span> &#34;</span><span>SEND_EMAIL</span><span>&#34;</span><span>;</span></span>
+<span><span>			email</span><span>:</span><span> string</span><span>;</span></span>
+<span><span>			subject</span><span>:</span><span> string</span><span>;</span></span>
+<span><span>			body</span><span>:</span><span> string</span><span>;</span></span>
+<span><span>	  };</span></span></code></pre>
+<p>Now, whenever we have a task that needs to be scheduled for the future, all we need to do is insert a new <code>ScheduledTask</code> into the database. We have a single cron job responsible for executing scheduled tasks that runs once every minute.</p>
+<p>The cron job works as follows:</p>
+<ol>
+<li>Get all tasks that meet the following criteria:
+<ul>
+<li>Status is not <code>Completed</code></li>
+<li>timestamp is less than <code>now + 30 seconds</code></li>
+<li>The task has not expired (<code>now</code> is less than <code>timestamp + expirationInMinutes</code> or <code>expirationInMinutes</code> is null)</li>
+<li>If status is <code>Executing</code>, <code>now &gt; timestamp + expectedExecutionTimeInMinutes</code></li>
+</ul>
+</li>
+<li>Sort all of the tasks by priority</li>
+<li>Update all of the tasks as <code>Executing</code> in the database</li>
+<li>Create an AWS SQS message for each task</li>
+</ol>
+<p>Separately, we have an SQS consumer that listens for the SQS messages. The consumer reads the <code>payload</code> discriminated union and calls the corresponding function responsible for executing the task.</p>
+<pre tabindex="0"><code><span><span>async</span><span> function</span><span> processTask</span><span>(</span><span>taskPayload</span><span>:</span><span> ScheduledTaskPayload</span><span>) {</span></span>
+<span><span>	if</span><span> (taskPayload.type </span><span>===</span><span> &#34;</span><span>PUBLISH_EVENT</span><span>&#34;</span><span>) {</span></span>
+<span><span>		await</span><span> publishEvent</span><span>(taskPayload.eventID);</span></span>
+<span><span>	} </span><span>else</span><span> if</span><span> (taskPayload.type </span><span>===</span><span> &#34;</span><span>PUBLISH_SCHEDULED_POST</span><span>&#34;</span><span>) {</span></span>
+<span><span>		await</span><span> publishScheduledPost</span><span>(taskPayload.scheduledPostID);</span></span>
+<span><span>	}</span></span>
+<span><span>	//...</span></span>
+<span><span>}</span></span></code></pre>
+<p>After the task runs, mark it as completed in the database. Some of our tasks will return a new scheduled task. If they do, insert the new scheduled task into the database. For example, after sending an event reminder for an instance of a recurring event, the next reminder is scheduled.</p>
+<p>The system has retry logic built in. If for some reason the script does not run for some amount of time due to an outage or error, the scheduled tasks will still exist in the database. Once the script is running again, any tasks that were not executed when they were originally supposed to will be run. The <code>expirationInMinutes</code> enables us to control which tasks are run at a later time. Some tasks, such as event reminders, don’t make sense to be run after a certain point. Others, like publishing scheduled posts, fall into the “better late than never” bucket, in which case <code>expirationInMinutes</code> will be set to null. The <code>expectedExecutionTimeInMinutes</code> field lets us handle retry for tasks that get stuck in <code>Executing</code>. If a task that was scheduled for 10:00am is still marked as <code>Executing</code> at 10:01am, we probably don’t want to run the task again because the first run might still be in progress. However, by 10:08am, if the task is still stuck in <code>Executing</code>, it probably ran into an error and we can try running it again. <code>expectedExecutionTimeInMinutes</code> tells the system how long to wait until rerunning a task stuck in <code>Executing</code>.</p>
+<p>To ensure tasks run at the right time, we need to make sure that whenever a change is made to an entity, the corresponding scheduled task is also updated. For example, when a user creates an event that starts at 3pm, we create a scheduled task for the reminder to be sent at 2pm. If the user later updates the event to be at 6pm, we need to update the same scheduled task to send the reminder at 5pm instead. We enable this by using consistent ids for editable tasks.</p>
+<pre tabindex="0"><code><span><span>type</span><span> ScheduledTaskPayload</span><span> =</span></span>
+<span><span>	|</span><span> {</span></span>
+<span><span>			type</span><span>:</span><span> &#34;</span><span>PUBLISH_EVENT</span><span>&#34;</span><span>;</span></span>
+<span><span>			eventID</span><span>:</span><span> EventID</span><span>;</span></span>
+<span><span>	  }</span></span>
+<span><span>	|</span><span> {</span></span>
+<span><span>			type</span><span>:</span><span> &#34;</span><span>PUBLISH_SCHEDULED_POST</span><span>&#34;</span><span>;</span></span>
+<span><span>			scheduledPostID</span><span>:</span><span> ScheduledPostID</span><span>;</span></span>
+<span><span>	  }</span></span>
+<span><span>	|</span><span> {</span></span>
+<span><span>			type</span><span>:</span><span> &#34;</span><span>SEND_EVENT_REMINDER</span><span>&#34;</span><span>;</span></span>
+<span><span>			eventID</span><span>:</span><span> EventID</span><span>;</span></span>
+<span><span>	  }</span></span>
+<span><span>	|</span><span> {</span></span>
+<span><span>			type</span><span>:</span><span> &#34;</span><span>SEND_EMAIL</span><span>&#34;</span><span>;</span></span>
+<span><span>			email</span><span>:</span><span> string</span><span>;</span></span>
+<span><span>			subject</span><span>:</span><span> string</span><span>;</span></span>
+<span><span>			body</span><span>:</span><span> string</span><span>;</span></span>
+<span><span>	  };</span></span>
+<span></span>
+<span><span>function</span><span> getTaskID</span><span>(</span><span>payload</span><span>:</span><span> ScheduledTaskPayload</span><span>) {</span></span>
+<span><span>	if</span><span> (payload.type </span><span>===</span><span> &#34;</span><span>PUBLISH_EVENT</span><span>&#34;</span><span>) {</span></span>
+<span><span>		return</span><span> `task-</span><span>${</span><span>payload.type</span><span>}</span><span>-</span><span>${</span><span>payload.eventID</span><span>}</span><span>`</span><span>;</span></span>
+<span><span>	} </span><span>else</span><span> if</span><span> (payload.type </span><span>===</span><span> &#34;</span><span>PUBLISH_SCHEDULED_POST</span><span>&#34;</span><span>) {</span></span>
+<span><span>		return</span><span> `task-</span><span>${</span><span>payload.type</span><span>}</span><span>-</span><span>${</span><span>payload.scheduledPostID</span><span>}</span><span>`</span><span>;</span></span>
+<span><span>	} </span><span>else</span><span> if</span><span> (payload.type </span><span>===</span><span> &#34;</span><span>SEND_EVENT_REMINDER</span><span>&#34;</span><span>) {</span></span>
+<span><span>		return</span><span> `task-</span><span>${</span><span>payload.type</span><span>}</span><span>-</span><span>${</span><span>payload.eventID</span><span>}</span><span>`</span><span>;</span></span>
+<span><span>	} </span><span>else</span><span> if</span><span> (payload.type </span><span>===</span><span> &#34;</span><span>SEND_EMAIL</span><span>&#34;</span><span>) {</span></span>
+<span><span>		return</span><span> generateUUID</span><span>();</span></span>
+<span><span>	} </span><span>else</span><span> {</span></span>
+<span><span>		assertNever</span><span>(payload);</span></span>
+<span><span>	}</span></span>
+<span><span>}</span></span></code></pre>
+<p>Whenever we create a task, we use <code>getTaskID</code> to get the id for the scheduled task. And rather than just creating the task, we do an upsert. So when a user creates an event for the first time, the scheduled task does not exist, so it will be created. When edits are made to the event, the eventID remains the same, so the id for the corresponding scheduled task will be the same. As a result, the previous scheduled task will be updated rather than creating a new one. Other tasks, such as <code>SEND_EMAIL</code>, can be triggered from a variety of sources and are not directly editable by the user, so those tasks just use a uuid instead.</p>
+<p>Overall, creating the scheduled tasks system has come with enormous benefits:</p>
+<ul>
+<li>We can centralize the work into one place. Our scheduled tasks cron job has a bunch of logging, error handling and monitoring built into it. We can implement all of this logic once instead of having to constantly reimplement it across various scripts.</li>
+<li>Retries are handled naturally. If we have an outage or if one our task handlers starts running into errors, it’s easy for us to catch up on tasks that we missed after we fix the problem.</li>
+<li>There’s a lasting record of every task that gets executed. If a user asks about why a certain action didn’t happen, we can check the database &amp; logs to see whether the task got created. If it did get created, we can see if it ran into a particular error.</li>
+<li>Implementing new features that involve task scheduling is now trivial. Instead of having to create a new cron script, all we need to do is add a new type to the <code>ScheduledTaskPayload</code> and a new handler to the <code>processTask</code> function.</li>
+</ul>
+<p>Many of you probably already had the foresight to centralize your scheduled tasks into one place. But I haven’t seen too many people talking about this problem, so hopefully this was helpful for anyone that’s currently stuck maintaining a sea of scattered cron jobs.</p>  </div></div>
+  </body>
+</html>
