@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://squadrick.dev/journal/going-faster-than-memcpy">Original</a>
+    <h1>Going faster than memcpy</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      
+
+
+
+<p>While profiling <a href="https://github.com/squadrick/shadesmar">Shadesmar</a> a couple of
+weeks ago, I noticed that for large binary unserialized messages (&gt;512kB) most
+of the execution time is spent doing copying the message (using <code>memcpy</code>)
+between process memory to shared memory and back.</p>
+
+<p>I had a few hours to kill last weekend, and I tried to implement a faster way
+to do memory copies.</p>
+
+<hr/>
+
+<h3 id="autopsy-of-memcpy">Autopsy of memcpy</h3>
+
+<p>Here’s the dumb of <a href="https://perf.wiki.kernel.org/index.php/Main_Page"><code>perf</code></a>
+when running pub-sub for messages of sizes between 512kB and 2MB.</p>
+
+<div><div><pre><code> Children      Self  Shared Object      Symbol
++  99.86%     0.00%  libc-2.27.so       [.] __libc_start_main
++  99.86%     0.00%  [unknown]          [k] 0x4426258d4c544155
++  99.84%     0.02%  raw_benchmark      [.] main
++  98.13%    97.12%  libc-2.27.so       [.] __memmove_avx_unaligned_erms
++  51.99%     0.00%  raw_benchmark      [.] shm::PublisherBin&lt;16u&gt;::publish
++  51.98%     0.01%  raw_benchmark      [.] shm::Topic&lt;16u&gt;::write
++  47.64%     0.01%  raw_benchmark      [.] shm::Topic&lt;16u&gt;::read
+</code></pre></div></div>
+
+<p><code>__memmove_avx_unaligned_erms</code> is an implementation of <code>memcpy</code> for unaligned
+memory blocks that uses AVX to copy over 32 bytes at a time. Digging into the
+<code>glibc</code> source code, I found this:</p>
+
+<div><div><pre><code><span>#if IS_IN (libc)
+# define VEC_SIZE                32
+# define VEC(i)                  ymm##i
+# define VMOVNT                  vmovntdq
+# define VMOVU                   vmovdqu
+# define VMOVA                   vmovdqa
+# define SECTION(p)              p##.avx
+# define MEMMOVE_SYMBOL(p,s)     p##_avx_##s
+</span>
+<span># include &#34;memmove-vec-unaligned-erms.S&#34;
+#endif
+</span></code></pre></div></div>
+
+<p>Breaking down this function:</p>
+
+<p><code>memmove</code>: <code>glibc</code> implements <code>memcpy</code> as a <code>memmove</code> instead, here’s the
+relevant source code:</p>
+
+<div><div><pre><code><span># define SYMBOL_NAME memcpy
+# include &#34;ifunc-memmove.h&#34;
+</span>
+<span>libc_ifunc_redirected</span> <span>(</span><span>__redirect_memcpy</span><span>,</span> <span>__new_memcpy</span><span>,</span>
+		       <span>IFUNC_SELECTOR</span> <span>());</span>
+</code></pre></div></div>
+
+<p>Here’s the difference between the two: With <code>memcpy</code>, the destination cannot
+overlap the source at all. With <code>memmove</code> it can. Initially, I wasn’t sure why
+it was implemented as <code>memmove</code>. The reason for this will become clearer as
+the post proceeds.</p>
+
+<p><code>erms</code>: <em>E</em>nhanced <em>R</em>ep <em>M</em>ov<em>s</em> is a hardware optimization for a loop that
+does a simple copy. In simple pseudo-code, this is what the loop implementation
+looks like for copying a single byte at a time (<code>REP MOVSB</code>).</p>
+
+<div><div><pre><code><span>void</span> <span>rep_movsb</span><span>(</span><span>void</span> <span>*</span><span>dest</span><span>,</span> <span>const</span> <span>void</span> <span>*</span><span>src</span><span>,</span> <span>size_t</span> <span>len</span><span>)</span> <span>{</span>
+  <span>const</span> <span>uint8_t</span><span>*</span> <span>s</span> <span>=</span> <span>(</span><span>uint8_t</span><span>*</span><span>)</span><span>src</span><span>;</span>
+  <span>uint8_t</span><span>*</span> <span>d</span> <span>=</span> <span>(</span><span>uint8_t</span><span>*</span><span>)</span><span>dest</span><span>;</span>
+
+  <span>while</span> <span>(</span><span>len</span><span>--</span><span>)</span>
+    <span>*</span><span>d</span><span>++</span> <span>=</span> <span>*</span><span>s</span><span>++</span><span>;</span>
+
+  <span>return</span> <span>dest</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Since the loop copies data pointer by pointer, it can handle the case of
+overlapping data.</p>
+
+<p><code>vec</code>: For the above loop rather than copying around single bytes, it uses x86
+vectorized instructions to copy multiple bytes in a single loop iteration
+(technically single instruction). <code>vmov*</code> are assembly instructions for AVX
+which is the latest instruction set that the CPU on my laptop supports. With
+<code>VEC_SIZE = 32</code>, it copies 32 bytes at a time.</p>
+
+<p><code>unaligned</code>: This is a generic version of <code>memmove</code> that can copy between any
+pointer locations irrespective of their alignment. Unaligned pointers increase
+complexity for the copy loop when using vectorized instructions. The unaligned
+preceeding and trailing memory locations must be copied separately before hitting the
+optimized loop.</p>
+
+<p><code>memmove-vec-unaligned-erms.S</code> holds the actual implementation in assembly. A
+few things that the implementation does:</p>
+
+<ol>
+  <li>
+    <p>It uses <code>REP MOVS</code> only if the data is greater than 4kB. For smaller values it uses the SSE2 optimization.</p>
+  </li>
+  <li>For handling <code>unaligned</code> pointers, it uses the following blocks:
+    <ul>
+      <li>16 to 31: <code>vmovdqu</code></li>
+      <li>15 to 8: <code>movq</code></li>
+      <li>7 to 4: <code>movl</code></li>
+      <li>3 to 2: <code>movzwl</code> and <code>movw</code></li>
+    </ul>
+  </li>
+  <li><code>VMOVNT</code> defined above is for doing non-temporal(NT) moves. NT instructions
+are used when there is an overlap between destination and source since
+destination may be in cache when source is loaded. Uses <code>prefetcht0</code> to load
+data into cache (all levels: t0). In the current iteration, we prefetch the
+data for 2 iterations later. The data is copied (via cache) into registers. The
+data (via NT) is copied from registers into destination.</li>
+</ol>
+
+<div><div><pre><code><span>L</span><span>(</span><span>loop_large_forward</span><span>):</span>
+	<span>; Copy 4 * VEC a time forward with non-temporal stores.</span>
+	<span>PREFETCH_ONE_SET</span> <span>(</span><span>1</span><span>,</span> <span>(</span><span>%</span><span>rsi</span><span>),</span> <span>PREFETCHED_LOAD_SIZE</span> <span>*</span> <span>2</span><span>)</span>
+	<span>PREFETCH_ONE_SET</span> <span>(</span><span>1</span><span>,</span> <span>(</span><span>%</span><span>rsi</span><span>),</span> <span>PREFETCHED_LOAD_SIZE</span> <span>*</span> <span>3</span><span>)</span>
+  <span>; PREFETCH 256b from rsi+256 to rsi+511</span>
+
+	<span>VMOVU</span>	<span>(</span><span>%</span><span>rsi</span><span>),</span> <span>%</span><span>VEC</span><span>(</span><span>0</span><span>)</span>
+	<span>VMOVU</span>	<span>VEC_SIZE</span><span>(</span><span>%</span><span>rsi</span><span>),</span> <span>%</span><span>VEC</span><span>(</span><span>1</span><span>)</span>
+	<span>VMOVU</span>	<span>(</span><span>VEC_SIZE</span> <span>*</span> <span>2</span><span>)(</span><span>%</span><span>rsi</span><span>),</span> <span>%</span><span>VEC</span><span>(</span><span>2</span><span>)</span>
+	<span>VMOVU</span>	<span>(</span><span>VEC_SIZE</span> <span>*</span> <span>3</span><span>)(</span><span>%</span><span>rsi</span><span>),</span> <span>%</span><span>VEC</span><span>(</span><span>3</span><span>)</span>
+  <span>; mov 128b from rsi to rsi+127 -&gt; 4 ymm registers (cache)</span>
+  <span>; 2 loops later, we hit the prefetched values</span>
+
+	<span>addq</span>	<span>$</span><span>PREFETCHED_LOAD_SIZE</span><span>,</span> <span>%</span><span>rsi</span>  <span>; advance to rsi+128 in next loop</span>
+	<span>subq</span>	<span>$</span><span>PREFETCHED_LOAD_SIZE</span><span>,</span> <span>%</span><span>rdx</span>
+
+	<span>VMOVNT</span>	<span>%</span><span>VEC</span><span>(</span><span>0</span><span>),</span> <span>(</span><span>%</span><span>rdi</span><span>)</span>
+	<span>VMOVNT</span>	<span>%</span><span>VEC</span><span>(</span><span>1</span><span>),</span> <span>VEC_SIZE</span><span>(</span><span>%</span><span>rdi</span><span>)</span>
+	<span>VMOVNT</span>	<span>%</span><span>VEC</span><span>(</span><span>2</span><span>),</span> <span>(</span><span>VEC_SIZE</span> <span>*</span> <span>2</span><span>)(</span><span>%</span><span>rdi</span><span>)</span>
+	<span>VMOVNT</span>	<span>%</span><span>VEC</span><span>(</span><span>3</span><span>),</span> <span>(</span><span>VEC_SIZE</span> <span>*</span> <span>3</span><span>)(</span><span>%</span><span>rdi</span><span>)</span>
+  <span>; mov 128b from 4 ymm register -&gt; rdi to rdi+127 (no cache)</span>
+
+	<span>addq</span>	<span>$</span><span>PREFETCHED_LOAD_SIZE</span><span>,</span> <span>%</span><span>rdi</span>  <span>; advance to rdi+128 in next loop</span>
+	<span>cmpq</span>	<span>$</span><span>PREFETCHED_LOAD_SIZE</span><span>,</span> <span>%</span><span>rdx</span>
+	<span>ja</span>	<span>L</span><span>(</span><span>loop_large_forward</span><span>)</span>
+</code></pre></div></div>
+
+<hr/>
+
+<h3 id="method-1-basic-rep-movsb">Method 1: Basic REP MOVSB</h3>
+
+<p>Before getting into more exotic implementations, I wanted to first implement a
+super simple version of ERSB to see how well it would perform. I used inline
+assembly to write out the loop.</p>
+
+<div><div><pre><code><span>void</span> <span>_rep_movsb</span><span>(</span><span>void</span> <span>*</span><span>d</span><span>,</span> <span>const</span> <span>void</span> <span>*</span><span>s</span><span>,</span> <span>size_t</span> <span>n</span><span>)</span> <span>{</span>
+  <span>asm</span> <span>volatile</span><span>(</span><span>&#34;rep movsb&#34;</span>
+               <span>:</span> <span>&#34;=D&#34;</span><span>(</span><span>d</span><span>),</span> <span>&#34;=S&#34;</span><span>(</span><span>s</span><span>),</span> <span>&#34;=c&#34;</span><span>(</span><span>n</span><span>)</span>
+               <span>:</span> <span>&#34;0&#34;</span><span>(</span><span>d</span><span>),</span> <span>&#34;1&#34;</span><span>(</span><span>s</span><span>),</span> <span>&#34;2&#34;</span><span>(</span><span>n</span><span>)</span>
+               <span>:</span> <span>&#34;memory&#34;</span><span>);</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>This does the same as the pseudo-code attached above, but I wrote it in
+assembly to prevent any compiler optimization, and rely only on the hardware
+ERMS optimization.</p>
+
+<h3 id="alternate-2-aligned-avx">Alternate 2: Aligned AVX</h3>
+
+<p>One of the complexities in <code>glibc</code>’s  implementation is getting it to work for
+unaligned pointers. Since I control the memory allocation, I figured I could
+recreate the implementation focused solely on aligned pointer and sizes. I’m
+using AVX intrinsics for 32-byte vectors (AVX):</p>
+
+<div><div><pre><code><span>void</span> <span>_avx_cpy</span><span>(</span><span>void</span> <span>*</span><span>d</span><span>,</span> <span>const</span> <span>void</span> <span>*</span><span>s</span><span>,</span> <span>size_t</span> <span>n</span><span>)</span> <span>{</span>
+  <span>// d, s -&gt; 32 byte aligned</span>
+  <span>// n -&gt; multiple of 32</span>
+  <span>auto</span> <span>*</span><span>dVec</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>__m256i</span> <span>*&gt;</span><span>(</span><span>d</span><span>);</span>
+  <span>const</span> <span>auto</span> <span>*</span><span>sVec</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>const</span> <span>__m256i</span> <span>*&gt;</span><span>(</span><span>s</span><span>);</span>
+  <span>size_t</span> <span>nVec</span> <span>=</span> <span>n</span> <span>/</span> <span>sizeof</span><span>(</span><span>__m256i</span><span>);</span>
+  <span>for</span> <span>(;</span> <span>nVec</span> <span>&gt;</span> <span>0</span><span>;</span> <span>nVec</span><span>--</span><span>,</span> <span>sVec</span><span>++</span><span>,</span> <span>dVec</span><span>++</span><span>)</span> <span>{</span>
+    <span>const</span> <span>__m256i</span> <span>temp</span> <span>=</span> <span>_mm256_load_si256</span><span>(</span><span>sVec</span><span>);</span>
+    <span>_mm256_store_si256</span><span>(</span><span>dVec</span><span>,</span> <span>temp</span><span>);</span>
+  <span>}</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>The logic is identical to the previous <code>REP MOVSB</code> loop instead operating on 32
+bytes at a time.</p>
+
+<h3 id="method-3-stream-aligned-avx">Method 3: Stream aligned AVX</h3>
+
+<p><code>_mm256_load_si256</code> and <code>_mm256_store_si256</code> go through the cache, which incurs
+additional overhead. AVX instruction set has <code>_stream_</code> load and store
+instructions that skip the cache. The performance of this copy is dependant
+on:</p>
+<ol>
+  <li>Quantity of data to copy</li>
+  <li>Cache size</li>
+</ol>
+
+<p>Non-temporal moves may bog down the performance for smaller copies (that can
+fit into L2 cache) compared to regular moves.</p>
+
+<div><div><pre><code><span>void</span> <span>_avx_async_cpy</span><span>(</span><span>void</span> <span>*</span><span>d</span><span>,</span> <span>const</span> <span>void</span> <span>*</span><span>s</span><span>,</span> <span>size_t</span> <span>n</span><span>)</span> <span>{</span>
+  <span>// d, s -&gt; 32 byte aligned</span>
+  <span>// n -&gt; multiple of 32</span>
+  <span>auto</span> <span>*</span><span>dVec</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>__m256i</span> <span>*&gt;</span><span>(</span><span>d</span><span>);</span>
+  <span>const</span> <span>auto</span> <span>*</span><span>sVec</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>const</span> <span>__m256i</span> <span>*&gt;</span><span>(</span><span>s</span><span>);</span>
+  <span>size_t</span> <span>nVec</span> <span>=</span> <span>n</span> <span>/</span> <span>sizeof</span><span>(</span><span>__m256i</span><span>);</span>
+  <span>for</span> <span>(;</span> <span>nVec</span> <span>&gt;</span> <span>0</span><span>;</span> <span>nVec</span><span>--</span><span>,</span> <span>sVec</span><span>++</span><span>,</span> <span>dVec</span><span>++</span><span>)</span> <span>{</span>
+    <span>const</span> <span>__m256i</span> <span>temp</span> <span>=</span> <span>_mm256_stream_load_si256</span><span>(</span><span>sVec</span><span>);</span>
+    <span>_mm256_stream_si256</span><span>(</span><span>dVec</span><span>,</span> <span>temp</span><span>);</span>
+  <span>}</span>
+  <span>_mm_sfence</span><span>();</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Exact code as before but using non-temporal moves instead. There’s an extra
+<code>_mm_sfence</code> which guarantees that all stores in the preceding loop are 
+visible globally.</p>
+
+<h3 id="method-4-stream-aligned-avx-with-prefetch">Method 4: Stream aligned AVX with prefetch</h3>
+
+<p>In the previous method, we skipped the cache entirely. We can squeeze a bit
+more performance by prefetching the source data into the cache for the next
+iteration in the current iteration. Since all prefetches work on cache-lines
+(64-bytes), each loop iteration copies 64-bytes from source to data.</p>
+
+<div><div><pre><code><span>void</span> <span>_avx_async_pf_cpy</span><span>(</span><span>void</span> <span>*</span><span>d</span><span>,</span> <span>const</span> <span>void</span> <span>*</span><span>s</span><span>,</span> <span>size_t</span> <span>n</span><span>)</span> <span>{</span>
+  <span>// d, s -&gt; 64 byte aligned</span>
+  <span>// n -&gt; multiple of 64</span>
+
+  <span>auto</span> <span>*</span><span>dVec</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>__m256i</span> <span>*&gt;</span><span>(</span><span>d</span><span>);</span>
+  <span>const</span> <span>auto</span> <span>*</span><span>sVec</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>const</span> <span>__m256i</span> <span>*&gt;</span><span>(</span><span>s</span><span>);</span>
+  <span>size_t</span> <span>nVec</span> <span>=</span> <span>n</span> <span>/</span> <span>sizeof</span><span>(</span><span>__m256i</span><span>);</span>
+  <span>for</span> <span>(;</span> <span>nVec</span> <span>&gt;</span> <span>2</span><span>;</span> <span>nVec</span> <span>-=</span> <span>2</span><span>,</span> <span>sVec</span> <span>+=</span> <span>2</span><span>,</span> <span>dVec</span> <span>+=</span> <span>2</span><span>)</span> <span>{</span>
+    <span>// prefetch the next iteration&#39;s data</span>
+    <span>// by default _mm_prefetch moves the entire cache-lint (64b)</span>
+    <span>_mm_prefetch</span><span>(</span><span>sVec</span> <span>+</span> <span>2</span><span>,</span> <span>_MM_HINT_T0</span><span>);</span>
+
+    <span>_mm256_stream_si256</span><span>(</span><span>dVec</span><span>,</span> <span>_mm256_load_si256</span><span>(</span><span>sVec</span><span>));</span>
+    <span>_mm256_stream_si256</span><span>(</span><span>dVec</span> <span>+</span> <span>1</span><span>,</span> <span>_mm256_load_si256</span><span>(</span><span>sVec</span> <span>+</span> <span>1</span><span>));</span>
+  <span>}</span>
+  <span>_mm256_stream_si256</span><span>(</span><span>dVec</span><span>,</span> <span>_mm256_load_si256</span><span>(</span><span>sVec</span><span>));</span>
+  <span>_mm256_stream_si256</span><span>(</span><span>dVec</span> <span>+</span> <span>1</span><span>,</span> <span>_mm256_load_si256</span><span>(</span><span>sVec</span> <span>+</span> <span>1</span><span>));</span>
+  <span>_mm_sfence</span><span>();</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>The load from source pointer to register should <strong>not</strong> skip the cache since
+that data is explicitly prefetched into the cache, non-stream
+<code>_mm256_load_si256</code> must be used instead.</p>
+
+<p>This also unrolls the loop for 2 copies at a time instead of a single copy.
+This is to guarantee that each loop iteration’s prefetch coincides the copy.
+Prefetch the next 64-bytes and copy the current 64-bytes.</p>
+
+<hr/>
+
+<h2 id="alternate-avenues">Alternate avenues</h2>
+
+<h3 id="unrolling">Unrolling</h3>
+
+<p>In the previous section, most of the changes were in the actual underlying
+load, store instructions used. Another avenue of exploration is to unroll the
+loop for a certain number of iterations. This reduces the number of branch
+statements by the factor of unrolling.</p>
+
+<p>In the <code>glibc</code> implementation the unrolling factor is 4 which is what I’ll use
+as well. A very simple way to implement this is to increase the alignment 
+required by 4x and treat each loop as 4 instructions that copy 4x data.</p>
+
+<p>A more complicated version would be trying to implement an unrolled loop
+without increasing alignment size. We’ll need to copy using a regular fully
+rolled loop till we hit a pointer location that is aligned to the size expected
+by our unrolled loop.</p>
+
+<p>Unrolling the aligned AVX copy:</p>
+
+<div><div><pre><code><span>void</span> <span>_avx_cpy_unroll</span><span>(</span><span>void</span> <span>*</span><span>d</span><span>,</span> <span>const</span> <span>void</span> <span>*</span><span>s</span><span>,</span> <span>size_t</span> <span>n</span><span>)</span> <span>{</span>
+  <span>// d, s -&gt; 128 byte aligned</span>
+  <span>// n -&gt; multiple of 128</span>
+
+  <span>auto</span> <span>*</span><span>dVec</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>__m256i</span> <span>*&gt;</span><span>(</span><span>d</span><span>);</span>
+  <span>const</span> <span>auto</span> <span>*</span><span>sVec</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>const</span> <span>__m256i</span> <span>*&gt;</span><span>(</span><span>s</span><span>);</span>
+  <span>size_t</span> <span>nVec</span> <span>=</span> <span>n</span> <span>/</span> <span>sizeof</span><span>(</span><span>__m256i</span><span>);</span>
+  <span>for</span> <span>(;</span> <span>nVec</span> <span>&gt;</span> <span>0</span><span>;</span> <span>nVec</span> <span>-=</span> <span>4</span><span>,</span> <span>sVec</span> <span>+=</span> <span>4</span><span>,</span> <span>dVec</span> <span>+=</span> <span>4</span><span>)</span> <span>{</span>
+    <span>_mm256_store_si256</span><span>(</span><span>dVec</span><span>,</span> <span>_mm256_load_si256</span><span>(</span><span>sVec</span><span>));</span>
+    <span>_mm256_store_si256</span><span>(</span><span>dVec</span> <span>+</span> <span>1</span><span>,</span> <span>_mm256_load_si256</span><span>(</span><span>sVec</span> <span>+</span> <span>1</span><span>));</span>
+    <span>_mm256_store_si256</span><span>(</span><span>dVec</span> <span>+</span> <span>2</span><span>,</span> <span>_mm256_load_si256</span><span>(</span><span>sVec</span> <span>+</span> <span>2</span><span>));</span>
+    <span>_mm256_store_si256</span><span>(</span><span>dVec</span> <span>+</span> <span>3</span><span>,</span> <span>_mm256_load_si256</span><span>(</span><span>sVec</span> <span>+</span> <span>3</span><span>));</span>
+  <span>}</span>
+<span>}</span>
+</code></pre></div></div>
+
+<h3 id="multithreading">Multithreading</h3>
+
+<p>The operation of copying data is super easy to parallelize across multiple
+threads. The total data to be transferred can be segmented into (almost)
+equal chunks, and then copied over using one of the above methods. This will
+make the copy super-fast especially if the CPU has a large core count.</p>
+
+<hr/>
+
+<h2 id="shadesmar-api">Shadesmar API</h2>
+
+<p>To make it easy to integrate custom memory copying logic into the library,
+I introduced the concept of <code>Copier</code> in <a href="https://github.com/Squadrick/shadesmar/commit/22dc762ca658d1396f3c00366e80e4f695189df9">this commit</a>.
+For a new copying algorithm, an abstract class <code>Copier</code> must be implemented.</p>
+
+<p>Here’s the definition of <code>Copier</code>:</p>
+
+<div><div><pre><code><span>class</span> <span>Copier</span> <span>{</span>
+ <span>public:</span>
+  <span>virtual</span> <span>void</span> <span>*</span><span>alloc</span><span>(</span><span>size_t</span><span>)</span> <span>=</span> <span>0</span><span>;</span>
+  <span>virtual</span> <span>void</span> <span>dealloc</span><span>(</span><span>void</span> <span>*</span><span>)</span> <span>=</span> <span>0</span><span>;</span>
+  <span>virtual</span> <span>void</span> <span>shm_to_user</span><span>(</span><span>void</span> <span>*</span><span>,</span> <span>void</span> <span>*</span><span>,</span> <span>size_t</span><span>)</span> <span>=</span> <span>0</span><span>;</span>
+  <span>virtual</span> <span>void</span> <span>user_to_shm</span><span>(</span><span>void</span> <span>*</span><span>,</span> <span>void</span> <span>*</span><span>,</span> <span>size_t</span><span>)</span> <span>=</span> <span>0</span><span>;</span>
+<span>};</span>
+</code></pre></div></div>
+
+<p>The original reason for introducing this construct was to allow cross-device
+usage, where a custom copier would be implemented to tranfer between CPU and
+GPU. E.g.: using <code>cudaMemcpy</code> for Nvidia GPUs.</p>
+
+<p>For a single device use case the implementation of <code>shm_to_user</code> and 
+<code>user_to_shm</code> are identical. The implementation of a copier that uses
+<code>std::memcpy</code>:</p>
+
+<div><div><pre><code><span>class</span> <span>DefaultCopier</span> <span>:</span> <span>public</span> <span>Copier</span> <span>{</span>
+ <span>public:</span>
+  <span>void</span> <span>*</span><span>alloc</span><span>(</span><span>size_t</span> <span>size</span><span>)</span> <span>override</span> <span>{</span> <span>return</span> <span>malloc</span><span>(</span><span>size</span><span>);</span> <span>}</span>
+
+  <span>void</span> <span>dealloc</span><span>(</span><span>void</span> <span>*</span><span>ptr</span><span>)</span> <span>override</span> <span>{</span> <span>free</span><span>(</span><span>ptr</span><span>);</span> <span>}</span>
+
+  <span>void</span> <span>shm_to_user</span><span>(</span><span>void</span> <span>*</span><span>dst</span><span>,</span> <span>void</span> <span>*</span><span>src</span><span>,</span> <span>size_t</span> <span>size</span><span>)</span> <span>override</span> <span>{</span>
+    <span>std</span><span>::</span><span>memcpy</span><span>(</span><span>dst</span><span>,</span> <span>src</span><span>,</span> <span>size</span><span>);</span>
+  <span>}</span>
+
+  <span>void</span> <span>user_to_shm</span><span>(</span><span>void</span> <span>*</span><span>dst</span><span>,</span> <span>void</span> <span>*</span><span>src</span><span>,</span> <span>size_t</span> <span>size</span><span>)</span> <span>override</span> <span>{</span>
+    <span>std</span><span>::</span><span>memcpy</span><span>(</span><span>dst</span><span>,</span> <span>src</span><span>,</span> <span>size</span><span>);</span>
+  <span>}</span>
+<span>};</span>
+</code></pre></div></div>
+
+<p>I also created an adapter <code>MTCopier</code> that adds multithreading support to other
+copiers:</p>
+
+<div><div><pre><code><span>template</span> <span>&lt;</span><span>class</span> <span>BaseCopierT</span><span>&gt;</span> 
+<span>class</span> <span>MTCopier</span> <span>:</span> <span>public</span> <span>Copier</span> <span>{</span>
+<span>public:</span>
+  <span>explicit</span> <span>MTCopier</span><span>(</span><span>uint32_t</span> <span>threads</span> <span>=</span> <span>std</span><span>::</span><span>thread</span><span>::</span><span>hardware_concurrency</span><span>())</span>
+      <span>:</span> <span>base_copier</span><span>(</span><span>base_copier</span><span>),</span> <span>nthreads</span><span>(</span><span>threads</span><span>)</span> <span>{}</span>
+
+  <span>void</span> <span>*</span><span>alloc</span><span>(</span><span>size_t</span> <span>size</span><span>)</span> <span>override</span> <span>{</span> <span>return</span> <span>base_copier</span><span>.</span><span>alloc</span><span>(</span><span>size</span><span>);</span> <span>}</span>
+
+  <span>void</span> <span>dealloc</span><span>(</span><span>void</span> <span>*</span><span>ptr</span><span>)</span> <span>override</span> <span>{</span> <span>base_copier</span><span>.</span><span>dealloc</span><span>(</span><span>ptr</span><span>);</span> <span>}</span>
+
+  <span>void</span> <span>_copy</span><span>(</span><span>void</span> <span>*</span><span>d</span><span>,</span> <span>void</span> <span>*</span><span>s</span><span>,</span> <span>size_t</span> <span>n</span><span>,</span> <span>bool</span> <span>shm_to_user</span><span>)</span> <span>{</span>
+    <span>std</span><span>::</span><span>vector</span><span>&lt;</span><span>std</span><span>::</span><span>thread</span><span>&gt;</span> <span>threads</span><span>;</span>
+    <span>threads</span><span>.</span><span>reserve</span><span>(</span><span>nthreads</span><span>);</span>
+
+    <span>ldiv_t</span> <span>per_worker</span> <span>=</span> <span>div</span><span>((</span><span>int64_t</span><span>)</span><span>n</span><span>,</span> <span>nthreads</span><span>);</span>
+
+    <span>size_t</span> <span>next_start</span> <span>=</span> <span>0</span><span>;</span>
+    <span>for</span> <span>(</span><span>uint32_t</span> <span>thread_idx</span> <span>=</span> <span>0</span><span>;</span> <span>thread_idx</span> <span>&lt;</span> <span>nthreads</span><span>;</span> <span>++</span><span>thread_idx</span><span>)</span> <span>{</span>
+      <span>const</span> <span>size_t</span> <span>curr_start</span> <span>=</span> <span>next_start</span><span>;</span>
+      <span>next_start</span> <span>+=</span> <span>per_worker</span><span>.</span><span>quot</span><span>;</span>
+      <span>if</span> <span>(</span><span>thread_idx</span> <span>&lt;</span> <span>per_worker</span><span>.</span><span>rem</span><span>)</span> <span>{</span>
+        <span>++</span><span>next_start</span><span>;</span>
+      <span>}</span>
+      <span>uint8_t</span> <span>*</span><span>d_thread</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>uint8_t</span> <span>*&gt;</span><span>(</span><span>d</span><span>)</span> <span>+</span> <span>curr_start</span><span>;</span>
+      <span>uint8_t</span> <span>*</span><span>s_thread</span> <span>=</span> <span>reinterpret_cast</span><span>&lt;</span><span>uint8_t</span> <span>*&gt;</span><span>(</span><span>s</span><span>)</span> <span>+</span> <span>curr_start</span><span>;</span>
+
+      <span>if</span> <span>(</span><span>shm_to_user</span><span>)</span> <span>{</span>
+        <span>threads</span><span>.</span><span>emplace_back</span><span>(</span><span>&amp;</span><span>Copier</span><span>::</span><span>shm_to_user</span><span>,</span> <span>&amp;</span><span>base_copier</span><span>,</span> <span>d_thread</span><span>,</span>
+                             <span>s_thread</span><span>,</span> <span>next_start</span> <span>-</span> <span>curr_start</span><span>);</span>
+      <span>}</span> <span>else</span> <span>{</span>
+        <span>threads</span><span>.</span><span>emplace_back</span><span>(</span><span>&amp;</span><span>Copier</span><span>::</span><span>user_to_shm</span><span>,</span> <span>&amp;</span><span>base_copier</span><span>,</span> <span>d_thread</span><span>,</span>
+                             <span>s_thread</span><span>,</span> <span>next_start</span> <span>-</span> <span>curr_start</span><span>);</span>
+      <span>}</span>
+    <span>}</span>
+    <span>for</span> <span>(</span><span>auto</span> <span>&amp;</span><span>thread</span> <span>:</span> <span>threads</span><span>)</span> <span>{</span>
+      <span>thread</span><span>.</span><span>join</span><span>();</span>
+    <span>}</span>
+    <span>threads</span><span>.</span><span>clear</span><span>();</span>
+  <span>}</span>
+
+  <span>void</span> <span>shm_to_user</span><span>(</span><span>void</span> <span>*</span><span>dst</span><span>,</span> <span>void</span> <span>*</span><span>src</span><span>,</span> <span>size_t</span> <span>size</span><span>)</span> <span>override</span> <span>{</span>
+    <span>_copy</span><span>(</span><span>dst</span><span>,</span> <span>src</span><span>,</span> <span>size</span><span>,</span> <span>true</span><span>);</span>
+  <span>}</span>
+
+  <span>void</span> <span>user_to_shm</span><span>(</span><span>void</span> <span>*</span><span>dst</span><span>,</span> <span>void</span> <span>*</span><span>src</span><span>,</span> <span>size_t</span> <span>size</span><span>)</span> <span>override</span> <span>{</span>
+    <span>_copy</span><span>(</span><span>dst</span><span>,</span> <span>src</span><span>,</span> <span>size</span><span>,</span> <span>false</span><span>);</span>
+  <span>}</span>
+
+<span>private:</span>
+  <span>BaseCopierT</span> <span>base_copier</span><span>;</span>
+  <span>uint32_t</span> <span>nthreads</span><span>;</span>
+<span>};</span>
+</code></pre></div></div>
+
+<p>Currently this only works for <code>memcpy</code> and <code>_rep_movsb</code> since the
+implementation expects the memory copy to work for unaligned memory.</p>
+
+<hr/>
+
+<h2 id="benchmark">Benchmark</h2>
+
+<p>I used Google’s <a href="https://github.com/google/benchmark">Benchmark</a> for timing
+the performance of copying data ranging from size of 32kB to 64MB. All the
+benchmarks were run on my PC with the following specifications:</p>
+<ol>
+  <li>AMD Ryzen 7 3700X</li>
+  <li>2x8GB DDR4 RAM @ 3600Mhz</li>
+</ol>
+
+
+
+
+
+
+
+
+
+
+<h3 id="conclusion">Conclusion</h3>
+
+<p>Stick to <code>std::memcpy</code>. It delivers great performance while also adapting to
+the hardware architecture, and makes no assumptions about the memory alignment.</p>
+
+<p>If performance truly matters, then you might want to consider using a more
+specific non-genetic implementation with alignment requirements. The streaming
+prefetching copy works the best for larger copies (&gt;1MB), but the performance
+for small sizes is abyssal, but <code>memcpy</code> matches its performance. For small to
+medium sizes Unrolled AVX absolutely dominates, but as for larger messages, it
+is slower than the streaming alternatives. The regular <code>RepMovsb</code> is by far the
+worst overall performer as excepted.</p>
+
+<p>Unrolling definitely improves performance in most cases by about 5-10%. The
+only case where the unrolled version is slower than rolled version is for
+<code>AvxCopier</code> with data size of 32B, which the unrolled version is 25% slower.
+The rolled version will do a single AVX-256 load/store and a conditional check.
+The unrolled version will do 4 AVX-256 load/stores and a conditional check.</p>
+
+<h3 id="code">Code</h3>
+
+<p>Code for all the methods is included in the library conforming to the above
+mentioned API. To actively warn about the danger of using these custom copiers
+I have named this file <a href="https://github.com/Squadrick/shadesmar/blob/master/include/shadesmar/memory/dragons.h"><code>dragons.h</code></a>,
+with an apt message: <em>Here be dragons</em>.</p>
+
+
+<p><span>
+  Written on
+  
+  May
+  24th,
+  2020
+  by
+  
+    Dheeraj R Reddy
+  
+</span>
+
+    </p></div></div>
+  </body>
+</html>
