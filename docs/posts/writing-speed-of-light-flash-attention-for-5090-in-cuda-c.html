@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://gau-nernst.github.io/fa-5090/">Original</a>
+    <h1>Writing Speed-of-Light Flash Attention for 5090 in CUDA C&#43;&#43;</h1>
+    
+    <div id="readability-page-1" class="page"><div><article><header><p><time>Aug 23, 2025</time></p></header><section><p>In this post, I will walkthrough how I learned to implement Flash Attention for 5090 in CUDA C++. The main objective is to learn writing attention in CUDA C++, since many features are not available in <a href="https://triton-lang.org/main/index.html">Triton</a>, such as MXFP8 / NVFP4 MMA for sm120. I also feel this is a natural next step after learning about matmul kernels. Lastly, there are <a href="https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html">many</a> <a href="https://www.spatters.ca/mma-matmul">excellent</a> <a href="https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog">blogposts</a> on writing fast matmul kernels, but there is none for attention. So I want to take this chance to write up something nicely.</p><p>Readers are highly recommended to be familiar with CUDA C++ and how to use Tensor cores on NVIDIA GPUs. Of course you can still read along and clarify with your favourite LLMs along the way. Or you can check out GPU-MODE series (<a href="https://github.com/gpu-mode/lectures">slides</a>, <a href="https://www.youtube.com/@GPUMODE">YouTube</a>) for basic CUDA C++ knowledge, as well as the excellent matmul blogposts mentioned above, to quickly get up to speed.</p><p>You can find the full implementation discussed in this post here: <a href="https://github.com/gau-nernst/learn-cuda/tree/e83c256/07_attention">https://github.com/gau-nernst/learn-cuda/tree/e83c256/07_attention</a>. For <code>bs=1, num_heads=8, len_query=4096, len_kv = 8192</code>, 5090 @ 400W, compile with CUDA 12.9, I obtained the following benchmark results (theoretical limit of 5090 is 209.5 TFLOPS for BF16)</p><table><thead><tr><th>Kernel</th><th>TFLOPS</th><th>% of SOL</th></tr></thead><tbody><tr><td><code>F.sdpa()</code> (Flash Attention)</td><td>186.73</td><td>89.13%</td></tr><tr><td><code>F.sdpa()</code> (CuDNN)</td><td>203.61</td><td>97.19%</td></tr><tr><td><code>flash-attn</code></td><td>190.58</td><td>90.97%</td></tr><tr><td>v1 (basic)</td><td>142.87</td><td>68.20%</td></tr><tr><td>v2 (shared memory swizzling)</td><td>181.11</td><td>86.45%</td></tr><tr><td>v3 (2-stage pipelining)</td><td>189.84</td><td>90.62%</td></tr><tr><td>v4 (<code>ldmatrix.x4</code> for K and V)</td><td>194.33</td><td>92.76%</td></tr><tr><td>v5 (better pipelining)</td><td>197.74</td><td>94.39%</td></tr></tbody></table><p>Do note that although I only use Ampere features in these implementations (sm120 supports <code>cp.async.bulk</code> i.e. TMA, but I don’t use it here), my implementations might not run performantly on earlier generations of GPUs. Due to improvements in newer hardware, you might need to use more tricks to reach Speed-of-Light on older GPUs e.g. pipeline shared memory to register memory data movements.</p><h2 id="flash-attention-algorithm">Flash Attention algorithm</h2><p>Let’s start with the reference implementation of attention.</p><div><pre tabindex="0"><code data-lang="python"><span><span><span>from</span> torch <span>import</span> Tensor
+</span></span><span><span>
+</span></span><span><span><span>def</span> <span>sdpa</span>(q: Tensor, k: Tensor, v: Tensor):
+</span></span><span><span>    <span># q: [B, Lq, DIM]</span>
+</span></span><span><span>    <span># k: [B, Lk, DIM]</span>
+</span></span><span><span>    <span># v: [B, Lk, DIM]</span>
+</span></span><span><span>    D <span>=</span> q<span>.</span>shape[<span>-</span><span>1</span>]
+</span></span><span><span>    scale <span>=</span> D <span>**</span> <span>-</span><span>0.5</span>
+</span></span><span><span>    attn <span>=</span> (q <span>@</span> k<span>.</span>transpose(<span>-</span><span>1</span>, <span>-</span><span>2</span>)) <span>*</span> scale  <span># [B, Lq, Lk]</span>
+</span></span><span><span>    attn <span>=</span> attn<span>.</span>softmax(dim<span>=-</span><span>1</span>)
+</span></span><span><span>    out <span>=</span> attn <span>@</span> v  <span># [B, Lq, DIM]</span>
+</span></span><span><span>    <span>return</span> out
+</span></span></code></pre></div><p>Technically, if the inputs are BF16, some computations should remain in FP32, especially softmax. However, for brevity, we omit them.</p><p>We are implementing the algorithm outlined in the <a href="https://arxiv.org/abs/2307.08691">Flash Attention 2 paper</a>. Each threadblock is responsible for a chunk of Q, and we will iterate along the sequence length of KV. A Python-like outline of the algorithm looks like below (S and P follow Flash Attention notation).</p><div><pre tabindex="0"><code data-lang="python"><span><span>scale <span>=</span> DIM <span>**</span> <span>-</span><span>0.5</span>
+</span></span><span><span><span>for</span> b_idx <span>in</span> range(B):
+</span></span><span><span>    <span>for</span> tile_Q_idx <span>in</span> range(Lq <span>//</span> BLOCK_Q):
+</span></span><span><span>        <span>### start of each threadblock&#39;s kernel</span>
+</span></span><span><span>        tile_O <span>=</span> torch<span>.</span>zeros(BLOCK_Q, DIM)
+</span></span><span><span>        tile_Q <span>=</span> load_Q(b_idx, tile_Q_idx)  <span># [BLOCK_Q, DIM]</span>
+</span></span><span><span>
+</span></span><span><span>        <span>for</span> tile_KV_idx <span>in</span> range(Lk <span>//</span> BLOCK_KV):
+</span></span><span><span>            <span># first MMA: S = Q @ K.T</span>
+</span></span><span><span>            <span># (BLOCK_Q, DIM) x (BLOCK_KV, DIM).T -&gt; (BLOCK_Q, BLOCK_KV)</span>
+</span></span><span><span>            tile_Q                               <span># (BLOCK_Q, DIM)</span>
+</span></span><span><span>            tile_K <span>=</span> load_K(b_idx, tile_KV_idx)  <span># (BLOCK_KV, DIM)</span>
+</span></span><span><span>            tile_S <span>=</span> tile_Q <span>@</span> tile_K<span>.</span>T           <span># (BLOCK_Q, BLOCK_KV)</span>
+</span></span><span><span>            tile_S <span>=</span> tile_S <span>*</span> scale
+</span></span><span><span>
+</span></span><span><span>            <span># online softmax and rescale tile_O</span>
+</span></span><span><span>            <span>...</span>
+</span></span><span><span>
+</span></span><span><span>            <span># second MMA: O = P @ V</span>
+</span></span><span><span>            <span># (BLOCK_Q, BLOCK_KV) x (BLOCK_KV, DIM) -&gt; (BLOCK_Q, DIM)</span>
+</span></span><span><span>            tile_P                               <span># (BLOCK_Q, BLOCK_KV)</span>
+</span></span><span><span>            tile_V <span>=</span> load_V(b_idx, tile_KV_idx)  <span># (BLOCK_KV, DIM)</span>
+</span></span><span><span>            tile_O <span>+=</span> tile_P <span>@</span> tile_V            <span># (BLOCK_Q, DIM)</span>
+</span></span><span><span>
+</span></span><span><span>        <span># normalize output and write results</span>
+</span></span><span><span>        store_O(b_idx, tile_Q_idx)
+</span></span><span><span>        <span>### end of each threadblock&#39;s kernel</span>
+</span></span></code></pre></div><p>It’s implied <code>DIM</code> is small, so that we can hold <code>tile_Q</code> in register memory throughout the duration of the kernel. This is the reason pretty much all models nowadays use <code>head_dim=128</code>. There are exceptions of course, like <a href="https://arxiv.org/abs/2405.04434">MLA</a>, which uses <code>head_dim=576</code> for Q and K, and <code>head_dim=512</code> for V. Talking about this, I should study <a href="https://github.com/deepseek-ai/FlashMLA">FlashMLA</a> some day.</p><p>Online softmax is quite tricky to explain, so let’s delay the explanation of that part. At the high level, you just need to know that online softmax will transform <code>tile_S</code> to <code>tile_P</code>, and also rescale <code>tile_O</code>.</p><h2 id="version-1---basic-implementation">Version 1 - Basic implementation</h2><p>We will follow the typical MMA flow</p><ul><li>Load a 2D tile of data from global memory to shared memory using <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async">cp.async</a>. This requires Ampere (sm80 and newer).</li><li>Load data from shared memory to register memory using <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix">ldmatrix</a>.</li><li>Call <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float">mma.m16n8k16</a> for BF16 matrix multiplication (and accumulate).</li></ul><p>I want to focus on implementing the algorithm correctly first, hence I leave out more complicated tricks like shared memory swizzling and pipelining. This reduces the surface area for mistakes, and we will revisit them later for performance optimization.</p><p>The following templated function does a 2D tile copy from global memory to shared memory.</p><ul><li>Shape of the 2D tile is specified via <code>HEIGHT</code> and <code>WIDTH</code>.</li><li><code>dst</code> is shared memory address, <code>src</code> is global memory address.</li><li>Global memory <code>src</code> is row-major, so <code>src_stride</code> specifies how much to move to the next row.</li><li>Shared memory <code>dst</code> is also row-major, and will be stored as a contiguous block -&gt; <code>dst_stride = WIDTH</code>.</li></ul><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>#include</span> <span>&lt;cuda_bf16.h&gt;</span><span>
+</span></span></span><span><span><span></span>
+</span></span><span><span><span>template</span> <span>&lt;</span><span>int</span> HEIGHT, <span>int</span> WIDTH, <span>int</span> TB_SIZE<span>&gt;</span>
+</span></span><span><span>__device__ <span>inline</span>
+</span></span><span><span><span>void</span> global_to_shared(<span>uint32_t</span> dst, <span>const</span> nv_bfloat16 <span>*</span>src, <span>int</span> src_stride, <span>int</span> tid) {
+</span></span><span><span>  <span>constexpr</span> <span>int</span> num_elems <span>=</span> <span>16</span> <span>/</span> <span>sizeof</span>(nv_bfloat16);
+</span></span><span><span>  <span>constexpr</span> <span>int</span> num_iters <span>=</span> HEIGHT <span>*</span> WIDTH <span>/</span> (TB_SIZE <span>*</span> num_elems);
+</span></span><span><span>
+</span></span><span><span>  <span>for</span> (<span>int</span> iter <span>=</span> <span>0</span>; iter <span>&lt;</span> num_iters; iter<span>++</span>) {
+</span></span><span><span>    <span>const</span> <span>int</span> idx <span>=</span> (iter <span>*</span> TB_SIZE <span>+</span> tid) <span>*</span> num_elems;
+</span></span><span><span>    <span>const</span> <span>int</span> row <span>=</span> idx <span>/</span> WIDTH;
+</span></span><span><span>    <span>const</span> <span>int</span> col <span>=</span> idx <span>%</span> WIDTH;
+</span></span><span><span>
+</span></span><span><span>    <span>const</span> <span>uint32_t</span> dst_addr <span>=</span> dst <span>+</span> (row <span>*</span> WIDTH <span>+</span> col) <span>*</span> <span>sizeof</span>(nv_bfloat16);
+</span></span><span><span>    <span>const</span> nv_bfloat16 <span>*</span>src_addr <span>=</span> src <span>+</span> (row <span>*</span> src_stride <span>+</span> col);
+</span></span><span><span>    <span>asm</span> <span>volatile</span>(<span>&#34;cp.async.cg.shared.global [%0], [%1], 16;&#34;</span> <span>::</span> <span>&#34;r&#34;</span>(dst_addr), <span>&#34;l&#34;</span>(src_addr));
+</span></span><span><span>  }
+</span></span><span><span>}
+</span></span></code></pre></div><figure><img src="http://tinylogger.com/fa-5090/global_to_shared.svg" alt="Global to Shared data transfer"/><figcaption><p>2D tile copy from Global memory to Shared memory.</p></figcaption></figure><p>We will use inline assembly to write <code>cp.async.cg.shared.global</code>. This PTX does 16-byte transfer, or 8 BF16 elements (<code>num_elems = 16 / sizeof(nv_bfloat16)</code>), for each CUDA thread. To ensure coalesced memory access, consecutive threads will be responsible for consecutive groups of 8xBF16.</p><figure><img src="http://tinylogger.com/fa-5090/coalesced.svg" alt="Coalesced memory access"/><figcaption><p>Consecutive threads are responsible for consecutive groups of 8xBF16.</p></figcaption></figure><p>Note:</p><ul><li>The loop <code>for (int iter = 0; iter &lt; num_iters; iter++)</code> is written this way so that the compiler (<code>nvcc</code>) can fully unroll the loop. <code>num_iters</code> is known at compile time (guaranteed by <code>constexpr</code>). If we mix <code>tid</code> in the loop, which is a “dynamic” variable to the compiler, the loop can’t be unrolled, even when we know certain constraints about the variable i.e. <code>tid &lt; TB_SIZE</code>.</li><li>Data type of shared memory pointer <code>dst</code> is <code>uint32_t</code>. This is intentional. Pretty much all PTX instructions expect shared memory addresses to be in <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#state-spaces">shared state space</a>. We can convert C++ pointers, which are generic addresses, to shared state space addresses with <code>static_cast&lt;uint32_t&gt;(__cvta_generic_to_shared(ptr))</code>. This is done outside of <code>global_to_shared()</code>.</li></ul><p>To finish using <code>cp.async</code>, we also need to add the following:</p><ul><li><code>cp.async.commit_group</code> (PTX): commit all previously issued <code>cp.async</code> instructions into a <strong><code>cp.async</code> group</strong>. This group will be the unit for synchronization.</li><li><code>cp.async.wait_all</code> (PTX): wait for all committed groups to finish.</li><li><code>__syncthreads()</code>: make sure all threads (in a threadblock) reach here before reading the loaded data in shared memory (because one thread may read data loaded by another thread). More importantly, this broadcasts <strong>visibility</strong> of the new data to all threads in the threadblock. Without <code>__syncthreads()</code>, the compiler is free to optimize away memory accesses.</li></ul><p>As always, refer to <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/">PTX doc</a> for more information about the instructions. Basically we issue multiple <code>cp.async</code> and wait for them to complete immediately right after. <code>commit_group</code> and <code>wait_group</code> provide a mechanism for us to implement pipelining later. But for now, just need to know we have to write it that way to use <code>cp.async</code>.</p><p>Our code snippet would look something like this.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>// nv_bfloat16 *Q;
+</span></span></span><span><span><span>// uint32_t Q_smem;
+</span></span></span><span><span><span>// const int tid = blockIdx.x;
+</span></span></span><span><span><span>// constexpr int TB_SIZE = 32 * 4;
+</span></span></span><span><span><span>// constexpr int DIM = 128;
+</span></span></span><span><span><span></span>
+</span></span><span><span>global_to_shared<span>&lt;</span>BLOCK_Q, DIM, TB_SIZE<span>&gt;</span>(Q_smem, Q, DIM, tid);
+</span></span><span><span><span>asm</span> <span>volatile</span>(<span>&#34;cp.async.commit_group;&#34;</span>);
+</span></span><span><span><span>asm</span> <span>volatile</span>(<span>&#34;cp.async.wait_all;&#34;</span>);
+</span></span><span><span>__syncthreads();
+</span></span></code></pre></div><p>When doing global-&gt;shared data transfer, we think in terms of threadblock tiles and individual CUDA threads. For shared-&gt;register data transfer, since this is to service later MMA instructions, we think in terms of warp tiles/MMA tiles and warps. Following Flash Attention 2 (section 3.3), we let each warp in a threadblock handle a portion of <code>tile_Q</code>, splitting along the Q sequence length dimension. This means that different warps will index into different chunks of <code>tile_Q</code>, but they all index to the same <code>tile_K</code> and <code>tile_V</code> chunks in the KV-sequence-length loop.</p><figure><img src="http://tinylogger.com/fa-5090/fa_warp_partition.svg" alt="Flash Attention warp partition"/><figcaption><p>Warp partition in Flash Attention 2.</p></figcaption></figure><p>Since we are using <code>mma.m16n8k16</code> instruction, each MMA 16x8 output tile (<code>m16n8</code>) requires 16x16 A tile (<code>m16k16</code>) and 8x16 B tile (<code>n8k16</code>). <code>ldmatrix</code> can load one, two, or four 8x8 tile(s) of 16-bit elements. Hence,</p><ul><li>A tile <code>m16k16</code> requires four 8x8 tiles -&gt; <code>ldmatrix.x4</code></li><li>B tile <code>n8k16</code> requires two 8x8 tiles -&gt; <code>ldmatrix.x2</code></li></ul><p>Only Q acts as A in an MMA. Both K and V act as B in their MMAs, though K will require transposed <code>ldmatrix</code> for correct layout (all tensors use row-major layout in global and shared memory).</p><p>To use <code>ldmatrix</code>, each thread supplies address of a row. Threads 0-7 select the 1st 8x8 tile, threads 8-15 select the 2nd 8x8 tile, and so on. The <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float">layout of A</a> in the official PTX documentation can look confusing. But it’s easier (at least for me) to focus on the order of 8x8 tiles within an MMA tile.</p><figure><img src="http://tinylogger.com/fa-5090/ldmatrix.svg" alt="ldmatrix for MMA layout"/><figcaption><p>Order of <code>ldmatrix</code> tiles in <code>mma.m16n8k16</code>.</p></figcaption></figure><p>With the visualisation above, I hope the following snippet makes sense</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>constexpr</span> <span>int</span> MMA_M <span>=</span> <span>16</span>;
+</span></span><span><span><span>constexpr</span> <span>int</span> MMA_N <span>=</span> <span>8</span>;
+</span></span><span><span><span>constexpr</span> <span>int</span> MMA_K <span>=</span> <span>16</span>;
+</span></span><span><span>
+</span></span><span><span><span>uint32_t</span> Q_smem;
+</span></span><span><span><span>uint32_t</span> Q_rmem[WARP_Q <span>/</span> MMA_M][DIM <span>/</span> MMA_K][<span>4</span>];
+</span></span><span><span>
+</span></span><span><span><span>for</span> (<span>int</span> mma_id_q <span>=</span> <span>0</span>; mma_id_q <span>&lt;</span> WARP_Q <span>/</span> MMA_M; mma_id_q<span>++</span>)
+</span></span><span><span>  <span>for</span> (<span>int</span> mma_id_d <span>=</span> <span>0</span>; mma_id_d <span>&lt;</span> DIM <span>/</span> MMA_K; mma_id_d<span>++</span>) {
+</span></span><span><span>    <span>const</span> <span>int</span> row <span>=</span> (warp_id <span>*</span> WARP_Q) <span>+</span> (mma_id_q <span>*</span> MMA_M) <span>+</span> (lane_id <span>%</span> <span>16</span>);
+</span></span><span><span>    <span>const</span> <span>int</span> col <span>=</span> (mma_id_d <span>*</span> MMA_K) <span>+</span> (lane_id <span>/</span> <span>16</span> <span>*</span> <span>8</span>);
+</span></span><span><span>    <span>const</span> <span>uint32_t</span> addr <span>=</span> Q_smem <span>+</span> (row <span>*</span> DIM <span>+</span> col) <span>*</span> <span>sizeof</span>(nv_bfloat16);
+</span></span><span><span>    ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
+</span></span><span><span>  }
+</span></span></code></pre></div><ul><li>The two nested loops tile <code>[MMA_M, MMA_K]</code> (i.e. <code>[16, 16]</code>) over <code>[WARP_Q, DIM]</code> in shared memory.</li><li><code>(warp_id * WARP_Q)</code> selects the warp tile. We don’t need this for K and V.</li><li><code>(mma_id_q * MMA_M)</code> in <code>row</code> and <code>(mma_id_d * MMA_K)</code> in <code>col</code> selects the MMA tile.</li><li><code>(lane_id % 16)</code> in <code>row</code> and <code>(lane_id / 16 * 8)</code> in <code>col</code> select the correct row address for each thread, following the required Multiplicand A layout (see the figure above).</li></ul><p><code>ldmatrix_x4()</code> is a small wrapper around <code>ldmatrix.sync.aligned.m8n8.x4.b16</code> PTX for convenience. You can refer to <a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/common.h">common.h</a> for more details.</p><p>K and V can be loaded from shared to register memory similarly. One thing to note is about the row-major / column-major layout when using <code>ldmatrix</code>. Regardless of whether <code>.trans</code> modifier is used, each thread still provides the row address of each row in 8x8 tiles. <code>.trans</code> only changes the <strong>register layout</strong> of <code>ldmatrix</code> results.</p><figure><img src="http://tinylogger.com/fa-5090/ldmatrix_kv.svg" alt="ldmatrix for K and V"/><figcaption><p>Use transposed version of <code>ldmatrix</code> for V.</p></figcaption></figure><p>One trick to know whether to use the transposed version of <code>ldmatrix</code> is to look at the K-dim or the reduction dimension. The 1st MMA’s K-dim is along <code>DIM</code> dimension, while the 2nd MMA’s K-dim is along the <code>BLOCK_KV</code> dimension.</p><h3 id="draft-version">Draft version</h3><p>We have the high-level tile-based design, and know how to load the data for MMA. Calling MMA is simple - just drop <code>mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32</code> PTX in our code. Our draft version looks like this.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>constexpr</span> <span>int</span> BLOCK_Q <span>=</span> <span>128</span>;
+</span></span><span><span><span>constexpr</span> <span>int</span> BLOCK_KV <span>=</span> <span>64</span>;
+</span></span><span><span><span>constexpr</span> <span>int</span> DIM <span>=</span> <span>128</span>;
+</span></span><span><span><span>constexpr</span> <span>int</span> NUM_WARPS <span>=</span> <span>4</span>;
+</span></span><span><span><span>constexpr</span> <span>int</span> TB_SIZE <span>=</span> NUM_WARPS <span>*</span> <span>32</span>;
+</span></span><span><span>
+</span></span><span><span><span>// mma.m16n8k16
+</span></span></span><span><span><span></span><span>constexpr</span> <span>int</span> MMA_M <span>=</span> <span>16</span>;
+</span></span><span><span><span>constexpr</span> <span>int</span> MMA_N <span>=</span> <span>8</span>;
+</span></span><span><span><span>constexpr</span> <span>int</span> MMA_K <span>=</span> <span>16</span>;
+</span></span><span><span>
+</span></span><span><span>__global__
+</span></span><span><span><span>void</span> <span>attention_v1_kernel</span>(
+</span></span><span><span>  <span>const</span> nv_bfloat16 <span>*</span>Q,  <span>// [bs, len_q, DIM]
+</span></span></span><span><span><span></span>  <span>const</span> nv_bfloat16 <span>*</span>K,  <span>// [bs, len_kv, DIM]
+</span></span></span><span><span><span></span>  <span>const</span> nv_bfloat16 <span>*</span>V,  <span>// [bs, len_kv, DIM]
+</span></span></span><span><span><span></span>  nv_bfloat16 <span>*</span>O,        <span>// [bs, len_q, DIM]
+</span></span></span><span><span><span></span>  <span>int</span> bs,
+</span></span><span><span>  <span>int</span> len_q,
+</span></span><span><span>  <span>int</span> len_kv) {
+</span></span><span><span>
+</span></span><span><span>  <span>// basic setup
+</span></span></span><span><span><span></span>  <span>const</span> <span>int</span> tid <span>=</span> threadIdx.x;
+</span></span><span><span>  <span>const</span> <span>int</span> warp_id <span>=</span> tid <span>/</span> <span>32</span>;
+</span></span><span><span>  <span>const</span> <span>int</span> lane_id <span>=</span> tid <span>%</span> <span>32</span>;
+</span></span><span><span>
+</span></span><span><span>  <span>// increment Q, K, V, O based on blockIdx.x
+</span></span></span><span><span><span></span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// set up shared memory
+</span></span></span><span><span><span></span>  <span>// Q_smem is overlapped with (K_smem + V_smem), since we only use Q_smem once
+</span></span></span><span><span><span></span>  <span>extern</span> __shared__ <span>uint8_t</span> smem[];
+</span></span><span><span>  <span>const</span> <span>uint32_t</span> Q_smem <span>=</span> __cvta_generic_to_shared(smem);
+</span></span><span><span>  <span>const</span> <span>uint32_t</span> K_smem <span>=</span> Q_smem;
+</span></span><span><span>  <span>const</span> <span>uint32_t</span> V_smem <span>=</span> K_smem <span>+</span> BLOCK_KV <span>*</span> DIM <span>*</span> <span>sizeof</span>(nv_bfloat16);
+</span></span><span><span>
+</span></span><span><span>  <span>// FA2: shard BLOCK_Q among warps
+</span></span></span><span><span><span></span>  <span>constexpr</span> <span>int</span> WARP_Q <span>=</span> BLOCK_Q <span>/</span> NUM_WARPS;
+</span></span><span><span>
+</span></span><span><span>  <span>// set up register memory
+</span></span></span><span><span><span></span>  <span>uint32_t</span> Q_rmem[WARP_Q <span>/</span> MMA_M][DIM <span>/</span> MMA_K][<span>4</span>];       <span>// act as A in MMA
+</span></span></span><span><span><span></span>  <span>uint32_t</span> K_rmem[BLOCK_KV <span>/</span> MMA_N][DIM <span>/</span> MMA_K][<span>2</span>];     <span>// act as B in MMA
+</span></span></span><span><span><span></span>  <span>uint32_t</span> P_rmem[WARP_Q <span>/</span> MMA_M][BLOCK_KV <span>/</span> MMA_K][<span>4</span>];  <span>// act as A in MMA
+</span></span></span><span><span><span></span>  <span>uint32_t</span> V_rmem[BLOCK_KV <span>/</span> MMA_K][DIM <span>/</span> MMA_N][<span>2</span>];     <span>// act as B in MMA
+</span></span></span><span><span><span></span>  <span>float</span> O_rmem[WARP_Q <span>/</span> MMA_M][DIM <span>/</span> MMA_N][<span>4</span>];          <span>// act as C/D in MMA
+</span></span></span><span><span><span></span>
+</span></span><span><span>  <span>// Q global-&gt;shared [BLOCK_Q, DIM]
+</span></span></span><span><span><span></span>  global_to_shared<span>&lt;</span>BLOCK_Q, DIM, TB_SIZE<span>&gt;</span>(Q_smem, Q, DIM, tid);
+</span></span><span><span>  <span>asm</span> <span>volatile</span>(<span>&#34;cp.async.commit_group;&#34;</span>);
+</span></span><span><span>  <span>asm</span> <span>volatile</span>(<span>&#34;cp.async.wait_all;&#34;</span>);
+</span></span><span><span>  __syncthreads();
+</span></span><span><span>
+</span></span><span><span>  <span>// Q shared-&gt;register. select the correct warp tile
+</span></span></span><span><span><span></span>  <span>// Q stays in registers throughout the kernel&#39;s lifetime
+</span></span></span><span><span><span></span>  <span>for</span> (<span>int</span> mma_id_q <span>=</span> <span>0</span>; mma_id_q <span>&lt;</span> WARP_Q <span>/</span> MMA_M; mma_id_q<span>++</span>)
+</span></span><span><span>    <span>for</span> (<span>int</span> mma_id_d <span>=</span> <span>0</span>; mma_id_d <span>&lt;</span> DIM <span>/</span> MMA_K; mma_id_d<span>++</span>) {
+</span></span><span><span>      <span>const</span> <span>int</span> row <span>=</span> warp_id <span>*</span> WARP_Q <span>+</span> mma_id_q <span>*</span> MMA_M <span>+</span> (lane_id <span>%</span> <span>16</span>);
+</span></span><span><span>      <span>const</span> <span>int</span> col <span>=</span> mma_id_d <span>*</span> MMA_K <span>+</span> (lane_id <span>/</span> <span>16</span> <span>*</span> <span>8</span>);
+</span></span><span><span>      <span>const</span> <span>uint32_t</span> addr <span>=</span> Q_smem <span>+</span> (row <span>*</span> DIM <span>+</span> col) <span>*</span> <span>sizeof</span>(nv_bfloat16);
+</span></span><span><span>      ldmatrix_x4(Q_rmem[mma_id_q][mma_id_d], addr);
+</span></span><span><span>    }
+</span></span><span><span>  __syncthreads();
+</span></span><span><span>
+</span></span><span><span>  <span>// main loop
+</span></span></span><span><span><span></span>  <span>const</span> <span>int</span> num_kv_iters <span>=</span> len_kv <span>/</span> BLOCK_KV;
+</span></span><span><span>  <span>for</span> (<span>int</span> kv_idx <span>=</span> <span>0</span>; kv_idx <span>&lt;</span> num_kv_iters; kv_idx<span>++</span>) {
+</span></span><span><span>    <span>// accumulator for the 1st MMA. reset to zeros
+</span></span></span><span><span><span></span>    <span>float</span> S_rmem[WARP_Q <span>/</span> MMA_M][BLOCK_KV <span>/</span> MMA_N][<span>4</span>] <span>=</span> {};  <span>// act as C/D in MMA
+</span></span></span><span><span><span></span>
+</span></span><span><span>    <span>// load K global-&gt;shared-&gt;registers [BLOCK_KV, DIM]
+</span></span></span><span><span><span></span>    <span>// similar to loading Q, except we use ldmatrix_x2()
+</span></span></span><span><span><span></span>    ...
+</span></span><span><span>
+</span></span><span><span>    <span>// 1st MMA: S = Q @ K.T
+</span></span></span><span><span><span></span>    <span>for</span> (<span>int</span> mma_id_q <span>=</span> <span>0</span>; mma_id_q <span>&lt;</span> WARP_Q <span>/</span> MMA_M; mma_id_q<span>++</span>)
+</span></span><span><span>      <span>for</span> (<span>int</span> mma_id_kv <span>=</span> <span>0</span>; mma_id_kv <span>&lt;</span> BLOCK_KV <span>/</span> MMA_N; mma_id_kv<span>++</span>)
+</span></span><span><span>        <span>for</span> (<span>int</span> mma_id_d <span>=</span> <span>0</span>; mma_id_d <span>&lt;</span> DIM <span>/</span> MMA_K; mma_id_d<span>++</span>)
+</span></span><span><span>          mma_m16n8k16(Q_rmem[mma_id_q][mma_id_d],
+</span></span><span><span>                       K_rmem[mma_id_kv][mma_id_d],
+</span></span><span><span>                       S_rmem[mma_id_q][mma_id_kv]);
+</span></span><span><span>
+</span></span><span><span>    <span>// online softmax. we will touch on this later
+</span></span></span><span><span><span></span>    <span>// also pack S_rmem to P_rmem for the 2nd MMA
+</span></span></span><span><span><span></span>    ...
+</span></span><span><span>
+</span></span><span><span>    <span>// load V global-&gt;shared-&gt;registers [BLOCK_KV, DIM]
+</span></span></span><span><span><span></span>    <span>// similar to loading K, except we use ldmatrix_x2_trans()
+</span></span></span><span><span><span></span>    ...
+</span></span><span><span>
+</span></span><span><span>    <span>// 2nd MMA: O += P @ V
+</span></span></span><span><span><span></span>    <span>// similar to the 1st MMA
+</span></span></span><span><span><span></span>    ...
+</span></span><span><span>
+</span></span><span><span>    <span>// increment pointer to the next KV block
+</span></span></span><span><span><span></span>    K <span>+=</span> BLOCK_KV <span>*</span> DIM;
+</span></span><span><span>    V <span>+=</span> BLOCK_KV <span>*</span> DIM;
+</span></span><span><span>  }
+</span></span><span><span>
+</span></span><span><span>  <span>// write output
+</span></span></span><span><span><span></span>  <span>for</span> (<span>int</span> mma_id_q <span>=</span> <span>0</span>; mma_id_q <span>&lt;</span> WARP_Q <span>/</span> MMA_M; mma_id_q<span>++</span>)
+</span></span><span><span>    <span>for</span> (<span>int</span> mma_id_d <span>=</span> <span>0</span>; mma_id_d <span>&lt;</span> DIM <span>/</span> MMA_N; mma_id_d<span>++</span>) {
+</span></span><span><span>      <span>const</span> <span>int</span> row <span>=</span> warp_id <span>*</span> WARP_Q <span>+</span> mma_id_q <span>*</span> MMA_M <span>+</span> (lane_id <span>/</span> <span>4</span>);
+</span></span><span><span>      <span>const</span> <span>int</span> col <span>=</span> mma_id_d <span>*</span> MMA_N <span>+</span> (lane_id <span>%</span> <span>4</span>) <span>*</span> <span>2</span>;
+</span></span><span><span>
+</span></span><span><span>      <span>float</span> <span>*</span>regs <span>=</span> O_rmem[mma_id_q][mma_id_d];
+</span></span><span><span>      <span>reinterpret_cast</span><span>&lt;</span>nv_bfloat162 <span>*&gt;</span>(O <span>+</span> (row <span>+</span> <span>0</span>) <span>*</span> DIM <span>+</span> col)[<span>0</span>] <span>=</span> __float22bfloat162_rn({regs[<span>0</span>], regs[<span>1</span>]});
+</span></span><span><span>      <span>reinterpret_cast</span><span>&lt;</span>nv_bfloat162 <span>*&gt;</span>(O <span>+</span> (row <span>+</span> <span>8</span>) <span>*</span> DIM <span>+</span> col)[<span>0</span>] <span>=</span> __float22bfloat162_rn({regs[<span>2</span>], regs[<span>3</span>]});
+</span></span><span><span>    }
+</span></span><span><span>}
+</span></span><span><span>
+</span></span><span><span><span>// kernel launcher
+</span></span></span><span><span><span></span><span>void</span> <span>attention_v1</span>(
+</span></span><span><span>  <span>const</span> nv_bfloat16 <span>*</span>Q,  <span>// [bs, len_q, DIM]
+</span></span></span><span><span><span></span>  <span>const</span> nv_bfloat16 <span>*</span>K,  <span>// [bs, len_kv, DIM]
+</span></span></span><span><span><span></span>  <span>const</span> nv_bfloat16 <span>*</span>V,  <span>// [bs, len_kv, DIM]
+</span></span></span><span><span><span></span>  nv_bfloat16 <span>*</span>O,        <span>// [bs, len_q, DIM]
+</span></span></span><span><span><span></span>  <span>int</span> bs,
+</span></span><span><span>  <span>int</span> len_q,
+</span></span><span><span>  <span>int</span> len_kv) {
+</span></span><span><span>
+</span></span><span><span>  <span>// 1 threadblock for each BLOCK_Q
+</span></span></span><span><span><span></span>  <span>const</span> <span>int</span> num_blocks <span>=</span> bs <span>*</span> cdiv(len_q, BLOCK_Q);
+</span></span><span><span>
+</span></span><span><span>  <span>// Q overlap with K+V.
+</span></span></span><span><span><span></span>  <span>const</span> <span>int</span> smem_size <span>=</span> max(BLOCK_Q, BLOCK_KV <span>*</span> <span>2</span>) <span>*</span> DIM <span>*</span> <span>sizeof</span>(nv_bfloat16);
+</span></span><span><span>
+</span></span><span><span>  <span>// use dynamic shared memory so we can allocate more than 48kb if needed.
+</span></span></span><span><span><span></span>  <span>if</span> (smem_size <span>&gt;</span> <span>48&#39;000</span>)
+</span></span><span><span>    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+</span></span><span><span>
+</span></span><span><span>  attention_v1_kernel<span>&lt;&lt;&lt;</span>num_blocks, TB_SIZE, smem_size<span>&gt;&gt;&gt;</span>(Q, K, V, O, bs, len_q, len_kv);
+</span></span><span><span>  CUDA_CHECK(cudaGetLastError());
+</span></span><span><span>}
+</span></span></code></pre></div><p>Now, let’s tackle online softmax.</p><h3 id="online-softmax---theory">Online softmax - Theory</h3><p>For the original explanation, you can refer to <a href="https://arxiv.org/abs/1805.02867">Online normalizer calculation for softmax</a> and Flash Attention 2 paper.</p><p>We have the following mathematical definition of softmax. For each row with length $L_{kv}$</p><p>$$
+p_l = \frac{\exp(s_l-m)}{\exp(s_0-m) + \exp(s_1-m) + \dots + \exp(s_{L_{kv}-1}-m)}
+$$
+$$
+l\in[0,L_{kv})
+$$
+$$
+m=\max(s_0,s_1,\dots,s_{L_{kv}-1})
+$$</p><p>$-m$ is max subtraction to improve numerical stability ($\exp(\cdot)$ can easily explode if its input is large). Let’s bring out the denominator normalizer and write the whole row as a vector.</p><p>$$
+\vec P =
+\begin{bmatrix}
+p_0 \\
+\vdots \\
+p_{L_{kv}-1}
+\end{bmatrix}
+= \frac{1}{\sum_{l\in[0,L_{kv})}\exp(s_l-m)}
+\begin{bmatrix}
+\exp(s_0-m) \\
+\vdots \\
+\exp(s_{L_{kv}-1}-m)
+\end{bmatrix}
+$$</p><p>In our 2nd matmul <code>O += P @ V</code>, each row of P (softmax output) is dot-producted with the corresponding column of V.</p><p>$$
+o=\vec P \cdot \vec V = \frac{1}{\sum_{l\in[0,L_{kv})}\exp(s_l-m)} \sum_{l\in[0,L_{kv})}\exp(s_l-m) \cdot v_l
+$$</p><p>The extra dot-product is a blessing in disguise - we no longer need individual elements in a row for the final result. This enables Flash Attention to compute attention in one pass. To see it more clearly, let’s consider the iterative process of adding a new element during online computation.</p><p>$$
+o_{[0,L)} = \frac{1}{\sum_{l\in[0,L)}\exp(s_l-m_{[0,L)})} \sum_{l\in[0,L)}\exp(s_l-m_{[0,L)}) \cdot v_l
+$$
+$$
+m_{[0,L)}=\max(s_0,s_1,\dots,s_{L-1})
+$$</p><p>I’m abusing the notation here, but I hope I get the idea across. When we add a new element $s_{L+1}$</p><p>$$
+o_{[0,L+1)} = \frac{1}{\sum_{l\in[0,L+1)}\exp(s_l-m_{[0,L+1)})} \sum_{l\in[0,L+1)}\exp(s_l-m_{[0,L+1)}) \cdot v_l
+$$</p><p>Look at the normalizer (denominator)</p><p>$$
+\sum_{l\in[0,L+1)}\exp(s_l-m_{[0,L+1)}) = \colorbox{red}{$\displaystyle\exp(m_{[0,L)}-m_{[0,L+1)})$}\colorbox{orange}{$\displaystyle\sum_{l\in[0,L)}\exp(s_l-m_{[0,L)})$} + \colorbox{lime}{$\displaystyle\exp(s_L-m_{[0,L+1)})$}
+$$</p><p>The equation means that we only need to $\colorbox{red}{rescale}$ the $\colorbox{orange}{previous normalizer}$ before adding the $\colorbox{lime}{new term}$. The same logic can be applied for the dot product with V (unnormalized output). <strong>This is the key idea of online softmax and Flash Attention</strong>.</p><p>Define <strong>attention state</strong></p><p>$$
+\begin{bmatrix}
+m \\
+\tilde{o} \\
+\mathrm{sumexp}
+\end{bmatrix}
+$$</p><p>where $m$ is the max of elements seen so far, $\tilde{o}$ is the <strong>unnormalized</strong> output, and $\mathrm{sumexp}$ is the normalizer. We need $m$ to compute the rescaling factor as seen above.</p><p>You can convince yourself that updating attention state is an <strong>associative</strong> operation - it does not matter the order in which elements are used to update the attention state.</p><p>$$
+\begin{aligned}
+\begin{bmatrix}
+m_1 \\
+\tilde{o}_1 \\
+\mathrm{sumexp}_1
+\end{bmatrix}
+\oplus \begin{bmatrix}
+m_2 \\
+\tilde{o}_2 \\
+\mathrm{sumexp}_2
+\end{bmatrix}
+&amp;= \begin{bmatrix}
+m_3 \\
+\tilde{o}_3 \\
+\mathrm{sumexp}_3
+\end{bmatrix} \\
+&amp;= \begin{bmatrix}
+\max(m_1,m_2) \\
+\exp(m_1-m_3)\tilde{o}_1+\exp(m_2-m_3)\tilde{o}_2 \\
+\exp(m_1-m_3)\mathrm{sumexp}_1+\exp(m_2-m_3)\mathrm{sumexp}_2
+\end{bmatrix}
+\end{aligned}
+$$</p><p>This associative property enables things like <a href="https://pytorch.org/blog/flash-decoding/">Flash Decoding</a>, a split-K version of attention.</p><h3 id="online-softmax---implementation">Online softmax - Implementation</h3><p>We can now fill in the gap of online softmax in our high-level Python implementation.</p><div><pre tabindex="0"><code data-lang="python"><span><span><span># attention state</span>
+</span></span><span><span>m <span>=</span> torch<span>.</span>zeros(BLOCK_Q)
+</span></span><span><span>tile_O <span>=</span> torch<span>.</span>zeros(BLOCK_Q, DIM)
+</span></span><span><span>sumexp <span>=</span> torch<span>.</span>zeros(BLOCK_Q)
+</span></span><span><span>
+</span></span><span><span><span>for</span> _ <span>in</span> range(Lk <span>//</span> BLOCK_KV):
+</span></span><span><span>  <span># 1st MMA</span>
+</span></span><span><span>  tile_S <span>=</span> tile_Q <span>@</span> tile_K<span>.</span>T  <span># [BLOCK_Q, BLOCK_KV]</span>
+</span></span><span><span>  tile_S <span>=</span> tile_S <span>*</span> scale
+</span></span><span><span>
+</span></span><span><span>  <span># online softmax</span>
+</span></span><span><span>  tile_max <span>=</span> tile_S<span>.</span>amax(dim<span>=-</span><span>1</span>)  <span># [BLOCK_Q]</span>
+</span></span><span><span>  new_m <span>=</span> torch<span>.</span>maximum(m, tile_max)
+</span></span><span><span>  tile_P <span>=</span> torch<span>.</span>exp(tile_S <span>-</span> new_m<span>.</span>unsqueeze(<span>-</span><span>1</span>))
+</span></span><span><span>
+</span></span><span><span>  <span># rescale</span>
+</span></span><span><span>  scale <span>=</span> torch<span>.</span>exp(m <span>-</span> new_m)
+</span></span><span><span>  tile_O <span>*=</span> scale<span>.</span>unsqueeze(<span>-</span><span>1</span>)
+</span></span><span><span>  sumexp <span>=</span> sumexp <span>*</span> scale <span>+</span> tile_P<span>.</span>sum(dim<span>=-</span><span>1</span>)
+</span></span><span><span>  m <span>=</span> new_m  <span># save new max</span>
+</span></span><span><span>
+</span></span><span><span>  <span># 2nd MMA</span>
+</span></span><span><span>  tile_O <span>+=</span> tile_P <span>@</span> tile_V  <span># [BLOCK_Q, DIM]</span>
+</span></span><span><span>
+</span></span><span><span><span># apply normalization</span>
+</span></span><span><span>tile_O <span>/=</span> sumexp<span>.</span>unsqueeze(<span>-</span><span>1</span>)
+</span></span></code></pre></div><h4 id="row-max">Row max</h4><p>When translating this to CUDA C++, the most tricky part is to wrap our head around MMA layout. Let’s start with <code>tile_S</code>.</p><figure><img src="https://docs.nvidia.com/cuda/parallel-thread-execution/_images/mma-16816-C-f16.png" alt="MMA m16n8k16 output layout"/><figcaption><p>Thread and register layout of MMA m16n8k16 output. Source: <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float">NVIDIA PTX doc</a>.</p></figcaption></figure><p>Softmax scale applies the same scaling for all elements, so that is trivial. Next, we need to compute row max for the current tile. Remember that we allocate the registers for <code>tile_S</code> this way.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>float</span> S_rmem[WARP_Q <span>/</span> MMA_M][BLOCK_KV <span>/</span> MMA_N][<span>4</span>];
+</span></span></code></pre></div><p><code>4</code> means <code>c0,c1,c2,c3</code> in the figure above i.e. each thread holds 2 consecutive elements from 2 rows. To do reduction within a row (of an MMA output tile), we do reduction for 2 consecutive elements held by a thread, then reduction within a group of 4 threads i.e. <code>T0-T3</code>, <code>T4-T7</code>, and so on. However, the row reduction is actually within the whole <code>tile_S</code>, hence we also need to loop over <code>BLOCK_KV / MMA_N</code> of <code>S_rmem</code>. This can be combined with thread-level reduction before 4-thread reduction.</p><figure><img src="http://tinylogger.com/fa-5090/row_reduction.svg" alt="Row reduction"/><figcaption><p>Perform row reduction on MMA output.</p></figcaption></figure><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>// initial attention state
+</span></span></span><span><span><span></span><span>float</span> rowmax[WARP_Q <span>/</span> MMA_M][<span>2</span>];
+</span></span><span><span><span>float</span> rowsumexp[WARP_Q <span>/</span> MMA_M][<span>2</span>] <span>=</span> {};
+</span></span><span><span><span>for</span> (<span>int</span> mma_id_q <span>=</span> <span>0</span>; mma_id_q <span>&lt;</span> WARP_Q <span>/</span> MMA_M; mma_id_q<span>++</span>) {
+</span></span><span><span>  rowmax[mma_id_q][<span>0</span>] <span>=</span> <span>-</span>FLT_MAX;
+</span></span><span><span>  rowmax[mma_id_q][<span>1</span>] <span>=</span> <span>-</span>FLT_MAX;
+</span></span><span><span>}
+</span></span><span><span>
+</span></span><span><span><span>// main loop
+</span></span></span><span><span><span></span><span>const</span> <span>int</span> num_kv_iters <span>=</span> len_kv <span>/</span> BLOCK_KV;
+</span></span><span><span><span>for</span> (<span>int</span> kv_idx <span>=</span> <span>0</span>; kv_idx <span>&lt;</span> num_kv_iters; kv_idx<span>++</span>) {
+</span></span><span><span>  <span>// tile_S = tile_Q @ tile_K.T
+</span></span></span><span><span><span></span>  S_rmem[][] <span>=</span> ...
+</span></span><span><span>
+</span></span><span><span>  <span>// loop over rows
+</span></span></span><span><span><span></span>  <span>for</span> (<span>int</span> mma_id_q <span>=</span> <span>0</span>; mma_id_q <span>&lt;</span> WARP_Q <span>/</span> MMA_M; mma_id_q<span>++</span>) {
+</span></span><span><span>    <span>// apply softmax scale
+</span></span></span><span><span><span></span>    <span>for</span> (<span>int</span> mma_id_kv <span>=</span> <span>0</span>; mma_id_kv <span>&lt;</span> BLOCK_KV <span>/</span> MMA_N; mma_id_kv<span>++</span>)
+</span></span><span><span>      <span>for</span> (<span>int</span> reg_id <span>=</span> <span>0</span>; reg_id <span>&lt;</span> <span>4</span>; reg_id<span>++</span>)
+</span></span><span><span>        S_rmem[mma_id_q][mma_id_kv][reg_id] <span>*=</span> softmax_scale;
+</span></span><span><span>
+</span></span><span><span>    <span>// rowmax
+</span></span></span><span><span><span></span>    <span>float</span> this_rowmax[<span>2</span>] <span>=</span> {<span>-</span>FLT_MAX, <span>-</span>FLT_MAX};
+</span></span><span><span>    <span>for</span> (<span>int</span> mma_id_kv <span>=</span> <span>0</span>; mma_id_kv <span>&lt;</span> BLOCK_KV <span>/</span> MMA_N; mma_id_kv<span>++</span>) {
+</span></span><span><span>      <span>float</span> <span>*</span>regs <span>=</span> S_rmem[mma_id_q][mma_id_kv];
+</span></span><span><span>      this_rowmax[<span>0</span>] <span>=</span> max(this_rowmax[<span>0</span>], max(regs[<span>0</span>], regs[<span>1</span>]));  <span>// c0 and c1
+</span></span></span><span><span><span></span>      this_rowmax[<span>1</span>] <span>=</span> max(this_rowmax[<span>1</span>], max(regs[<span>2</span>], regs[<span>3</span>]));  <span>// c2 and c3
+</span></span></span><span><span><span></span>    }
+</span></span><span><span>
+</span></span><span><span>    <span>// butterfly reduction within 4 threads
+</span></span></span><span><span><span></span>    this_rowmax[<span>0</span>] <span>=</span> max(this_rowmax[<span>0</span>], __shfl_xor_sync(<span>0xFFFF&#39;FFFF</span>, this_rowmax[<span>0</span>], <span>1</span>));
+</span></span><span><span>    this_rowmax[<span>0</span>] <span>=</span> max(this_rowmax[<span>0</span>], __shfl_xor_sync(<span>0xFFFF&#39;FFFF</span>, this_rowmax[<span>0</span>], <span>2</span>));
+</span></span><span><span>    this_rowmax[<span>1</span>] <span>=</span> max(this_rowmax[<span>1</span>], __shfl_xor_sync(<span>0xFFFF&#39;FFFF</span>, this_rowmax[<span>1</span>], <span>1</span>));
+</span></span><span><span>    this_rowmax[<span>1</span>] <span>=</span> max(this_rowmax[<span>1</span>], __shfl_xor_sync(<span>0xFFFF&#39;FFFF</span>, this_rowmax[<span>1</span>], <span>2</span>));
+</span></span><span><span>  }
+</span></span><span><span>
+</span></span><span><span>  ...
+</span></span><span><span>}
+</span></span></code></pre></div><p>In a typical reduction kernel, when there are only 32 active threads left, we can use warp shuffle <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions">__shfl_down_sync()</a> to copy data from higher lanes to lower lanes, and the final result is stored in thread 0. In this case, since we need the max value to be shared among the 4 threads in a group (for max subtraction later), we can use <code>__shfl_xor_sync()</code> to avoid an additional broadcast step.</p><figure><img src="http://tinylogger.com/fa-5090/butterfly_reduction.svg" alt="Butterfly reduction"/><figcaption><p>Butterfly reduction within 4 threads using __shfl_xor_sync().</p></figcaption></figure><h4 id="rescaling">Rescaling</h4><p>With row max of the new tile, we can compute rescaling factor for (unnormalized) output as well as normalizer (sumexp of each row).</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>// new rowmax
+</span></span></span><span><span><span></span>this_rowmax[<span>0</span>] <span>=</span> max(this_rowmax[<span>0</span>], rowmax[mma_id_q][<span>0</span>]);
+</span></span><span><span>this_rowmax[<span>1</span>] <span>=</span> max(this_rowmax[<span>1</span>], rowmax[mma_id_q][<span>1</span>]);
+</span></span><span><span>
+</span></span><span><span><span>// rescale for previous O
+</span></span></span><span><span><span></span><span>float</span> rescale[<span>2</span>];
+</span></span><span><span>rescale[<span>0</span>] <span>=</span> __expf(rowmax[mma_id_q][<span>0</span>] <span>-</span> this_rowmax[<span>0</span>]);
+</span></span><span><span>rescale[<span>1</span>] <span>=</span> __expf(rowmax[mma_id_q][<span>1</span>] <span>-</span> this_rowmax[<span>1</span>]);
+</span></span><span><span><span>for</span> (<span>int</span> mma_id_d <span>=</span> <span>0</span>; mma_id_d <span>&lt;</span> DIM <span>/</span> MMA_N; mma_id_d<span>++</span>) {
+</span></span><span><span>  O_rmem[mma_id_q][mma_id_d][<span>0</span>] <span>*=</span> rescale[<span>0</span>];
+</span></span><span><span>  O_rmem[mma_id_q][mma_id_d][<span>1</span>] <span>*=</span> rescale[<span>0</span>];
+</span></span><span><span>  O_rmem[mma_id_q][mma_id_d][<span>2</span>] <span>*=</span> rescale[<span>1</span>];
+</span></span><span><span>  O_rmem[mma_id_q][mma_id_d][<span>3</span>] <span>*=</span> rescale[<span>1</span>];
+</span></span><span><span>}
+</span></span><span><span>
+</span></span><span><span><span>// save new rowmax
+</span></span></span><span><span><span></span>rowmax[mma_id_q][<span>0</span>] <span>=</span> this_rowmax[<span>0</span>];
+</span></span><span><span>rowmax[mma_id_q][<span>1</span>] <span>=</span> this_rowmax[<span>1</span>];
+</span></span></code></pre></div><p>We don’t rescale <code>rowsumexp</code> here because we want to fuse it with addition of the new sumexp term later i.e. FMA - fused multiply add. We can’t fuse multiplication with MMA, hence we need to do a separate multiplication for <code>O_rmem</code>.</p><h4 id="pack-tile_s-to-tile_p-and-compute-row-sum-exp">Pack <code>tile_S</code> to <code>tile_P</code> (and compute row sum exp)</h4><p>For the next part, we will loop over the row dimension again (<code>BLOCK_KV / MMA_N</code>), to compute and pack <code>tile_P</code> from <code>tile_S</code>, as well as doing reduction for sumexp. Recall that we declare registers for <code>S</code> and <code>P</code> as follows.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>float</span> S_rmem[WARP_Q <span>/</span> MMA_M][BLOCK_KV <span>/</span> MMA_N][<span>4</span>]      <span>// m16n8
+</span></span></span><span><span><span></span><span>uint32_t</span> P_rmem[WARP_Q <span>/</span> MMA_M][BLOCK_KV <span>/</span> MMA_K][<span>4</span>];  <span>// m16k16
+</span></span></span></code></pre></div><p>Look up the thread/register layout for MMA multiplicand A and output C/D again in PTX doc. Luckily, the layouts are exactly the same - within an 8x8 tile, the arrangement of elements is identical.</p><figure><img src="http://tinylogger.com/fa-5090/m16n8_to_m16k16.svg" alt="Register layout of MMA m16n8k16"/><figcaption><p>The left half of multiplicand A has the same layout as accumulator. Source: <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-fragment-mma-16816-float">NVIDIA PTX doc</a>.</p></figcaption></figure><p>It means that for all threads, every 2 floats in <code>S_rmem</code> can be packed as BF16x2 in a single 32-bit register of <code>P_rmem</code>, exactly how <code>mma.m16n8k16</code> expects for the 2nd MMA. There are no data movements across threads. Note that this is not always true: if we use INT8 or FP8 MMA for the 1st and/or 2nd MMA, we would need to permute data across threads to pack <code>tile_S</code> to <code>tile_P</code>.</p><p>Our code for the last part of online softmax is below.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>// rowsumexp
+</span></span></span><span><span><span></span><span>float</span> this_rowsumexp[<span>2</span>] <span>=</span> {};
+</span></span><span><span><span>for</span> (<span>int</span> mma_id_kv <span>=</span> <span>0</span>; mma_id_kv <span>&lt;</span> BLOCK_KV <span>/</span> MMA_N; mma_id_kv<span>++</span>) {
+</span></span><span><span>  <span>float</span> <span>*</span>regs <span>=</span> S_rmem[mma_id_q][mma_id_kv];
+</span></span><span><span>  regs[<span>0</span>] <span>=</span> __expf(regs[<span>0</span>] <span>-</span> rowmax[mma_id_q][<span>0</span>]);  <span>// c0
+</span></span></span><span><span><span></span>  regs[<span>1</span>] <span>=</span> __expf(regs[<span>1</span>] <span>-</span> rowmax[mma_id_q][<span>0</span>]);  <span>// c1
+</span></span></span><span><span><span></span>  regs[<span>2</span>] <span>=</span> __expf(regs[<span>2</span>] <span>-</span> rowmax[mma_id_q][<span>1</span>]);  <span>// c2
+</span></span></span><span><span><span></span>  regs[<span>3</span>] <span>=</span> __expf(regs[<span>3</span>] <span>-</span> rowmax[mma_id_q][<span>1</span>]);  <span>// c3
+</span></span></span><span><span><span></span>
+</span></span><span><span>  this_rowsumexp[<span>0</span>] <span>+=</span> regs[<span>0</span>] <span>+</span> regs[<span>1</span>];
+</span></span><span><span>  this_rowsumexp[<span>1</span>] <span>+=</span> regs[<span>2</span>] <span>+</span> regs[<span>3</span>];
+</span></span><span><span>
+</span></span><span><span>  <span>// pack to P registers for next MMA
+</span></span></span><span><span><span></span>  <span>// we need to change from m16n8 to m16k16
+</span></span></span><span><span><span></span>  <span>// each iteration of this loop packs half of m16k16
+</span></span></span><span><span><span></span>  nv_bfloat162 <span>*</span>this_P_rmem <span>=</span> <span>reinterpret_cast</span><span>&lt;</span>nv_bfloat162 <span>*&gt;</span>(P_rmem[mma_id_q][mma_id_kv <span>/</span> <span>2</span>]);
+</span></span><span><span>  this_P_rmem[(mma_id_kv <span>%</span> <span>2</span>) <span>*</span> <span>2</span>]     <span>=</span> __float22bfloat162_rn({regs[<span>0</span>], regs[<span>1</span>]});  <span>// top row
+</span></span></span><span><span><span></span>  this_P_rmem[(mma_id_kv <span>%</span> <span>2</span>) <span>*</span> <span>2</span> <span>+</span> <span>1</span>] <span>=</span> __float22bfloat162_rn({regs[<span>2</span>], regs[<span>3</span>]});  <span>// bottom row
+</span></span></span><span><span><span></span>}
+</span></span><span><span>
+</span></span><span><span><span>// butterfly reduction on this_rowsumexp[2]
+</span></span></span><span><span><span></span>...
+</span></span><span><span>
+</span></span><span><span><span>// accumulate to total rowsumexp using FMA
+</span></span></span><span><span><span></span>rowsumexp[mma_id_q][<span>0</span>] <span>=</span> rowsumexp[mma_id_q][<span>0</span>] <span>*</span> rescale[<span>0</span>] <span>+</span> this_rowsumexp[<span>0</span>];
+</span></span><span><span>rowsumexp[mma_id_q][<span>1</span>] <span>=</span> rowsumexp[mma_id_q][<span>1</span>] <span>*</span> rescale[<span>1</span>] <span>+</span> this_rowsumexp[<span>1</span>];
+</span></span></code></pre></div><p>After this is the 2nd MMA: load V, then compute <code>tile_O += tile_P @ tile_V</code>. This completes our 1st version of Flash Attention. Actually we also need to normalize the output before writing <code>O_rmem</code> to global memory, but the logic for that should be pretty straightforward.</p><p>You can find the full code for Version 1 at <a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v1.cu">attention_v1.cu</a>.</p><h3 id="benchmark-setup">Benchmark setup</h3><p>Wow, that’s plentiful for the 1st version. Indeed, I spent the most time on version 1 trying to implement Flash Attention correctly. Took me 2 days to realize <a href="https://github.com/gau-nernst/learn-cuda/commit/8fdb3e6a">__shfl_xor_sync()’s mask should be 2 (0b10) instead of 0x10 for butterfly reduction</a>.</p><p>Anyway, now we need a script for correctness check as well as speed benchmark. I prefer to do these things in Python Pytorch since it’s easy to do, as well as making it simple to compare against other attention kernels with PyTorch bindings. To achieve this, I create:</p><ol><li><a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention.cpp">attention.cpp</a>: provides PyTorch bindings for my attention kernels.</li><li><a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/main.py">main.py</a>: correctness check and speed benchmark.</li></ol><p>For correctness check, I compare against <code>F.sdpa()</code>, which should dispatch Flash Attention 2 by default (at least on my GPU and current PyTorch version). I also purposely add a small bias to the random inputs, which are sampled from the standard normal distribution, so that the output has a positive mean. This is to avoid large relative error caused by zero mean.</p><div><pre tabindex="0"><code data-lang="python"><span><span><span>def</span> <span>generate_input</span>(<span>*</span>shape):
+</span></span><span><span>    <span>return</span> torch<span>.</span>randn(shape)<span>.</span>add(<span>0.5</span>)<span>.</span>bfloat16()<span>.</span>cuda()
+</span></span></code></pre></div><p>For speed benchmarks, it’s generally a good idea to compare against (1) theoretical limit of the hardware i.e. Speed-of-Light, and (2) known good implementations. I’m more interested in the compute-bound regime of attention, hence I will be using FLOPS (floating point operations per second, with a capital S) as the metric for comparison.</p><p>To compute FLOPS of a given kernel, we count the number of required floating point operations (FLOPs, with a small s), then divide by the latency. Just counting FLOPs from the MMAs should be good enough, which turns out to be <code>4 * bsize * num_heads * len_q * len_kv * head_dim</code>.</p><p>The “known good implementations” are FA2 and CuDNN backends of <code>F.sdpa()</code>, as well as FA2 from <a href="https://github.com/Dao-AILab/flash-attention">flash-attn</a> package. For my kernel, I did do some tuning of <code>BLOCK_Q</code> and <code>BLOCK_KV</code>, and obtained the following results.</p><table><thead><tr><th>Kernel</th><th>TFLOPS</th><th>% of SOL</th></tr></thead><tbody><tr><td><code>F.sdpa()</code> (Flash Attention)</td><td>186.73</td><td>89.13%</td></tr><tr><td><code>F.sdpa()</code> (CuDNN)</td><td>203.61</td><td>97.19%</td></tr><tr><td><code>flash-attn</code></td><td>190.58</td><td>90.97%</td></tr><tr><td>v1 (basic)</td><td>142.87</td><td>68.20%</td></tr></tbody></table><p>It doesn’t look too bad for the first version, but we still have some headroom to go. That’s fine, because we still have a few tricks up our sleeves for the next versions. In fact, the tricks are exactly the same as the ones used in optimizing a matmul kernel.</p><h4 id="profiling">Profiling</h4><p>Before moving to the next version, I want to talk about profiling tools. I think it’s always a good idea to use profiling as the guide for optimization. Previously I only knew how to use <a href="https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html">ncu</a> at a very basic level. Seeing so many people using <a href="https://developer.nvidia.com/nsight-compute">Nsight Compute</a> with cool diagrams, I decided to learn how to use it, and it was actually quite easy to use.</p><p>Nsight Compute can run on macOS with SSH access to another machine with NVIDIA GPU, which is exactly the setup I’m using right now (yes, I write code exclusively on my Macbook). If you are unfamiliar with Nsight Compute, I recommend watching a tutorial or two to get acquainted with it.</p><p>To enable source inspection feature, remember to pass <code>-lineinfo</code> to NVCC (see <a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/main.py#L22">here</a>), and enable “Import Source” in Nsight Compute.</p><p>Let’s do a profiling with Nsight Compute, and look at <strong>Warp State Statistics</strong> section.</p><figure><img src="http://tinylogger.com/fa-5090/v1_warp_state_stats.png" alt="Warp state statistics of v1"/><figcaption><p>Warp state statistics of kernel v1.</p></figcaption></figure><p><strong>Stall Math Pipe Throttle</strong> being the highest is good - it means warps are busy with math operations i.e. Tensor Cores. The second highest is <strong>Stall Short Scoreboard</strong>. This typically means waiting for accesses to and from shared memory. You can check <a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html">Nsight Compute doc</a> and search for <code>stalled_short_scoreboard</code>.</p><p>We can double confirm this by looking at <strong>Memory Workload Analysis</strong>, which reveals several problems.</p><figure><img src="http://tinylogger.com/fa-5090/v1_memory_analysis.png" alt="Memory analsysis of v1"/><figcaption><p>Memory analysis of kernel v1.</p></figcaption></figure><ul><li><strong>L1TEX Global Store Access Pattern</strong> comes from storing the output, since it is the only global write we have. This is not important since the runtime of looping over the sequence length of KV should dominate when <code>len_kv</code> is large.</li><li><strong>L1TEX Local Load/Store Access Pattern</strong> is due to register spilling. Since it’s register spilling, only spilling and reloading 1 element at a time is normal. Reducing <code>BLOCK_Q</code> (so that we use fewer registers to hold accumulators) would resolve this issue, but my manual tuning showed that some spilling was actually faster.</li><li><strong>Shared Load Bank Conflicts</strong> is exactly what we are looking for - bank conflicts that result in “Stall Short Scoreboard”.</li></ul><p>NVIDIA GPU’s shared memory is backed by 32 memory banks. Consecutive 4-byte memory addresses are assigned to consecutive memory banks. This poses a problem when we load data from shared to register memory with <code>ldmatrix</code>. Although it’s not explitcitly stated in any documentations, <code>ldmatrix.x2</code> and <code>ldmatrix.x4</code> operate per 8x8 tile at a time. This is good, since it makes our analysis simpler: we only need to consider the case of loading a 8x8 tile.</p><p>Consider a 2D tile of shape 8x64, BF16 dtype, in shared memory.</p><figure><img src="http://tinylogger.com/fa-5090/bank_conflicts.svg" alt="Bank conflicts"/><figcaption><p>Memory bank distribution for a 8x64 BF16 tile in shared memory.</p></figcaption></figure><p>From the figure above, when we load the 8x8 <code>ldmatrix</code> tile, the same 4 banks 0-3 service all 32 threads, resulting in 8-way bank conflict. I’m not sure why Nsight Compute reports 16-way bank conflict as shown above. I tried looking up <a href="https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html">matmul blogposts with swizzling</a> and <a href="https://forums.developer.nvidia.com/t/ncu-detects-bank-conflicts-in-matrix-transposition-after-padding/239100/6">NVIDIA forum threads</a>, and found another way to check for bank conflicts was to go to the <strong>Source</strong> tab of Nsight Compute and check for <strong>L1 Wavefronts Shared</strong> and <strong>L1 Wavefronts Shared Ideal</strong> (I had to enable these two columns manually since they were not displayed by default for me).</p><figure><img src="http://tinylogger.com/fa-5090/ldmatrix_bank_conflicts.png" alt="Bank conflicts in ldmatrix"/><figcaption><p>Actual and Ideal L1 Wavefronts Shared of <code>ldmatrix</code> in kernel v1.</p></figcaption></figure><p>The ratio of <strong>Actual / Ideal</strong> is 8, matching our hypothesis of 8-way bank conflicts. I’m still not sure why there is a discrepancy between this value and the one in <strong>Details</strong> tab.</p><p>Anyway, there are 2 standard solutions to this problem</p><ol><li><strong>Pad shared memory</strong>. Due to <code>ldmatrix</code>’s alignment requirement, we can only pad the width with 16 bytes, equivalent to 4 banks. This means that when we go to the next row, the memory banks are shifted by 4, avoiding bank conflicts. In many cases, this is good enough. However, it’s generally quite wasteful as we are not utilising the padded storage.</li><li><strong>Swizzle shared memory address</strong>. This is black magic: you XOR the shared memory address with some magic numbers, then suddenly bank conflicts disappear!</li></ol><p>Let’s elaborate on the 2nd approach. I’m not smart enough to invent this trick, but at least I hope I can give some pointers on why it makes sense. We use XOR since this operation permutes the data nicely - there is a one-to-one mapping between input and output, given a fixed 2nd input. We get bank conflicts because when we move to the next row, we are hitting the same memory banks again -&gt; we can use this row index to permute the addresses.</p><p>In particular, if we look at the raw row addresses:</p><ul><li><strong>Bits 0-3</strong> are always zeros due to 16-byte alignment constraint.</li><li><strong>Bits 2-6</strong> determine bank index. We only need to care about bits 4-6 since the lower bits are always zeros (due to alignment).</li><li>Row stride determines which bits are incremented when we move to the next row (this is by definition). If our 2D tile’s width is 64 BF16 elements, row stride is 128 bytes. Going to the next row will increment bit 7, leaving <strong>bits 0-6 unchanged</strong> (but we don’t care about bits 0-3).</li><li>Thus, we can XOR <strong>bits 4-6</strong> of row address with <strong>bits 0-2</strong> of row index, which is guaranteed to change for every row.</li></ul><p>If the tile width is different, e.g. 32 BF16, we can go through the same reasoning. Also notice that row index is encoded within the row address, thus we only need the row address and row stride to do swizzling.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>// NOTE: stride in bytes
+</span></span></span><span><span><span></span><span>template</span> <span>&lt;</span><span>int</span> STRIDE<span>&gt;</span>
+</span></span><span><span>__device__
+</span></span><span><span><span>uint32_t</span> swizzle(<span>uint32_t</span> index) {
+</span></span><span><span>  <span>// no need swizzling
+</span></span></span><span><span><span></span>  <span>if</span> <span>constexpr</span> (STRIDE <span>==</span> <span>16</span>)
+</span></span><span><span>    <span>return</span> index;
+</span></span><span><span>
+</span></span><span><span>  <span>uint32_t</span> row_idx <span>=</span> (index <span>/</span> STRIDE) <span>%</span> <span>8</span>;
+</span></span><span><span>  <span>uint32_t</span> bits_to_xor <span>=</span> row_idx <span>/</span> max(<span>64</span> <span>/</span> STRIDE, <span>1</span>);
+</span></span><span><span>  <span>return</span> index <span>^</span> (bits_to_xor <span>&lt;&lt;</span> <span>4</span>);
+</span></span><span><span>}
+</span></span></code></pre></div><p>To enable this swizzling, we need to add it to <code>cp.async</code> (write to shared memory) and <code>ldmatrix</code> (read from shared memory) calls.</p><div><pre tabindex="0"><code data-lang="diff"><span><span>// for cp.async
+</span></span><span><span><span>- const uint32_t dst_addr = dst + (row * WIDTH + col) * sizeof(nv_bfloat16);
+</span></span></span><span><span><span></span><span>+ const uint32_t dst_addr = swizzle&lt;WIDTH * sizeof(nv_bfloat16)&gt;(dst + (row * WIDTH + col) * sizeof(nv_bfloat16));
+</span></span></span><span><span><span></span>asm volatile(&#34;cp.async.cg.shared.global [%0], [%1], 16;&#34; :: &#34;r&#34;(dst_addr), &#34;l&#34;(src_addr));
+</span></span><span><span>
+</span></span><span><span>// for ldmatrix
+</span></span><span><span><span>- ldmatrix_x2(K_rmem[mma_id_kv][mma_id_d], addr);
+</span></span></span><span><span><span></span><span>+ ldmatrix_x2(K_rmem[mma_id_kv][mma_id_d], swizzle&lt;DIM * sizeof(nv_bfloat16)&gt;(addr));
+</span></span></span></code></pre></div><p>Since this is a standard optimization in matmul kernels, I also added a small optimization for <code>ldmatrix</code>. I pre-compute row addresses and swizzling outside of the main loop, so that there is less work in the hot loop. When we iterate over MMA tiles within a warp tile, we need to increment the address. However, swizzling is a XOR operation, and we cannot simply exchange XOR with addition i.e. <code>(a + b) ^ c != (a ^ c) + b</code>. Notice that if there is some alignment in the base address <code>a</code>, addition becomes XOR! i.e. <code>100 + 001 == 100 ^ 001</code>. Hence, when incrementing the input address of <code>ldmatrix</code>, we XOR it with column offset, instead of doing addition. Row offset will affect bits higher than the swizzled bits, so we can keep addition for it.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>// K shared-&gt;registers
+</span></span></span><span><span><span></span><span>for</span> (<span>int</span> mma_id_kv <span>=</span> <span>0</span>; mma_id_kv <span>&lt;</span> BLOCK_KV <span>/</span> MMA_N; mma_id_kv<span>++</span>)
+</span></span><span><span>  <span>for</span> (<span>int</span> mma_id_d <span>=</span> <span>0</span>; mma_id_d <span>&lt;</span> DIM <span>/</span> MMA_K; mma_id_d<span>++</span>) {
+</span></span><span><span>    <span>// swizzle(addr + offset) = swizzle(addr) XOR offset
+</span></span></span><span><span><span></span>    <span>uint32_t</span> addr <span>=</span> K_smem_thread;
+</span></span><span><span>    addr <span>+=</span> mma_id_kv <span>*</span> MMA_N <span>*</span> DIM <span>*</span> <span>sizeof</span>(nv_bfloat16);  <span>// row
+</span></span></span><span><span><span></span>    addr <span>^=</span> mma_id_d <span>*</span> MMA_K <span>*</span> <span>sizeof</span>(nv_bfloat16);  <span>// col
+</span></span></span><span><span><span></span>    ldmatrix_x2(K_rmem[mma_id_kv][mma_id_d], addr);
+</span></span><span><span>  }
+</span></span></code></pre></div><p>Version 2: <a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v2.cu">attention_v2.cu</a>.</p><p>We can verify that there are no more bank conflicts with Nsight Compute. Benchmark results show an impressive uplift (I always re-tune <code>BLOCK_Q</code> and <code>BLOCK_KV</code> for new versions of the kernel).</p><table><thead><tr><th>Kernel</th><th>TFLOPS</th><th>% of SOL</th></tr></thead><tbody><tr><td>v1 (basic)</td><td>142.87</td><td>68.20%</td></tr><tr><td>v2 (shared memory swizzling)</td><td>181.11</td><td>86.45%</td></tr></tbody></table><h2 id="version-3---2-stage-pipelining">Version 3 - 2-stage pipelining</h2><figure><img src="http://tinylogger.com/fa-5090/v2_warp_state_stats.png" alt="Warp state statistics of v2"/><figcaption><p>Warp state statistics of kernel v2.</p></figcaption></figure><p><strong>Stall Short Scoreboard</strong> is no longer an issue, since we have handled it with swizzling. Now the issues are:</p><ul><li><strong>Stall Wait</strong> (<code>stalled_wait</code> in Nsight Compute doc): “waiting on a fixed latency execution dependency”, doesn’t seem to be a big issue.</li><li><strong>Stall Long Scoreboard</strong> (<code>stalled_long_scoreboard</code> in Nsight Compute doc): usually means waiting for global memory accesses.</li></ul><p>Up until now, we haven’t overlapped global memory operations with compute operations (MMA). This means the Tensor Cores are idle while waiting for global-&gt;shared transfer to complete. This seems to be the right time to introduce <strong>pipelining</strong> or <strong>double-buffering</strong>: allocate more shared memory than needed so that we can prefetch data for the next iteration while working on the current iteration.</p><ul><li>Technically we can also pipeline shared-&gt;register data transfer. This is in fact mentioned in <a href="https://github.com/NVIDIA/cutlass/blob/v4.1.0/media/docs/cpp/efficient_gemm.md">Efficient GEMM doc</a> of CUTLASS. However, I could never implement it successfully on my 5090. Inspecting the generated SASS of my current code, I see that there is interleaving between <code>LDSM</code> (<code>ldmatrix</code> in PTX) and <code>HMMA</code> (half-precision <code>mma</code> in PTX), probably done by the compiler to achieve similar memory-compute overlapping effect.</li></ul><p>Let’s discuss the more general implementation of <strong>N-stage pipelining</strong>. This <a href="https://developer.nvidia.com/blog/controlling-data-movement-to-boost-performance-on-ampere-architecture/">NVIDIA blogpost</a> gives a pretty good explanation of the idea, but generally I don’t really like using CUDA C++ API (and considering that CUTLASS also doesn’t, I think it’s more fun to use PTX directly). N-stage means there are N ongoing stages at any point in time. This will be the <strong>invariance</strong> we want to keep throughout the inner loop.</p><ul><li>This is the same concept of <code>num_stages</code> mentioned in <a href="https://triton-lang.org/main/python-api/generated/triton.Config.html">triton.Config</a> for autotuning.</li><li>Double buffering is a special case of N=2.</li></ul><div><pre tabindex="0"><code data-lang="python"><span><span>num_stages <span>=</span> <span>4</span>
+</span></span><span><span>
+</span></span><span><span><span># set up num_stages buffers</span>
+</span></span><span><span>tile_K_buffers <span>=</span> torch<span>.</span>empty(num_stages, BLOCK_KV, DIM)
+</span></span><span><span>tile_V_buffers <span>=</span> torch<span>.</span>empty(num_stages, BLOCK_KV, DIM)
+</span></span><span><span>
+</span></span><span><span><span># initiate with (num_stages-1) prefetches</span>
+</span></span><span><span><span># this is async: the code continues before data loading finishes.</span>
+</span></span><span><span><span>for</span> stage_idx <span>in</span> range(num_stages<span>-</span><span>1</span>):
+</span></span><span><span>    tile_K_buffers[stage_idx] <span>=</span> load_K(stage_idx)
+</span></span><span><span>    tile_V_buffers[stage_idx] <span>=</span> load_V(stage_idx)
+</span></span><span><span>
+</span></span><span><span><span>for</span> tile_KV_idx <span>in</span> range(Lk <span>//</span> BLOCK_KV):
+</span></span><span><span>    <span># prefetch tile (num_stages-1) ahead</span>
+</span></span><span><span>    <span># now we have num_stages global-&gt;shared inflight.</span>
+</span></span><span><span>    <span># in practice, we need to guard against out of bounds memory access.</span>
+</span></span><span><span>    prefetch_idx <span>=</span> tile_KV_idx <span>+</span> num_stages <span>-</span> <span>1</span>
+</span></span><span><span>    tile_K_buffers[prefetch_idx <span>%</span> num_stages] <span>=</span> load_K(prefetch_idx)
+</span></span><span><span>    tile_V_buffers[prefetch_idx <span>%</span> num_stages] <span>=</span> load_V(prefetch_idx)
+</span></span><span><span>
+</span></span><span><span>    <span># select the current tile</span>
+</span></span><span><span>    <span># we need a synchronization mechanism to make sure data loading</span>
+</span></span><span><span>    <span># for this tile has finished.</span>
+</span></span><span><span>    <span># this &#34;consumes&#34; the oldest global-&gt;shared inflight, and</span>
+</span></span><span><span>    <span># replaces it with a compute stage.</span>
+</span></span><span><span>    tile_K <span>=</span> tile_K_buffers[tile_KV_idx <span>%</span> num_stages]
+</span></span><span><span>    tile_V <span>=</span> tile_V_buffers[tile_KV_idx <span>%</span> num_stages]
+</span></span><span><span>
+</span></span><span><span>    <span># compute attention as normal</span>
+</span></span><span><span>    <span>...</span>
+</span></span></code></pre></div><p>NVIDIA engineers/architects have graced us with <code>cp.async.commit_group</code> and <code>cp.async.wait_group</code> to implement this elegantly.</p><ul><li><code>cp.async.commit_group</code>: one <code>cp.async</code> group maps naturally to one prefetch stage in the pipeline.</li><li><code>cp.async.wait_group N</code>: means wait until there are at most N ongoing groups left. If we do <code>cp.async.wait_group num_stages-1</code>, it means we wait until the earliest prefetch has finished (remember, we always have <code>num_stages</code> ongoing prefetches as the loop invariance).</li></ul><p>In our case of implementing attention, there are two small changes.</p><ol><li>Since we already consume a lot of shared memory for K and V, and <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications-technical-specifications-per-compute-capability">consumer GPUs typically have modest shared memory size</a> compared to their server counterparts, I decide to keep it to 2-stage pipeline, which also makes the code slightly simpler.</li><li>We can split K and V prefetches since issuing V prefetch can be delayed to after the 1st MMA. The second change requires some minor adjustments: each K and V prefetch is a separate <code>cp.async</code> group (so that we can wait for them independently).</li></ol><p>One neat coding style that I have learned from <a href="https://github.com/mingfeima">Mingfei Ma</a>, the maintainer of PyTorch CPU backend, is to use <a href="https://github.com/pytorch/pytorch/blob/v2.8.0/aten/src/ATen/native/cpu/int8mm_kernel.cpp#L63">lambda expression</a> to write prefetch code. It achieves two benefits: (1) keep the relevant code close to the call site, and (2) make it very clean to call the same block of code multiple times.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>const</span> <span>int</span> num_kv_iter <span>=</span> cdiv(len_kv, BLOCK_KV);
+</span></span><span><span>
+</span></span><span><span><span>auto</span> load_K <span>=</span> [<span>&amp;</span>](<span>int</span> kv_id) {
+</span></span><span><span>  <span>// guard against out-of-bounds global read
+</span></span></span><span><span><span></span>  <span>if</span> (kv_id <span>&lt;</span> num_kv_iter) {
+</span></span><span><span>    <span>// select the shared buffer destination
+</span></span></span><span><span><span></span>    <span>const</span> <span>uint32_t</span> dst <span>=</span> K_smem <span>+</span> (kv_id <span>%</span> <span>2</span>) <span>*</span> (<span>2</span> <span>*</span> BLOCK_KV <span>*</span> DIM <span>*</span> <span>sizeof</span>(nv_bfloat16));
+</span></span><span><span>    global_to_shared_swizzle<span>&lt;</span>BLOCK_KV, DIM, TB_SIZE<span>&gt;</span>(dst, K, DIM, tid);
+</span></span><span><span>
+</span></span><span><span>    <span>// load_K() will be in charge of incrementing global memory address
+</span></span></span><span><span><span></span>    K <span>+=</span> BLOCK_KV <span>*</span> DIM;
+</span></span><span><span>  }
+</span></span><span><span>
+</span></span><span><span>  <span>// we always commit a cp-async group regardless of whether there is a cp.async
+</span></span></span><span><span><span></span>  <span>// to maintain loop invariance.
+</span></span></span><span><span><span></span>  <span>asm</span> <span>volatile</span>(<span>&#34;cp.async.commit_group;&#34;</span>);
+</span></span><span><span>};
+</span></span><span><span><span>auto</span> load_V <span>=</span> ...;
+</span></span><span><span>
+</span></span><span><span><span>// prefetch K and V
+</span></span></span><span><span><span></span>load_K(<span>0</span>);
+</span></span><span><span>load_V(<span>0</span>);
+</span></span><span><span>
+</span></span><span><span><span>for</span> (<span>int</span> kv_id <span>=</span> <span>0</span>; kv_id <span>&lt;</span> num_kv_iter; kv_id<span>++</span>) {
+</span></span><span><span>  <span>// prefetch K for the next iteration
+</span></span></span><span><span><span></span>  <span>// now we have 3 prefetches in flight: K-V-K
+</span></span></span><span><span><span></span>  load_K(kv_id <span>+</span> <span>1</span>);
+</span></span><span><span>
+</span></span><span><span>  <span>// wait for prefetch of current K to finish and load K shared-&gt;registers
+</span></span></span><span><span><span></span>  <span>// now we have 2 prefetches in flight: V-K
+</span></span></span><span><span><span></span>  <span>asm</span> <span>volatile</span>(<span>&#34;cp.async.wait_group 2;&#34;</span>);
+</span></span><span><span>  __syncthreads();
+</span></span><span><span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// 1st MMA
+</span></span></span><span><span><span></span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// prefetch V for the next iteration
+</span></span></span><span><span><span></span>  <span>// now we have 3 prefetches in flight: V-K-V
+</span></span></span><span><span><span></span>  load_V(kv_id <span>+</span> <span>1</span>);
+</span></span><span><span>
+</span></span><span><span>  <span>// online softmax
+</span></span></span><span><span><span></span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// wait for prefetch of current V to finish and load V shared-&gt;registers
+</span></span></span><span><span><span></span>  <span>// now we have 2 prefetches in flight: K-V
+</span></span></span><span><span><span></span>  <span>asm</span> <span>volatile</span>(<span>&#34;cp.async.wait_group 2;&#34;</span>);
+</span></span><span><span>  __syncthreads();
+</span></span><span><span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// 2nd MMA
+</span></span></span><span><span><span></span>  ...
+</span></span><span><span>}
+</span></span></code></pre></div><p>I experimented a bit with where to place <code>load_K/V</code> and <code>cp.async.wait_group</code> in the loop, and have found the above placement yielded the best performance. Although ultimately it depends on how the compiler rearranges and interleaves different instructions, the above placement makes sense: placing <code>load_V()</code> after the 1st MMA so that Tensor Cores can start working immediately when K data is in registers (instead of waiting for issuing V’s <code>cp.async</code>) i.e. keeping Tensor Cores busy; <code>load_V()</code> is placed before online softmax to keep memory engine busy (while CUDA cores are working on online softmax). Again, the optimal placement can also depend a lot on the hardware e.g. relative speed of memory and compute, whether different memory and compute units can work at the same time…</p><p>Version 3: <a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v3.cu">attention_v3.cu</a>.</p><figure><img src="http://tinylogger.com/fa-5090/v3_warp_state_stats.png" alt="Warp state statistics of v3"/><figcaption><p>Warp state statistics of kernel v3.</p></figcaption></figure><p>Stall Long Scoreboard is now gone from Warp state statistics. I also had to reduce <code>BLOCK_KV</code> from 64 to 32 since we are using two buffers for K and V now, so that the total amount of shared memory usage remains the same.</p><table><thead><tr><th>Kernel</th><th>TFLOPS</th><th>% of SOL</th></tr></thead><tbody><tr><td>v2 (shared memory swizzling)</td><td>181.11</td><td>86.45%</td></tr><tr><td>v3 (2-stage pipelining)</td><td>189.84</td><td>90.62%</td></tr></tbody></table><h2 id="version-4---ldmatrixx4-for-k-and-v">Version 4 - ldmatrix.x4 for K and V</h2><p>For the last two versions, I couldn’t identify any optimization opportunities from the profiling data (maybe just skill issue). The ideas mostly come from reading up random stuff and staring at the kernel.</p><p>Previously, we use <code>ldmatrix.x2</code> for K and V since it naturally fits <code>n8k16</code> MMA tile. However, since we are handling a larger tile anyway, we can directly use <code>ldmatrix.x4</code> to issue fewer instructions. There are two options: load <code>n16k16</code> tile, or <code>n8k32</code> tile.</p><figure><img src="http://tinylogger.com/fa-5090/ldmatrix_x4_B.svg" alt="ldmatrix.x4 for B"/><figcaption><p>Possible options for using ldmatrix.x4 for multiplicand B.</p></figcaption></figure><p>Is one option better than the other? We can try doing some analysis in terms of arithmetic intensity. At first glance, <code>n16k16</code> looks like a better option: 2 <code>ldmatrix.x4</code> (1 for A and 1 for B) to do 2 <code>mma.m16n8k16</code>; while <code>n8k32</code> option needs 3 <code>ldmatrix.x4</code> (2 for A and 1 for B) to do 2 <code>mma.m16n8k16</code>. If we are to implement this idea for a matmul kernel, this analysis would make sense. However, in our case, multiplicand A (query) is already in registers, thus we only need to consider loading cost of multiplicand B (key and value). This realization shows that the two options should be the same.</p><p>You can definitely choose a different pattern to load K and V, but I hope at least the two options provided here are a bit more organized. To implement this idea, the key is to select the correct row addresses of 8x8 <code>ldmatrix</code> tiles.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span>{
+</span></span><span><span>  <span>// pre-compute ldmatrix address for K, using n8k32 option
+</span></span></span><span><span><span></span>  <span>// [8x8][8x8][8x8][8x8]
+</span></span></span><span><span><span></span>  <span>const</span> <span>int</span> row_off <span>=</span> lane_id <span>%</span> <span>8</span>;
+</span></span><span><span>  <span>const</span> <span>int</span> col_off <span>=</span> lane_id <span>/</span> <span>8</span> <span>*</span> <span>8</span>;
+</span></span><span><span>  K_smem_thread <span>=</span> swizzle<span>&lt;</span>DIM <span>*</span> <span>sizeof</span>(nv_bfloat16)<span>&gt;</span>(K_smem <span>+</span> (row_off <span>*</span> DIM <span>+</span> col_off) <span>*</span> <span>sizeof</span>(nv_bfloat16));
+</span></span><span><span>}
+</span></span><span><span>
+</span></span><span><span><span>for</span> (<span>int</span> kv_id <span>=</span> <span>0</span>; kv_id <span>&lt;</span> num_kv_iter; kv_id<span>++</span>) {
+</span></span><span><span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// K shared-&gt;registers
+</span></span></span><span><span><span></span>  <span>// notice mma_id_d is incremented by 2
+</span></span></span><span><span><span></span>  <span>for</span> (<span>int</span> mma_id_kv <span>=</span> <span>0</span>; mma_id_kv <span>&lt;</span> BLOCK_KV <span>/</span> MMA_N; mma_id_kv<span>++</span>)
+</span></span><span><span>    <span>for</span> (<span>int</span> mma_id_d <span>=</span> <span>0</span>; mma_id_d <span>&lt;</span> DIM <span>/</span> MMA_K; mma_id_d <span>+=</span> <span>2</span>) {
+</span></span><span><span>      <span>uint32_t</span> addr <span>=</span> K_smem_thread <span>+</span> (kv_id <span>%</span> <span>2</span>) <span>*</span> (<span>2</span> <span>*</span> BLOCK_KV <span>*</span> DIM <span>*</span> <span>sizeof</span>(nv_bfloat16));
+</span></span><span><span>      addr <span>+=</span> mma_id_kv <span>*</span> MMA_N <span>*</span> DIM <span>*</span> <span>sizeof</span>(nv_bfloat16);  <span>// row
+</span></span></span><span><span><span></span>      addr <span>^=</span> mma_id_d <span>*</span> MMA_K <span>*</span> <span>sizeof</span>(nv_bfloat16);  <span>// col
+</span></span></span><span><span><span></span>      ldmatrix_x4(K_rmem[mma_id_kv][mma_id_d], addr);
+</span></span><span><span>    }
+</span></span><span><span>
+</span></span><span><span>  ...
+</span></span><span><span>}
+</span></span></code></pre></div><p>Version 4: <a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v4.cu">attention_v4.cu</a>.</p><table><thead><tr><th>Kernel</th><th>TFLOPS</th><th>% of SOL</th></tr></thead><tbody><tr><td>v3 (2-stage pipelining)</td><td>189.84</td><td>90.62%</td></tr><tr><td>v4 (<code>ldmatrix.x4</code> for K and V)</td><td>194.33</td><td>92.76%</td></tr></tbody></table><p>I was quite surprised at the speedup. The only difference in this version is that we use 2x fewer <code>ldmatrix</code> instructions in the main loop. Yet, we obtain a non-trivial improvement, inching towards SOL. I’m guessing since Tensor Cores and memory engine are so fast in newer GPUs, scheduling and issuing instructions can become a bottleneck!</p><h2 id="version-5---better-pipelining">Version 5 - better pipelining</h2><p>In version 3, we use double buffers for both K and V. However, this is redundant: while doing the 1st MMA, we can prefect V for the current iteration; while doing the 2nd MMA, we can prefetch K for the next iteration. In other words, we only need double buffers for K.</p><div><pre tabindex="0"><code data-lang="cpp"><span><span><span>// prefetch K
+</span></span></span><span><span><span></span>load_K(<span>0</span>);
+</span></span><span><span>
+</span></span><span><span><span>for</span> (<span>int</span> kv_id <span>=</span> <span>0</span>; kv_id <span>&lt;</span> num_kv_iter; kv_id<span>++</span>) {
+</span></span><span><span>  <span>// prefetch V for current iteration
+</span></span></span><span><span><span></span>  <span>// now we have 2 prefetches in flight: K-V
+</span></span></span><span><span><span></span>  <span>// __syncthreads() here is required to make sure we finish using V_smem
+</span></span></span><span><span><span></span>  <span>// from the previous iteration, since there is only 1 shared buffer for V.
+</span></span></span><span><span><span></span>  __syncthreads();
+</span></span><span><span>  load_V(kv_id);
+</span></span><span><span>
+</span></span><span><span>  <span>// wait for prefetch of current K and load K shared-&gt;registers
+</span></span></span><span><span><span></span>  <span>// now we have 1 prefetch in flight: V
+</span></span></span><span><span><span></span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// 1st MMA
+</span></span></span><span><span><span></span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// prefetch K for the next iteration
+</span></span></span><span><span><span></span>  <span>// now we have 2 prefetches in flight: V-K
+</span></span></span><span><span><span></span>  load_K(kv_id <span>+</span> <span>1</span>);
+</span></span><span><span>
+</span></span><span><span>  <span>// online softmax
+</span></span></span><span><span><span></span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// wait for prefetch of current V and load V shared-&gt;registers
+</span></span></span><span><span><span></span>  <span>// now we have 1 prefetch in flight: K
+</span></span></span><span><span><span></span>  ...
+</span></span><span><span>
+</span></span><span><span>  <span>// 2nd MMA
+</span></span></span><span><span><span></span>  ...
+</span></span><span><span>}
+</span></span></code></pre></div><p>Version 5: <a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v5.cu">attention_v5.cu</a>.</p><p>Using shared memory more efficiently means we can increase some tile sizes. I increased <code>BLOCK_KV</code> from 32 back to 64. Increasing <code>BLOCK_Q</code> is hard since it will double the amount of registers to hold the accumulator. The improvement is modest but noticeable.</p><table><thead><tr><th>Kernel</th><th>TFLOPS</th><th>% of SOL</th></tr></thead><tbody><tr><td>v4 (<code>ldmatrix.x4</code> for K and V)</td><td>194.33</td><td>92.76%</td></tr><tr><td>v5 (better pipelining)</td><td>197.74</td><td>94.39%</td></tr></tbody></table><h2 id="whats-next">What’s next?</h2><table><thead><tr><th>Kernel</th><th>TFLOPS</th><th>% of SOL</th></tr></thead><tbody><tr><td><code>F.sdpa()</code> (Flash Attention)</td><td>186.73</td><td>89.13%</td></tr><tr><td><code>F.sdpa()</code> (CuDNN)</td><td>203.61</td><td>97.19%</td></tr><tr><td><code>flash-attn</code></td><td>190.58</td><td>90.97%</td></tr><tr><td>v1 (basic)</td><td>142.87</td><td>68.20%</td></tr><tr><td>v2 (shared memory swizzling)</td><td>181.11</td><td>86.45%</td></tr><tr><td>v3 (2-stage pipelining)</td><td>189.84</td><td>90.62%</td></tr><tr><td>v4 (<code>ldmatrix.x4</code> for K and V)</td><td>194.33</td><td>92.76%</td></tr><tr><td>v5 (better pipelining)</td><td>197.74</td><td>94.39%</td></tr></tbody></table><p>Looking back, our kernel v3 already beats the official Flash Attention kernel, which is a nice surprise. It feels like it’s rather easy to get good performance out of 5090 compared to previous generations. However, our best kernel lagging behind CuDNN’s means that there is still headroom available. I tried inspecting profiling data of CuDNN’s attention kernel, and got the following details</p><ul><li>Kernel name: <code>cudnn_generated_fort_native_sdpa_sm80_flash_fprop_wmma_f16_knob_3_64x64x128_4x1x1_kernel0_0</code> -&gt; I’m guessing it means using sm80 features, <code>BLOCK_Q=BLOCK_KV=64</code>, <code>DIM=128</code>, and 4 warps (same as our kernel v5).</li><li>Shared memory: 40.96 Kb -&gt; that is <code>40960 / (64 * 128 * 2) = 2.5</code> times <code>(BLOCK_KV, DIM)</code>. The fractional number of buffers is rather strange. Or is their kernel more like <code>BLOCK_KV=32</code> and 5 buffers? I have no idea.</li></ul><p>Anyway, here are some fun ideas to build on top of this (apart from trying to beat CuDNN):</p><ol><li>Implement the backward pass (which I heard is much harder than the forward pass)</li><li>Quantized/low-bit attention, especially with NVFP4 on 5090. I believe <a href="https://github.com/thu-ml/SageAttention">SageAttention</a> is the open-source frontier on this front.</li><li>Use TMA (i.e. <code>cp.async.bulk</code>) with warp-specialization design. <a href="https://x.com/pranjalssh">Pranjal</a> wrote a <a href="https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog">nice blogpost</a> on this for H100 matmul.</li><li><a href="https://arxiv.org/abs/2309.06180">PagedAttention</a> (i.e. vLLM and SGLang), and then build a performant dependency-free serving engine.</li></ol><p>I hope this blogpost is useful to many people. Happy writing kernels!</p></section></article></div></div>
+  </body>
+</html>
