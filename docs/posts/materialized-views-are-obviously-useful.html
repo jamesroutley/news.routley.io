@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://sophiebits.com/2025/08/22/materialized-views-are-obviously-useful">Original</a>
+    <h1>Materialized views are obviously useful</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>As programmers we spend a lot of time shuttling data back and forth between different systems and transforming it from one format to another. Sometimes it gets pretty miserable!</p>
+<p>Let’s say you’re making a fancy task tracking app. Tasks belong to projects, and on the projects page, you want to show how many tasks are in each project. Maybe you start with a little SQL that you call from your “get info about project” view model code:</p>
+<pre><code><span>async</span> <span>function</span> <span>getTaskCountForProject</span>(<span>projectId</span>) {
+  <span>return</span> <span>await</span> db.<span>query</span>(<span>&#39;select count(1) from tasks where project_id = $1&#39;</span>, [projectId]);
+}
+</code></pre>
+<p>Wow! So easy.</p>
+<p>Uh oh, someone is tapping you on the shoulder and saying this is too slow because it has to do a complete index scan of the tasks for the project, every time you load the page. That’s fine, we’ll just put a… Redis cache on it?</p>
+<h2>Putting a cache on it</h2>
+<pre><code><span>async</span> <span>function</span> <span>getTaskCountForProject</span>(<span>projectId</span>) {
+  <span>const</span> key = <span>`project:<span>${projectId}</span>:task-count`</span>;
+  <span>const</span> redisCount = <span>await</span> redis.<span>get</span>(key);
+  <span>if</span> (redisCount !== <span>null</span>) {
+    <span>return</span> +redisCount;
+  }
+
+  <span>const</span> count = <span>await</span> db.<span>query</span>(
+    <span>&#39;select count(1) from tasks where project_id = $1&#39;</span>,
+    [projectId],
+  );
+  <span>await</span> redis.<span>set</span>(key, count, { <span>ex</span>: <span>3600</span> }); 
+  <span>return</span> count;
+}
+</code></pre>
+<p>Works great. It’s fast enough. (Technically speaking, if 100 people load the same page at the same time and the cache isn’t populated yet, then we’ll end up sending 100 queries to the database which isn’t amazing, but let’s just pretend we didn’t hear that.)</p>
+<p>Unfortunately our users are complaining that the count is wrong a lot of the time now? Like they add a new task or delete a task and the count doesn’t change and they’re confused. Reasonably so.</p>
+<p>I guess we could clear the cache entry whenever we create or delete tasks. But really it would be better to not scan the whole list of tasks whenever we need a count. Some projects have many thousands of tasks in them!</p>
+<h2>Incremental updates</h2>
+<p>So let’s do something smarter. It’s not necessary to recompute the count from scratch every time. When we’re creating a task, we’ll just increment the count; upon delete, decrement.</p>
+<pre><code><span>async</span> <span>function</span> <span>getTaskCountForProject</span>(<span>projectId</span>) {
+  
+  <span>await</span> redis.<span>set</span>(<span>getProjectTaskCountKey</span>(projectId), count); 
+}
+
+<span>async</span> <span>function</span> <span>createTask</span>(<span>task</span>) {
+  <span>await</span> db.<span>query</span>(<span>&#39;insert into tasks ...&#39;</span>, ...);
+  <span>await</span> redis.<span>incr</span>(<span>getProjectTaskCountKey</span>(task.<span>projectId</span>), <span>1</span>);
+}
+
+<span>async</span> <span>function</span> <span>deleteTask</span>(<span>task</span>) {
+  <span>await</span> db.<span>query</span>(<span>&#39;delete from tasks ...&#39;</span>, ...);
+  <span>await</span> redis.<span>decr</span>(<span>getProjectTaskCountKey</span>(task.<span>projectId</span>), <span>1</span>);
+}
+</code></pre>
+<p>Well actually that’s not quite right because if the count is somehow missing from Redis then we don’t want to set it to 1 when incrementing. So it’s actually more like</p>
+<pre><code><span>async</span> <span>function</span> <span>incrByIfExists</span>(<span>redis, key, by</span>) {
+  <span>await</span> redis.<span>eval</span>(<span>`
+    if redis.call(&#39;EXISTS&#39;, KEYS[1]) == 1 then
+      return redis.call(&#39;INCRBY&#39;, KEYS[1], ARGS[1])
+    end
+    return nil
+  `</span>, [key], [by]);
+}
+
+<span>async</span> <span>function</span> <span>createTask</span>(<span>task</span>) {
+  <span>await</span> db.<span>query</span>(<span>&#39;insert into tasks ...&#39;</span>, ...);
+  <span>await</span> <span>incrByIfExists</span>(redis, <span>getProjectTaskCountKey</span>(task.<span>projectId</span>), <span>1</span>);
+}
+
+<span>async</span> <span>function</span> <span>deleteTask</span>(<span>task</span>) {
+  <span>await</span> db.<span>query</span>(<span>&#39;delete from tasks ...&#39;</span>, ...);
+  <span>await</span> <span>incrByIfExists</span>(redis, <span>getProjectTaskCountKey</span>(task.<span>projectId</span>), -<span>1</span>);
+}
+</code></pre>
+<p>This is fine. I mean, it’s super annoying that we have to do this, but this is what we’re getting paid to do.</p>
+<p>Oops. There’s an incoming bug report that the counts are wrong when our users move tasks between projects. Probably should’ve foreseen that. Kind of a pain that we need to worry about this on every update path now. Oh well, when a task moves between projects we’ll just increment the new project’s count and decrement the old one.</p>
+<p>And rebuild all the stored counts to correct for our past mistakes.</p>
+<p><em>Now</em> it works well.</p>
+<p>Right?</p>
+<p>You deploy this to prod and it works great for several months. But then there was that incident last week where the servers were crashing because they were running out of memory, and ever since then it seems like there are a bunch of projects whose counts are just off by 1 or 2. After some sleuthing, you realize that some of the servers crashed after writing the row to the database but before writing to Redis, so now the counts are just wrong forever.</p>
+<p>If you really care about the project task counts being accurate, I guess this is where you pull in Kafka and make everything retriable and idempotent so that your different systems can stay in sync.</p>
+<p>Or maybe you store these counts in your SQL database and update them in the same database transaction? That’s what the A stands for, after all. It’s probably fast enough for that. Having logic in your database is out of vogue these days, but you could even use triggers so that the database guarantees that whenever an insert happens on the <code>tasks</code> table, it runs your SQL code to increment the count.</p>
+<p>I don’t know about you, but for me it’s pretty annoying when the correctness of my system today depends not only on the code being correct right now but also on my code having done the correct thing at every point in the past. Way too easy to end up with little bugs whose errors accumulate and come back to bite you months later!</p>
+<h2>Isn’t there something better?</h2>
+<p>I miss the code that we started with. It was one line of code instead of dozens and also <em>it was actually correct</em>, without room for subtle errors and without me needing to be an expert in writing distributed systems.</p>
+<p>In most applications I’ve worked on, there are thousands and thousands and thousands of lines of code just doing this sort of “derive some data and keep it in sync with the source” type of thing. It’s tedious and also it makes it way harder to see what the essential complexity of the application actually is and to refactor over time.</p>
+<p>There are a few startups these days peddling a newfangled technology called “incremental view maintenance” or “differential dataflow”. Basically the way it works is you just say “hey, I’d like to keep track of how many tasks each project has” by writing any SQL query you want:</p>
+<pre><code><span>create</span> <span>materialized</span> <span>view</span> projects_task_count <span>as</span>
+<span>select</span> project_id, <span>count</span>(<span>1</span>) <span>as</span> count
+<span>from</span> tasks
+<span>group</span> <span>by</span> project_id
+</code></pre>
+<p>And then ✨ by magic ✨ the results of this query will just always exist and be up-to-date. You can just query it and it’s instant; the database doesn’t need to iterate over every task in the project in order to produce your answer.</p>
+<pre><code><span>select</span> count <span>from</span> projects_task_count <span>where</span> project_id <span>=</span> $<span>1</span>
+</code></pre>
+<p>The “magic” is actually really cool. Basically the SQL query is analyzed to produce a DAG of the data flow with different nodes for filters, groups, joins, etc, and then each node “knows” how to map any change in its input to the appropriate change in the output.</p>
+<p>In this particular example, the graph will know that if you insert a task, it needs to increment the corresponding count; for deletes, a decrement; for updates, it’s a no-op unless project_id changes, in which case it knows that the row now gets assigned to a new group and updates the counts accordingly.</p>
+<p>I don’t know yet if the implementations of this yet are good enough to use at scale. Maybe they’re slow or maybe the bugs aren’t ironed out yet. But obviously it’s <em>possible</em> to build a system that takes an arbitrary declarative, stateless query and does this sort of static analysis and incremental computation behind the scenes, and it should be possible to make it fast and reliable. And if you can make it good, it’s obviously extremely useful. You get to cut out all of that application code that’s dealing with keeping things in sync and make dealing with the stateful data updates someone else’s job. And ideally you can change the performance characteristics (eg: how much to store in memory, whether the result needs to be updated immediately or can be deferred, etc) without rewriting all your code that actually computes the answer.</p>
+<p>It’s too good of an idea for it to not succeed. Certainly if I was in charge of databases at AWS, this would be a major tentpole for my roadmap! I figure that a decade from now, most database systems will have a version of this built in.</p>
+<p>I can’t wait until they do.</p></div></div>
+  </body>
+</html>
