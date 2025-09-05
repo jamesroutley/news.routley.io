@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.bitflux.ai/blog/memory-is-slow-part2/">Original</a>
+    <h1>Memory is slow, Disk is fast – Part 2</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        <article>
+            
+
+            
+
+            
+            
+
+            <section>
+                <h2 id="tl-dr">TL;DR</h2>
+<p>Sourcing data directly from disk <em>IS</em> faster than caching in memory.  I brought receipts.
+Because hardware got wider but not faster, the old methods don&#39;t get you there.  You need new tools to use what is scaling and avoid what isn&#39;t.</p>
+<h2 id="introduction">Introduction</h2>
+<p>In part 1 I showed how some computer performance factors are scaling exponentially while others have been stagnant for decades.  I then asserted, without proof, that sourcing data from disk can be faster than from memory.  What follows is the proof.</p>
+<p>Computer Science dogma says that unused memory should be used to cache things from the filesystem because the disk is slow and memory is fast.  Given that disk bandwidth is growing exponentially and memory access latency has stagnated this isn&#39;t always true anymore.</p>
+<h2 id="experimental-set-up">Experimental set up</h2>
+<p>We need data and something straight forward to do with the data.  I used my free will or the illusion thereof to create a benchmark I cleverly call &#34;counting 10s&#34;.  I write some pseudo random integers between 0 and 20 to a buffer and then count how many of the integers are 10.  I want to make sure we are doing all the counting in a single thread to simulate an Amdahl&#39;s Law situation.</p>
+<p>So how fast can we expect this to run?  The upper limit would be the memory bandwidth.</p>
+<p>My testing rig is a server with an old AMD EPYC 7551P 32-Core Processor on a Supermicro H11SSL-i and 96GB of DDR4 2133 MHz and a couple of 1.92TB Samsung PM983a PCIe 3.0 SSDs I pieced together from EBay parts.  Given the way this server is configured, the upper limit for memory bandwidth can be calculated as 3 channels * 2133MT/s * 8B/T / 4 numa domains = ~13GB/s for a single thread.  It&#39;s kind of an odd system but that just makes it more fun to optimize for!</p>
+<p>The disks are rated at 3.1GB/s read BW each for an upper limit of 6.2GB/s.  I made a raid0 volume with 4KB stripe size, formatted the the raid as ext4 with no journaling, and made sure it fully finished initializing the metadata before running the tests.</p>
+<pre data-lang="bash"><code data-lang="bash"><span>sudo</span><span> mdadm</span><span> --create</span><span> /dev/md0</span><span> --level</span><span>=0</span><span> --raid-devices</span><span>=2</span><span> --chunk</span><span>=4K /dev/nvme1n1 /dev/nvme2n1
+</span><span>sudo</span><span> mkfs.ext4</span><span> -F -L</span><span> data</span><span> -O</span><span> ^has_journal</span><span> -E</span><span> lazy_itable_init=0 /dev/md0
+</span><span>sudo</span><span> mount</span><span> -o</span><span> noatime /dev/md0 mnt
+</span></code></pre>
+<p>We&#39;ll use a 50GB dataset for most benchmarking here, because when I started this I thought the test system only had 64GB and it stuck.</p>
+<h2 id="simple-loop">Simple Loop</h2>
+<p>The simple and cleanest way to do this in C would look like this.</p>
+<pre data-lang="c"><code data-lang="c"><span>#include </span><span>&lt;</span><span>stdio.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>stdlib.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>fcntl.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>sys/mman.h</span><span>&gt;
+</span><span>
+</span><span>// count_10_loop
+</span><span>int </span><span>main</span><span>(</span><span>int </span><span>argc</span><span>, </span><span>char </span><span>*</span><span>argv</span><span>[]) {
+</span><span>    </span><span>char</span><span>* filename = argv[</span><span>1</span><span>];
+</span><span>    size_t size_bytes = </span><span>strtoull</span><span>(argv[</span><span>2</span><span>], </span><span>NULL</span><span>, </span><span>10</span><span>);
+</span><span>    size_t total_ints = size_bytes / sizeof(</span><span>int</span><span>);
+</span><span>    size_t count = </span><span>0</span><span>;
+</span><span>
+</span><span>    </span><span>int</span><span> fd = </span><span>open</span><span>(filename, O_RDONLY);
+</span><span>    </span><span>int</span><span>* data = (</span><span>int</span><span>*)</span><span>mmap</span><span>(</span><span>NULL</span><span>, size_bytes, PROT_READ, MAP_SHARED, fd, </span><span>0</span><span>);
+</span><span> 
+</span><span>    </span><span>for </span><span>(size_t i = </span><span>0</span><span>; i &lt; total_ints; ++i) {
+</span><span>        </span><span>if </span><span>(data[i] == </span><span>10</span><span>) count++;
+</span><span>    }
+</span><span>
+</span><span>    </span><span>printf</span><span>(&#34;</span><span>Found </span><span>%ld</span><span> 10s</span><span>\n</span><span>&#34;, count);
+</span><span>}
+</span></code></pre>
+<p>Just mmap() the file which will give us a buffer that we can read from.  Then we just loop and count the 10s.</p>
+<p>Because the point is to benchmark we will integrate some timing mechanisms before we move on.</p>
+<pre data-lang="c"><code data-lang="c"><span>#include </span><span>&lt;</span><span>stdio.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>stdlib.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>fcntl.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>sys/mman.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>sys/time.h</span><span>&gt;
+</span><span>
+</span><span>long </span><span>get_time_us</span><span>() {
+</span><span>    </span><span>struct</span><span> timeval tv;
+</span><span>    </span><span>gettimeofday</span><span>(&amp;tv, </span><span>NULL</span><span>);
+</span><span>    </span><span>return</span><span> tv.</span><span>tv_sec </span><span>* </span><span>1000000</span><span>L </span><span>+ tv.</span><span>tv_usec</span><span>;
+</span><span>}
+</span><span>
+</span><span>// count_10_loop
+</span><span>int </span><span>main</span><span>(</span><span>int </span><span>argc</span><span>, </span><span>char </span><span>*</span><span>argv</span><span>[]) {
+</span><span>    </span><span>char</span><span>* filename = argv[</span><span>1</span><span>];
+</span><span>    size_t size_bytes = </span><span>strtoull</span><span>(argv[</span><span>2</span><span>], </span><span>NULL</span><span>, </span><span>10</span><span>);
+</span><span>    size_t total_ints = size_bytes / sizeof(</span><span>int</span><span>);
+</span><span>    size_t count = </span><span>0</span><span>;
+</span><span>
+</span><span>    </span><span>int</span><span> fd = </span><span>open</span><span>(filename, O_RDONLY);
+</span><span>    </span><span>int</span><span>* data = (</span><span>int</span><span>*)</span><span>mmap</span><span>(</span><span>NULL</span><span>, size_bytes, PROT_READ, MAP_SHARED, fd, </span><span>0</span><span>);
+</span><span> 
+</span><span>    </span><span>long</span><span> start = </span><span>get_time_us</span><span>();
+</span><span>    </span><span>for </span><span>(size_t i = </span><span>0</span><span>; i &lt; total_ints; ++i) {
+</span><span>        </span><span>if </span><span>(data[i] == </span><span>10</span><span>) count++;
+</span><span>    }
+</span><span>    </span><span>long</span><span> elapsed = </span><span>get_time_us</span><span>() - start;
+</span><span>
+</span><span>    </span><span>printf</span><span>(&#34;</span><span>simple loop found </span><span>%ld</span><span> 10s processed at </span><span>%0.2f</span><span> GB/s</span><span>\n</span><span>&#34;, count, (</span><span>double</span><span>)(size_bytes/</span><span>1073741824</span><span>)/((</span><span>double</span><span>)elapsed/</span><span>1.0e6</span><span>));
+</span><span>}
+</span></code></pre>
+<p>For the first run we&#39;re going to be reading from the disk. The disk/filesystem read is going to limit the performance before the memory bandwidth can.</p>
+<pre><code><span>❯ sudo  ./count_10_loop ./mnt/datafile.bin 53687091200
+</span><span>simple loop found 167802249 10s processed at 0.61 GB/s
+</span></code></pre>
+<p>As expected, it&#39;s not anywhere near memory speeds because as everyone knows, disk is slow.  We can look at the system and confirm that the first run cached the data to memory.</p>
+<p><img src="https://www.bitflux.ai/pics/memory_is_slow_part2/cached.png" alt="cached"/></p>
+<p>Our expectation is that the second run will be faster because the data is already in memory and as everyone knows, memory is fast.</p>
+<pre><code><span>❯ sudo  ./count_10_loop ./mnt/datafile.bin 53687091200
+</span><span>simple loop found 167802249 10s processed at 3.71 GB/s
+</span></code></pre>
+<p><img src="https://www.bitflux.ai/pics/memory_is_slow_part2/performance1.png" alt="performance1"/></p>
+<p>It is faster, but clearly that’s slower than the memory can feed it to the processor.  What bottleneck might we be hitting?  This speed does look possibly correlated to the instructions per second limit for this generation of CPU (between 2GHz * 1.5 IPC = 3G and 3GHz boost * 1.5 IPC = 4.5G instructions per second).</p>
+<p>We can use perf to see if the CPU is using vector instructions, if not then the actual compute is the bottleneck.</p>
+<pre><code><span>Percent│      test     %rbp,%rbp
+</span><span>       │    ↓ je       84
+</span><span>       │      lea      (%rbx,%rbp,4),%rcx
+</span><span>       │      mov      %rbx,%rax
+</span><span>       │      xor      %ebp,%ebp
+</span><span>       │      nop
+</span><span>       │70:   xor      %edx,%edx
+</span><span>  1.31 │      cmpl     $0xa,(%rax)
+</span><span> 42.38 │      sete     %dl
+</span><span> 45.72 │      add      $0x4,%rax
+</span><span>  0.01 │      add      %rdx,%rbp
+</span><span> 10.42 │      cmp      %rax,%rcx
+</span><span>  0.16 │    ↑ jne      70
+</span><span>       │84:   xor      %eax,%eax
+</span><span>       │      shr      $0x14,%r12
+</span><span>       │    → call     get_time_us
+</span><span>       │      pxor     %xmm0,%xmm0
+</span><span>       │      pxor     %xmm1,%xmm1
+</span></code></pre>
+<p>Confirmed. We&#39;re running non-vectorized instructions, with a single thread counting that&#39;s as fast as it can go with a 2GHz CPU.  Well crap.  We’ve hit our first non-exponential limit.  Even a brand new CPU running this machine code would probably struggle to do much better than a 50% improvement, still well below the memory bandwidth limit.</p>
+<h2 id="unrolling-the-loop">Unrolling the loop</h2>
+<p>Good news is this code can definitely be vectorized if we help the compiler.  Unroll the loop!</p>
+<p>We&#39;re gonna make it very obvious to the compiler that it&#39;s safe to use vector instructions which could process our integers up to 8x faster.</p>
+<pre data-lang="c"><code data-lang="c"><span>#include </span><span>&lt;</span><span>stdio.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>stdlib.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>fcntl.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>sys/mman.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>stdint.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>sys/time.h</span><span>&gt;
+</span><span>
+</span><span>long </span><span>get_time_us</span><span>() {
+</span><span>    </span><span>struct</span><span> timeval tv;
+</span><span>    </span><span>gettimeofday</span><span>(&amp;tv, </span><span>NULL</span><span>);
+</span><span>    </span><span>return</span><span> tv.</span><span>tv_sec </span><span>* </span><span>1000000</span><span>L </span><span>+ tv.</span><span>tv_usec</span><span>;
+</span><span>}
+</span><span>
+</span><span>// count_10_unrolled
+</span><span>int </span><span>main</span><span>(</span><span>int </span><span>argc</span><span>, </span><span>char </span><span>*</span><span>argv</span><span>[]) {
+</span><span>    </span><span>char</span><span>* filename = argv[</span><span>1</span><span>];
+</span><span>    size_t size_bytes = </span><span>strtoull</span><span>(argv[</span><span>2</span><span>], </span><span>NULL</span><span>, </span><span>10</span><span>);
+</span><span>    size_t total_ints = size_bytes / sizeof(</span><span>int</span><span>);
+</span><span>    size_t count = </span><span>0</span><span>;
+</span><span>
+</span><span>    </span><span>int</span><span> fd = </span><span>open</span><span>(filename, O_RDONLY);
+</span><span>    </span><span>void</span><span>* buffer = </span><span>mmap</span><span>(</span><span>NULL</span><span>, size_bytes, PROT_READ, MAP_SHARED, fd, </span><span>0</span><span>);
+</span><span> 
+</span><span>    </span><span>// Get the compiler to align the buffer
+</span><span>    </span><span>const int </span><span>* </span><span>__restrict</span><span> data = (</span><span>const int </span><span>* </span><span>__restrict</span><span>)</span><span>__builtin_assume_aligned</span><span>(buffer, </span><span>4096</span><span>);
+</span><span>    uint64_t c0=</span><span>0</span><span>, c1=</span><span>0</span><span>, c2=</span><span>0</span><span>, c3=</span><span>0</span><span>,
+</span><span>            c4=</span><span>0</span><span>, c5=</span><span>0</span><span>, c6=</span><span>0</span><span>, c7=</span><span>0</span><span>,
+</span><span>            c8=</span><span>0</span><span>, c9=</span><span>0</span><span>, c10=</span><span>0</span><span>, c11=</span><span>0</span><span>,
+</span><span>            c12=</span><span>0</span><span>, c13=</span><span>0</span><span>, c14=</span><span>0</span><span>, c15=</span><span>0</span><span>;
+</span><span>
+</span><span>    </span><span>long</span><span> start = </span><span>get_time_us</span><span>();
+</span><span>    </span><span>// Unrolling the compiler knows it can use a vector unit like AVX2 to process
+</span><span>    </span><span>for </span><span>(size_t i = </span><span>0</span><span>; i &lt; total_ints; i += </span><span>16</span><span>) {
+</span><span>        </span><span>// removed &#39;if&#39; to get it to be branchless: each compares to 10, adds 0 or 1
+</span><span>        c0  += (</span><span>unsigned</span><span>)(data[i+ </span><span>0</span><span>] == </span><span>10</span><span>);
+</span><span>        c1  += (</span><span>unsigned</span><span>)(data[i+ </span><span>1</span><span>] == </span><span>10</span><span>);
+</span><span>        c2  += (</span><span>unsigned</span><span>)(data[i+ </span><span>2</span><span>] == </span><span>10</span><span>);
+</span><span>        c3  += (</span><span>unsigned</span><span>)(data[i+ </span><span>3</span><span>] == </span><span>10</span><span>);
+</span><span>        c4  += (</span><span>unsigned</span><span>)(data[i+ </span><span>4</span><span>] == </span><span>10</span><span>);
+</span><span>        c5  += (</span><span>unsigned</span><span>)(data[i+ </span><span>5</span><span>] == </span><span>10</span><span>);
+</span><span>        c6  += (</span><span>unsigned</span><span>)(data[i+ </span><span>6</span><span>] == </span><span>10</span><span>);
+</span><span>        c7  += (</span><span>unsigned</span><span>)(data[i+ </span><span>7</span><span>] == </span><span>10</span><span>);
+</span><span>        c8  += (</span><span>unsigned</span><span>)(data[i+ </span><span>8</span><span>] == </span><span>10</span><span>);
+</span><span>        c9  += (</span><span>unsigned</span><span>)(data[i+ </span><span>9</span><span>] == </span><span>10</span><span>);
+</span><span>        c10 += (</span><span>unsigned</span><span>)(data[i+</span><span>10</span><span>] == </span><span>10</span><span>);
+</span><span>        c11 += (</span><span>unsigned</span><span>)(data[i+</span><span>11</span><span>] == </span><span>10</span><span>);
+</span><span>        c12 += (</span><span>unsigned</span><span>)(data[i+</span><span>12</span><span>] == </span><span>10</span><span>);
+</span><span>        c13 += (</span><span>unsigned</span><span>)(data[i+</span><span>13</span><span>] == </span><span>10</span><span>);
+</span><span>        c14 += (</span><span>unsigned</span><span>)(data[i+</span><span>14</span><span>] == </span><span>10</span><span>);
+</span><span>        c15 += (</span><span>unsigned</span><span>)(data[i+</span><span>15</span><span>] == </span><span>10</span><span>);
+</span><span>    }
+</span><span>
+</span><span>    </span><span>// pairwise reduce to help some compilers schedule better
+</span><span>    uint64_t s0 = c0 + c1,   s1 = c2 + c3,   s2 = c4 + c5,   s3 = c6 + c7;
+</span><span>    uint64_t s4 = c8 + c9,   s5 = c10 + c11, s6 = c12 + c13, s7 = c14 + c15;
+</span><span>    uint64_t t0 = s0 + s1,   t1 = s2 + s3,   t2 = s4 + s5,   t3 = s6 + s7;
+</span><span>
+</span><span>    count = (t0 + t1) + (t2 + t3);
+</span><span>    </span><span>long</span><span> elapsed = </span><span>get_time_us</span><span>() - start;
+</span><span>
+</span><span>    </span><span>printf</span><span>(&#34;</span><span>unrolled loop found </span><span>%ld</span><span> 10s processed at </span><span>%0.2f</span><span> GB/s</span><span>\n</span><span>&#34;, count, (</span><span>double</span><span>)(size_bytes/</span><span>1073741824</span><span>)/((</span><span>double</span><span>)elapsed/</span><span>1.0e6</span><span>));
+</span><span>}
+</span></code></pre>
+<p>Check if we now have vectorized instructions with <code>perf</code>.</p>
+<pre><code><span>Percent│       movq      %xmm0,%rcx
+</span><span>       │       movdqa    %xmm7,%xmm14
+</span><span>       │       pxor      %xmm0,%xmm0
+</span><span>       │       nop
+</span><span>       │ e8:   movdqa    %xmm6,%xmm4
+</span><span>  0.30 │       movdqa    %xmm6,%xmm3
+</span><span>  0.12 │       movdqa    %xmm6,%xmm2
+</span><span>  0.35 │       add       $0x1,%rdx
+</span><span>  1.54 │       pcmpeqd   (%rax),%xmm4
+</span><span> 54.64 │       pcmpeqd   0x10(%rax),%xmm3
+</span><span>  1.62 │       movdqa    %xmm6,%xmm1
+</span><span>  0.99 │       add       $0x40,%rax
+</span><span>  0.12 │       pcmpeqd   -0x20(%rax),%xmm2
+</span><span>  3.03 │       pcmpeqd   -0x10(%rax),%xmm1
+</span><span>  1.32 │       pand      %xmm5,%xmm4
+</span><span>  1.25 │       pand      %xmm5,%xmm3
+</span><span>  1.55 │       movdqa    %xmm4,%xmm15
+</span><span>  0.24 │       punpckhdq %xmm0,%xmm4
+</span><span>
+</span></code></pre>
+<p>Confirmed. We&#39;re using 128bit vector instructions, this should be up to 4x faster than the original.</p>
+<blockquote>
+<p>NOTE: These are 128-bit vector instructions, but I expected 256-bit.  I dug deeper here and found claims that Gen1 EPYC had unoptimized 256-bit instructions.  I forced the compiler to use 256-bit instructions and found it was actually slower.  Looks like the compiler was smart enough to know that here.</p>
+</blockquote>
+<p>Let&#39;s benchmark this unrolled version with the data as page cache in memory.</p>
+<pre><code><span>❯ sudo  ./count_10_unrolled ./mnt/datafile.bin 53687091200
+</span><span>unrolled loop found 167802249 10s processed at 5.51 GB/s
+</span></code></pre>
+<p><img src="https://www.bitflux.ai/pics/memory_is_slow_part2/performance2.png" alt="performance2"/></p>
+<p>We&#39;re still nowhere close to hitting the memory bus speed limit of 13GB/s but 50% faster than the original is a win.  There must be some other bottleneck.</p>
+<h2 id="can-the-ssds-beat-that">Can the SSDs beat that?</h2>
+<p>5.51GB/s?  On paper the SSDs can read at 6.2GB/s, but the first run from disk only did 0.61GB/s.  How can I meet or beat this performance sourcing the data directly from disk?</p>
+<p>Consider how the default mmap() mechanism works, it is a background IO pipeline to transparently fetch the data from disk.  When you read the empty buffer from userspace it triggers a fault, the kernel handles the fault by reading the data from the filesystem, which then queues up IO from disk.  Unfortunately these legacy mechanisms just aren&#39;t set up for serious high performance IO.  Note that at 610MB/s it&#39;s faster than what a disk SATA can do.  On the other hand, it only managed 10% of our disk&#39;s potential.  Clearly we&#39;re going to have to do something else.</p>
+<p>SSDs don&#39;t just automatically read data at multigigabyte speeds.  You need to put some real effort into an IO pipeline to get serious performance.</p>
+<p>I made a io_uring based IO engine, a kind of userspace driver, that can hit these speeds.  The main thread will request data, the IO engine will handle the IO, then the main thread will do the counting when the data is in a buffer.  We will use a set of queues to manage the IO requests, responses, and buffers.  The IO engine will start 6 workers, target a queue depth of 8192, and have a buffer size of 16KB.</p>
+<p>I wish I had tighter code here, but A) I didn’t have time to clean it up B) some of the complexity is intractable.  The IO engine code was a lot to scroll through so I moved it to github <a href="https://github.com/bitflux-ai/blog_notes/tree/main/memory_is_slow_part2/diskbased">link</a></p>
+<pre data-lang="c"><code data-lang="c"><span>#include </span><span>&#34;</span><span>io_engine.h</span><span>&#34;
+</span><span>#include </span><span>&lt;</span><span>sys/mman.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>getopt.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>stdio.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>stdlib.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>fcntl.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>sys/mman.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>stdint.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>sys/time.h</span><span>&gt;
+</span><span>
+</span><span>#define </span><span>DEFAULT_WORKERS </span><span>6
+</span><span>#define </span><span>DEFAULT_BLOCK_SIZE </span><span>16384
+</span><span>#define </span><span>DEFAULT_QUEUE_DEPTH </span><span>8192
+</span><span>
+</span><span>// Count the number of &#34;10&#34; (int format) in the buffer
+</span><span>static inline </span><span>size_t </span><span>count_tens_unrolled</span><span>(</span><span>void</span><span>* </span><span>data</span><span>, size_t </span><span>size_bytes</span><span>) {
+</span><span>    </span><span>const </span><span>size_t total = size_bytes / sizeof(</span><span>int</span><span>);
+</span><span>    </span><span>// Get the compiler to align the buffer
+</span><span>    </span><span>const int </span><span>* </span><span>__restrict</span><span> p = (</span><span>const int </span><span>* </span><span>__restrict</span><span>)</span><span>__builtin_assume_aligned</span><span>(data, </span><span>4096</span><span>);
+</span><span>    uint64_t c0=</span><span>0</span><span>, c1=</span><span>0</span><span>, c2=</span><span>0</span><span>, c3=</span><span>0</span><span>,
+</span><span>            c4=</span><span>0</span><span>, c5=</span><span>0</span><span>, c6=</span><span>0</span><span>, c7=</span><span>0</span><span>,
+</span><span>            c8=</span><span>0</span><span>, c9=</span><span>0</span><span>, c10=</span><span>0</span><span>, c11=</span><span>0</span><span>,
+</span><span>            c12=</span><span>0</span><span>, c13=</span><span>0</span><span>, c14=</span><span>0</span><span>, c15=</span><span>0</span><span>;
+</span><span>
+</span><span>    </span><span>// Unrolling the compiler knows it can use a vector unit like AVX2 to process
+</span><span>    </span><span>for </span><span>(size_t i = </span><span>0</span><span>; i &lt; total; i += </span><span>16</span><span>) {
+</span><span>        </span><span>// removed &#39;if&#39; to get it to be branchless: each compares to 10, adds 0 or 1
+</span><span>        c0  += (</span><span>unsigned</span><span>)(p[i+ </span><span>0</span><span>] == </span><span>10</span><span>);
+</span><span>        c1  += (</span><span>unsigned</span><span>)(p[i+ </span><span>1</span><span>] == </span><span>10</span><span>);
+</span><span>        c2  += (</span><span>unsigned</span><span>)(p[i+ </span><span>2</span><span>] == </span><span>10</span><span>);
+</span><span>        c3  += (</span><span>unsigned</span><span>)(p[i+ </span><span>3</span><span>] == </span><span>10</span><span>);
+</span><span>        c4  += (</span><span>unsigned</span><span>)(p[i+ </span><span>4</span><span>] == </span><span>10</span><span>);
+</span><span>        c5  += (</span><span>unsigned</span><span>)(p[i+ </span><span>5</span><span>] == </span><span>10</span><span>);
+</span><span>        c6  += (</span><span>unsigned</span><span>)(p[i+ </span><span>6</span><span>] == </span><span>10</span><span>);
+</span><span>        c7  += (</span><span>unsigned</span><span>)(p[i+ </span><span>7</span><span>] == </span><span>10</span><span>);
+</span><span>        c8  += (</span><span>unsigned</span><span>)(p[i+ </span><span>8</span><span>] == </span><span>10</span><span>);
+</span><span>        c9  += (</span><span>unsigned</span><span>)(p[i+ </span><span>9</span><span>] == </span><span>10</span><span>);
+</span><span>        c10 += (</span><span>unsigned</span><span>)(p[i+</span><span>10</span><span>] == </span><span>10</span><span>);
+</span><span>        c11 += (</span><span>unsigned</span><span>)(p[i+</span><span>11</span><span>] == </span><span>10</span><span>);
+</span><span>        c12 += (</span><span>unsigned</span><span>)(p[i+</span><span>12</span><span>] == </span><span>10</span><span>);
+</span><span>        c13 += (</span><span>unsigned</span><span>)(p[i+</span><span>13</span><span>] == </span><span>10</span><span>);
+</span><span>        c14 += (</span><span>unsigned</span><span>)(p[i+</span><span>14</span><span>] == </span><span>10</span><span>);
+</span><span>        c15 += (</span><span>unsigned</span><span>)(p[i+</span><span>15</span><span>] == </span><span>10</span><span>);
+</span><span>    }
+</span><span>
+</span><span>    </span><span>// pairwise reduce to help some compilers schedule better
+</span><span>    uint64_t s0 = c0 + c1,   s1 = c2 + c3,   s2 = c4 + c5,   s3 = c6 + c7;
+</span><span>    uint64_t s4 = c8 + c9,   s5 = c10 + c11, s6 = c12 + c13, s7 = c14 + c15;
+</span><span>    uint64_t t0 = s0 + s1,   t1 = s2 + s3,   t2 = s4 + s5,   t3 = s6 + s7;
+</span><span>
+</span><span>    </span><span>return </span><span>(t0 + t1) + (t2 + t3);
+</span><span>}
+</span><span>
+</span><span>int </span><span>main</span><span>(</span><span>int </span><span>argc</span><span>, </span><span>char </span><span>*</span><span>argv</span><span>[]) {
+</span><span>    </span><span>char</span><span>* filename = argv[</span><span>1</span><span>];
+</span><span>    size_t size_bytes = </span><span>strtoull</span><span>(argv[</span><span>2</span><span>], </span><span>NULL</span><span>, </span><span>10</span><span>);
+</span><span>
+</span><span>    </span><span>// Set up the io engine
+</span><span>    ioengine_t* na = </span><span>ioengine_alloc</span><span>(filename, size_bytes, DEFAULT_QUEUE_DEPTH, DEFAULT_BLOCK_SIZE, DEFAULT_WORKERS);
+</span><span>
+</span><span>    </span><span>sleep</span><span>(</span><span>1</span><span>);
+</span><span>
+</span><span>    </span><span>// Use the background workers to read file directly
+</span><span>    size_t total_blocks = na-&gt;file_size / na-&gt;block_size;
+</span><span>    uint64_t uid = </span><span>1</span><span>;
+</span><span>    size_t count = </span><span>0</span><span>;
+</span><span>
+</span><span>    </span><span>long</span><span> start = </span><span>get_time_us</span><span>();
+</span><span>
+</span><span>    </span><span>// Read all blocks
+</span><span>    size_t blocks_queued = </span><span>0</span><span>;
+</span><span>    size_t blocks_read = </span><span>0</span><span>;
+</span><span>    </span><span>int</span><span> buffer_queued = </span><span>0</span><span>;
+</span><span>    </span><span>while </span><span>(blocks_read &lt; total_blocks) {
+</span><span>        </span><span>//// Queue IO phase //////
+</span><span>        </span><span>//     Do we have more blocks to queue up?
+</span><span>        </span><span>if </span><span>(buffer_queued &lt; na-&gt;num_io_buffers/</span><span>2 </span><span>&amp;&amp; blocks_queued &lt;= total_blocks) {
+</span><span>            </span><span>// Calculate how many blocks on average we want our workers to queue up
+</span><span>            size_t free_buffers = (size_t)(na-&gt;num_io_buffers - buffer_queued - </span><span>4</span><span>); </span><span>// hold back a few buffers
+</span><span>            size_t blocks_remaining = total_blocks - blocks_queued;  </span><span>// how many blocks have we not queued
+</span><span>            size_t blocks_to_queue = free_buffers &gt; blocks_remaining ? blocks_remaining : free_buffers;
+</span><span>            </span><span>int</span><span> blocks_to_queue_per_worker = (</span><span>int</span><span>) (blocks_to_queue + na-&gt;num_workers - </span><span>1</span><span>) / na-&gt;num_workers;
+</span><span>            </span><span>// Iterate through workers and assign work
+</span><span>            </span><span>for </span><span>(</span><span>int</span><span> i = </span><span>0</span><span>; i &lt; na-&gt;num_workers; i++) {
+</span><span>                worker_thread_data_t* worker = &amp;na-&gt;workers[i];
+</span><span>                </span><span>// Try to queue N blocks to this worker
+</span><span>                </span><span>for </span><span>(</span><span>int</span><span> j = </span><span>0</span><span>; j &lt; blocks_to_queue_per_worker; j++) {
+</span><span>                    </span><span>if </span><span>(blocks_queued == total_blocks) </span><span>break</span><span>;
+</span><span>                    </span><span>int</span><span> bgio_tail = worker-&gt;bgio_tail;
+</span><span>                    </span><span>int</span><span> bgio_head = worker-&gt;bgio_head;
+</span><span>                    </span><span>int</span><span> bgio_next = (bgio_tail + </span><span>1</span><span>) % worker-&gt;num_max_bgio;
+</span><span>                    </span><span>int</span><span> next_bhead = (worker-&gt;buffer_head + </span><span>1</span><span>) % worker-&gt;num_max_bgio;
+</span><span>                    </span><span>if </span><span>(bgio_next == bgio_head) </span><span>break</span><span>;  </span><span>// queue for send requests is full
+</span><span>                    </span><span>if </span><span>(next_bhead == worker-&gt;buffer_tail) </span><span>break</span><span>; </span><span>// queue for recieving completed IO is full
+</span><span>                    </span><span>// Queue this block with the worker.  We have to track which buffer it&#39;s going to.
+</span><span>                    </span><span>int</span><span> buffer_idx = worker-&gt;buffer_start_idx + worker-&gt;buffer_head;
+</span><span>                    na-&gt;buffer_state[buffer_idx] = BUFFER_PREFETCHING;
+</span><span>                    worker-&gt;bgio_uids[bgio_tail] = (uid++)&lt;&lt;</span><span>16</span><span>; </span><span>// unique id helps track IOs in io_uring, we encode 4 bytes later
+</span><span>                    worker-&gt;bgio_buffer_idx[bgio_tail] = buffer_idx;
+</span><span>                    worker-&gt;bgio_block_idx[bgio_tail] = blocks_queued++;  </span><span>// block sized index into file
+</span><span>                    worker-&gt;bgio_queued[bgio_tail] = -</span><span>1</span><span>;  </span><span>// Requested but not yet queued
+</span><span>                    </span><span>int</span><span> next_tail = (bgio_tail + </span><span>1</span><span>) % worker-&gt;num_max_bgio;
+</span><span>                    worker-&gt;bgio_tail = next_tail;
+</span><span>                    </span><span>// Log the buffer in an ordered queue for us to read
+</span><span>                    worker-&gt;complete_ring[worker-&gt;buffer_head] = buffer_idx;
+</span><span>                    worker-&gt;buffer_head = next_bhead;
+</span><span>                    buffer_queued++;
+</span><span>                }
+</span><span>                </span><span>// Tell the worker to submit IOs as a group
+</span><span>                worker-&gt;bgio_submit++;
+</span><span>            }
+</span><span>        }
+</span><span>
+</span><span>        </span><span>//// Completion Phase //////
+</span><span>        </span><span>//     Iterate through worker and check if they have complete IOs
+</span><span>        </span><span>for </span><span>(</span><span>int</span><span> i = </span><span>0</span><span>; i &lt; na-&gt;num_workers; i++) {
+</span><span>            worker_thread_data_t* worker = &amp;na-&gt;workers[i];
+</span><span>            </span><span>int</span><span> current = worker-&gt;buffer_tail;
+</span><span>            </span><span>// We know what IO&#39;s we&#39;re waiting on, but we have to poll
+</span><span>            </span><span>//  to see if they are done.
+</span><span>            </span><span>for </span><span>(</span><span>int</span><span> scan = </span><span>0</span><span>; scan &lt; worker-&gt;num_max_bgio; scan++) {
+</span><span>                </span><span>// Scan until we get to the end of the list
+</span><span>                </span><span>if </span><span>(current == worker-&gt;buffer_head) </span><span>break</span><span>;
+</span><span>                </span><span>int</span><span> buffer_idx = worker-&gt;complete_ring[current];
+</span><span>                </span><span>int</span><span> state = na-&gt;buffer_state[buffer_idx];
+</span><span>                </span><span>if </span><span>(state == BUFFER_PREFETCHED) {
+</span><span>                    </span><span>// This buffer is completed - Process this buffer.
+</span><span>                    count += </span><span>count_tens_unrolled</span><span>(na-&gt;io_buffers[buffer_idx], na-&gt;block_size);
+</span><span>                    na-&gt;buffer_state[buffer_idx] = BUFFER_UNUSED;
+</span><span>                    blocks_read++;
+</span><span>                    buffer_queued--;
+</span><span>                }
+</span><span>                current = (current + </span><span>1</span><span>) % worker-&gt;num_max_bgio;
+</span><span>            }
+</span><span>            </span><span>// IO&#39;s might have been completed out of order, advance the tail when we can
+</span><span>            current = worker-&gt;buffer_tail;
+</span><span>            </span><span>while </span><span>(current != worker-&gt;buffer_head) {
+</span><span>                </span><span>int</span><span> buffer_idx = worker-&gt;complete_ring[current];
+</span><span>                </span><span>int</span><span> state = na-&gt;buffer_state[buffer_idx];
+</span><span>                </span><span>if </span><span>(state != BUFFER_UNUSED) </span><span>break</span><span>;
+</span><span>                current = (current + </span><span>1</span><span>) % worker-&gt;num_max_bgio;
+</span><span>            }
+</span><span>            worker-&gt;buffer_tail = current;
+</span><span>            worker-&gt;bgio_submit++;  </span><span>// probably unnecessary
+</span><span>        }
+</span><span>    }
+</span><span>    </span><span>long</span><span> elapsed = </span><span>get_time_us</span><span>() - start;
+</span><span>    </span><span>printf</span><span>(&#34;</span><span>diskbased found </span><span>%ld</span><span> 10s processed at </span><span>%0.2f</span><span> GB/s</span><span>\n</span><span>&#34;, count, (</span><span>double</span><span>)(size_bytes/</span><span>1073741824</span><span>)/((</span><span>double</span><span>)elapsed/</span><span>1.0e6</span><span>));
+</span><span>
+</span><span>    </span><span>// Cleanup I/O system
+</span><span>    </span><span>ioengine_free</span><span>(na);
+</span><span>
+</span><span>    </span><span>return </span><span>0</span><span>;
+</span><span>}
+</span></code></pre>
+<p>I hope all this extra code makes it faster.</p>
+<pre><code><span>❯ sudo ./diskbased/benchmark ./mnt/datafile.bin 53687091200
+</span><span>diskbased found 167802249 10s processed at 5.81 GB/s
+</span></code></pre>
+<p><img src="https://www.bitflux.ai/pics/memory_is_slow_part2/performance3.png" alt="performance3"/></p>
+<p>Boom!  Disk is faster than memory!  It takes several hundred lines of code but now we can source the data from my SSDs faster than the copy from the page cache in memory.</p>
+<h2 id="so-what-s-going-on-here">So what&#39;s going on here?</h2>
+<p>Of course my 6GB/s disk stripe isn’t actually faster than the memory bus, even on this weird hack of a system.  So what is happening?  Where is the bottleneck?  It&#39;s got to be the way the data is being read from the page cache in memory.</p>
+<p>What if we replace the mmap() with a read() from disk into a preallocated buffer.  That way we can measure the counting with the data in-memory without any page cache related overhead mmap() can introduce.</p>
+<pre data-lang="c"><code data-lang="c"><span>#include </span><span>&lt;</span><span>stdio.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>stdlib.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>sys/time.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>sys/stat.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>fcntl.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>unistd.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>stdint.h</span><span>&gt;
+</span><span>#include </span><span>&lt;</span><span>string.h</span><span>&gt;
+</span><span>
+</span><span>long </span><span>get_time_us</span><span>() {
+</span><span>    </span><span>struct</span><span> timeval tv;
+</span><span>    </span><span>gettimeofday</span><span>(&amp;tv, </span><span>NULL</span><span>);
+</span><span>    </span><span>return</span><span> tv.</span><span>tv_sec </span><span>* </span><span>1000000</span><span>L </span><span>+ tv.</span><span>tv_usec</span><span>;
+</span><span>}
+</span><span>
+</span><span>int </span><span>main</span><span>(</span><span>int </span><span>argc</span><span>, </span><span>char </span><span>*</span><span>argv</span><span>[]) {
+</span><span>    </span><span>char</span><span>* filename = argv[</span><span>1</span><span>];
+</span><span>    size_t size_bytes = </span><span>strtoull</span><span>(argv[</span><span>2</span><span>], </span><span>NULL</span><span>, </span><span>10</span><span>);
+</span><span>    size_t total_ints = size_bytes / sizeof(</span><span>int</span><span>);
+</span><span>    size_t count = </span><span>0</span><span>;
+</span><span>
+</span><span>    </span><span>int</span><span> fd = </span><span>open</span><span>(filename, O_RDONLY|O_DIRECT);
+</span><span>    </span><span>void </span><span>*buf;
+</span><span>    </span><span>posix_memalign</span><span>(&amp;buf, </span><span>4096</span><span>, size_bytes);
+</span><span>    </span><span>int </span><span>*data = buf;
+</span><span>
+</span><span>    size_t off = </span><span>0</span><span>;
+</span><span>    </span><span>while </span><span>(off &lt; size_bytes) {
+</span><span>        ssize_t n = </span><span>read</span><span>(fd, (</span><span>char</span><span>*)data + off, size_bytes - off);
+</span><span>        off += (size_t)n;   </span><span>// YOLO: assume n &gt; 0 until done
+</span><span>    }
+</span><span>
+</span><span>    </span><span>long</span><span> start = </span><span>get_time_us</span><span>();
+</span><span>    </span><span>for </span><span>(size_t i = </span><span>0</span><span>; i &lt; total_ints; ++i) {
+</span><span>        </span><span>if </span><span>(data[i] == </span><span>10</span><span>) count++;
+</span><span>    }
+</span><span>    </span><span>long</span><span> elapsed = </span><span>get_time_us</span><span>() - start;
+</span><span>
+</span><span>    </span><span>printf</span><span>(&#34;</span><span>simple loop </span><span>%ld</span><span> 10s processed at </span><span>%0.2f</span><span> GB/s</span><span>\n</span><span>&#34;,
+</span><span>           count,
+</span><span>           (</span><span>double</span><span>)(size_bytes/</span><span>1073741824</span><span>)/((</span><span>double</span><span>)elapsed/</span><span>1.0e6</span><span>));
+</span><span>
+</span><span>
+</span><span>    </span><span>// Get the compiler to align the buffer
+</span><span>    </span><span>const int </span><span>* </span><span>__restrict</span><span> p = (</span><span>const int </span><span>* </span><span>__restrict</span><span>)</span><span>__builtin_assume_aligned</span><span>((</span><span>void</span><span>*)data, </span><span>4096</span><span>);
+</span><span>    uint64_t c0=</span><span>0</span><span>, c1=</span><span>0</span><span>, c2=</span><span>0</span><span>, c3=</span><span>0</span><span>,
+</span><span>            c4=</span><span>0</span><span>, c5=</span><span>0</span><span>, c6=</span><span>0</span><span>, c7=</span><span>0</span><span>,
+</span><span>            c8=</span><span>0</span><span>, c9=</span><span>0</span><span>, c10=</span><span>0</span><span>, c11=</span><span>0</span><span>,
+</span><span>            c12=</span><span>0</span><span>, c13=</span><span>0</span><span>, c14=</span><span>0</span><span>, c15=</span><span>0</span><span>;
+</span><span>
+</span><span>    start = </span><span>get_time_us</span><span>();
+</span><span>    </span><span>// Unrolling the compiler knows it can use a vector unit like AVX2 to process
+</span><span>    </span><span>for </span><span>(size_t i = </span><span>0</span><span>; i &lt; total_ints; i += </span><span>16</span><span>) {
+</span><span>        </span><span>// removed &#39;if&#39; to get it to be branchless: each compares to 10, adds 0 or 1
+</span><span>        c0  += (</span><span>unsigned</span><span>)(p[i+ </span><span>0</span><span>] == </span><span>10</span><span>);
+</span><span>        c1  += (</span><span>unsigned</span><span>)(p[i+ </span><span>1</span><span>] == </span><span>10</span><span>);
+</span><span>        c2  += (</span><span>unsigned</span><span>)(p[i+ </span><span>2</span><span>] == </span><span>10</span><span>);
+</span><span>        c3  += (</span><span>unsigned</span><span>)(p[i+ </span><span>3</span><span>] == </span><span>10</span><span>);
+</span><span>        c4  += (</span><span>unsigned</span><span>)(p[i+ </span><span>4</span><span>] == </span><span>10</span><span>);
+</span><span>        c5  += (</span><span>unsigned</span><span>)(p[i+ </span><span>5</span><span>] == </span><span>10</span><span>);
+</span><span>        c6  += (</span><span>unsigned</span><span>)(p[i+ </span><span>6</span><span>] == </span><span>10</span><span>);
+</span><span>        c7  += (</span><span>unsigned</span><span>)(p[i+ </span><span>7</span><span>] == </span><span>10</span><span>);
+</span><span>        c8  += (</span><span>unsigned</span><span>)(p[i+ </span><span>8</span><span>] == </span><span>10</span><span>);
+</span><span>        c9  += (</span><span>unsigned</span><span>)(p[i+ </span><span>9</span><span>] == </span><span>10</span><span>);
+</span><span>        c10 += (</span><span>unsigned</span><span>)(p[i+</span><span>10</span><span>] == </span><span>10</span><span>);
+</span><span>        c11 += (</span><span>unsigned</span><span>)(p[i+</span><span>11</span><span>] == </span><span>10</span><span>);
+</span><span>        c12 += (</span><span>unsigned</span><span>)(p[i+</span><span>12</span><span>] == </span><span>10</span><span>);
+</span><span>        c13 += (</span><span>unsigned</span><span>)(p[i+</span><span>13</span><span>] == </span><span>10</span><span>);
+</span><span>        c14 += (</span><span>unsigned</span><span>)(p[i+</span><span>14</span><span>] == </span><span>10</span><span>);
+</span><span>        c15 += (</span><span>unsigned</span><span>)(p[i+</span><span>15</span><span>] == </span><span>10</span><span>);
+</span><span>    }
+</span><span>
+</span><span>    </span><span>// pairwise reduce to help some compilers schedule better
+</span><span>    uint64_t s0 = c0 + c1,   s1 = c2 + c3,   s2 = c4 + c5,   s3 = c6 + c7;
+</span><span>    uint64_t s4 = c8 + c9,   s5 = c10 + c11, s6 = c12 + c13, s7 = c14 + c15;
+</span><span>    uint64_t t0 = s0 + s1,   t1 = s2 + s3,   t2 = s4 + s5,   t3 = s6 + s7;
+</span><span>
+</span><span>    count = (t0 + t1) + (t2 + t3);
+</span><span>    elapsed = </span><span>get_time_us</span><span>() - start;
+</span><span>
+</span><span>    </span><span>printf</span><span>(&#34;</span><span>unrolled loop </span><span>%ld</span><span> 10s processed at </span><span>%0.2f</span><span> GB/s</span><span>\n</span><span>&#34;,
+</span><span>           count,
+</span><span>           (</span><span>double</span><span>)(size_bytes/</span><span>1073741824</span><span>)/((</span><span>double</span><span>)elapsed/</span><span>1.0e6</span><span>));
+</span><span>}
+</span></code></pre>
+<p>If we keep the dataset smaller than a numa domain and we bind this to a single numa node to prevent numa overheads we see that the theoretical memory bandwidth we projected seems to be the primary bottleneck for the unrolled loop as we hoped to see at the outset.</p>
+<pre><code><span>❯  sudo numactl --cpunodebind=0   ./in_ram mnt/datafile.bin 2147483648
+</span><span>simple loop 6709835 10s processed at 4.76 GB/s
+</span><span>unrolled loop 6709835 10s processed at 13.04 GB/s
+</span></code></pre>
+<p>But this isn&#39;t useful to compare the with the other runs with the 50GB dataset.  However if we do the full 50GB dataset the performance suffers.  We have to get much of the data across numa domains which is going to be higher cost.</p>
+<pre><code><span>❯ sudo ./in_ram ./mnt/datafile.bin 53687091200
+</span><span>simple loop 167802249 10s processed at 3.76 GB/s
+</span><span>unrolled loop 167802249 10s processed at 7.90 GB/s
+</span></code></pre>
+<p><img src="https://www.bitflux.ai/pics/memory_is_slow_part2/performance4.png" alt="performance4"/></p>
+<p>Comparing the results of &#34;fully in-memory (50GB)&#34; which is pre-loaded in memory before measuring against the &#34;unrolled loop&#34; that is only cached in memory we see 40% overhead.  That&#39;s 2.75 seconds out of 9 seconds that was spent waiting on the caching system instead of counting.  Why so much?</p>
+<p><strong>mmap()</strong></p>
+<p>The mmap() call presents the process with a buffer that is a blank slate even when the data is already in memory.  The buffer is populated page by page as it&#39;s accessed from the page cache.  This isn&#39;t a copy, it&#39;s just the operating system mapping the cached memory into the process.  This costs more than it might seem.  The worst case with mmap() the counting has to pause at every 4KB page boundary while the kernel processes a fault, tracks down the page of data in the page cache, then updates the page table of the process to insert the memory into the process.  Fundamentally this is a process that is limited by the memory latency, not the CPU speed or memory bandwidth.  With the potential for TLB walks and searching lists that track the page cache, we’re taking potentially dozens of CPU cache misses and several microseconds of waiting on memory for every 4KB page.</p>
+<p><strong>direct IO</strong></p>
+<p>Using our direct from disk approach uses pipelines and streams which avoids the kind of memory latency dominated bottleneck that mmap() has.  In our case we&#39;re limited by the bandwidth of our disks yet because of the pipelining, the larger latency of the IOs doesn&#39;t get in the critical path of the counting very much.  Allowing for higher throughput.</p>
+<h2 id="scaling">Scaling</h2>
+<p>Consider the implications of these experiments as we scale.  The well vetted solution to get data from memory to a process is slower than using the disk directly.  This isn&#39;t because the memory is slower than the disk.  The memory has higher bandwidth than the disk, not by an order of magnitude, but a decent margin.  But the latency of the memory is orders of magnitude lower than the disk.  Nevertheless the <em>way</em> the data in memory is accessed is the culprit.  Its a synchronous approach that assumes memory operations are cheap and low latency.  These accesses add up and it ends up waiting on memory latencies.  The disk method on the other hand is as a streaming approach built to leverage bandwidth and hide latencies.</p>
+<p><strong>extending the existing rig</strong></p>
+<p>If I got a few more of these disks I could push the IO bandwidth to be greater than the 13GB/s per thread memory bandwidth limit.  IO is DMA&#39;ed to buffers that are pretty small compared to the total dataset. These buffers scale with the throughput capabilities of the CPU and the disks, not the dataset size. The buffers can be located in a single numa domain allowing us to avoid the overhead of accessing the buffers between NUMA domains.  Add more disks to this system I might be able to create a disk based solution to count at the full 13GB/s rather than be limited to the 7.90GB/s we see with the in memory example at the full 50GB dataset.  With such a system our throughput would not be affected by the dataset size, unlike the in-memory case, which has numa overhead and eventually runs out of memory to scale.</p>
+<p><strong>faster than memory is possible</strong></p>
+<p>On a proper modern server the CPUs will let you do IO directly to the L3 cache, bypassing memory altogether.  Because PCIe bandwidth is higher than memory bandwidth, on paper we could even get more max bandwidth than we can get from memory if we carefully pin the buffers into the CPU cache.  I haven&#39;t confirm this works in practice, however, it could be made to work and is the sort of thing that CPU designs will be forced to lean into to push performance forward.</p>
+<p><strong>memory is changing too</strong></p>
+<p>This isn&#39;t just about disks vs memory.  Similar techniques and principles apply to memory.  Memory bandwidth is still scaling even if the latency is not.  This means to take advantage of memory performance you have to actually treat it more like a disk and less like Random Access Memory.  To scale performance with generational updates you have to make sure to stream data from memory into the CPU caches in blocks, similar to how data is streamed from disk to memory.  If not you end up with 90s level memory throughput.  A custom mechanism to cache data in memory could easily avoid the memory latency problems seen with the default mmap() solution with much less code than the io_uring solution.</p>
+<h2 id="is-this-worth-it">Is this worth it?</h2>
+<p>I&#39;m not going to say that going to the effort of implementing something like this is always worth it.  The mmap() method is sure elegant from a coding perspective, especially when compared to all the code I had to write to get the io_uring setup working.  Sometimes the simple way is the way to go.</p>
+<p>Is using 6 cores of IO for 1 core of compute is always the right answer?  Probably not.  This was an extreme situation to prove a point.  In realworld situations you&#39;ll need to look at the tradeoffs and decide what&#39;s best for your use case.  Correctly understanding the strengths and weaknesses of the hardware can open up a number of possibilities where you can get a lot more performance for a lot less money.</p>
+<p>The kind of overhead demonstrated with mmap() isn’t going to go away, new hardware isn&#39;t going to fix it.  At the same time disk bandwidth and the number of cores are scaling each generation.  But doing things that scale performance with new technology is going to take extra code and effort.</p>
+<p>But don&#39;t just blow this stuff off.  Sure you <em>can</em> dedicate a server with 3TB of memory to serve 10K client connections. Memory in the cloud is like ~$5/GB/month, if you can afford it, then you do you.  However it is worth considering that humanity doesn&#39;t have the silicon fabs or the power plants to support this for every moron vibe coder out there making an app.  I figure either the karmic debt to the planet, or a vengeful AI demigod hungry for silicon and electricity will come for those that don&#39;t heed this warning, eventually.  Either way my conscience is clear.</p>
+<h2 id="recap">Recap</h2>
+<ul>
+<li>Memory is slow - when you use it oldschool.</li>
+<li>Disk is fast - when you are clever with it.</li>
+<li>Test the dogma - compounded exponentials are flipping somethings from true to false.</li>
+</ul>
+<p><strong>Bad news</strong> is that this cleverness requires extra code and effort.</p>
+<p><strong>Good news</strong> is we now have AI to write and test the extra code this cleverness requires.</p>
+<p><strong>Better news</strong> is that, for those that are willing to learn, AI&#39;s don&#39;t do this unless you know how to ask them.</p>
+<p>Lean into things that scale, avoid things that don’t.</p>
+<h2 id="next-time">Next Time</h2>
+<p>What will be revealed in the next episode?</p>
+<ul>
+<li>Is O(√n) actually faster than O(log n)?  Will the foundations of Computer Science survive this unveiling?</li>
+<li>Will traditional code be consumed into the latent space of our AI overlords?</li>
+<li>Is AI hiding these performance gains from me?  Is AI even capable of writing optimized code?</li>
+</ul>
+<hr/>
+<p><em>Jared Hulbert</em></p>
+<blockquote>
+<p>A few notes for the &#34;um actually&#34; haters commenting on Hacker News:</p>
+<ul>
+<li>This is not and does not claim to be an academic paper.</li>
+<li>I do not intend to prove that NAND is a drop in replacement for DRAM.</li>
+<li>Tis but a humble and hopefully fun exercise in exploring the limits and trends of modern hardware and the tradeoffs needed to maximize performance.</li>
+<li>As I stated before I have no problem with your choice to ignore this and write lazy code that will perform just as fast on new hardware in 15 years as it does on todays hardware.  In fact I applaud your choice.  Jeff Bezos has an orbital yacht to build, someone has to pay for it, why not you?</li>
+<li>I am not an AI.  I am a human with a computer that don&#39;t write perfect.</li>
+</ul>
+</blockquote>
+<blockquote>
+<p>source code can be found <a href="https://github.com/bitflux-ai/blog_notes">here</a>.</p>
+</blockquote>
+
+            </section>
+        </article>
+    </div></div>
+  </body>
+</html>
