@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://fil-c.org/safepoints">Original</a>
+    <h1>Safepoints and Fil-C</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        
+        <main>
+
+
+<p>Safepointing is an underappreciated aspect of modern multithreaded VM/GC tech. It forms the foundation of Fil-C&#39;s accurate stack scanning, safe signal handling, and safe forking. It also forms the foundation of accurate GC, debugging, and profiling in modern lots of other virtual machines (JVMs in particular). Perhaps most crucially:</p>
+
+<p><em>Safepointing is the reason why multiple threads can race on the heap in Fil-C using non-atomic unordered instructions, under any widely used hardware memory model, without breaking the soundness guarantees of the garbage collector.</em></p>
+
+<p>You can replace &#34;Fil-C&#34; with &#34;Java&#34; or most other GC-based languages that support threads and the same thing holds. Let&#39;s dig into what this magical technique does!</p>
+
+<h2>What Does Safepointing Do?</h2>
+
+<p>Safepointing is:</p>
+
+<ul>
+<li><p>a lightweight synchronization mechanism that allows threads in a VM to make assumptions about the VM&#39;s state, and</p></li>
+<li><p>a lightweight mechanism for threads executing in the VM to report their current state.</p></li>
+</ul>
+
+<p>Let&#39;s dig into how safepointing works by considering <em>just one of the many assumptions</em> that we want <a href="https://fil-c.org/compiler.html">the compiler</a> to be able to make about how it interacts with <a href="https://fil-c.org/fugc.html">the accurate garbage collector</a>: we want to allow threads to assume that a pointer loaded from the heap will point to a live object even if that thread hasn&#39;t done anything to enable the GC&#39;s root scanning to find that pointer. Say that one thread does:</p>
+
+<pre><code>void* local_variable = object-&gt;field;
+</code></pre>
+
+<p>while another thread runs the garbage collector. The thread that loaded <code>object-&gt;field</code> is doing so with code compiled with a sophisticated compiler based on LLVM so we cannot practically know what instruction sequence this results in. Let&#39;s say that the instruction sequence happens to be:</p>
+
+<pre><code>movdqu (%rsi),%xmm0
+</code></pre>
+
+<p>This is surprising but entirely possible. The compiler is using a vector instruction! Perhaps there was a control-flow-equivalent load of a 64-bit field right next to <code>object-&gt;field</code>, so the compiler combined the two loads into a SIMD load. Now imagine that <em>right after this instruction executes</em>, the thread gets preempted, and the garbage collector runs start to finish.</p>
+
+<h2>What Could Possibly Go Wrong?</h2>
+
+<p>In the worst case, there&#39;s another thread in the race: a thread that stores a different pointer (perhaps <code>NULL</code>) to <code>object-&gt;field</code>. Now, the only place that points to the object is half of <code>%xmm0</code>! Therefore, we need the GC to somehow know to scan that half of <code>%xmm0</code>. Since Fil-C uses an accurate GC, the GC would have to know exactly which half.</p>
+
+<p>Unfortunately, we have no way to do this practically, since this would require a highly invasive rewrite of the LLVM compiler to track precisely where pointers end up, and to produce data about where pointers might be at every single instruction boundary. Even if such a rewrite was possible, it would likely pessimize LLVM&#39;s code generator and make every pass in LLVM harder to understand. We don&#39;t want that!</p>
+
+<p>But let&#39;s even say that we did exactly that undesirable change to LLVM. This would mean that the GC would have to have some way to suspend threads and then lift up those threads&#39; register state, and have a plan for what to do no matter what the state of the registers was (including if the program counter was off in some kind of native code). Sounds awful! Not only would such an approach be bad for the compiler, it would be bad for the whole rest of the system, too!</p>
+
+<h2>So What Do We Do?</h2>
+
+<p>We pick specific points (&#34;safe points&#34;) in each function where we force the compiler to tell us where the pointers are, and then we make sure that the GC can only preempt a thread of execution at those safepoints.</p>
+
+<p>If our compiler did happen to have the ability to report that a pointer is in some specific lane of a vector register, then the point right after <code>movdqu (%rsi),%xmm0</code> could be a safepoint and the GC could run start-to-finish while our thread is stopped at that point. Since our compiler doesn&#39;t have that ability, we have the GC wait for the thread to make progress to a safepoint inserted later in the code before finishing.</p>
+
+<p>Making safepoints efficient is a bottomless pit of innovation across many virtual machines. There are many ways to do it! Fil-C currently does it in a very simple way that focuses in maximum concurrency rather than peak throughput. Let&#39;s look at how it works.</p>
+
+
+
+<h2>How Fil-C Compiles Safepoints</h2>
+
+<p>The Fil-C compiler inserts <em>pollchecks</em> at each backward control flow edge. A pollcheck is just:</p>
+
+<pre><code>if (UNLIKELY((my_thread-&gt;state &amp; (FILC_THREAD_STATE_CHECK_REQUESTED |
+                                  FILC_THREAD_STATE_STOP_REQUESTED |
+                                  FILC_THREAD_STATE_DEFERRED_SIGNAL))))
+    filc_pollcheck_slow(my_thread, origin);
+</code></pre>
+
+<p>Where <code>my_thread</code> is a register-allocated pointer to the internal Fil-C representation of a thread. The compiler knows how to inline this (except for the call to the slow path, which is too big to inline). The instruction sequence on x86 is just a single <code>test</code> instruction involving a memory operand and a constant; usually something like:</p>
+
+<pre><code>testb  $0xe,0x8(%rbx)
+jne    &lt;somewhere&gt;
+</code></pre>
+
+<p>We want to bound the amount of code that can execute between pollcheck executions, so it&#39;s worth dwelling a bit on what a <em>backward control flow edge</em> is and why it&#39;s important. Notably, we&#39;re not specifically talking about <em>loop edges</em>. In a compiler, a <em>loop</em> is whenever it&#39;s possible to prove that a structured looping construct is in use; usually it means <em>any set of blocks that is backwards-reachable from a block whose terminator branches to a block that dominates it</em>. In other words, <em>loop</em> doesn&#39;t actually encompass all of the cases where control flow leads to reexecution of the same code. On the other hand <em>backwards control flow edge</em> does conservatively encompass all of those cases, using a different definition: <em>any control flow edge from a descendant in the control flow graph&#39;s DFS tree to its ancestor</em>. Fil-C focuses only on such edges, and does not do any pollcheck insertion for calls. This is acceptable since Fil-C doesn&#39;t currently have tail calls (if it did, then pollchecks would have to be inserted at those).</p>
+
+
+
+<h2>How Fil-C Tracks Pointers</h2>
+
+<p>Fil-C uses <em>Pizderson frames</em> to track pointers. A Pizderson frame is like a <a href="https://dl.acm.org/doi/10.1145/512429.512449">Henderson frame</a> except optimized for non-moving GC. Pointer register allocation is still possible since pointers are just mirrored into Pizderson frames, as opposed to being outright stored there like a Henderson frame. Here&#39;s the struct layout of a Pizderson frame:</p>
+
+<pre><code>struct filc_frame {
+    filc_frame* parent;
+    const filc_origin* origin;
+    void* lowers[];
+};
+</code></pre>
+
+<p>The compiler stack-allocates such a frame, with enough room in <code>lowers</code> to track the high watermark of how many GC pointers are live at any time at any pollcheck. The compiler ensures that any pointer that may be live across a pollcheck is stored somewhere into the <code>lowers</code> array before that pollcheck fires.</p>
+
+
+
+<h2>How The GC Synchronizes With Safepoints</h2>
+
+<p><a href="https://fil-c.org/fugc.html">FUGC</a> is an <em>on-the-fly</em> collector, meaning that there is no global stop-the-world where all threads are stopped for the GC. Instead of stop-the-world, Fil-C uses the <em>soft handshake</em> style of safepointing. In a soft handshake, the GC tells each thread what it would like it to do at the next safepoint and then sets the <code>FILC_THREAD_STATE_CHECK_REQUESTED</code> bit. Then the GC waits until all threads have executed the requested action at a safepoint.</p>
+
+<p>Each thread has a lock and condition variable in addition to the <code>state</code> field. The <code>state</code> field has the following rules for how it must be accessed:</p>
+
+<ul>
+<li><p>The owning thread may read <code>state</code> without locks.</p></li>
+<li><p>The owning thread may modify <code>state</code> using CAS.</p></li>
+<li><p>Any other thread may read or CAS <code>state</code> if it holds the thread&#39;s lock.</p></li>
+<li><p>Some changes to <code>state</code> require the lock to be held even if they are made by the owning thread, and some changes to <code>state</code> require a broadcast on the condition variable.</p></li>
+</ul>
+
+
+
+<h2>What About Native Code?</h2>
+
+<p>Pollchecks are only executed by Fil-C-compiled code. So, if a Fil-C thread makes a blocking system call (like <code>read(2)</code> or one of the <code>futex</code> wait calls), then the thread may not execute any pollchecks for an unbounded amount of time. We still want the GC to make progress then!</p>
+
+<p>The answer to this problem is two-fold:</p>
+
+<ul>
+<li><p>From the compiler&#39;s perspective, any function call that may conservatively have a pollcheck or native call in it is treated as a safepoint; i.e. the any pointers live across the call must be in <code>lowers</code>.</p></li>
+<li><p>Before a native blocking call, the Fil-C runtime performs a <code>filc_exit</code>, which tells the GC that the state of the thread is not <code>FILC_THREAD_STATE_ENTERED</code> anymore. After returning from a native call, the Fil-C runtime performs a <code>filc_enter</code>, which tells the GC that the thread is <code>FILC_THREAD_STATE_ENTERED</code> again. Both <code>filc_enter</code> and <code>filc_exit</code> use a compare-and-swap on the thread&#39;s state on the fast path. If the GC tries to request a soft handshake on a thread that isn&#39;t entered, then the GC will perform that action on behalf of the thread.</p></li>
+</ul>
+
+<p>It&#39;s possible that a thread might be exiting or entering while the GC is safepointing. To protect this race, the enter/exit CAS fast paths only succeed if none of the <code>FILC_THREAD_STATE_CHECK_REQUESTED</code>, <code>FILC_THREAD_STATE_STOP_REQUESTED</code>, or <code>FILC_THREAD_STATE_DEFERRED_SIGNAL</code> bits are set. If any of those bits are set, the enter/exit has to also grab the thread&#39;s lock. Additionally, if the GC wants to execute the work of a soft handshake on behalf of an exited thread, then it must do so while holding the thread&#39;s lock. This ensures that there is no way for a thread to return from <code>filc_enter</code> while the GC is concurrently scanning the thread&#39;s stack.</p>
+
+<h2>Other GC-Mutator Races</h2>
+
+<p>We have deeply explored the &#34;mutator-loads-pointer/GC-runs-to-completion&#34; race. That&#39;s a useful race to consider when designing safepoints because it forces us to answer both how threads synchronize with GC and what data threads provide to the GC when that happens. But safepointing in Fil-C (and other systems) also deals with a bunch of other races. Let&#39;s review those!</p>
+
+<h3>Store Barrier</h3>
+
+<p>The <a href="https://fil-c.org/fugc.html">FUGC</a> store barrier for <code>object-&gt;field = new_value</code> looks something like:</p>
+
+<pre><code>if (GC is marking
+    &amp;&amp; new_value is not NULL
+    &amp;&amp; new_value is not marked)
+    mark(new_value)
+</code></pre>
+
+<p>Note that the <code>GC is marking</code> check is important; we cannot have objects marked by the barrier before the GC is ready for it, and we <em>must</em> have objects get marked by the barrier after the GC is both ready for it and starts to require it. Additionally, we cannot have a race like:</p>
+
+<ol>
+<li><p>Thread executes the store barrier.</p></li>
+<li><p>GC completes a full cycle.</p></li>
+<li><p>Thread does the <code>object-&gt;field = new_value</code> store that the barrier guarded.</p></li>
+</ol>
+
+<p>Safepoints protect us from all of these problems because we ensure that the compiler will <em>never insert a pollcheck between the barrier and the store it protects</em>.</p>
+
+<h3>Weak Load Barrier</h3>
+
+<p>Fil-C supports a weak pointer API. Weak pointers only work if we have a load barrier, which leads to the same problem: everything breaks if the load barrier executes in a different GC cycle from the load it protects. Again, we protect this by ensuring that there is no pollcheck between the load and its barrier.</p>
+
+<h3>Thread Local Caches</h3>
+
+<p>Fil-C optimizes allocation by giving threads local caches of memory they can allocate out of without synchronizing with the rest of the heap. But whenever the GC wishes to do something that affects allocation, we need those caches to get cleared. FUGC achieves this using soft handshakes that request that threads reset their local caches (give all of the memory back to the global heap).</p>
+
+<h2>What Else?</h2>
+
+<p>Fil-C hooks into its safepointing mechanism for signal handling. When the OS delivers a signal, and the thread is entered, the Fil-C runtime&#39;s signal handler just raises the <code>FILC_THREAD_STATE_DEFERRED_SIGNAL</code> bit, and the next pollcheck will run the signal handler. This ensures signal handlers run at well-defined points that the runtime understands, which allows signal handlers to safely allocate GC memory (needed for stack allocations in Fil-C; and as a byproduct it means that Fil-C&#39;s malloc is signal-safe). If the thread is exited, then the signal is delivered immediately.</p>
+
+<p>Fil-C&#39;s pollchecks also support stop-the-world (via the <code>FILC_THREAD_STATE_STOP_REQUESTED</code> bit). This is used for:</p>
+
+<ul>
+<li><p>Implementing <code>fork(2)</code>, which needs all threads to stop at a known-good point before the fork child jettisons them.</p></li>
+<li><p>Debugging the <a href="https://fil-c.org/fugc.html">FUGC</a>. If you set the <code>FUGC_STW=1</code> environment variable, then the GC runs in a stop-the-world mode. This is useful for figuring out if a crash bug is due specifically to the concurrency support.</p></li>
+</ul>
+
+<h2>Further Reading</h2>
+
+<p>Check out <a href="https://github.com/pizlonator/fil-c/blob/deluge/libpas/src/libpas/filc_runtime.h"><code>filc_runtime.h</code></a> and <a href="https://github.com/pizlonator/fil-c/blob/deluge/libpas/src/libpas/filc_runtime.c"><code>filc_runtime.c</code></a>, looking especially for the definition of <code>struct filc_thread</code>, and these functions: <code>filc_enter</code>, <code>filc_exit</code>, <code>filc_pollcheck</code>, and <code>filc_soft_handshake</code>. Also look at how <a href="https://github.com/pizlonator/fil-c/blob/deluge/libpas/src/libpas/fugc.c"><code>fugc.c</code></a> uses the <code>filc_soft_handshake</code> API. Finally, it&#39;s worth looking at the <code>FILC_SYSCALL</code> macro in <a href="https://github.com/pizlonator/fil-c/blob/deluge/libpas/src/libpas/filc_runtime.h"><code>filc_runtime.h</code></a> and uses of that macro in <a href="https://github.com/pizlonator/fil-c/blob/deluge/libpas/src/libpas/filc_runtime.c"><code>filc_runtime.c</code></a>.</p>
+
+<p>This is a super old technique! There are lots of variations on it in different VMs. The most sophisticated and mature implementations tend to be in JVMs (in my experience). <a href="https://foojay.io/today/the-inner-workings-of-safepoints/">The Inner Workings of Safepoints</a> is a great write-up of how JVMs do it.</p>
+        </main>
+    </div></div>
+  </body>
+</html>
