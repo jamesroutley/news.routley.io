@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://max-inden.de/post/fast-udp-io-in-firefox/">Original</a>
+    <h1>Fast UDP I/O for Firefox in Rust</h1>
+    
+    <div id="readability-page-1" class="page"><div><h2 id="motivation">Motivation</h2>
+<p>Around 20% of Firefox’s HTTP traffic today uses HTTP/3, which runs over QUIC, which in turn runs over UDP.
+This translates to substantial UDP I/O activity.</p>
+<p>Firefox uses <a href="https://www-archive.mozilla.org/projects/nspr/">NSPR</a> for most of its network I/O.
+When it comes to UDP I/O, NSPR only offers a limited set of dated APIs, most relevant here <a href="https://firefox-source-docs.mozilla.org/nspr/reference/pr_sendto.html"><code>PR_SendTo</code></a> and <a href="https://firefox-source-docs.mozilla.org/nspr/reference/pr_recvfrom.html"><code>PR_RecvFrom</code></a>, wrappers around POSIX’s <code>sendto</code> and <code>recvfrom</code>.
+The N in NSPR stands for Netscape, giving you a hint of its age.</p>
+<p>Operating systems have evolved since.
+Many offer multi-message APIs like <code>sendmmsg</code> and <code>recvmmsg</code>.
+Some offer segmentation offloading like GSO (Generic Segmentation Offload) and GRO (Generic Receive Offload).
+Each of these promise significant performance improvements for UDP I/O.</p>
+<p>Can Firefox benefit from replacing its aging UDP I/O stack with modern system calls?</p>
+<h2 id="overview">Overview</h2>
+<p>This project began in mid-2024 with the goal of rewriting Firefox’s QUIC UDP I/O stack using modern system calls across all supported operating systems.
+Beyond performance improvements, we wanted to increase security by using a memory-safe language to do UDP I/O.
+Firefox’s QUIC state machine itself is implemented in Rust already.
+We thereby chose Rust for this project as well, giving us both increased security and easy integration with the existing QUIC codebase.</p>
+<p>Instead of starting from scratch, we built on top of <a href="https://github.com/quinn-rs/quinn/tree/main/quinn-udp"><code>quinn-udp</code></a>, the UDP I/O library of the Quinn project, a QUIC implementation in Rust.
+This sped up our development efforts significantly.
+Big thank you to the Quinn project.
+Operating system calls are complex, with a myriad of idiosyncrasies, especially across versions.
+Firefox is multi-platform, focusing on Windows, Android, MacOS and Linux as <a href="https://firefox-source-docs.mozilla.org/build/buildsystem/supported-configurations.html#supported-build-targets">tier 1</a>.
+The main complexity though stems from Firefox supporting ancient versions of each of them, e.g.
+Android 5.</p>
+<p>One year later, i.e., mid 2025, this project is now rolling out to the majority of Firefox users.
+Performance benchmark results are promising.
+In extreme cases, on purely CPU bound benchmarks, we’re seeing a jump from &lt; 1Gbit/s <a href="https://github.com/mozilla/neqo/actions/workflows/bench.yml">to 4 Gbit/s</a>.
+Looking at CPU flamegraphs, the majority of CPU time is now spent in I/O system calls and cryptography code.</p>
+<p>Below are the many improvements we were able to land, plus the ones we weren’t.
+I hope other projects in need of fast UDP I/O can benefit from our work.
+To make their lifes easier, below I am documenting the many learnings we made.</p>
+<h2 id="the-basics">The basics</h2>
+<p>To understand the improvements, it’s helpful to first examine how UDP I/O traditionally works and how modern optimizations change this picture.</p>
+<h3 id="single-datagram">Single datagram</h3>
+<p>Previously Firefox would send (and receive) single UDP datagrams to (and from) the OS via <code>sendto</code> (and <code>recvfrom</code>) system call family.
+The OS would send (and receive) that UDP datagram to (and from) the network interface card (NIC).
+The NIC would send (and receive) it to (and from) <em>the Internet</em>.</p>
+<p>Thus each datagram would require leaving user space which is cheap for one UDP datagram, but <a href="https://max-inden.de/post/2020-06-19-latencies/">expensive when sending at say a 500 Mbit/s rate</a>.
+In addition all user space and kernel space overhead independent of the number of bytes sent and received, is paid per datagram, i.e. per &lt; 1500 bytes.</p>
+<pre tabindex="0"><code>    +----------------------+
+    |       Firefox        |
+    |    +-----------+     |
+    |    |   QUIC    |     |
+    |    +-----------+     |
+    +----------------------+
+              |
+         [ datagram ]
+              |
+    === User / Kernel ===
+              |
+         [ datagram ]
+              |
+    +----------------------+
+    |         OS           |
+    +----------------------+
+              |
+         [ datagram ]
+              |
+    +----------------------+
+    |         NIC          |
+    +----------------------+
+              |
+         [ datagram ]
+              |
+    +----------------------+
+    |      Internet        |
+    +----------------------+
+</code></pre><h3 id="batch-of-datagrams">Batch of datagrams</h3>
+<p>Instead of sending a single datagram at a time, some operating systems nowadays offer multi-message system call families, e.g. on Linux <code>sendmmsg</code> and <code>recvmmsg</code>.
+The idea is simple.
+Send and receive multiple UDP datagrams at once, save on the costs that are independent of the number of bytes sent and received.</p>
+<pre tabindex="0"><code>    +--------------------------+
+    |         Firefox          |
+    |      +-----------+       |
+    |      |   QUIC    |       |
+    |      +-----------+       |
+    +--------------------------+
+                  |
+  [ datagram, datagram, datagram ]
+                  |
+    ===== User / Kernel =====
+                  |
+  [ datagram, datagram, datagram ]
+                  |
+    +--------------------------+
+    |           OS             |
+    +--------------------------+
+                  |
+  [ datagram, datagram, datagram ]
+                  |
+    +--------------------------+
+    |           NIC            |
+    +--------------------------+
+                  |
+  [ datagram, datagram, datagram ]
+                  |
+    +--------------------------+
+    |        Internet          |
+    +--------------------------+
+</code></pre><h3 id="single-large-segmented-datagram">Single large segmented datagram</h3>
+<p>Some modern operating systems and network interface cards also support system call families with UDP segmentation offloading, e.g. <code>GSO</code> and <code>GRO</code> on Linux.
+Instead of sending multiple UDP datagrams in a batch, it enables the application to send a single large UDP datagram, i.e. larger than the Maximum Transmission Unit, to the kernel.
+Next, either the kernel, but really ideally the network interface card, will segment it into multiple smaller packets, add a header to each and calculates the UDP checksum.
+The reverse happens on the receive path, where multiple incoming packets can be coalesced into a single large UDP datagram delivered to the application all at once.</p>
+<pre tabindex="0"><code>    +------------------------------+
+    |           Firefox            |
+    |        +-----------+         |
+    |        |   QUIC    |         |
+    |        +-----------+         |
+    +------------------------------+
+                    |
+      [ large segmented datagram ]
+                    |
+      ====== User / Kernel ======
+                    |
+      [ large segmented datagram ]
+                    |
+    +------------------------------+
+    |             OS               |
+    +------------------------------+
+                    |
+      [ large segmented datagram ]
+                    |
+    +------------------------------+
+    |             NIC              |
+    +------------------------------+
+                    |
+    [ datagram, datagram, datagram ]
+                    |
+    +------------------------------+
+    |          Internet            |
+    +------------------------------+
+</code></pre><p><em>Note: Unfortunately, <a href="https://gitlab.com/wireshark/wireshark/-/issues/19109">Wireshark does not yet support GSO</a>, making network-level debugging more challenging when these optimizations are active.</em></p>
+<p>For performance analysis of these different approaches, <a href="https://blog.cloudflare.com/accelerating-udp-packet-transmission-for-quic/">Cloudflare’s comprehensive study</a> provides excellent benchmarks and detailed explanations.</p>
+<h2 id="replacing-nspr-in-firefox">Replacing NSPR in Firefox</h2>
+<p>Batching and segmentation offloading aside for now, first step in the project was to replace usage of NSPR with quinn-udp, still sending and receiving one UDP datagram at a time.
+We updated the <a href="https://github.com/mozilla/neqo/pull/1604">Mozilla QUIC client and server test implementation</a>, then <a href="https://phabricator.services.mozilla.com/D216308">integrated quinn-udp into Firefox itself</a>.</p>
+<p>Next we rewrote the UDP datagram processing pipeline in the Mozilla QUIC implementation to <a href="https://github.com/mozilla/neqo/pull/2184">send</a> and <a href="https://github.com/mozilla/neqo/pull/2184">receive</a> batches of datagrams.
+This is done in a way, such that we can leverage both the multi-message style system calls, as well as the segmentation offloading style, if available.
+We added this along with various other I/O improvements, e.g. Lars added <a href="https://github.com/mozilla/neqo/pull/2385">in-place en-/decryption</a>.
+Going into detail here is better done in a separate blog post.
+Let’s focus on UDP I/O here.</p>
+<p>So far so good.
+This was the easy part.
+Up next, the edge cases by platform.</p>
+<h2 id="platform-details">Platform details</h2>
+<h3 id="windows">Windows</h3>
+<p>Windows offers <a href="https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsasendmsg?redirectedfrom=MSDN"><code>WSASendMsg</code></a> and <a href="https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/ms741687(v=vs.85)"><code>WSARecvMsg</code></a> to send and receive a single UDP datagram.
+That UDP datagram can either be a classic MTU size datagram, or a large segmented datagram.
+For the latter, what Linux calls <code>GSO</code> and <code>GRO</code>, Windows call <a href="https://learn.microsoft.com/en-us/windows-hardware/drivers/network/udp-segmentation-offload-uso-"><code>USO</code></a> and <a href="https://learn.microsoft.com/en-us/windows-hardware/drivers/network/udp-rsc-offload"><code>URO</code></a>.
+As described above, we started off rolling out quinn-udp using single-datagram system calls only.
+This went without issues on Windows.</p>
+<p>Next we tested <code>WSARecvMsg</code> with <code>URO</code>, i.e. receiving a batch of inbound datagrams as a single large segmented datagram, but got <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=1916558">the following bug report</a>:</p>
+<blockquote>
+<p>fosstodon.org doesn’t load with network.http.http3.use_nspr_for_io=false on ARM64 Windows</p></blockquote>
+<p>fosstodon is a Mastodon server.
+It is hosted behind the CDN provider Fastly.
+Fastly is a heavy user of Linux’s GSO, i.e. sends larger UDP datagram trains, perfect to be coalesced into a single large segmented UDP datagram when Firefox receives it.
+Why would Window’s <code>URO</code> prevent Firefox from loading the site?</p>
+<p>After many hours of back and forth with the reporter, luckily a Mozilla employee as well, I ended up buying the exact same laptop, <strong>same color</strong>, in a desperate attempt to reproduce the issue.
+Without much luck at first, I eventually needed a Linux command line tool, thus installed WSL, and to my surprise, that triggered the bug (<a href="https://github.com/quinn-rs/quinn/issues/2041#issuecomment-2495419003">reproducer</a>).
+Turns out, on Windows on ARM, with WSL enabled, a <code>WSARecvMsg</code> call with <code>URO</code> would not return a segment size, thus Firefox was unable to differentiate a single datagram, from a single segmented datagram.
+QUIC short header packets don’t carry a length, thus there is no way to tell where one QUIC packet ends and another starts, leading to the above page load failures.</p>
+<p>We have been in touch with Microsoft since.
+No progress thus far.
+Thereby we are keeping <a href="https://github.com/quinn-rs/quinn/pull/2092"><code>URO</code> on Windows disabled</a> in Firefox for now.</p>
+<p>After <code>URO</code> we started using <code>WSASendMsg</code> <code>USO</code>, i.e. sending a single large segmented datagram per system call.
+But this too we rolled back quickly, seeing <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=1979279">increased packet loss on Firefox Windows installations</a>.
+In addition, we have at least one report of a user, seeing their network driver crash <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=1978821">due to Firefox’s usage of <code>USO</code></a>.
+More debugging needed.</p>
+<h3 id="macos">MacOS</h3>
+<p>The transition on MacOS from NSPR to quinn-udp for HTTP/3 QUIC UDP I/O involved switching from the system calls <code>sendto</code> and <code>recvfrom</code> to the system calls <code>sendmsg</code> and <code>recvmsg</code>.
+As with Windows, no issues on this first step, ignoring one <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=1987606">report</a> where MacOS 10.15 might be seeing <a href="https://github.com/quinn-rs/quinn/pull/2387">IP packets other than v4 and v6</a> (fixed since).</p>
+<p>Unfortunately MacOS does not offer UDP segmentation offloading, neither on the send, nor on the receive side.
+What it does offer though are two undocumented system calls, namely <a href="https://github.com/apple-oss-distributions/xnu/blob/94d3b452840153a99b38a3a9659680b2a006908e/bsd/sys/socket.h#L1457-L1487"><code>sendmsg_x</code></a> and <a href="https://github.com/apple-oss-distributions/xnu/blob/94d3b452840153a99b38a3a9659680b2a006908e/bsd/sys/socket.h#L1425-L1455"><code>recvmsg_x</code></a>, allowing a user to send and receive batches of UDP datagrams at once.
+Lars from Mozilla added it to quinn-udp, exposed behind the <code>fast-apple-datapath</code> feature flag, off by default.
+After multiple iterations with smaller bugfixes (<a href="https://github.com/quinn-rs/quinn/pull/2154">#2154</a>, <a href="https://github.com/quinn-rs/quinn/issues/2214">#2214</a>, <a href="https://github.com/quinn-rs/quinn/pull/2216">#2216</a> …) we decided to <a href="https://github.com/mozilla/neqo/pull/2638">not ship it to users</a>, not knowing how MacOS would behave, in case Apple ever decides to remove it, but with Firefox still calling it.</p>
+<h3 id="linux">Linux</h3>
+<p>Linux provides the most comprehensive and mature UDP optimization support, offering both multi-message APIs (<code>sendmmsg</code>/<code>recvmmsg</code>) and segmentation offloading (GSO/GRO).
+The quinn-udp library makes a deliberate choice to <a href="https://github.com/quinn-rs/quinn/pull/1729#issuecomment-1866939467">prioritize GSO over <code>sendmmsg</code></a> for transmission, as GSO typically provides superior performance with diminishing returns when both techniques are combined.
+Thus far, this has proven the right choice for Firefox as well.</p>
+<p>In addition to segmentation offloading being superior in the first place, Firefox uses one UDP socket per connection in order to improve privacy.
+As each socket gets its own source port it is harder to correlate connections.
+Why is this relevant here?
+<code>GSO</code> (and <code>GRO</code>) can only segment (and coalesce) datagrams from the same 4-tuple (src IP, src port, dst IP, dst port), <code>sendmmsg</code> and <code>recvmmsg</code> on the other hand can send and receive across 4-tuples.
+Given that Firefox uses one socket per connection, it cannot make use of that distinct benefit of <code>sendmmsg</code> (and <code>recvmmsg</code>), making segmentation offloading yet again the obvious choice for Firefox.</p>
+<p>Ignoring minor changes required to <a href="https://hg-edge.mozilla.org/integration/autoland/rev/5f3a2655d2f4">Firefox’s optional network sandboxing</a>, and an additional at runtime <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=1989895">GSO support check</a>, replacing Firefox’s QUIC UDP I/O stack on Linux has been without issues, now enjoying all the benefits of segmentation offloading.</p>
+<h3 id="android">Android</h3>
+<p>During the time of this project I learned quickly that (a) Android is not Linux and (b) that <a href="https://support.mozilla.org/en-US/kb/will-firefox-work-my-mobile-device">Firefox still supports Android 5</a>, …, on x86 (32 bit).</p>
+<p>On x86, <a href="https://github.com/quinn-rs/quinn/pull/1964">Android dispatches advanced socket calls through <code>socketcall</code> system call</a> instead of calling e.g. <code>sendmsg</code> directly.
+In addition Android has various default seccomp filters, crashing an app when e.g. not going through the required <code>socketcall</code> system call.
+<a href="https://github.com/quinn-rs/quinn/pull/1966">The combination of the two</a> did cost me a couple of days, resulting in <a href="https://github.com/quinn-rs/quinn/pull/1966">this (basically single line) change in quinn-udp</a>.</p>
+<p>On Android API level 25 and below, calling <code>sendmsg</code> with an ECN bit set <a href="https://github.com/quinn-rs/quinn/pull/1975">results in an error <code>EINVAL</code></a>.
+<a href="https://github.com/quinn-rs/quinn/pull/2079">quinn-udp will now simply retry on <code>EINVAL</code></a> disabling various optional settings (e.g. ECN) on the second attempt.</p>
+<p>Great benefit of the Quinn community is that Firefox will benefit from any improvements made to quinn-udp.
+For example <a href="https://github.com/quinn-rs/quinn/pull/2050">this excellent find by Thomas</a> where Android in some cases would complain if we did a <code>GSO</code> with a single segment only.</p>
+<h2 id="explicit-congestion-notifications-ecn">Explicit congestion notifications (ECN)</h2>
+<p>With Firefox using modern system calls across all major operating systems, a nice additional benefit is the ability to send and receive ancillary data like <a href="https://en.wikipedia.org/wiki/Explicit_Congestion_Notification">IP ECN</a>.
+This too <a href="https://github.com/quinn-rs/quinn/pull/1765">came with some minor surprises</a>, but QUIC ECN in Firefox is well on its way now.
+Firefox Nightly telemetry shows around <a href="https://glam.telemetry.mozilla.org/fog/probe/networking_http_3_ecn_path_capability/explore?">50% of all QUIC connections running on ECN outbound capable paths</a>.
+With <a href="https://datatracker.ietf.org/doc/rfc9330/">L4S</a> and thus ECN becoming more and more relevant in today’s Internet, this is a great step forward.</p>
+<h2 id="summary">Summary</h2>
+<p>We successfully replaced Firefox’s QUIC UDP I/O stack with a modern memory-safe implementation using quinn-udp.
+Instead of limited and dated system calls like <code>sendto</code> and <code>recvfrom</code>, Firefox now uses modern OS specific system calls across all major platforms, resulting in HTTP/3 QUIC throughput improvements when CPU bound, and enabling QUIC ECN support across all major platforms.
+Some OS specific optimizations still need more work, e.g. <code>USO</code> and <code>URO</code> on Windows.
+That said, especially given QUIC’s growing adoption and thus increased UDP usage, I am optimistic that OS and driver support will continue to improve.</p>
+
+
+  </div></div>
+  </body>
+</html>
