@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://davidlattimore.github.io/posts/2025/09/02/rustforge-wild-performance-tricks.html">Original</a>
+    <h1>Wild performance tricks</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    <article>
+      <p>
+  
+  David Lattimore - <time datetime="2025-09-02">2025-09-02</time>
+  
+  
+</p>
+      <p>Last week I had the pleasure of attending RustForge in Wellington, New Zealand. I gave a talk titled
+“Wild performance tricks”. You can watch a <a href="https://www.youtube.com/live/6Scgq9fBZQM?t=9246s">recording of my
+talk</a>. If you’d prefer to read rather than watch,
+the rest of this post will cover more or less the same material. The talk shows some linker
+benchmarks, which I’ll skip here and focus instead on the optimisations, which I think are the more
+interesting part of the talk.</p>
+
+<p>The tricks here are a few of my favourites that I’ve used in the <a href="https://github.com/davidlattimore/wild">Wild
+linker</a>.</p>
+
+<h2 id="mutable-slicing-for-sharing-between-threads">Mutable slicing for sharing between threads</h2>
+
+<p>In the linker, we have a type <code>SymbolId</code> defined as:</p>
+
+
+
+<p>We need a way to store resolutions, where one <code>SymbolId</code> resolves (maps) to another <code>SymbolId</code>. If
+we need to look up which symbol <code>SymbolId(5)</code> maps to, we then look at index <code>5</code> in the <code>Vec</code>.
+Because every symbol maps to some other symbol (possibly itself), this means that we make use of the
+entire <code>Vec</code>. i.e. it’s dense, not sparse. For a sparse mapping, a <code>HashMap</code> might be preferable.</p>
+
+<p>The Wild linker is very multi-threaded, so we want to be able to process symbols for our input
+objects in parallel. To achieve this, we make sure that all symbols for a given object get allocated
+adjacent to each other. i.e. each object has <code>SymbolId</code>s in a contiguous range. This is good for
+cache locality because when a thread is working with an object, all its symbols will be nearby in
+memory, so more likely to be in cache. It also lets us do things like this:</p>
+
+<div><div><pre><code><span>fn</span> <span>parallel_process_resolutions</span><span>(</span><span>mut</span> <span>resolutions</span><span>:</span> <span>&amp;</span><span>mut</span> <span>[</span><span>SymbolId</span><span>],</span> <span>objects</span><span>:</span> <span>&amp;</span><span>[</span><span>Object</span><span>])</span> <span>{</span>
+   <span>objects</span>
+       <span>.iter</span><span>()</span>
+       <span>.map</span><span>(|</span><span>obj</span><span>|</span> <span>(</span><span>obj</span><span>,</span> <span>resolutions</span><span>.split_off_mut</span><span>(</span><span>..</span><span>obj</span><span>.num_symbols</span><span>)</span><span>.unwrap</span><span>()))</span>
+       <span>.par_bridge</span><span>()</span>
+       <span>.for_each</span><span>(|(</span><span>obj</span><span>,</span> <span>object_resolutions</span><span>)|</span> <span>{</span>
+           <span>obj</span><span>.process_resolutions</span><span>(</span><span>object_resolutions</span><span>);</span>
+       <span>});</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Here, we’re using the Rayon crate to process the resolutions for all our objects in parallel from
+multiple threads. We start by iterating over our objects, then for each object, we use
+<code>split_off_mut</code> to split off a mutable slice of <code>resolutions</code> that contains the resolutions for that
+object. <code>par_bridge</code> converts this regular Rust iterator into a Rayon parallel iterator. The closure
+passed to <code>for_each</code> then runs in parallel on multiple threads, with each thread getting access to
+the object and a mutable slice of that object’s resolutions.</p>
+
+<h2 id="parallel-initialisation-of-the-vec">Parallel initialisation of the Vec</h2>
+
+<p>The previous technique of using <code>split_off_mut</code> to get multiple non-overlapping mutable slices of
+our Vec relies on the Vec having already been initialised. We’d like to initialise our Vec in
+parallel, otherwise we’d have to wait for the main thread to fill the entire Vec with a placeholder
+value only to then have our threads overwrite those placeholder values. To do this, we can use the
+<code>sharded-vec-writer</code> crate, which was created for use in Wild, but which can be used for similar
+purposes elsewhere.</p>
+
+<p>First, we create a Vec with sufficient capacity to store the resolutions for all our symbols:</p>
+
+<div><div><pre><code><span>let</span> <span>mut</span> <span>resolutions</span><span>:</span> <span>Vec</span><span>&lt;</span><span>SymbolId</span><span>&gt;</span> <span>=</span> <span>Vec</span><span>::</span><span>with_capacity</span><span>(</span><span>total_num_symbols</span><span>);</span>
+</code></pre></div></div>
+
+<p>At this point, we’ve allocated space on the heap for the Vec, but that space is still uninitialised.
+i.e. the length is still zero.</p>
+
+<p>Next, we create a <code>VecWriter</code>, which mutably borrows the Vec, then split that writer into shards,
+with each shard having a size equal to the number of symbols in the corresponding object.</p>
+
+<div><div><pre><code><span>let</span> <span>mut</span> <span>writer</span> <span>=</span> <span>VecWriter</span><span>::</span><span>new</span><span>(</span><span>&amp;</span><span>mut</span> <span>resolutions</span><span>);</span>
+<span>let</span> <span>mut</span> <span>shards</span> <span>=</span> <span>writer</span><span>.take_shards</span><span>(</span><span>objects</span><span>.iter</span><span>()</span><span>.map</span><span>(|</span><span>o</span><span>|</span> <span>o</span><span>.num_symbols</span><span>));</span>
+</code></pre></div></div>
+
+<p>We can now, in parallel, iterate through our objects and their corresponding shards and initialise
+the shards.</p>
+
+<div><div><pre><code><span>objects</span>
+   <span>.par_iter</span><span>()</span>
+   <span>.zip_eq</span><span>(</span><span>&amp;</span><span>mut</span> <span>shards</span><span>)</span>
+   <span>.for_each</span><span>(|(</span><span>obj</span><span>,</span> <span>shard</span><span>)|</span> <span>{</span>
+      <span>for</span> <span>symbol</span> <span>in</span> <span>obj</span><span>.symbols</span><span>()</span> <span>{</span>
+         <span>shard</span><span>.push</span><span>(</span><span>...</span><span>);</span>
+      <span>}</span>
+   <span>});</span>
+</code></pre></div></div>
+
+<p>Lastly, we return the shards to the writer, which verifies that all the shards were fully
+initialised, thus resizing the Vec, after which it can be used normally.</p>
+
+<div><div><pre><code><span>writer</span><span>.return_shards</span><span>(</span><span>shards</span><span>);</span>
+</code></pre></div></div>
+
+<h2 id="atomic---non-atomic-in-place-conversion">Atomic - non-atomic in-place conversion</h2>
+
+<p>Most parts of the linker can make do with either exclusive access to part of the <code>resolutions</code> Vec,
+or shared access to the entire Vec. However, there’s one part of the linker where we need to perform
+random writes to the <code>resolutions</code> Vec. This is done when we have multiple symbol definitions with
+the same name. Originally, I just did this work from the main thread, since I figured most of the
+time there would only be a small number of symbols that had the same name. This was mostly true,
+however for large C++ binaries like Chromium, it turns out that there are actually a lot of symbols
+with the same names, presumably due to C++’s use of header files, which create lots of identical
+definitions.</p>
+
+<p>To allow random writes to <code>resolutions</code>, we introduce a new type:</p>
+
+<div><div><pre><code><span>struct</span> <span>AtomicSymbolId</span><span>(</span><span>AtomicU32</span><span>);</span>
+</code></pre></div></div>
+
+<p>Being an atomic, we can write to an <code>AtomicSymbolId</code> using only a shared (non-exclusive) reference.
+However, we need a way to temporarily view our <code>Vec&lt;SymbolId&gt;</code> as a <code>&amp;[AtomicSymbolId]</code>.</p>
+
+<p>The standard library has something that might help - <code>AtomicU32::from_mut_slice</code>:</p>
+
+<div><div><pre><code><span>fn</span> <span>from_mut_slice</span><span>(</span><span>v</span><span>:</span> <span>&amp;</span><span>mut</span> <span>[</span><span>u32</span><span>])</span> <span>-&gt;</span> <span>&amp;</span><span>mut</span> <span>[</span><span>AtomicU32</span><span>]</span>
+</code></pre></div></div>
+
+<p>However, it’s unstable (nightly only). Even if it were stable, it only works with slices of
+primitive types, so we’d have to lose our newtypes (SymbolId etc).</p>
+
+<p>Another option would be to always use atomics, however that would quite possibly hurt performance of
+the rest of the linker, which doesn’t need atomics. It’d also hurt ergonomics, since currently our
+<code>SymbolId</code>s implement <code>Copy</code>, but if they wrapped an <code>AtomicU32</code>, then they wouldn’t be able to.</p>
+
+<p>A reasonable option at this point would be to resort to unsafe and use something like
+<code>core::mem::transmute</code>. We’d need to check all the rules and make sure that we were meeting all the
+requirements. This is not a bad option, but I personally like the challenge of doing things without
+unsafe if I can, especially if I can do so without loss of performance.</p>
+
+<p>Indeed, it turns out that we can, as follows:</p>
+
+<div><div><pre><code><span>fn</span> <span>into_atomic</span><span>(</span><span>symbols</span><span>:</span> <span>Vec</span><span>&lt;</span><span>SymbolId</span><span>&gt;</span><span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>AtomicSymbolId</span><span>&gt;</span> <span>{</span>
+   <span>symbols</span>
+       <span>.into_iter</span><span>()</span>
+       <span>.map</span><span>(|</span><span>s</span><span>|</span> <span>AtomicSymbolId</span><span>(</span><span>AtomicU32</span><span>::</span><span>new</span><span>(</span><span>s</span><span>.0</span><span>)))</span>
+       <span>.collect</span><span>()</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>It’d be reasonable to think that this will have a runtime cost, however it doesn’t. The reason is
+that the Rust standard library has a nice optimisation in it that when we consume a Vec and collect
+the result into a new Vec, in many circumstances, the heap allocation of the original Vec can be
+reused. This applies in this case. But what even with the heap allocation being reused, we’re still
+looping over all the elements to transform them right? Because the in-memory representation of an
+<code>AtomicSymbolId</code> is identical to that of a <code>SymbolId</code>, our loop becomes a no-op and is optimised
+away.</p>
+
+<p>We can verify this by looking at the assembly produced for this function:</p>
+
+<div><div><pre><code><span>movups</span>  <span>xmm0</span><span>,</span> <span>xmmword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rsi</span><span>]</span>
+<span>mov</span>     <span>rax</span><span>,</span> <span>qword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rsi</span><span>,</span> <span>+</span><span>,</span> <span>16</span><span>]</span>
+<span>movups</span>  <span>xmmword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rdi</span><span>],</span> <span>xmm0</span>
+<span>mov</span>     <span>qword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rdi</span><span>,</span> <span>+</span><span>,</span> <span>16</span><span>],</span> <span>rax</span>
+<span>ret</span>
+</code></pre></div></div>
+
+<p>The main takeaway from this assembly is that there’s no branching, no looping, just a few moves and
+a return. If we allowed this function to be inlined into the caller, it would likely vanish to
+nothing.</p>
+
+<p>For conversion back to the non-atomic form, we can do much the same:</p>
+
+<div><div><pre><code><span>fn</span> <span>into_non_atomic</span><span>(</span><span>atomic_symbols</span><span>:</span> <span>Vec</span><span>&lt;</span><span>AtomicSymbolId</span><span>&gt;</span><span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>SymbolId</span><span>&gt;</span> <span>{</span>
+   <span>atomic_symbols</span>
+       <span>.into_iter</span><span>()</span>
+       <span>.map</span><span>(|</span><span>s</span><span>|</span> <span>SymbolId</span><span>(</span><span>s</span><span>.0</span><span>.into_inner</span><span>()))</span>
+       <span>.collect</span><span>()</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>The main thing to note here is that we avoid doing an atomic load from the atomic and instead
+consume the atomic with <code>into_inner</code>. This is easier for the compiler to optimise and if we look at
+the assembly produced it’s identical to what we got for <code>into_atomic</code>.</p>
+
+<p>To actually use these functions, we first need to get ownership of our Vec using <code>core::mem::take</code>.
+This puts an empty Vec in its place. Empty Vecs don’t heap allocate, so this is very cheap. We then
+call <code>into_atomic</code> to convert the Vec into the form we need.</p>
+
+<div><div><pre><code><span>let</span> <span>atomic_resolutions</span> <span>=</span> <span>into_atomic</span><span>(</span><span>core</span><span>::</span><span>mem</span><span>::</span><span>take</span><span>(</span><span>&amp;</span><span>mut</span> <span>self</span><span>.resolutions</span><span>));</span>
+</code></pre></div></div>
+
+<p>We can then do whatever parallel processing we need with the Vec in its atomic form.</p>
+
+<div><div><pre><code><span>process_resolutions_in_parallel</span><span>(</span><span>&amp;</span><span>atomic_resolutions</span><span>);</span>
+</code></pre></div></div>
+
+<p>Finally, we convert back to the original non-atomic form and store back where we got it from,
+overwriting the empty Vec that we temporarily put in its place.</p>
+
+<div><div><pre><code><span>self</span><span>.resolutions</span> <span>=</span> <span>into_non_atomic</span><span>(</span><span>atomic_resolutions</span><span>);</span>
+</code></pre></div></div>
+
+<p>One thing worth noting here is that if we panic (or do an early return), we might leave
+<code>self.resolutions</code> as the empty Vec. This isn’t a problem in the linker, since if we’re returning an
+error or have hit a panic, then we don’t care at that point about resolutions. It would be possible
+to ensure that the proper Vec was restored for use-cases where that was important, however it would
+add extra complexity and might be enough to convince me that it’d be better to just use transmute.</p>
+
+<h2 id="buffer-reuse">Buffer reuse</h2>
+
+<p>Doing too much heap allocation tends to hurt performance. A common trick is to move heap allocations
+outside of loops. For example, rather than this:</p>
+
+<div><div><pre><code><span>loop</span> <span>{</span>
+    <span>let</span> <span>mut</span> <span>buffer</span> <span>=</span> <span>Vec</span><span>::</span><span>new</span><span>();</span>
+    <span>// Do work with `buffer`.</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>We might prefer to allocate buffer before the loop, then just clear it inside the loop:</p>
+
+<div><div><pre><code><span>let</span> <span>mut</span> <span>buffer</span> <span>=</span> <span>Vec</span><span>::</span><span>new</span><span>();</span>
+<span>loop</span> <span>{</span>
+    <span>buffer</span><span>.clear</span><span>();</span>
+    <span>// Do work with `buffer`.</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>However, if we’re storing something into a Vec that has a non-static lifetime, then we can run into
+problems. Here, we have a variable <code>text</code>, which holds a <code>String</code>. We then split that string and
+store the resulting string-slices into <code>buffer</code>. Even though we clear <code>buffer</code> at the end of the
+loop, the compiler is unhappy. It wants <code>text</code> to outlive <code>buffer</code> because we’re storing references
+to <code>text</code> into <code>buffer</code>.</p>
+
+<div><div><pre><code><span>let</span> <span>mut</span> <span>buffer</span> <span>=</span> <span>Vec</span><span>::</span><span>new</span><span>();</span>
+<span>loop</span> <span>{</span>
+    <span>let</span> <span>text</span> <span>=</span> <span>get_text</span><span>();</span>
+    <span>buffer</span><span>.extend</span><span>(</span><span>text</span><span>.split</span><span>(</span><span>&#34;,&#34;</span><span>));</span>
+    <span>// Do work with `buffer`.</span>
+    <span>buffer</span><span>.clear</span><span>();</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>We could at this point give up and just move our Vec creation back inside the loop. However, it
+turns out that there’s another solution.</p>
+
+<div><div><pre><code><span>fn</span> <span>reuse_vec</span><span>&lt;</span><span>T</span><span>,</span> <span>U</span><span>&gt;</span><span>(</span><span>mut</span> <span>v</span><span>:</span> <span>Vec</span><span>&lt;</span><span>T</span><span>&gt;</span><span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>U</span><span>&gt;</span> <span>{</span>
+   <span>v</span><span>.clear</span><span>();</span>
+   <span>v</span><span>.into_iter</span><span>()</span><span>.map</span><span>(|</span><span>x</span><span>|</span> <span>unreachable!</span><span>())</span><span>.collect</span><span>()</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>The idea of this function is to convert from a Vec of some time to an empty Vec of another type,
+reusing the heap allocation. This works in a very similar way to how we converted between atomic and
+non-atomic <code>SymbolId</code>s, except this time because we first clear the Vec, the body of our <code>map</code>
+function is unreachable.</p>
+
+<p>The optimisation in the Rust standard library that allows reuse of the heap allocation will only
+actually work if the size and alignment of <code>T</code> and <code>U</code> are the same, so let’s verify that that’s the
+case. We can do the check at compile time, so if we accidentally call this function with
+incompatible <code>T</code> and <code>U</code>, we’ll get a compilation error at the call site.</p>
+
+<div><div><pre><code><span>fn</span> <span>reuse_vec</span><span>&lt;</span><span>T</span><span>,</span> <span>U</span><span>&gt;</span><span>(</span><span>mut</span> <span>v</span><span>:</span> <span>Vec</span><span>&lt;</span><span>T</span><span>&gt;</span><span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>U</span><span>&gt;</span> <span>{</span>
+   <span>const</span> <span>{</span>
+       <span>assert!</span><span>(</span><span>size_of</span><span>::</span><span>&lt;</span><span>T</span><span>&gt;</span><span>()</span> <span>==</span> <span>size_of</span><span>::</span><span>&lt;</span><span>U</span><span>&gt;</span><span>());</span>
+       <span>assert!</span><span>(</span><span>align_of</span><span>::</span><span>&lt;</span><span>T</span><span>&gt;</span><span>()</span> <span>==</span> <span>align_of</span><span>::</span><span>&lt;</span><span>U</span><span>&gt;</span><span>());</span>
+   <span>}</span>
+   <span>v</span><span>.clear</span><span>();</span>
+   <span>v</span><span>.into_iter</span><span>()</span><span>.map</span><span>(|</span><span>_</span><span>|</span> <span>unreachable!</span><span>())</span><span>.collect</span><span>()</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Let’s verify that this optimises as we expect:</p>
+
+<div><div><pre><code><span>mov</span>     <span>qword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rsi</span><span>,</span> <span>+</span><span>,</span> <span>16</span><span>],</span> <span>0</span>
+<span>movups</span>  <span>xmm0</span><span>,</span> <span>xmmword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rsi</span><span>]</span>
+<span>movups</span>  <span>xmmword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rdi</span><span>],</span> <span>xmm0</span>
+<span>mov</span>     <span>qword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rdi</span><span>,</span> <span>+</span><span>,</span> <span>16</span><span>],</span> <span>0</span>
+<span>ret</span>
+</code></pre></div></div>
+
+<p>More or less the same assembly as before, except that we’re now setting the length of the Vec to 0.
+Note, that the loop and the panic from the use of <code>unreachable!</code> are gone.</p>
+
+<p>We can now integrate this into our previous code as follows:</p>
+
+<div><div><pre><code><span>let</span> <span>mut</span> <span>buffer_store</span><span>:</span> <span>Vec</span><span>&lt;&amp;</span><span>str</span><span>&gt;</span> <span>=</span> <span>Vec</span><span>::</span><span>new</span><span>();</span>
+<span>loop</span> <span>{</span>
+    <span>let</span> <span>mut</span> <span>buffer</span> <span>=</span> <span>reuse_vec</span><span>(</span><span>buffer_store</span><span>);</span>
+    <span>let</span> <span>text</span> <span>=</span> <span>get_text</span><span>();</span>
+    <span>buffer</span><span>.extend</span><span>(</span><span>text</span><span>.split</span><span>(</span><span>&#34;,&#34;</span><span>));</span>
+    <span>// Do work with `buffer`.</span>
+    <span>buffer_store</span> <span>=</span> <span>reuse_vec</span><span>(</span><span>buffer</span><span>);</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Effectively, each time around the loop we move out of <code>buffer_store</code>, converting the type of the
+<code>Vec</code>, use it for a bit, then convert it back and store it again in <code>buffer_store</code>. The only time
+we’ll need a new heap allocation is when our <code>Vec</code> needs to grow. The types of <code>buffer_store</code> and
+<code>buffer</code> are both <code>Vec&lt;&amp;str&gt;</code>, however the lifetime of the references is different.</p>
+
+<h2 id="deallocation-on-a-separate-thread">Deallocation on a separate thread</h2>
+
+<p>Freeing memory is generally a lot slower than allocating it. If we’ve done a very large allocation,
+it can sometimes be worthwhile passing it to another thread to free it, so that we can get on with
+other work.</p>
+
+<p>For example, if using rayon, we might use <code>rayon::spawn</code> to spawn a task that drops our buffer:</p>
+
+<div><div><pre><code><span>fn</span> <span>process_buffer</span><span>(</span><span>buffer</span><span>:</span> <span>Vec</span><span>&lt;</span><span>u8</span><span>&gt;</span><span>)</span> <span>{</span>
+   <span>// Do some work with `buffer`.</span>
+
+   <span>rayon</span><span>::</span><span>spawn</span><span>(||</span> <span>drop</span><span>(</span><span>buffer</span><span>));</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Note, that <code>rayon::spawn</code> itself does a heap allocation, so this would only be worthwhile if
+<code>buffer</code> was potentially very large. This is definitely something you’d want to benchmark to see if
+it actually improves the runtime for your use-case. There is at least one place in the Wild linker
+where we did this and it did give a measurable reduction in runtime.</p>
+
+<p>Similar to buffer reuse, if our heap allocation has non-static lifetimes associated with it, we can
+get rid of them using <code>reuse_vec</code>.</p>
+
+<div><div><pre><code><span>fn</span> <span>process_buffer</span><span>(</span><span>names</span><span>:</span> <span>Vec</span><span>&lt;&amp;</span><span>[</span><span>u8</span><span>]</span><span>&gt;</span><span>)</span> <span>{</span>
+   <span>// Do some work with `names`.</span>
+
+   <span>let</span> <span>names</span><span>:</span> <span>Vec</span><span>&lt;&amp;</span><span>[</span><span>u8</span><span>]</span><span>&gt;</span> <span>=</span> <span>reuse_vec</span><span>(</span><span>names</span><span>);</span>
+   <span>rayon</span><span>::</span><span>spawn</span><span>(||</span> <span>drop</span><span>(</span><span>names</span><span>));</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>In this case, we’re converting the <code>Vec</code> from a <code>Vec&lt;&amp;[u8]&gt;</code> to  <code>Vec&lt;&amp;&#39;static [u8]&gt;</code>.</p>
+
+<h2 id="bonus-strip-lifetime-with-non-trivial-drop">Bonus: Strip lifetime with non-trivial Drop</h2>
+
+<p>This is a bonus tip that wasn’t included in the talk and builds on the previous tip and is in
+response to a question by VorpalWay on Reddit. If you want to drop a <code>Vec&lt;T&gt;</code> and <code>T</code> has both a
+non-static lifetime and a non-trivial <code>Drop</code>, then things get slightly more tricky. The trick here
+is to convert to a struct that is the same as <code>T</code>, but has non-static references replaced with
+<code>MaybeUninit</code>.</p>
+
+<p>For example, suppose we have the following struct:</p>
+
+<div><div><pre><code><span>pub</span> <span>struct</span> <span>Foo</span><span>&lt;</span><span>&#39;a</span><span>&gt;</span> <span>{</span>
+    <span>owned</span><span>:</span> <span>String</span><span>,</span>
+    <span>borrowed</span><span>:</span> <span>&amp;</span><span>&#39;a</span> <span>str</span><span>,</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>We can define a new struct:</p>
+
+<div><div><pre><code><span>struct</span> <span>StaticFoo</span> <span>{</span>
+    <span>owned</span><span>:</span> <span>String</span><span>,</span>
+    <span>borrowed</span><span>:</span> <span>MaybeUninit</span><span>&lt;&amp;</span><span>&#39;static</span> <span>str</span><span>&gt;</span><span>,</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>We can then convert our Vec to the new type with zero cost and no unsafe:</p>
+
+<div><div><pre><code><span>fn</span> <span>without_lifetime</span><span>(</span><span>foos</span><span>:</span> <span>Vec</span><span>&lt;</span><span>Foo</span><span>&gt;</span><span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>StaticFoo</span><span>&gt;</span> <span>{</span>
+    <span>foos</span><span>.into_iter</span><span>()</span>
+        <span>.map</span><span>(|</span><span>f</span><span>|</span> <span>StaticFoo</span> <span>{</span>
+            <span>owned</span><span>:</span> <span>f</span><span>.owned</span><span>,</span>
+            <span>borrowed</span><span>:</span> <span>MaybeUninit</span><span>::</span><span>uninit</span><span>(),</span>
+        <span>})</span>
+        <span>.collect</span><span>()</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>The presence of <code>MaybeUnit::uninit()</code> tells the compiler that it’s OK to have anything there, so it
+can choose to leave whatever <code>&amp;str</code> was in the original <code>Foo</code> struct. This means that it’s valid to
+produce a <code>StaticFoo</code> with the same in-memory representation as the <code>Foo</code> that it replaces, allowing
+it to eliminate the loop. The asm for this function is:</p>
+
+<div><div><pre><code> <span>movups</span>  <span>xmm0</span><span>,</span> <span>xmmword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rsi</span><span>]</span>
+ <span>mov</span>     <span>rax</span><span>,</span> <span>qword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rsi</span><span>,</span> <span>+</span><span>,</span> <span>16</span><span>]</span>
+ <span>movups</span>  <span>xmmword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rdi</span><span>],</span> <span>xmm0</span>
+ <span>mov</span>     <span>qword</span><span>,</span> <span>ptr</span><span>,</span> <span>[</span><span>rdi</span><span>,</span> <span>+</span><span>,</span> <span>16</span><span>],</span> <span>rax</span>
+ <span>ret</span>
+</code></pre></div></div>
+
+<p>i.e. the loop was indeed eliminated.</p>
+
+<p>Now that we have a Vec with no non-static lifetimes, we can safely move it to another thread.</p>
+
+
+
+<p>Thanks to my <a href="https://github.com/sponsors/davidlattimore">github sponsors</a>. Your contributions help
+to make it possible for me to continue to work on this kind of stuff rather than going and getting a
+“real job”.</p>
+
+<ul>
+  <li>CodeursenLiberte</li>
+  <li>Urgau</li>
+  <li>pmarks</li>
+  <li>repi</li>
+  <li>embark-studios</li>
+  <li>mati865</li>
+  <li>bes</li>
+  <li>joshtriplett</li>
+  <li>mstange</li>
+  <li>bcmyers</li>
+  <li>Rafferty97</li>
+  <li>acshi</li>
+  <li>Kobzol</li>
+  <li>flba-eb</li>
+  <li>jonhoo</li>
+  <li>marxin</li>
+  <li>tommythorn</li>
+  <li>binarybana</li>
+  <li>teburd</li>
+  <li>bearcove</li>
+  <li>yerke</li>
+  <li>teh</li>
+  <li>twilco</li>
+  <li>Shnatsel</li>
+  <li>coastalwhite</li>
+  <li>wezm</li>
+  <li>davidcornu</li>
+  <li>gendx</li>
+  <li>rrbutani</li>
+  <li>nazar-pc</li>
+  <li>willstott101</li>
+  <li>tatsuya6502</li>
+  <li>teohhanhui</li>
+  <li>jkendall327</li>
+  <li>EdorianDark</li>
+  <li>drmason13</li>
+  <li>HadrienG2</li>
+  <li>jplatte</li>
+  <li>rukai</li>
+  <li>ymgyt</li>
+  <li>dream-dasher</li>
+  <li>alexkirsz</li>
+  <li>Pratyush</li>
+  <li>Tudyx</li>
+  <li>coreyja</li>
+  <li>dralley</li>
+  <li>irfanghat</li>
+  <li>mvolfik</li>
+  <li>simtheverse</li>
+</ul>
+
+<h2 id="discussion">Discussion</h2>
+
+<ul>
+  <li><a href="https://www.reddit.com/r/rust/comments/1n7814i/wild_performance_tricks/">Reddit</a></li>
+</ul>
+
+    </article>
+  </div></div>
+  </body>
+</html>
