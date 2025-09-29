@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://emschwartz.me/subtleties-of-sqlite-indexes/">Original</a>
+    <h1>Subtleties of SQLite Indexes</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    
+
+    
+        
+    
+
+    
+        
+
+        <p>
+            <i>
+                <time datetime="2025-09-29T15:17Z">
+                    Sep 29, 2025
+                </time>
+            </i>
+        </p>
+    
+
+    <p>In the last 6 months, <a href="https://scour.ing">Scour</a> has gone from ingesting 330,000 pieces of content per month to over 1.4 million this month. The massive increase in the number of items slowed down the ranking for users&#39; feeds and sent me looking for ways to speed it up again.</p>
+<p>After spending too many hours trying in vain to squeeze more performance out of my queries and indexes, I dug into how SQLite&#39;s query planner uses indexes, learned some of the subtleties that explained why my initial tweaks weren&#39;t working, and sped up one of my main queries by ~35%.</p>
+<h2 id="scours-codeitemscode-table">Scour&#39;s <code>items</code> table</h2><p>Scour is a personalized content feed that finds articles, blog posts, etc related to users&#39; interests. For better and for worse, Scour does its ranking on the fly whenever users load their feeds page. Initially, this took 100 milliseconds or less, thanks to <a href="https://emschwartz.me/binary-vector-embeddings-are-so-cool/">binary vector embeddings</a> and the fact that it&#39;s using SQLite so there is no network latency to load data.</p>
+<p>The most important table in Scour&#39;s database is the <code>items</code> table. It includes an ID, URL, title, language, publish date (stored as a Unix timestamp), and a text quality rating.</p>
+<p>Scour&#39;s main ranking query filters items based on when they were published, whether they are in a language the user understands, and whether they are above a certain quality threshold.</p>
+<p>The question is: what indexes do we need to speed up this query?</p>
+<h2 id="dont-bother-with-multiple-single-column-indexes">Don&#39;t bother with multiple single-column indexes</h2><p>When I first set up Scour&#39;s database, I put a bunch of indexes on the <code>items</code> table without really thinking about whether they would help. For example, I had separate indexes on the published date, the language, and the quality rating. Useless.</p>
+<p><strong>It&#39;s more important to have one or a small handful of good composite indexes on multiple columns than to have separate indexes on each column.</strong></p>
+<p>In most cases, the query planner won&#39;t bother merging the results from two indexes on the same table. Instead, it will use one of the indexes and then scan all of the rows that match the filter for that index&#39;s column.</p>
+<p>It&#39;s worth being careful to only add indexes that will be used by real queries. Having additional indexes on each column won&#39;t hurt read performance. However, each index takes up storage space and more indexes will slow down writes, because all of the indexes need to be updated when new rows are inserted into the table.</p>
+<p>If we&#39;re going to have an index on multiple columns, which columns should we include and what order should we put them in?</p>
+<h2 id="index-column-order-matters">Index column order matters</h2><p>The order of conditions in a query doesn&#39;t matter, but the order of columns in an index very much does.</p>
+<p>Columns that come earlier in the index should be more &#34;selective&#34;: they should help the database narrow the results set as much as possible.</p>
+<p>In Scour&#39;s case, the most selective column is the publish date, followed by the quality rating, followed by the language. I put an index on those columns in that order:</p>
+<div><pre><span></span><span>CREATE</span><span> </span><span>INDEX</span><span> </span><span>idx_items_published_quality_lang</span>
+<span>ON</span><span> </span><span>items</span><span>(</span><span>published</span><span>,</span><span> </span><span>low_quality_probability</span><span>,</span><span> </span><span>lang</span><span>);</span>
+</pre></div>
+<p>...and found that SQLite was only using one of the columns. Running this query:</p>
+<div><pre><span></span><span>EXPLAIN</span><span> </span><span>QUERY</span><span> </span><span>PLAN</span>
+<span>SELECT</span><span> </span><span>id</span><span>,</span><span> </span><span>low_quality_probability</span>
+<span>FROM</span><span> </span><span>items</span>
+<span>WHERE</span><span> </span><span>published</span><span> </span><span>BETWEEN</span><span> </span><span>$</span><span>1</span><span> </span><span>AND</span><span> </span><span>$</span><span>2</span>
+<span>AND</span><span> </span><span>low_quality_probability</span><span> </span><span>&lt;=</span><span> </span><span>$</span><span>3</span>
+<span>AND</span><span> </span><span>lang</span><span> </span><span>IN</span><span> </span><span>(</span><span>SELECT</span><span> </span><span>lang</span><span> </span><span>FROM</span><span> </span><span>user_languages</span><span> </span><span>WHERE</span><span> </span><span>user_id</span><span> </span><span>=</span><span> </span><span>$</span><span>4</span><span>)</span>
+</pre></div>
+<p>Produced this query plan:</p>
+<div><pre><span></span>QUERY PLAN
+   |--SEARCH items USING COVERING INDEX idx_items_published_quality_lang (published&gt;? AND published&lt;?)
+   `--CORRELATED LIST SUBQUERY 1
+      `--SCAN user_languages USING COVERING INDEX sqlite_autoindex_user_languages_1
+</pre></div>
+<p>It was using the right index but only filtering by <code>published</code> (note the part of the plan that says <code>(published&gt;? AND published&lt;?)</code>). Puzzling.</p>
+<h2 id="left-to-right-no-skipping-stops-at-the-first-range">Left to right, no skipping, stops at the first range</h2><p>My aha moment came while watching Aaron Francis&#39; <a href="https://highperformancesqlite.com/watch/composite-indexes">High Performance SQLite course</a>. He said the main rule for SQLite indexes is: <strong>&#34;Left to right, no skipping, stops at the first range.&#34;</strong> (This is a much clearer statement of the implications of the <a href="https://sqlite.org/optoverview.html#where_clause_analysis">Where Clause Analysis</a> buried in the <a href="https://sqlite.org/optoverview.html#index_term_usage_examples">Query Optimizer Overview</a> section of the official docs.)</p>
+<p>This rule means that the query planner will:</p>
+<ol>
+<li>Consider columns from <strong>left to right</strong>. In my case, the first column in the index is <code>published</code>. SQLite will search for rows where the <code>published</code> field is in the correct range before considering the other columns.</li>
+<li><strong>No skipping</strong> means that SQLite cannot use only the 1st and 3rd column in an index. As soon as it reaches a column in the index that does not appear in the query, it must do a scan through all of the rows matching the 1st column.</li>
+<li><strong>Stops at the first range.</strong> That was the key I was missing. Filtering by the <code>published</code> timestamp first would indeed narrow down the results more than filtering first by one of the other columns. However, the fact that the query uses a range condition on the <code>published</code> column (<code>WHERE published BETWEEN $1 AND $2</code>) means that SQLite can only scan all of the rows in that <code>published</code> range, rather than fully utilizing the other columns in the index to hone in on the correct rows.</li>
+</ol>
+<p>My query includes two ranges (<code>published BETWEEN $1 AND $2 AND low_quality_probability &lt;= $3</code>), so the &#34;stops at the first range&#34; rule explains why I was only seeing the query planner use one of those columns. This rule does, however, suggest that I can create an index that will allow SQLite to filter by the one non-range condition (<code>lang IN (SELECT lang FROM user_languages WHERE user_id = $4)</code>) before using one of the ranges:</p>
+<div><pre><span></span><span>CREATE</span><span> </span><span>INDEX</span><span> </span><span>idx_lang_published_quality</span>
+<span>ON</span><span> </span><span>items</span><span>(</span><span>lang</span><span>,</span><span> </span><span>published</span><span>,</span><span> </span><span>low_quality_probability</span><span>);</span>
+</pre></div>
+<p>The query plan shows that it can use both the <code>lang</code> and <code>published</code> columns (note the part that reads <code>lang=? AND published&gt;? AND published&lt;?</code>):</p>
+<div><pre><span></span>QUERY PLAN
+|--SEARCH items USING COVERING INDEX idx_items_lang_published_quality (lang=? AND published&gt;? AND published&lt;?)
+`--LIST SUBQUERY 1
+   `--SEARCH user_languages USING COVERING INDEX sqlite_autoindex_user_languages_1 (user_id=?)
+</pre></div>
+<p>Now we&#39;re using two out of the three columns to quickly filter the rows. Can we use all three? (Remember, the query planner won&#39;t be able to use multiple range queries on the same index, so we&#39;ll need something else.)</p>
+<h2 id="codewherecode-conditions-for-partial-indexes-must-exactly-match"><code>WHERE</code> conditions for partial indexes must exactly match</h2><p>SQLite has a nice feature called <a href="https://sqlite.org/partialindex.html">Partial Indexes</a> that allows you to define an index that only applies to a subset of the rows matching some conditions.</p>
+<p>In Scour&#39;s case, we only really want items where the <code>low_quality_probability</code> is less than or equal to 90%. The model I&#39;m using to judge quality isn&#39;t <em>that great</em>, so I only trust it to filter out items if it&#39;s really sure they&#39;re low quality.</p>
+<p>This means I can create an index like this:</p>
+<div><pre><span></span><span>CREATE</span><span> </span><span>INDEX</span><span> </span><span>idx_lang_published_quality_filtered</span>
+<span>ON</span><span> </span><span>items</span><span>(</span><span>lang</span><span>,</span><span> </span><span>published</span><span>,</span><span> </span><span>low_quality_probability</span><span>)</span>
+<span>WHERE</span><span> </span><span>low_quality_probability</span><span> </span><span>&lt;=</span><span> </span><span>.</span><span>9</span><span>;</span>
+</pre></div>
+<p>And then update the query to use the same <code>WHERE</code> condition:</p>
+<div><pre><span></span><span>EXPLAIN</span><span> </span><span>QUERY</span><span> </span><span>PLAN</span>
+<span>SELECT</span><span> </span><span>id</span><span>,</span><span> </span><span>low_quality_probability</span>
+<span>FROM</span><span> </span><span>items</span>
+<span>WHERE</span><span> </span><span>low_quality_probability</span><span> </span><span>&lt;=</span><span> </span><span>0</span><span>.</span><span>9</span>
+<span>AND</span><span> </span><span>published</span><span> </span><span>BETWEEN</span><span> </span><span>$</span><span>1</span><span> </span><span>AND</span><span> </span><span>$</span><span>2</span>
+<span>AND</span><span> </span><span>low_quality_probability</span><span> </span><span>&lt;=</span><span> </span><span>$</span><span>3</span>
+<span>AND</span><span> </span><span>lang</span><span> </span><span>IN</span><span> </span><span>(</span><span>SELECT</span><span> </span><span>lang</span><span> </span><span>FROM</span><span> </span><span>user_languages</span><span> </span><span>WHERE</span><span> </span><span>id</span><span> </span><span>=</span><span> </span><span>$</span><span>4</span><span>)</span>
+</pre></div>
+<p>And it should use our new partial index... right? Wrong. This query is still using the previous index.</p>
+<div><pre><span></span>QUERY PLAN
+|--SEARCH items USING COVERING INDEX idx_items_lang_published_quality (lang=? AND published&gt;? AND published&lt;?)
+`--LIST SUBQUERY 1
+   `--SEARCH user_languages USING COVERING INDEX sqlite_autoindex_user_languages_1 (user_id=?)
+</pre></div>
+<p>There&#39;s a subtle mistake in the relationship between our index and our query. Can you spot it?</p>
+<p>Our index contains the condition <code>WHERE low_quality_probability &lt;= .9</code> but our query says <code>WHERE low_quality_probability &lt;= 0.9</code>. These are mathematically equivalent but they are not <em>exactly the same</em>.</p>
+<p>SQLite&#39;s query planner requires the conditions to match exactly in order for it to use a partial index. Relatedly, a condition of <code>&lt;= 0.95</code> or even <code>&lt;= 0.5 + 0.4</code> in the query would also not utilize the partial index.</p>
+<p>If we rewrite our query to use the exact same condition of <code>&lt;= .9</code>, we get the query plan:</p>
+<div><pre><span></span>QUERY PLAN
+|--SEARCH items USING COVERING INDEX idx_lang_published_quality_filtered (ANY(lang) AND published&gt;? AND published&lt;?)
+`--CORRELATED LIST SUBQUERY 1
+   `--SCAN user_languages USING COVERING INDEX sqlite_autoindex_user_languages_1
+</pre></div>
+<p>Now, we&#39;re starting with the items whose <code>low_quality_probability &lt;= .9</code>, then using the index to find the items in the desired language(s), and lastly narrowing down the results to the items that were published in the correct time range.</p>
+<h2 id="better-query-plans-find-matching-rows-faster">Better query plans find matching rows faster</h2><p>As mentioned in the intro, these changes to the indexes and one of Scour&#39;s main ranking queries yielded a ~35% speedup.</p>
+<p>Enabling the query planner to make better use of the indexes makes it so that SQLite doesn&#39;t need to scan as many rows to find the ones that match the query conditions.</p>
+<p>Concretely, in Scour&#39;s case, filtering by language removes about 30% of items for most users and filtering out low quality content removes a further 50%. Together, these changes reduce the number of rows scanned by around 66%.</p>
+<p>Sadly, however, a 66% reduction in the number of rows scanned does not directly translate to a 66% speedup in the query. If we&#39;re doing more than counting rows, the work to load the data out of the database and process it can be more resource intensive than scanning rows to match conditions. (The optimized queries and indexes still load the same number of rows as before, they just identifying the desired rows faster.) Nevertheless, a 35% speedup is a noticeable improvement.</p>
+<h2 id="conclusion">Conclusion</h2><p>It&#39;s worth digging into how your database&#39;s query planner uses indexes to help get to the bottom of performance issues.</p>
+<p>If you&#39;re working with SQLite, remember that:</p>
+<ol>
+<li>A smaller number of composite indexes are more useful that multiple single-column indexes. It&#39;s better to have an index over <code>(lang, published, low_quality_probability)</code> than separate indexes for each.</li>
+<li>The query planner uses the rule <strong>&#34;Left to right, no skipping, stops at the first range&#34;</strong>. If a query has multiple range conditions, it may be worth putting the columns that use strict equality first in the index, like we did above with <code>lang</code> coming before <code>published</code> or <code>low_quality_probability</code>.</li>
+<li>Conditions used in <code>WHERE</code> clauses for partial indexes must exactly match the condition used in the corresponding query. <code>&lt;= 0.9</code> is not exactly the same as <code>&lt;= .9</code>, even if they are mathematically equivalent.</li>
+</ol>
+<p><em>Thanks to Aaron Francis for putting together the <a href="https://highperformancesqlite.com/">High Performance SQLite course</a>! (I have no personal or financial relationship to him, but I appreciate his course unblocking me and helping me speed up Scour&#39;s ranking.) Thank you also to Adam Gluck and Alex Kesling for feedback on this post.</em></p>
+
+
+    
+
+    
+        
+            <p>
+                
+                    <a href="https://emschwartz.me/blog/?q=scour">#scour</a>
+                
+                    <a href="https://emschwartz.me/blog/?q=understanding">#understanding</a>
+                
+            </p>
+        
+
+        
+            
+
+
+        
+    
+
+
+  </div></div>
+  </body>
+</html>
