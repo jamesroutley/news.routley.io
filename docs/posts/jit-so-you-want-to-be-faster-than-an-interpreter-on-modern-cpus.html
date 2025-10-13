@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.pinaraf.info/2025/10/jit-so-you-want-to-be-faster-than-an-interpreter-on-modern-cpus/">Original</a>
+    <h1>JIT: So you want to be faster than an interpreter on modern CPUs</h1>
+    
+    <div id="readability-page-1" class="page"><article id="post-112">
+		
+	
+	<div>
+		
+<p>Hi</p>
+
+
+
+<p>Since my previous blog entry about JIT compiler for PostgreSQL, sadly not much happened due to a lack of time, but still some things were done (biggest improvement was the port to ARM64, a few optimizations, implementing more opcodes…). But I am often asking myself how to really beat the interpreter… And on “modern” CPUs, with a well written interpreter, that’s far more complicated than many would imagine. So in order to explain all this and show how I am planning to improve performance (possibly of the interpreter itself too, thus making this endeavor self-defeating), let’s first talk about…</p>
+
+
+
+<h2>The magics of OoO execution and super-scalar CPUs</h2>
+
+
+
+<p>If you already know about all the topics mentioned in this title, feel free to jump to the <a href="#interpreter-inpact" data-type="internal" data-id="#interpreter-inpact">next section</a>. Note that the following section is over-simplified to make the concepts more accessible.</p>
+
+
+
+<p>I am writing this blog post on a Zen 2+ CPU. If I upgraded to a Zen 3 CPU, same motherboard, same memory, I would get an advertised 25% performance jump in single thread benchmarks while the CPU frequency would be only 2% higher. Why such a discrepancy?</p>
+
+
+
+<p>Since the 90s and the Pentium-class CPUs, x86 has followed RISC CPUs in the super-scalar era. Instead of running one instruction per cycle, when conditions are right, several instructions can be executed at the same time. Let’s consider the following pseudo-code:</p>
+
+
+
+<pre><code>f(a, b, c, d):
+  X = a + b
+  Y = c + d
+  Z1 = 2 * X
+  Z2 = 2 * Y
+  Z = Z1 + Z2
+  return Z</code></pre>
+
+
+
+<p>X and Y can be calculated at the same time. The CPU can execute these on two integer units, fetch the results and store them. The only issue is the computation of Z: everything must be done before this step, making it impossible for the CPU to go further without waiting for the previous results. But now, what if the code was written as follow:</p>
+
+
+
+<pre><code>f(a, b, c, d):
+  X = a + b
+  Z1 = 2 * X
+  Y = c + d
+  Z2 = 2 * Y
+  Z = Z1 + Z2
+  return Z</code></pre>
+
+
+
+<p>Every step would require waiting for the previous one, slowing down the CPU terribly. Hence the most important technique used to implement superscalar CPUs: out-of-order execution. The CPU will fetch the instructions, dispatch them in several instruction queues, and resolve dependencies to compute Y before computing Z1 in order to have it ready sooner. The CPU is spending less time idling, thus the whole thing is faster. But, alas, what would happen with the following function?</p>
+
+
+
+<pre><code>f(a, b, c, d):
+  X = a + b
+  Y = c + d
+  if X &gt; Y:
+    Z = b + d
+  else:
+    Z = a + c
+  return Z</code></pre>
+
+
+
+<p>Should the CPU wait for X and Y before deciding which Z to compute? Here is the biggest trick: it will try its luck and compute something anyway. This way, if its bet was right, a lot of time will be saved, otherwise the mistake result will be dropped and the proper computation will be done instead. This is called branch prediction, it has been the source of many fun security issues (hello meltdown), but the performance benefits are so huge that one would never consider disabling this.</p>
+
+
+
+<h2 id="interpreter-inpact">How does this impact interpreters</h2>
+
+
+
+<p>Most interpreters will operate on an intermediate representation, using opcodes instead of directly executing from an AST or similar. So you could use the following main loop for an interpreter.</p>
+
+
+
+<pre><code>step = steps[0]
+while 1:
+  switch step.opcode:
+    case A:
+      // code for opcode A
+    case B:
+      // code for opcode B
+    case C:
+      // code for opcode C
+    ...
+  step++</code></pre>
+
+
+
+<p>This is how many, many interpreters were written. But this has a terrible drawback at least when compiled that way: it has branches all over the place from a single starting point (most if not all optimizing compilers will generate a jump table to optimize the dispatch, but this will still jump from the same point). The CPU will have a hard time predicting the right jump, and is thus losing a lot of performance. If this was the only way an interpreter could be written, generating a function by stitching the code together would save a lot of time, likely giving a more than 10% performance improvement. If one look at Python, removing this switch made the interpreter 15 to 20% faster. Many project, including PostgreSQL, use this same technique, called “computed gotos”. After a first pass to fill in “label” targets in each step, the execution would be</p>
+
+
+
+<pre><code>step = steps[0]
+goto step-&gt;label;
+OPCODE_A:
+  // code for opcode A
+  step++; goto step-&gt;label;
+OPCODE_B:
+  // code for opcode B
+  step++; goto step-&gt;label;
+OPCODE_C:
+  // code for opcode C
+  step++; goto step-&gt;label;
+...
+</code></pre>
+
+
+
+<p>When running a short sequence of operations in a loop, the jumps will be far more predictable, making the branch predictor’s job easier, and thus improving the speed of the interpreter.</p>
+
+
+
+<p>Now that we have a very basic understanding of modern CPUs and the insane level of optimization they reach, let’s talk about fighting the PostgreSQL interpreter on performance.</p>
+
+
+
+<h2>Optimizing a simple “SELECT a FROM table WHERE a = 42”</h2>
+
+
+
+<p>I will not discuss optimizing the tuple deforming part (aka. going from on-disc structure to the “C” structure used by the code), this will be a topic for a future blog post when I implement it in my compiler. </p>
+
+
+
+<p>As you may know, PostgreSQL has a very complete type system with operators overloading. Even this simple query ends up being a call to int4eq, a strict function that will perform the comparison.</p>
+
+
+
+<pre><code>#define PG_GETARG_DATUM(n)    (fcinfo-&gt;args[n].value)
+#define PG_GETARG_INT32(n)    DatumGetInt32(PG_GETARG_DATUM(n))
+
+static inline int32
+DatumGetInt32(Datum X)
+{
+        return (int32) X;..
+}
+
+Datum
+int4eq(PG_FUNCTION_ARGS)
+{
+        int32           arg1 = PG_GETARG_INT32(0);
+        int32           arg2 = PG_GETARG_INT32(1);
+
+        PG_RETURN_BOOL(arg1 == arg2);
+}</code></pre>
+
+
+
+<p>Since it is a strict function, PostgreSQL must check that the arguments are not null, otherwise the function is not called and the result will be null.</p>
+
+
+
+<p>If you execute a very basic query like the one in the title, PostgreSQL will have the following opcodes:</p>
+
+
+
+<pre><code>EEOP_SCAN_FETCHSOME
+EEOP_SCAN_VAR
+EEOP_FUNCEXPR_STRICT_2
+EEOP_QUAL
+EEOP_DONE_RETURN</code></pre>
+
+
+
+<p>The EEOP_FUNCEXPR_STRICT_2 will perform the null check, and then call the function.</p>
+
+
+
+<p>If we unroll all the opcodes in real C code, we end up with the following:</p>
+
+
+
+<pre><code><strong>// SCAN_FETCHSOME</strong>
+CheckOpSlotCompatibility(op, scanslot);
+
+slot_getsomeattrs(scanslot, op-&gt;d.fetch.last_var);
+
+op++; goto op-&gt;code;
+
+<strong>// SCAN_VAR</strong>
+int			attnum = op-&gt;d.var.attnum;
+
+/* See EEOP_INNER_VAR comments */
+
+Assert(attnum &gt;= 0 &amp;&amp; attnum &lt; scanslot-&gt;tts_nvalid);
+*op-&gt;resvalue = scanslot-&gt;tts_values[attnum];
+*op-&gt;resnull = scanslot-&gt;tts_isnull[attnum];
+
+op++; goto op-&gt;code;
+
+<strong>// FUNCEXPR_STRICT_2</strong>
+FunctionCallInfo fcinfo = op-&gt;d.func.fcinfo_data;
+NullableDatum *args = fcinfo-&gt;args;
+
+Assert(op-&gt;d.func.nargs == 2);
+
+/* strict function, so check for NULL args */
+if (args[0].isnull || args[1].isnull)
+    *op-&gt;resnull = true;
+else
+{
+    Datum		d;
+
+    fcinfo-&gt;isnull = false;
+    d = op-&gt;d.func.fn_addr(fcinfo);
+    *op-&gt;resvalue = d;
+    *op-&gt;resnull = fcinfo-&gt;isnull;
+}
+
+op++; goto op-&gt;code;
+
+<strong>// QUAL</strong>
+/* simplified version of BOOL_AND_STEP for use by ExecQual() */
+
+/* If argument (also result) is false or null ... */
+if (*op-&gt;resnull ||
+    !DatumGetBool(*op-&gt;resvalue))
+{
+    /* ... bail out early, returning FALSE */
+    *op-&gt;resnull = false;
+    *op-&gt;resvalue = BoolGetDatum(false);
+    EEO_JUMP(op-&gt;d.qualexpr.jumpdone);
+}
+
+/*
+ * Otherwise, leave the TRUE value in place, in case this is the
+ * last qual.  Then, TRUE is the correct answer.
+ */
+
+op++; goto op-&gt;code;
+
+<strong>// DONE_RETURN</strong>
+*isnull = state-&gt;resnull;
+return state-&gt;resvalue;</code></pre>
+
+
+
+<p>We can already spot one optimization: why do we check the two arguments, including our constant, against null? It will never change for the entire run of this query and thus each comparison is going to use an ALU, and branch depending on that comparison. But of course the CPU will notice the corresponding branch pattern, and will thus be able to remain active and feed its other units.</p>
+
+
+
+<p>What is the real cost of such a pointless comparison? For this purpose, I’ve broken a PostgreSQL instance and replaced all FUNCEXPR_STRICT with a check on one argument only, and one with no STRICT check (do not try this at home!). Doing 10 times a simple SELECT * FROM demo WHERE a = 42 on a 100 million rows table, with no index, here are the two perf results:</p>
+
+
+
+<pre><code>// non-broken PostgreSQL, the query took about 124ms per run
+ Performance counter stats for process id &#39;1757113&#39;:
+
+          1,175.93 msec task-clock:u                     #    0.133 CPUs utilized             
+                 0      context-switches:u               #    0.000 /sec                      
+                 0      cpu-migrations:u                 #    0.000 /sec                      
+                80      page-faults:u                    #   68.031 /sec                      
+    <strong>13,377,719,062      instructions:u</strong>                   #    2.92  insn per cycle            
+                                                  #    0.01  stalled cycles per insn   
+     <strong>4,583,676,400      cycles:u</strong>                         #    3.898 GHz                       
+        87,108,713      stalled-cycles-frontend:u        #    1.90% frontend cycles idle      
+     <strong>2,322,262,677      branches:u</strong>                       #    1.975 G/sec                     
+         1,577,035      branch-misses:u                  #    0.07% of all branches           
+
+// only 1 argument checked, the query took about 117ms per run
+ Performance counter stats for process id &#39;1760731&#39;:
+
+          1,137.86 msec task-clock:u                     #    0.137 CPUs utilized             
+                 0      context-switches:u               #    0.000 /sec                      
+                 0      cpu-migrations:u                 #    0.000 /sec                      
+               480      page-faults:u                    #  421.845 /sec                      
+    <strong>13,238,656,204      instructions:u</strong>                   #    2.99  insn per cycle            
+                                                  #    0.01  stalled cycles per insn   
+     <strong>4,429,234,344      cycles:u</strong>                         #    3.893 GHz                       
+        80,398,623      stalled-cycles-frontend:u        #    1.82% frontend cycles idle      
+     <strong>2,277,385,482      branches:u</strong>                       #    2.001 G/sec                     
+         1,513,041      branch-misses:u                  #    0.07% of all branches           
+
+// broken PostgreSQL, the query took about 115ms per run
+ Performance counter stats for process id &#39;1758298&#39;:
+
+          1,134.46 msec task-clock:u                     #    0.132 CPUs utilized             
+                 0      context-switches:u               #    0.000 /sec                      
+                 0      cpu-migrations:u                 #    0.000 /sec                      
+               484      page-faults:u                    #  426.634 /sec                      
+    <strong>13,199,914,639      instructions:u</strong>                   #    2.99  insn per cycle            
+                                                  #    0.01  stalled cycles per insn   
+     <strong>4,416,014,805      cycles:u</strong>                         #    3.893 GHz                       
+        80,840,330      stalled-cycles-frontend:u        #    1.83% frontend cycles idle      
+     <strong>2,248,257,937      branches:u</strong>                       #    1.982 G/sec                     
+         1,497,270      branch-misses:u                  #    0.07% of all branches           
+</code></pre>
+
+
+
+<p>So, even if this is not the optimization of the century, it’s not that expensive to make, so… why not do it? (Patch coming to pgsql-hackers soon)</p>
+
+
+
+<p>But a better optimization is to go all-in on inlining. Indeed, instead of jumping through a pointer to the int4eq code (again, something that the CPU will optimize a lot), one could have a special opcode for this quite common operation.</p>
+
+
+
+<pre><code>// Code of the opcodes unrolled, merged back and hand-optimized
+
+<strong>// SCAN_FETCHSOME</strong>
+CheckOpSlotCompatibility(op, scanslot);
+
+slot_getsomeattrs(scanslot, op-&gt;d.fetch.last_var);
+
+op++;
+
+<strong>// SCAN_VAR</strong>
+int			attnum = op-&gt;d.var.attnum;
+
+/* See EEOP_INNER_VAR comments */
+
+Assert(attnum &gt;= 0 &amp;&amp; attnum &lt; scanslot-&gt;tts_nvalid);
+*op-&gt;resvalue = scanslot-&gt;tts_values[attnum];
+*op-&gt;resnull = scanslot-&gt;tts_isnull[attnum];
+
+op++;
+
+<strong>// FUNCEXPR_STRICT_INT4EQ</strong>
+FunctionCallInfo fcinfo = op-&gt;d.func.fcinfo_data;
+NullableDatum *args = fcinfo-&gt;args;
+
+
+/* strict function, so check for NULL args */
+if (args[0].isnull || args[1].isnull)
+    *op-&gt;resnull = true;
+else
+{
+    *op-&gt;resvalue = ((int32) args[0].value == (int32) args[1].value);
+    *op-&gt;resnull = false;
+}
+
+op++;
+
+<strong>// QUAL</strong>
+/* simplified version of BOOL_AND_STEP for use by ExecQual() */
+
+/* If argument (also result) is false or null ... */
+if (*op-&gt;resnull ||
+    !DatumGetBool(*op-&gt;resvalue))
+{
+    /* ... bail out early, returning FALSE */
+    *op-&gt;resnull = false;
+    *op-&gt;resvalue = BoolGetDatum(false);
+    EEO_JUMP(op-&gt;d.qualexpr.jumpdone);
+}
+
+/*
+ * Otherwise, leave the TRUE value in place, in case this is the
+ * last qual.  Then, TRUE is the correct answer.
+ */
+
+op++;
+
+<strong>// DONE_RETURN</strong>
+*isnull = state-&gt;resnull;
+return state-&gt;resvalue;
+</code></pre>
+
+
+
+<p>With this change alone (but keeping the two null checks, so there are still optimizations possible), we end up with the following perf results.</p>
+
+
+
+<pre><code>// broken PostgreSQL, the query took about 114ms per run
+
+          1,125.33 msec task-clock:u                     #    0.143 CPUs utilized             
+                 0      context-switches:u               #    0.000 /sec                      
+                 0      cpu-migrations:u                 #    0.000 /sec                      
+               456      page-faults:u                    #  405.215 /sec                      
+    <strong>12,941,745,741      instructions:u</strong>                   #    3.01  insn per cycle            
+                                                  #    0.01  stalled cycles per insn     (71.33%)
+     <strong>4,305,023,693      cycles:u</strong>                         #    3.826 GHz                         (71.38%)
+        85,985,959      stalled-cycles-frontend:u        #    2.00% frontend cycles idle        (71.65%)
+     <strong>2,211,080,124      branches:u</strong>                       #    1.965 G/sec                       (71.71%)
+         1,596,208      branch-misses:u                  #    0.07% of all branches             (71.27%)</code></pre>
+
+
+
+<p>Let’s sum up these results.</p>
+
+
+
+<figure><table><tbody><tr><td>PostgreSQL</td><td data-align="center">Unpatched</td><td data-align="center">Only 1 NULL check</td><td data-align="center">No NULL check</td><td data-align="center">Two NULL checks, inlined int4eq</td></tr><tr><td>Average time (ms)</td><td data-align="center">127</td><td data-align="center">117 (-7.9%)</td><td data-align="center">115 (-9.5%)</td><td data-align="center">114 (-10.3%)</td></tr><tr><td>Instructions</td><td data-align="center">13,377,719,062</td><td data-align="center">13,238,656,204 (-1.1%)</td><td data-align="center">13,199,914,639 (-1.4%)</td><td data-align="center">12,941,745,741 (-3.3%)</td></tr><tr><td>Cycles</td><td data-align="center">4,583,676,400</td><td data-align="center">4,429,234,344 (-3.4%)</td><td data-align="center">4,416,014,805 (-3.7%)</td><td data-align="center">4,305,023,693 (-6.1%)</td></tr><tr><td>Branches</td><td data-align="center">2,322,262,677</td><td data-align="center">2,277,385,482 (-2%)</td><td data-align="center">2,248,257,937 (-3.2%)</td><td data-align="center">2,211,080,124 (-4.8%)</td></tr></tbody></table><figcaption>Summary of performances along three changes</figcaption></figure>
+
+
+
+<p>The biggest change comes, quite obviously, from inlining the int4eq call. Why is it that much better? Because it reduces by quite a lot the number of instructions to run, and it removes a call to an address stored in memory. And this is again an optimization I could do on my JIT compiler that can also be done on the interpreter with the same benefits. The biggest issue here is that you must keep the number of opcodes within (unspecified) limits: too many opcodes could make the compiler job far worse.</p>
+
+
+
+<h2>Fighting the wrong fight against the interpreter in my JIT compiler</h2>
+
+
+
+<p>Well. At first, I thought the elimination of null checks could not be implemented easily in the interpreter. The first draft in my compiler was certainly invalid, but gave me interesting numbers (around 5%, as seen above) and made me want to go ahead. And I realized that implementing it cleanly in the interpreter was far easier than implementing it in my JIT compiler …</p>
+
+
+
+<p>Then I went with optimizing another common case, the call to int4eq, and, well… One could also add an opcode for that in the interpreter, and thus the performance gain of the JIT compiler are going to be minimal compared to the interpreter.</p>
+
+
+
+<p>Modern CPUs don’t make my job easy here.  Most of the cost of an interpreter is taken away by the branch predictor and the other optimizations implemented in silicon. So is all hope lost, am I to declare the interpreter the winner against the limitations of the copy-patch method I have available for my JIT?</p>
+
+
+
+
+
+
+
+<figure><table><tbody><tr><td>PostgreSQL</td><td data-align="center">Unpatched</td><td data-align="center">Only 1 NULL check</td><td data-align="center">No NULL check</td><td data-align="center">Two NULL checks, inlined int4eq</td><td data-align="center"><strong>Copyjit, optimization in development</strong></td></tr><tr><td>Average time (ms)</td><td data-align="center">127</td><td data-align="center">117 (-7.9%)</td><td data-align="center">115 (-9.5%)</td><td data-align="center">114 (-10.3%)</td><td data-align="center">98 (<strong>-23%</strong>)</td></tr><tr><td>Instructions</td><td data-align="center">13,377,719,062</td><td data-align="center">13,238,656,204 (-1,1%)</td><td data-align="center">13,199,914,639 (-1,4%)</td><td data-align="center">12,941,745,741 (-3,3%)</td><td data-align="center">12,013,081,667 (<strong>-11%</strong>)</td></tr><tr><td>Cycles</td><td data-align="center">4,583,676,400</td><td data-align="center">4,429,234,344 (-3,4%)</td><td data-align="center">4,416,014,805 (-3,7%)</td><td data-align="center">4,305,023,693 (-6,1%)</td><td data-align="center">3,701,112,703 (<strong>-20%</strong>)</td></tr><tr><td>Branches</td><td data-align="center">2,322,262,677</td><td data-align="center">2,277,385,482 (-2%)</td><td data-align="center">2,248,257,937 (-3,2%)</td><td data-align="center">2,211,080,124 (-4,8%)</td><td data-align="center">2,028,224,528 (<strong>-13%</strong>)</td></tr></tbody></table><figcaption>Look, some fun ahead! </figcaption></figure>
+
+
+
+<p>Of course not, see you in the next post to discuss the biggest interpreter bottleneck!</p>
+
+
+
+
+
+
+
+<p>PS: help welcome. Last year I managed to spend some time working on this during my work time. Since then I’ve changed job, and can hardly get some time on this. I also tried to get some sponsoring to work on this and present at future PostgreSQL conferences, to no luck :/</p>
+
+
+
+<p>If you can help in any way on this project, feel free to reach me (code contribution, sponsoring, missions, job offers, nudge nudge wink wink). Since I’ve been alone on this, a lot of things are dibbles on scratch paper, I benchmark code and stuff in my head when life gives me some boring time but testing it for real is of course far better. I have some travel planned soon so I hope for next part to be released before next year, with interesting results since my experiences have been as successful as anticipated.</p>
+	</div><!-- .entry-content -->
+
+	<!-- .entry-footer -->
+
+				
+</article></div>
+  </body>
+</html>
