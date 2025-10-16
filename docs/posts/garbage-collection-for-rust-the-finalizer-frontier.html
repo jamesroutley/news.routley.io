@@ -1,0 +1,5296 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://soft-dev.org/pubs/html/hughes_tratt__garbage_collection_for_rust_the_finalizer_frontier/">Original</a>
+    <h1>Garbage collection for Rust: The finalizer frontier</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+  
+<p><strong>Abstract</strong> Rust is a non-Garbage Collected (GCed) language, but the lack of GC
+makes expressing data-structures that require shared ownership awkward,
+inefficient, or both. In this paper we explore a new design for, and
+implementation of, GC in Rust, called <span>Alloy</span>. Unlike previous approaches to GC in
+Rust, <span>Alloy</span> allows existing Rust
+destructors to be automatically used as GC finalizers: this makes <span>Alloy</span> integrate better with existing Rust code
+than previous solutions but introduces surprising soundness and
+performance problems. <span>Alloy</span> provides
+novel solutions for the core problems: <em>finalizer safety
+analysis</em> rejects unsound destructors from automatically being
+reused as finalizers; <em>finalizer elision</em> optimises away
+unnecessary finalizers; and <em>premature finalizer prevention</em>
+ensures that finalizers are only run when it is provably safe to do
+so.</p>
+    <h3><span>1    </span> <a id="x1-10001"></a>Introduction</h3>
+
+<p>
+Amongst the ways one can classify programming languages are whether they are Garbage Collected
+(GCed) or not: GCed languages enable implicit memory management; non-GCed languages require
+explicit memory management (e.g <code>C</code>&#39;s <code>malloc</code> / <code>free</code> functions). Rust&#39;s use of affine types [<a href="#Xpierce04advanced">25</a>, p. 5] and
+ownership does not fit within this classification: it is not GCed but it has implicit scope-based
+memory management. Most portions of Rust programs are as succinct as a GCed equivalent, but
+ownership is too inflexible to express <em>shared ownership</em> for data-structures that require multiple
+owners (e.g. doubly linked lists). Workarounds such as reference counting impose an extra
+burden on the programmer, make mistakes more likely, and often come with a performance
+penalty.
+</p>
+<p>
+In an attempt to avoid such problems, there are now a number of GCs for Rust (e.g. [<a href="#Xshifgrethor">2</a>, <a href="#Xcoblenz21bronze">11</a>, <a href="#Xmanish15rustgc">14</a>, <a href="#Xgcarena">32</a>, <a href="#Xboa">33</a>]).
+Most introduce a user-visible type <code>Gc&lt;T&gt;</code> which takes a value <em>v</em> of type <code>T</code> and moves <em>v</em> to the &#39;GC
+heap&#39;. The <code>Gc&lt;T&gt;</code> value itself is a wrapper around a pointer to <em>v</em> on the GC heap. <code>Gc&lt;T&gt;</code> can be
+<em>cloned</em> (i.e. duplicated) and <em>dereferenced</em> to a value of type <code>&amp;T</code> (i.e. a type-safe pointer) at
+will by the user. When no <code>Gc&lt;T&gt;</code> wrappers pointing to <em>v</em> can be found, indirectly or directly,
+from the program&#39;s <em>roots</em> (e.g. variables on the stack), then the GC heap memory for <em>v</em> can be
+reclaimed.
+</p>
+<p>
+It has proven hard to find a satisfying design and implementation for a GC for Rust, as perhaps
+suggested by the number of attempts to do so. We identify two fundamental challenges for
+GC for Rust: how to give <code>Gc&lt;T&gt;</code> an idiomatic and complete API; and how to make <em>finalizers</em>
+(i.e. the code that is run just before a value is collected by the GC) safe, performant, and
+ergonomic.
+</p>
+<figure>
+<a id="x1-1001r1"></a>
+    <pre><code>struct GcNode { value: u8, nbr: Option&lt;Gc&lt;RefCell&lt;GcNode&gt;&gt;&gt;}
+impl Drop for GcNode { fn drop(&amp;mut self) { println!(&#34;drop {}&#34;, self.value); } }
+
+fn main() {
+  let mut gc1 = Gc::new(RefCell::new(GcNode { value: 1, nbr: None } ));
+  gc1.borrow_mut().nbr = Some(gc1);
+  let gc2 = Gc::new(RefCell::new(GcNode { value: 2, nbr: None } ));
+  gc2.borrow_mut().nbr = Some(gc2);
+  gc1 = gc2;
+  force_gc();
+  println!(&#34;{} {}&#34;, gc1.borrow().value, gc1.borrow().nbr.unwrap().borrow().value);
+}</code></pre>
+<figcaption>
+    <span>Listing 1.</span> An <em>Alloy</em> example, showing <code>Gc&lt;T&gt;</code>
+and destructors as finalizers. We create a type <code>GcNode</code> which
+models a graph: it stores an 8 bit integer value and a possibly-null
+reference (via Rust&#39;s standard <code>Option</code> type) to a neighbouring node
+(<span data-line="1">line 1</span>). We add a normal Rust destructor which <span>Alloy</span> is able to use as a
+finalizer when <code>GcNode</code> is used inside <code>Gc&lt;T&gt;</code> (<span data-line="2">line 2</span>).
+Inside <code>main</code> we create the first GCed node in the graph (<span data-line="5">line 5</span>).
+We use Rust&#39;s normal <code>RefCell</code> type to allow the node to be mutated
+(using the <code>RefCell::borrow_mut</code> method which dynamically checks
+for mutation that would undermine Rust&#39;s static rules)
+and a cycle created directly back to itself (<span data-line="6">line 6</span>). We then create a second cyclic graph (<span data-line="7">lines 7</span>
+and <span data-line="8">8</span>), immediately assigning it to the <code>gc1</code> variable (<span data-line="9">line 9</span>):
+this copies, rather than moves, the <code>Gc&lt;T&gt;</code>.
+This causes the first cyclic graph <code>GcNode{value: 1, ..}</code>
+to no longer be reachable, so after forcing a collection (<span data-line="10">line 10</span>) that node
+can be collected. Its finalizer is then scheduled to be run, causing
+<code>drop 1</code> to be printed out at a later point; when it has completed the GC
+heap memory can be reclaimed. The print statement outputs <code>2 2</code> (<span data-line="11">line
+11</span>).
+</figcaption>
+</figure>
+<p>
+In this paper we introduce <span>Alloy</span>, a new GC for Rust: an example of its use is shown in Listing <a href="#x1-1001r1">1</a>.
+<span>Alloy</span> uses <em>conservative</em> garbage collection (i.e. treating each reachable machine word as a potential
+pointer), which naturally solves the API challenge. However, the finalization challenge is much
+more involved: the causes of this challenge, and our solutions to it, occupy the bulk of this
+paper.
+</p>
+<p>
+Normal Rust code uses <em>destructors</em> (i.e. code which is run just before a value is reclaimed by Rust&#39;s
+implicit memory management) extensively. Although finalizers and destructors may seem to be
+synonyms, existing GCs for Rust cannot reuse destructors as finalizers: the latter must be manually
+implemented for each type that needs it. Unfortunately, even this is trickier than it appears: it is not
+possible to implement a finalizer for <code>Gc&lt;T&gt;</code> if <code>T</code> is an external library; some parts of destructors are
+automatically created by the Rust compiler, but hand-written finalizers must duplicate those parts
+manually; and users can accidentally cause a type&#39;s finalizer to be run more than once. In short,
+finalization in existing GCs for Rust is unpalatable.
+</p>
+<p>
+GCs for Rust are not alone in requiring manually written finalizers. In a close cousin to our work, a
+GC proposal for C++, the reuse of destructors as finalizers was ruled out due to seemingly
+insoluble problems [<a href="#Xboehm09garbage">8</a>, p. 32], which we divide into four categories: (1) some safe destructors are
+not safe finalizers; (2) finalizers can be run prematurely; (3) running finalizers on the same
+thread as a paused mutator can cause race conditions and deadlocks; (4) and finalizers are
+prohibitively slower than destructors. All are, at least to some degree, classical GC problems; all are
+exacerbated in some way by Rust; and none, with the partial exception of #2, has existing
+solutions.
+</p>
+<p>
+We show that it is possible to reuse most Rust destructors as finalizers in a satisfying way. We
+introduce novel solutions to the long-standing problems this implies by making use of some of Rust&#39;s
+unusual static guarantees. We thus gain a better GC for Rust <em>and</em> solutions to open GC problems. Our
+solutions, in order, are: (1) <em>finalizer safety analysis</em> extends Rust&#39;s static analyses to reject
+programs whose destructors are not provably safe to be used as finalizers; (2) <em>premature finalizer
+prevention</em> automatically inserts fences to prevent the GC from being &#39;tricked&#39; into collecting
+values before they are dead; (3) we run finalizers on a separate thread; and (4) and <em>finalizer
+elision</em> statically optimises away finalizers if the underlying destructor duplicates the GC&#39;s
+work.
+</p>
+<p>
+<span>Alloy</span> as an implementation is necessarily tied to Rust, though most of the novel techniques in this
+paper rely on general properties of affine types and ownership. While we do not wish to claim generality
+without evidence, it seems likely that many of the techniques in this paper will generalise to other
+ownership-based languages, as and when such emerge.
+</p>
+<p>
+Although <span>Alloy</span> is not production ready, its performance is already reasonable: when we control for
+the (admittedly somewhat slow) conservative GC (<span>BDWGC</span>) <span>Alloy</span> currently uses, the performance of
+<span>Alloy</span> varies from 0.74× to, in the worst case, 1.17× that of reference counting. <span>Alloy</span> is also sufficiently
+polished (e.g. good quality error messages) in other ways for it to: show a plausible path forwards for
+those who may wish to follow it; and to allow others to evaluate whether GC for Rust is a good idea or
+not.
+</p>
+<p>
+This paper is divided into four main parts: GC and Rust background (Section <a href="#x1-20002">2</a>); <span>Alloy</span>&#39;s basic
+design (Section <a href="#x1-50003">3</a>); destructor and finalizer challenges and solutions (Sections 4 to 7); and
+evaluation (Section <a href="#x1-210008">8</a>). The first three parts have the challenge that our work straddles two
+areas that can seem mutually exclusive: GC and Rust. We have tried to provide sufficient
+material for readers expert in one of these areas to gain adequate familiarity with the other,
+without boring either, but we encourage readers to skip material they are already comfortable
+with.
+</p>
+
+    <h3><span>2    </span> <a id="x1-20002"></a>Background</h3>
+
+<p><span><span><span>2.1    </span></span> <a id="x1-30002.1"></a><span>The Challenges of Shared Ownership in Rust</span></span>
+</p>
+
+<p>
+Rust uses affine types and <em>ownership</em> to statically guarantee that: a value has a single owner (e.g. a
+variable); an owner can <em>move</em> (i.e. permanently transfer the ownership of) a value to another owner;
+and when a value&#39;s owner goes out of scope, the value&#39;s destructor is run and its backing
+memory reclaimed. An owner can pass <em>references</em> to a value to other code, subject to the
+following static restrictions: there can be multiple immutable references (&#39;<code>&amp;</code>&#39;) to a value or a single
+mutable reference (&#39;<code>&amp;mut</code>&#39;); and references cannot outlast the owner. These rules allow many
+Rust programs to be as succinct as their equivalents in GCed languages. This suggests that
+the search for a good GC for Rust may be intellectually stimulating but of little practical
+value.
+</p>
+
+<p>
+However, there are many programs which need to express data structures which do not fit into the
+restrictions of affine types and ownership. These are often described as &#39;cyclic data-structures&#39;, but in this
+paper we use the more abstract term &#39;shared ownership&#39;, which includes, but is not limited to, cyclic
+data-structures.
+</p>
+
+<p>
+A common way of expressing shared ownership is to use the reference counting type <code>Rc&lt;T&gt;</code> from
+Rust&#39;s standard library. For many data-structures, this is a reasonable solution, but some forms of shared
+ownership require juggling strong and weak counts. This complicates programs (see Listing <a href="#x1-3001r2">2</a>) and can
+cause problems when values live for shorter or longer than intended.
+</p>
+
+<figure>
+<a id="x1-3001r2"></a>
+<pre><code>struct RcNode { value: u8, nbr: Option&lt;Weak&lt;RefCell&lt;RcNode&gt;&gt;&gt; }
+impl Drop for RcNode { fn drop(&amp;mut self) { println!(&#34;drop {}&#34;, self.value); } }
+
+fn main() {
+  let mut rc1 = Rc::new(RefCell::new(RcNode{value: 1, nbr: None}));
+  rc1.borrow_mut().nbr = Some(Rc::downgrade(&amp;rc1));
+  let rc2 = Rc::new(RefCell::new(RcNode{value: 2, nbr: None}));
+  rc2.borrow_mut().nbr = Some(Rc::downgrade(&amp;rc2));
+  rc1 = Rc::clone(&amp;rc2);
+  println!(&#34;{} {}&#34;, rc1.borrow().value,
+                   rc1.borrow().nbr.as_ref().unwrap().upgrade().unwrap().borrow().value);
+}</code></pre>
+
+<figcaption>
+    <span>Listing 2. </span>
+    <span>A version of Listing <a href="#x1-1001r1">1</a> using Rust&#39;s standard reference counting type <code>Rc&lt;T&gt;</code>. To avoid
+memory leaks we use <em>weak</em> references between nodes (<span data-line="1">line 1</span>). We again create two cyclic
+graphs (<span data-line="5">lines 5</span>–<span data-line="8">8</span>) using <code>Rc::downgrade</code> to create weak references (<span data-line="6">lines 6</span> and <span data-line="8">8</span>). Since <code>Rc&lt;T&gt;</code> is
+not copyable, we must use a manual <code>clone</code> call to have both the <code>rc1</code> and <code>rc2</code> variables point to
+the same cyclic graph (<span data-line="9">line 9</span>). Accessing a neighbour node becomes a delicate dance requiring
+upgrading the weak reference (<span data-line="11">line 11</span>). The need to downgrade <code>Rc&lt;T&gt;</code> to <code>Weak&lt;T&gt;</code> and upgrade
+(which may fail, hence the <code>unwrap</code>) back to <code>Rc&lt;T&gt;</code> creates significant extra complexity relative
+to Listing <a href="#x1-1001r1">1</a>: compare line 11 in Listing <a href="#x1-1001r1">1</a> to <span data-line="10">lines 10</span>-<span data-line="11">11</span> above.</span>
+</figcaption>
+
+</figure>
+
+<p>
+A different solution is to store values in a vector and use integer indices into that vector. Such indices
+are morally closer to machine pointers than normal Rust references: the indices can become stale,
+dangle, or may never have been valid in the first place. The programmer must also manually
+deal with issues such as detecting unused values, compaction, and so on. In other words,
+the programmer ends up writing a partial GC themselves. A variant of this idea are <em>arenas</em>,
+which gradually accumulate multiple values but free all of them in one go: values can no
+longer be reclaimed too early, though arenas tend to unnecessarily increase the lifetime of
+values.
+</p>
+
+<p>
+A type-based approach is <code>GhostCell</code> [<a href="#Xyanovski21ghostcell">35</a>], which uses <em>branding</em> to statically ensure that at any given
+point only one part of a program can access a shared ownership data-structure. This necessarily excludes
+common use cases where multiple owners (e.g. in different threads) need to simultaneously access
+disjoint parts of a data-structure.
+</p>
+
+<p>
+Although it is easily overlooked, some workarounds (e.g. <code>Rc&lt;T&gt;</code>) rely on using <em>unsafe</em> Rust
+(i.e. parts of the language, often involving pointers, that are not fully statically checked by the
+compiler). Pragmatically, we assume that widely used code, even if technically unsafe, has
+been pored over sufficiently that it is trustworthy in practise. However, &#39;new&#39; solutions that a
+programmer implements using unsafe Rust are unlikely to immediately reach the same level of
+trustworthiness.
+</p>
+
+<p>
+While we do not believe that every Rust program would be improved by GC, the variety of
+workarounds already present in Rust code, and the difficultly of creating new ones, suggests that there is
+a subset that would benefit from GC.
+</p>
+
+    <p><span><span>2.2    </span> <a id="x1-40002.2"></a>GC Terminology</span></p><p>
+GC is a venerable field and has accumulated terminology that can seem unfamiliar or unintuitive. We mostly
+use the same terminology as Jones et al [<a href="#Xjones23garbage">19</a>],
+the major parts of which we define here.
+</p>
+
+<p>
+A program which uses GC is split between the <em>mutator</em> (the user&#39;s program) and the <em>collector</em> (the GC
+itself). At any given point in time, a thread is either running as a mutator or a collector. In our context, all
+threads run as a collector at least sometimes (for reasons that will become apparent later, some threads
+always run as a collector). Tracing and reclamation is performed during a <em>collection</em> phase. Our
+collections always <em>stop-the-world</em>, where all threads running mutator code are paused while collection
+occurs.
+</p>
+
+<p>
+A <em>tracing</em> GC is one that scans memory looking for reachable values from a program&#39;s roots: values,
+including cycles of values, that are not reachable from the roots can then be <em>reclaimed</em>. In contrast, a pure
+reference counting GC does not scan memory, and thus cannot free values that form a cycle. Increasingly,
+GC implementations make use of multiple techniques (see [<a href="#Xbacon04unified">3</a>]) but, for simplicity&#39;s sake, we assume that
+implementations wholly use one technique or another except otherwise stated. For brevity, we use &#39;GC&#39;
+as a short-hand for &#39;tracing GC&#39;; when we deal with other kinds of GC (e.g. reference counting), we
+explicitly name them.
+</p>
+
+<p>
+We refer to memory which is allocated via <code>Gc&lt;T&gt;</code> as being on the <em>GC heap</em>. We use the term &#39;GC value&#39;
+to refer both to the pointer wrapped in a <code>Gc&lt;T&gt;</code> and the underlying value on the GC heap, even though
+multiple pointers / wrappers can refer to a single value on the GC heap, unless doing so would lead to
+ambiguity.
+</p>
+
+<p>
+We use &#39;<span>Alloy</span>&#39; to refer to the combination of: our extension to the Rust language; our modifications to
+the <code>rustc</code> compiler; and our integration of the Boehm-Demers-Weiser GC (<span>BDWGC</span>) into the runtime of
+programs compiled with our modified <code>rustc</code>.
+</p>
+
+    <h3><span>3    </span> <a id="x1-50003"></a><span>Alloy</span>: Design and Implementation</h3>
+
+<p>In this section we outline <span>Alloy</span>&#39;s basic design and implementation choices – the rest of the paper then
+goes into detail on the more advanced aspects.
+</p>
+
+<p><span>3.1    </span> <a id="x1-60003.1"></a>Basic Design</p>
+
+<p><span>Alloy</span> provides a <code>Gc&lt;T&gt;</code> type that exposes an API modelled on the <code>Rc&lt;T&gt;</code> type from Rust&#39;s
+standard library, because <code>Rc&lt;T&gt;</code>: is conceptually similar to <code>Gc&lt;T&gt;</code>; widely used in Rust code, and
+its API familiar; and that API reflects long-term experience about what Rust programmers
+need.
+</p>
+
+<p>
+When a user calls <code>Gc::new(v)</code>, the value <code>v</code> is moved to the GC heap: the <code>Gc&lt;T&gt;</code> value returned
+to the user is a simple wrapper around a pointer to <code>v</code>&#39;s new address. The same underlying
+GCed value may thus have multiple, partly or wholly overlapping, references active at any
+point. To avoid undermining Rust&#39;s ownership system, dereferencing a <code>Gc&lt;T&gt;</code> produces an
+immutable (i.e. &#39;<code>&amp;</code>&#39;) reference to the underlying value. If the user wishes to mutate the underlying
+value, they must use other Rust types that enable <em>interior mutability</em> (e.g. <code>RefCell&lt;T&gt;</code> or
+<code>Mutex&lt;T&gt;</code>).
+</p>
+
+<p>
+One feature that <span>Alloy</span> explicitly supports is the ability in Rust to cast references to raw pointers and
+back again. This can occur in two main ways. <code>Gc&lt;T&gt;</code> can be dereferenced to <code>&amp;T</code> which can
+then, as with any other reference, be converted to *const T (i.e. a C-esque pointer to T).
+<code>Gc&lt;T&gt;</code> also supports the common Rust functions (<code>into_raw</code> and <code>from_raw</code>) which wrap the
+value-to-pointer conversion in a slightly higher-level API. The ability to convert references to raw
+pointers is used in many places (e.g. Rust&#39;s standard C Foreign Function Interface (FFI)).
+We believe that a viable GC for Rust must allow the same conversions, but doing so has a
+profound impact because Rust allows raw pointers to be converted to the integer type <code>usize</code> and
+back<a id="x1-6001f1"></a>.
+</p>
+
+<p>
+Having acknowledged that pointers can be &#39;disguised&#39; as integers, it is then inevitable that <span>Alloy</span> must
+be a conservative GC: if a machine word&#39;s integer value, when considered as a pointer, falls within a
+GCed block of memory, then that block itself is considered reachable (and is transitively scanned). Since a
+conservative GC cannot know if a word is really a pointer, or is a random sequence of bits that happens
+to be the same as a valid pointer, this over-approximates the <em>live set</em> (i.e. the blocks that the GC will not
+reclaim). Typically the false detection rate is very low (see e.g. a Java study which measures it at under
+0.01% of the live set [<a href="#Xshahriyar14fast">28</a>]).
+</p>
+
+<p>
+Conservative GC occupies a grey zone in programming language semantics: in most languages, and
+most compiler&#39;s internal semantics, conservative GC is, formally speaking, unsound; and
+furthermore some languages (including Rust) allow arbitrary &#39;bit fiddling&#39; on pointers, temporarily
+obscuring the address they are referring to. Despite this, conservative GC is widely used,
+including in the two most widespread web browsers: Chrome uses it in its Blink rendering
+engine [<a href="#Xager13oilpan">1</a>] and Safari uses it in its JavaScript VM JavaScriptCore [<a href="#Xpizlo17riptide">26</a>]. Even in 2025,
+we lack good alternatives to conservative GC: there is no cross-platform API for precise GC; and while
+some compilers such as LLVM provide some support for GC features [<a href="#Xllvm14statepoints">23</a>], we have found them
+incomplete and buggy. Despite the potential soundness worries, conservative GC thus remains a widely
+used technique.
+</p>
+
+<p>
+Conservative GC enables <span>Alloy</span> to make a useful ergonomic improvement over most other GCs
+for Rust whose <code>Gc&lt;T&gt;</code> is only <em>cloneable</em>. Such types can be duplicated, but doing so requires
+executing arbitrary user code. To make the possible run-time cost of this clear, Rust has no
+direct syntax for cloning: users must explicitly call <code>Rc::clone(&amp;v)</code> to duplicate a value <code>v</code>. In
+contrast, since <span>Alloy</span>&#39;s <code>Gc&lt;T&gt;</code> is just a wrapper around a pointer it is not just cloneable but
+also <em>copyable</em>: duplication only requires copying bytes (i.e. no arbitrary user code need be
+executed). Copying is implied by assignment (i.e. <code>w = v</code>), reducing the need for explicit
+cloning<a id="x1-6003f2"></a>.
+This is not just a syntactic convenience but also reflects an underlying semantic difference: duplicating a
+<code>Gc&lt;T&gt;</code> in <span>Alloy</span> is is a cheaper and simpler operation than most other GCs for Rust which which tend to
+rely, at least in part, on reference counting.
+</p>
+
+<p>
+There is one notable limitation of <code>Gc&lt;T&gt;</code>&#39;s API relative to <code>Rc&lt;T&gt;</code>. The latter, by definition, knows how
+many references there are to the underlying data, allowing the value stored inside it to be mutably
+borrowed at run-time if there is only a single reference to it (via <code>get_mut</code> and <code>make_mut</code>). In contrast,
+<code>Gc&lt;T&gt;</code> cannot know how many references there are to the underlying data. As we shall see in Section <a href="#x1-210008">8</a>,
+some Rust programs are built around the performance advantages of this API (e.g. turning &#39;copy on
+write&#39; into just &#39;write&#39; in some important cases).
+</p>
+
+<p><span>3.2    </span> <a id="x1-70003.2"></a>Basic Implementation</p>
+
+<p>The most visible aspect of <span>Alloy</span> is its fork, and extension of, the standard Rust compiler <code>rustc</code>. We
+forked <code>rustc</code> 1.79.0, adding or changing approximately 5,500 Lines of Code (LoC) in the core compiler,
+and adding approximately 2,250 LoC of tests.
+</p>
+
+<p>
+<span>Alloy</span> uses <span>BDWGC</span> [<a href="#Xboehm88garbage">9</a>] as the underlying conservative GC, because it is the most widely ported
+conservative GC we know of. We use <span>BDWGC</span>&#39;s <code>GC_set_finalize_on_demand(1)</code> API, which causes
+finalizers to be run on their own thread.
+</p>
+
+<p>
+We had to make some minor changes to <span>BDWGC</span> to suit our situation. First, we disabled <span>BDWGC</span>&#39;s
+parallel collector because it worsens <span>Alloy</span>&#39;s performance. It is unclear to us why this happens:
+we observe significant lock contention within <span>BDWGC</span> during GC collections, but have not
+correlated this with a cause. Second, <span>BDWGC</span> cannot scan pointers stored in thread locals
+because these are platform dependent. Fortunately, <code>rustc</code> uses LLVM&#39;s thread local storage
+implementation, which stores such pointers in the <code>PT_TLS</code> segment of the ELF binary: we modified
+<span>BDWGC</span> to scan this ELF segment during each collection. Third, <span>BDWGC</span> dynamically intercepts
+thread creation calls so that it can can scan their stacks, but (for bootstrapping reasons) is
+unable to do so in our context: we explicitly changed <span>Alloy</span> to register new threads with
+<span>BDWGC</span>.
+</p>
+
+    <h3><span>4    </span> <a id="x1-80004"></a>Destructors and Finalizers</h3>
+
+<p>In many GCed languages, &#39;destructor&#39; and &#39;finalizer&#39; are used as synonyms, as both terms refer to code
+run when a value&#39;s lifetime has ended. In existing GCs for Rust, these two terms refer to completely
+different hierarchies of code (i.e. destructors and finalizers are fundamentally different). In <span>Alloy</span>, in
+contrast, a reasonable first approximation is that finalizers are a strict subset of destructors. In this
+section we pick apart these differences, before describing the challenges of using destructors as
+finalizers.
+</p>
+
+<p>
+When a value in Rust is <em>dropped</em> (i.e. at the point its owner goes out of lexical scope) its destructor is
+automatically run. Rust&#39;s destructors enable a style of programming that originated in C++ called RAII
+(Resource Acquisition Is Initialization) [<a href="#Xstroustrup97c++">30</a>, Section 14.4]: when a value is dropped, the underlying
+resources it possesses (e.g. file handles or heap memory) are released. Destructors are used frequently in
+Rust code (to give a rough idea: approximately 15% of source-level types in our benchmark suite have
+destructors).
+</p>
+
+<p>
+Rust destructors are formed of two parts, run in the following order: a user-defined <em>drop method</em>; and
+automatically inserted <em>drop glue</em>. Drop methods are optional and users can provide one for a type by
+implementing the <code>Drop</code> trait&#39;s <code>drop</code> method. Drop glue recursively calls destructors of contained types
+(e.g. fields in a struct). Although it is common usage to conflate &#39;destructor&#39; in Rust with drop methods,
+drop glue is an integral part of a Rust destructor: we therefore use &#39;destructor&#39; as the umbrella term for
+both drop methods and drop glue.
+</p>
+
+<p>
+When considering finalizers for a GC for Rust, there are several layers of design choices. We will
+shortly see that finalizers cause a number of challenges (Section <a href="#x1-90004.1">4.1</a>) and one choice would be to forbid
+finalizers entirely. However, this would mean that one could not sensibly embed types that have
+destructors in a <code>Gc&lt;T&gt;</code>. While Rust does not always call destructors, the situations where this occurs are
+best considered &#39;exceptional&#39;: not calling destructors from <code>Gc&lt;T&gt;</code> would completely undermine
+reasonable programmer expectations. Because of this, <span>Alloy</span>, and indeed virtually all GCs for Rust,
+support finalizers in some form.
+</p>
+
+<p>
+However, existing GCs force distinct notions of destructors and finalizers onto the programmer. Where
+the former have the <code>Drop</code> trait, the latter typically have a <code>Finalize</code> trait. If a user type needs to be
+finalized then the user must provide an implementation of the <code>Finalize</code> trait. However, doing so
+introduces a number of problems: (1) external libraries are unlikely to provide finalizers, so they must be
+manually implemented by each consumer; (2) Rust&#39;s <em>orphan rule</em> [<a href="#Xrustlangref">27</a>, Section 6.12] prevents one
+implementing traits for types defined in external libraries (i.e. unless a library&#39;s types were designed to
+support <code>Gc&lt;T&gt;</code>, those types cannot be directly GCed); (3) one cannot automatically replicate drop glue
+for finalizers; and (4) one cannot replicate <code>rustc</code>&#39;s refusal to allow calls to the equivalent of
+<code>Drop::drop</code>.
+</p>
+
+<p>
+Programmers can work around problems #1 and #2 in various ways. For example, they can wrap
+external library types in <em>newtypes</em> (zero-cost wrappers) and implement finalizers on those instead [<a href="#Xklabnik18rust">20</a>,
+Section 19.3]. Doing so is tedious but not conceptually difficult.
+</p>
+
+<p>
+Problem #3 has partial solutions: for example, [<a href="#Xmanish15rustgc">14</a>] uses the <code>Trace</code> macro to generate <em>finalizer glue</em> (the
+finalizer equivalent of drop glue) for struct fields. This runs into an unsolvable variant of problem #2:
+types in external libraries will not implement this trait and cannot be recursively scanned for finalizer
+glue.
+</p>
+
+<p>
+Problem #4 is impossible to solve in Rust as-is. One cannot define a function that can never be called —
+what use would such a function have? A possible partial solution might seem to be for the <code>finalize</code>
+method take ownership of the value, but <code>Drop::drop</code> does not do so because that would not allow drop
+glue to be run afterwards.
+</p>
+
+<p><span>4.1    </span> <a id="x1-90004.1"></a>General Challenges When Using Destructors as Finalizers</p>
+
+<p>We have stated as our aim that <span>Alloy</span> should use destructors as finalizers. Above we explained some
+Rust-specific challenges — but there are several non-Rust-specific challenges too! Fundamentally, finalizers
+and destructors have different, and sometimes incompatible, properties. The best guide to these differences,
+and the resulting problems, is Boehm [<a href="#Xboehm03destructors">6</a>], supplemented by later work on support for GC in the C++
+specification [<a href="#Xboehm09garbage">8</a>]<a id="x1-9001f3"></a>.
+</p>
+
+<p>
+An obvious difference between destructors and finalizers is when both are run. While C++ and Rust define precisely when a destructor will be
+run<a id="x1-9003f4"></a>,
+finalizers run at an unspecified point in time. This typically happens at some point after the
+equivalent destructor would run, though a program may exit before any given finalizer is
+run<a id="x1-9005f5"></a>.
+There are, however, two situations which invert this. First, if a thread exits due to an error, and the
+program is either not compiled with unwinding, or the thread has crossed a non-unwinding ABI
+boundary, then destructors might not be run at all, where a GC will naturally run the equivalent
+finalizers: we do not dwell on this, as both behaviours are reasonable in their different contexts. Second,
+and more surprisingly, it is possible for finalizers in non-error situations to run <em>prematurely</em>, that is before
+the equivalent destructor [<a href="#Xboehm03destructors">6</a>, section 3.4].
+</p>
+
+<p>
+A less obvious difference relates to where destructors and finalizers are run. Destructors run in the
+same thread as the last owner of a value. However, running finalizers in the same thread as the last owner
+of the value can lead to race conditions [<a href="#Xniko13destructors">24</a>] and deadlocks [<a href="#Xboehm03destructors">6</a>, section 3.3] if a finalizer tries to
+access a resource that the mutator expects to have exclusive access too. When such problems
+affect destructors in normal Rust code, it is the clear result of programmer error, since they
+should have taken into account the predictable execution point of destructors. However, since
+finalizers do not have a predictable execution point, there is no way to safely access shared
+resources if they are run on the same thread. The only way to avoid this is to run finalizers
+on a non-mutator thread — but not all Rust types / destructors are safe to run on another
+thread.
+</p>
+
+<p>
+There are several additional differences such as: finalizers can reference other GCed values
+that are partly, or wholly, &#39;finalized&#39; and may have had their backing memory reused; and
+finalizers can <em>resurrect</em> values by copying the reference passed to the finalizer and storing it
+somewhere.
+</p>
+
+<p>
+Over time, finalizers have thus come to be viewed with increasing suspicion. Java, for example, has
+deprecated, and intends eventually removing, per-type finalizers: instead it has introduced deliberately
+less flexible per-object &#39;cleaners&#39;, whose API prevents problems such as object resurrection and per-class
+finalization [<a href="#Xgoetz21deprecated">13</a>].
+</p>
+
+<p><span>4.2    </span> <a id="x1-100004.2"></a>The Challenge of Finalizers for <span>Alloy</span></p>
+
+<p>At this point we hope to have convinced the reader that: a viable GC for Rust needs to be able to use
+existing destructors as finalizers whenever possible; but that finalizers, even in existing GCs, cause
+various problems.
+</p>
+
+<p>
+It is our belief that some problems with finalizers are fundamental. For example, finalizers inevitably
+introduce latency between the last use of a value and its finalization.
+</p>
+
+<p>
+Some problems with finalizers are best considered the accidental artefacts of older designs.
+Java&#39;s cleaners, for example, can be thought of as a more restrictive version of finalizers that
+allow most common use-cases but forbid by design many dangerous use cases. For example,
+per-class/struct finalization can easily be replaced by per-object/value finalization; and object
+resurrection can be prevented if object access requires a level of indirection. <span>Alloy</span> benefits from
+our better shared understanding of such problems and the potential solutions: it trivially
+addresses per-object/value finalization (<code>Gc::new_unfinalizable</code> function turns finalization off
+for specific values) and, as we shall see later, via only slightly more involved means, object
+resurrection.
+</p>
+
+<p>
+However, that leaves many problems that are potentially in the middle: they are not obviously
+fundamental, but there are not obvious fixes for them either. In our context, where we wish to use
+destructors as finalizers, four problems have hitherto been thought insoluble [<a href="#Xboehm09garbage">8</a>, p. 32]: (1) finalizers are
+prohibitively slower than destructors; (2) finalizers can run prematurely; (3) running finalizers on the
+same thread as a paused mutator can cause race conditions and deadlocks; (4) some safe destructors are
+not safe finalizers.
+</p>
+
+<p>
+Fortunately for us, Rust&#39;s unusual static guarantees, suitably expanded by <span>Alloy</span>, allow us to
+address each problem in novel, satisfying, ways. In the following section, we tackle these
+problems in the order above, noting that we tackle problems #1 and #2 separately, and #3 and #4
+together.
+</p>
+
+<h3><span>5    </span> <a id="x1-110005"></a>Finalizer Elision</h3>
+
+<p>As we shall see in Section <a href="#x1-210008">8</a>, there is a correlation between the number of finalizers that are run and
+overhead from GC (with a worst case, albeit a definite outlier, in our experiment of 3.35× slowdown). In
+this section we show how to reduce the number of finalizers that are run, which helps reduce this
+overhead.
+</p>
+
+<p>
+A variety of factors contribute to the finalizer performance overhead, including: a queue of finalizers
+must be maintained, whereas destructors can be run immediately; finalizers run some time after the last
+access of a value, making cache misses more likely; and finalizers can cause values (including values they
+own) to live for longer (e.g. leading to increased memory usage and marking overhead). Most of these
+factors are inherent to any GC and our experience of using and working on <span>BDWGC</span>– a mature, widely
+used GC – does not suggest that it is missing optimisations which would overcome all of this
+overhead.
+</p>
+
+<p>
+Instead, whenever possible, <span>Alloy</span> <em>elides</em> finalizers so that they do not need to be run at all. We are able
+to do this because: (1) <span>BDWGC</span> is responsible for all allocations and will, if necessary GC allocations even
+if they are not directly wrapped in a <code>Gc&lt;T&gt;</code>; and (2) many Rust destructors only free memory which
+<span>BDWGC</span> would, albeit with some latency, do anyway.
+</p>
+
+<p>
+Consider the standard Rust type <code>Box&lt;T&gt;</code> which heap allocates space for a value; when a <code>Box&lt;T&gt;</code> value
+is dropped, the heap allocation will be freed. We can then make two observations. First, <code>Box&lt;T&gt;</code>&#39;s drop
+method solely consists of a <code>deallocate</code> call. Second, while we informally say that <code>Box&lt;T&gt;</code> allocates on
+the &#39;heap&#39; and <code>Gc&lt;T&gt;</code> allocates on the &#39;GC heap&#39;, all allocations in <span>Alloy</span> are made through <span>BDWGC</span> and
+stored in the same heap.
+</p>
+
+<p>
+When used as a finalizer, <code>Box&lt;T&gt;</code>&#39;s drop method is thus unneeded, as the underlying memory will be
+freed by <span>BDWGC</span> anyway. This means that there is no need to run a finalizer for a type such as
+<code>Gc&lt;Box&lt;u8&gt;&gt;</code> at all, and the finalizer can be statically elided. However, we cannot elide a
+finalizer for a type such as <code>Gc&lt;Box&lt;Rc&lt;u8&gt;&gt;&gt;</code> because <code>Rc&lt;T&gt;</code>&#39;s drop method must be run for the
+reference count to be decremented. As this shows, we must consider the complete destructor, and
+not just the top-level drop method, when deciding whether a corresponding finalizer can be
+elided.
+</p>
+
+<figure>
+<a id="x1-11002r1"></a>
+<pre><code>function NeedsFinalizer(T):
+    if Impls(T, Drop) and not Impls(T, DropMethodFinalizerElidable) then
+        return true;
+    for each field ∈ T do
+        if NeedsFinalizer(field) then
+            return true;
+    return false;</code></pre>
+<figcaption><span>Algorithm 1. </span><span>Finalizer Elision</span></figcaption>
+</figure>
+
+<figure>
+<a id="x1-11019r3"></a>
+<pre><code>impl&lt;T&gt; Gc&lt;T&gt; {
+  pub fn new(value: T) -&gt; Self {
+    if needs_finalizer::&lt;T&gt;() { Gc&lt;T&gt;::new_with_finalizer(value) }
+    else { Gc&lt;T&gt;::new_without_finalizer(value) }
+    ...
+  }
+}</code></pre>
+<figcaption><span>Listing 3.  </span><span>A  simplified  view  of  how  finalizers  are  elided  inside  <span>Alloy</span>.  The  new  compiler
+intrinsic <code>needs_finalizer</code> returns true if a finalizer is required for a type. The <code>Gc&lt;T&gt;</code> type uses this
+intrinsic to ensure that the value is registered as requiring a finalizer. With optimisations turned
+on, this seemingly dynamic, branching code will be turned into static, branchless code.</span></figcaption>
+</figure>
+
+<p><span>5.1    </span> <a id="x1-120005.1"></a>Implementing Finalizer Elision</p>
+
+<p>Finalizer elision statically determines which type&#39;s destructors do not require corresponding finalizers
+and elides them. It does so conservatively, and deals correctly with drop glue.
+</p>
+
+<p>
+As shown in Algorithm <a href="#x1-11002r1">1</a>, any type which implements the <code>Drop</code> trait requires finalization unless it also
+implements the new <code>DropMethodFinalizerElidable</code> <em>marker trait</em> (i.e. a trait without methods). This
+trait can be used by a programmer to signify that a type&#39;s drop method need not be called if the type is
+placed inside a <code>Gc&lt;T&gt;</code>. The &#39;Drop&#39; part of the trait name is deliberate (i.e. it is not a simplification of
+&#39;destructor&#39;) as it allows the programmer to reason about a type locally (i.e. without considering drop
+glue or concrete type paramaters). If the type has a transitively reachable field whose type implements
+the <code>Drop</code> trait but not the <code>DropMethodFinalizerElidable</code> trait, then then the top-level type still
+requires finalization.
+</p>
+
+<p>
+Even though neither normal Rust destructors or <span>Alloy</span> finalizers are guaranteed to run, a program
+whose destructors or finalizers never run would probably not be usable (leaking resources such as
+memory, deadlocking, and so on). We therefore make <code>DropMethodFinalizerElidable</code> an unsafe trait,
+because implementing it inappropriately is likely to lead to undesired – though not incorrect! –
+behaviour at run-time.
+</p>
+
+<p>
+<span>Alloy</span> modifies the standard Rust library to implement <code>DropMethodFinalizerElidable</code> on the following types:
+<code>Box&lt;T&gt;</code>, <code>Vec&lt;T&gt;</code>, <code>RawVec&lt;T&gt;</code>, <code>VecDeque&lt;T&gt;</code>, <code>LinkedList&lt;T&gt;</code>, <code>BTreeMap&lt;K, V&gt;</code>, <code>BTreeSet&lt;T&gt;</code>, <code>HashMap&lt;K, V&gt;</code>, <code>HashSet&lt;T&gt;</code>,
+<code>RawTable&lt;K, V&gt;</code><a id="x1-12001f6"></a>,
+and <code>BinaryHeap&lt;T&gt;</code>. Fortunately, not only are these types&#39; drop methods compatible with
+<code>DropMethodFinalizerElidable</code>, but they are extensively used in real Rust code: they enable significant
+numbers of finalizers to be elided.
+</p>
+
+<p>
+Listing <a href="#x1-11019r3">3</a> shows the new const compiler intrinsic <code>needs_finalizer</code> we added to implement
+Algorithm <a href="#x1-11002r1">1</a>. The intrinsic is evaluated at compile-time: its result can be inlined into <code>Gc::new</code>, allowing
+the associated conditional to be removed too. In other words – compiler optimisations allowing – the
+&#39;does this specific type require a finalizer?&#39; check has no run-time overhead.
+</p>
+
+<h3><span>6    </span> <a id="x1-130006"></a>Premature Finalizer Prevention</h3>
+
+<p>Most of us assume that finalizers are always run later than the equivalent destructor would have run, but
+they can sometimes run before [<a href="#Xboehm03destructors">6</a>, section 3.4], undermining soundness. Such premature finalization is
+also possible in <span>Alloy</span> as described thus far (see Listing <a href="#x1-13001r4">4</a>). In this section we show how to prevent
+premature finalization.
+</p>
+
+<p>
+There are two aspects to premature finalization. First, language specifications often do not define, or do
+not precisely define, when the earliest point that a value can be finalized is. While this means
+that, formally, there is no &#39;premature&#39; finalization, it seems unlikely that language designers
+anticipated some of the resulting implementation surprises (see e.g. this example in Java [<a href="#Xshipilev20local">29</a>]).
+Second, compiler optimisations – at least in LLVM – are &#39;GC unaware&#39;, so optimisations such
+as scalar replacement can change the point in a program when GCed values appear to be
+finalizable.
+</p>
+
+<figure>
+<a id="x1-13001r4"></a>
+
+<pre><code>struct S { value: u8 }
+impl Drop for S { fn drop(&amp;mut self) { self.value = 0; } }
+
+fn main() {
+  let root = Gc::new(Box::new(S{ value: 1 }));
+  let inner: &amp;u8 = &amp;**root.value;
+  force_gc();
+  println!(&#34;{}&#34;, *inner);
+}</code></pre>
+<figcaption>
+    <span>Listing 4. </span>
+    <span>An example of possible premature finalization. We create a new struct <code>S</code> (<span data-line="1">line 1</span>) with
+a drop method that sets the wrapped integer to zero (<span data-line="2">line 2</span>). In the main method, we move an
+instance of the struct into a <code>Box&lt;T&gt;</code>, which we then move into a <code>Gc&lt;T&gt;</code> (<span data-line="4">line 4</span>). We obtain a Rust
+reference to the inner integer (<span data-line="5">line 5</span>), which at run-time will be a pointer to the <code>Box&lt;T&gt;</code>. At this
+point, the compiler can determine that the <code>Gc&lt;T&gt;</code> is no longer used and overwrite <code>root</code>&#39;s pointer
+(which may be in a register). If a collection then occurs, a finalizer can run <code>S</code>&#39;s drop method,
+causing the program to print &#39;0&#39; instead of the expected &#39;1&#39; (<span data-line="7">line 7</span>).</span>
+</figcaption>
+
+
+</figure>
+
+<p>
+In our context, it is natural to define premature finalization as a (dynamic) finalizer for a <code>Gc&lt;T&gt;</code> value
+running before the (static) <code>Gc&lt;T&gt;</code> owner has gone out of scope. Similar to the high-level proposal mooted
+in [<a href="#Xboehm07optimization">7</a>, Solution 1], we must ensure that the dynamic lifetime of a reference derived from a <code>Gc&lt;T&gt;</code> matches
+or exceeds the lifetime of the <code>Gc&lt;T&gt;</code> itself.
+</p>
+
+<p>
+Our solution relies on adjusting <code>Gc&lt;T&gt;</code>&#39;s drop method to keep alive a GCed value for at least the static
+lifetime of the <code>Gc&lt;T&gt;</code> itself. In other words, we ensure that the conservative GC will always see a pointer
+to a GCed value while the corresponding <code>Gc&lt;T&gt;</code> is in-scope.
+</p>
+
+<p>
+However, there is a major problem to overcome: copyable types such as <code>Gc&lt;T&gt;</code> are forbidden from
+having destructors. The fundamental challenge we have to solve is that each copied value will have a
+destructor called on it, which has the potential for any shared underlying value to be destructed more
+than once. <span>Alloy</span> explicitly allows <code>Gc&lt;T&gt;</code> – but no other copyable type – to have a destructor, but to
+ensure it doesn&#39;t cause surprises in the face of arbitrary numbers of copies, the destructor must be
+idempotent. Our task is made easier because <code>Gc&lt;T&gt;</code> naturally has no drop glue from Rust&#39;s perspective:
+<code>Gc&lt;T&gt;</code> consists of a field with a pointer type, and such types are opaque from a destruction
+perspective.
+</p>
+
+<p>
+We therefore only need to make sure that <code>Gc&lt;T&gt;</code>&#39;s drop method is idempotent. Fortunately, this is
+sufficient for our purposes: we want the drop method to inhibit finalization but that does not
+require run-time side effects. To achieve this, we use a <em>fence</em>. These come in various flavours.
+What we need is a fence that prevents both: the compiler from reordering computations
+around a particular syntactic point; and the CPU from reordering computations around a
+particular address. We copy the platform specific code from the <span>BDWGC</span> <code>GC_reachable_here</code>
+macro<a id="x1-13011f7"></a>
+into <code>Gc&lt;T&gt;</code>&#39;s drop method, which achieves the effect we require.
+</p>
+
+<p><span>6.1    </span> <a id="x1-140006.1"></a>Optimising Premature Finalizer Prevention</p>
+
+<p>The drop method we add to <code>Gc&lt;T&gt;</code> fully prevents premature finalization. It also naturally solves a
+performance problem with the suggested solution for C++ in [<a href="#Xboehm07optimization">7</a>, Solution 1], which requires keeping
+alive all pointers, no matter their type, for their full scope. By definition, our solution only
+keeps alive <code>Gc&lt;T&gt;</code> values: the compiler is free to optimise values of other types as it so wishes.
+However, on an artificial microbenchmark we observed a noticeable overhead from our fence
+insertion.
+</p>
+
+<p>
+We thus implemented a simple optimisation: we only insert fences for a <code>Gc&lt;T&gt;</code> if it has a finalizer.
+Intuitively, it seems that we should not generate drop methods in such cases, but this is difficult to do
+directly inside <code>rustc</code>. Instead, we suppress calls to the drop methods of such types: the two approaches
+are functionally equivalent, though ours does put an extra burden on dead-code elimination in the
+compiler tool-chain.
+</p>
+
+<p>
+<span>Alloy</span> adds a new pass <code>RemoveElidableDrops</code> to <code>rustc</code>&#39;s Mid-Level Intermediate Representation
+(MIR) processing. MIR is best thought of as the main IR inside <code>rustc</code>: it contains the complete set of
+functions in the program, where each function consists of a sequence of basic blocks. Simplifying
+somewhat, function and drop method calls are represented as different kinds of <em>terminators</em> on basic
+blocks. Terminators reference both a callee and a successor basic block.
+</p>
+
+<p>
+The <code>remove_elidable_drops</code> pass iterates over a program&#39;s MIR, identifies drop method
+terminators which reference elidable finalizers, and turns them into &#39;goto&#39; terminators to the
+successor basic basic block. Algorithm 4 in the Appendix presents a more formal version of this
+algorithm.
+</p>
+
+<h3><span>7    </span> <a id="x1-150007"></a>Finalizer Safety Analysis</h3>
+
+<p>In this section we address two high-level problems: running finalizers on the same thread as a paused
+mutator can cause race conditions and deadlocks; and some safe destructors are not safe finalizers.
+Addressing the former problem is conceptually simple – finalizers must be run on a separate thread – but
+we must ensure that doing so is sound. We therefore consider this a specific instance of the latter
+problem, treating both equally in this section.
+</p>
+
+<p>
+We therefore introduce Finalizer Safety Analysis (FSA), which prevents unsafe (in the sense of &#39;not
+safe Rust&#39;) destructors being used as finalizers. As a first approximation, FSA guarantees
+that finalizers are memory safe, cycle safe (i.e. do not access already finalized objects), and
+thread safe. We present the three main components of FSA individually before bringing them
+together.
+</p>
+
+<p><span>7.1    </span> <a id="x1-160007.1"></a>Rust References</p>
+
+<p><code>Gc&lt;T&gt;</code> can store, directly or indirectly, normal Rust references (i.e. <code>&amp;</code> and <code>&amp;mut</code>), at which point it is
+subject to Rust&#39;s normal borrow checker rules and cannot outlive the reference. However, finalizers
+implicitly extend the lifetime of a GCed value, including any stored references: accessing a reference in a
+finalizer could undermine Rust&#39;s borrow checking rules.
+</p>
+
+<p>
+A simple way of avoiding this problem is to forbid <code>Gc&lt;T&gt;</code> from storing, directly or indirectly,
+references. This might seem to be no great loss: storing references in a <code>Gc&lt;T&gt;</code> largely nullifies the
+&#39;GCness&#39; of <code>Gc&lt;T&gt;</code>. However, we found the result hard to use, as it can make simple tasks such as
+gradually migrating existing code to use <code>Gc&lt;T&gt;</code> painful.
+</p>
+
+<p>
+A moderate, but in our experience insufficient, relaxation is to recognise that only types that
+need a finalizer can possibly have problems with references, and to forbid such types from
+storing references in <code>Gc&lt;T&gt;</code>. For example, if there is no drop method for <code>struct S{x: &amp;u8}</code>
+then its destructor is safe to use as a finalizer, since its non-drop aspects will not use the <code>&amp;u8</code>
+reference.
+</p>
+
+<p>
+The eventual rule we alighted upon for FSA is that a destructor for a type <code>T</code> can be used as a
+finalizer provided the destructor&#39;s drop methods do not obtain references derived from <code>T</code>&#39;s
+fields (including fields reachable from its attributes). Using Rust&#39;s terminology, we forbid
+<em>projections</em> (which include a struct&#39;s fields, indexes into a vector, and so on) in destructors from
+generating references. Any non-projection references that are used in a destructor are by
+definition safe to use, as they either exist only for the duration of the drop method (references to
+variables on the stack) or will exist for the remainder of the program (references to global
+variables).
+</p>
+
+<p>
+This rule over-approximates the safe set of destructors. For example, a drop method that
+creates a new value and tries to obtain a reference to a field in it (i.e. a projection) cannot be a
+destructor under FSA, even though the reference cannot outlast the drop method. We found that
+attempting to relax our rule further to deal with such cases rapidly complicates exposition and
+implementation.
+</p>
+
+<figure>
+<pre><code>struct GcNode { value: u8, nbr: Option<gc<refcell<gcnode>&gt;&gt; }
+impl Drop for GcNode {
+  fn drop(&amp;mut self) { self.value = 0; println!(&#34;{}&#34;, self.nbr.unwrap().borrow().value); }
+}
+
+fn main() {
+  let mut gc1 = Gc::new(RefCell::new(GcNode{value: 1, nbr: None}));
+  let gc2 = Gc::new(RefCell::new(GcNode{value: 2, nbr: None}));
+  gc1.borrow_mut().nbr = Some(gc2);
+  gc2.borrow_mut().nbr = Some(gc1);
+}</gc<refcell<gcnode></code></pre>
+<figcaption>
+    <span>Listing 5. </span>
+    <span>An example of the problems that come from mixing cycles and finalization. The salient
+difference from Listing <a href="#x1-1001r1">1</a> is that the drop method prints the value of a field inside <code>nbr</code> (<span data-line="3">line
+3</span>). Running this program on a strong memory model machine is likely to print either <code>2 0</code> or <code>1 0</code>
+depending on whether <code>gc1</code> or <code>gc2</code> is finalized first. The &#39;seemingly expected&#39; output of <code>1 2</code> or <code>2 1</code>
+would never be printed: whichever GCed value is finalized first changes what the other GCed
+value sees in its finalizer. As that implies, this example is unsound: whichever finalizer runs
+second leads to undefined behaviour.</span>
+</figcaption>
+</figure>
+
+<p><span>7.2    </span> <a id="x1-170007.2"></a>Cycles and Finalization</p>
+
+<p>One of the main motivations for GCs is that they solve problems with cyclic data structures. However,
+finalizers can be unsound if they access state shared within members of a cycle. Listing <a href="#x1-16001r5">5</a> shows an
+example of undefined behaviour when two GCed values create a cycle and both their finalizers reference
+the other GCed value. Whichever order the finalizers are run in, at least one of the finalizers will see the
+other GCed value as partly or wholly &#39;finalized&#39;.
+</p>
+
+<p>Most languages and systems we are aware of assume that users either don&#39;t run into this problem
+    (finalization cycles are considered rare in GCed languages [<a href="#Xjones23garbage">19</a>, p. 229]) or know how to deal with it when they do (e.g. refactoring the
+    types into parts that do and don&#39;t require finalization [<a href="#Xboehm03destructors">6</a>, p. 11]). There is no fully automatic
+    solution to this problem. Some GCs offer weak references, which allow users to detect when
+    finalization cycles have been broken, though they still have to deal with the consequences
+    manually.</p>
+
+<p>
+We wanted to provide users with static guarantees that their destructors will not behave unexpectedly
+when used as finalizers in a cycle. A first attempt at enforcing such a property might seem to
+be that a <code>Gc&lt;T&gt;</code> cannot have, directly or indirectly, fields of type <code>Gc&lt;T&gt;</code>. This would indeed
+prevent the mistakes we want to catch but also disallow shared ownership! We therefore
+check only that a type&#39;s destructor does not, directly or indirectly, access a <code>Gc&lt;T&gt;</code>. This allows
+GCed types to express shared ownership so long as their destructor(s) do not access other GC
+types.
+</p>
+
+<p>
+To make this check easier to implement, we introduce an <em>auto trait</em> [<a href="#Xrustlangref">27</a>, Section. 11], a kind of marker
+trait that the compiler propagates automatically. An auto trait <code>A</code> will be automatically implemented for a
+type <code>T</code> unless one of the following is true: there is an explicit <em>negative implementation</em> of <code>A</code> for <code>T</code>; or <code>T</code>
+contains a field that is not itself <code>A</code>. Informally, we say that a negative implementation of an auto-trait
+<em>pollutes</em> containing types.
+</p>
+
+<p>
+Our new auto trait is called <code>FinalizerSafe</code>, and we provide a single negative implementation
+<code>impl&lt;T&gt; !FinalizerSafe for Gc&lt;T&gt;</code>. This naturally handles transitively reachable code, allowing FSA
+itself to only check that a destructor&#39;s direct field accesses are <code>FinalizerSafe</code>.
+</p>
+
+<p><span>7.3    </span> <a id="x1-180007.3"></a>Destructors Need to be Runnable on a Finalizer Thread</p>
+
+<figure>
+<pre><code>impl Drop for GcNode {
+  fn drop(&amp;mut self) { println!(&#34;drop {}&#34;, self.value.lock().unwrap()); }
+}
+
+fn main() {
+  let counter = Rc::new(Mutex::new(0));
+  { let _ = Gc::new(GcNode { value: Rc::clone(&amp;counter), nbr: None }); }
+  let r1 = counter.lock().unwrap();
+  force_gc();
+  assert_eq!(*r1, 0);
+}</code></pre>
+<figcaption>
+    <span>Listing 6. </span>
+    <span>How destructors can cause deadlocks when used as finalizers. The mutator creates a
+reference-counted mutex (<span data-line="6">line 6</span>), placing a copy in a <code>GcNode</code> that immediately goes out of scope
+(<span data-line="7">line 7</span>). The mutator then acquires the lock (<span data-line="8">line 8</span>) but before it can release the lock a GC cycle
+occurs and the <code>GcNode</code>&#39;s finalizer run (<span data-line="9">line 9</span>). If the finalizer is run on the same thread as the
+mutator, then it will fail to grab the lock (<span data-line="2">line 2</span>) and cause a deadlock.</span>
+</figcaption>
+</figure>
+
+<p>
+Running finalizers on the same thread as a mutator can cause problems when the finalizer accesses
+state shared with the mutator (see Section <a href="#x1-90004.1">4.1</a> for a general description and Listing <a href="#x1-18001r6">6</a> for a concrete
+example). The most general solution to this problem is to run finalizers on a separate <em>finalizer thread</em> that
+never runs mutator code.
+</p>
+
+<p>
+We must therefore ensure that it is safe to run a type&#39;s destructor on the finalizer thread. A
+conservative definition is that <code>Gc&lt;T&gt;</code> is safe to use if <code>T</code> implements both of Rust&#39;s existing <code>Send</code> (denoting
+a type that can be permanently moved from one thread to another) and <code>Sync</code> (denoting a type that can be
+safely accessed simultaneously by multiple threads) auto traits. However, requiring that finalization be
+restricted to types that implement both <code>Send</code> and <code>Sync</code> can be frustrating, particularly because more
+types implement <code>Send</code> than <code>Sync</code>.
+</p>
+
+<p>
+It may seem sufficient for <code>T</code> to implement <code>Send</code> alone so that the value can be safely sent to the finalizer
+thread. However, this would not prevent a finalizer indirectly accessing state shared with a
+non-GCed value via a mechanism such as <code>Arc</code>, causing the very problems we are trying to
+avoid.
+</p>
+
+<p>
+FSA thus ignores whether a type implements <code>Send</code> or <code>Sync</code> (or not) and instead examines the
+destructor directly. To pass FSA: the destructor must not access thread locals; and any types the
+destructor accesses via projections must implement both <code>Send</code> and <code>Sync</code>. Intuitively, this allows a
+non-<code>Send</code>-or-<code>Sync</code> type <code>T</code> to have a safe finalizer provided that <code>T</code>&#39;s destructor only access the <code>Send</code> and
+<code>Sync</code> &#39;subset&#39; of <code>T</code>.
+</p>
+
+<p>
+This rule shows clearly that FSA is a form of abstract interpretation rather than a mere extension of the type
+system<a id="x1-18013f8"></a>.
+After careful examination we believe this is compatible with Rust&#39;s semantics (and <code>rustc</code> and LLVM&#39;s
+implementations) at the time of writing, but it is worth knowing that this rule would be unsafe in other
+languages and implementations (for example our assumption would be unsafe in Java due to
+synchronisation removal [<a href="#Xwang06escape">31</a>]). We leave it as an open question to others as to whether Rust should
+deliberately permit or forbid such checks in its semantics.
+</p>
+
+<p>
+The implementation of the finalization thread is fairly simple. For example, we do not need to
+explicitly synchronise memory between the mutator and finalization threads because <span>BDWGC</span>&#39;s
+stop-the-world collection phase already synchronises all memory between threads.
+</p>
+
+<p><span>7.4    </span> <a id="x1-190007.4"></a>Putting it All Together</p>
+
+<figure>
+<a id="x1-19002r2"></a>
+<pre><code>function FinalizerSafetyAnalysis(func):
+    for each basic_block ∈ func do
+        t ← basic_block.terminator;
+        if not IsGcConstructorCall(t) then
+            continue;
+        ty ← GetTyOfGcValue(t);
+        if isFinalizerUnchecked(ty) or not NeedsFinalizer(ty) then
+            continue;
+        for each drop_method ∈ GetDropGlue(ty) do
+            if not IsMIRAvailable(drop_method) then
+                EmitFinalizerUnsafeError();
+            CheckFunctionSafety(drop_method);
+
+function CheckFunctionSafety(drop):
+    for each basic_block ∈ drop do
+        for each statement ∈ basic_block do
+            for each projection ∈ statement do
+                if not IsFinalizerSafe(projection.element) then
+                    EmitFinalizerUnsafeError();
+        if IsFunctionCall(basic_block.terminator) then
+            CheckFunctionSafety(basic_block.terminator);
+
+function IsFinalizerSafe(ty):
+    return Impls(ty, Send) and Impls(ty, Sync) and Impls(ty, FinalizerSafe);</code></pre>
+
+<figcaption><span>Algorithm 2. </span><span>Finalizer Safety Analysis</span></figcaption>
+</figure>
+
+<p>
+FSA integrates the seemingly separate components presented above into one. It iterates over every
+function in a Rust program analysing destructors of types that are used in <code>Gc&lt;T&gt;</code>. Algorithm <a href="#x1-19002r2">2</a> shows the
+essence of FSA (for example eliding details of caching which <span>Alloy</span> uses to speed up compile
+times).
+</p>
+
+<p>
+Because FSA is a form of abstract interpretation, we need to determine when to run FSA on a program.
+In essence, whenever a previously unchecked type <code>T</code> is used to create a new <code>Gc&lt;T&gt;</code>, FSA is run. As well as
+the <code>Gc::new</code> constructor, <code>Gc&lt;T&gt;</code> instances can be created with conversion traits such as <code>From</code>. We
+annotated each such entry point with a new <code>rustc</code>-only attribute <code>rustc_fsa_entry_point</code>: calls to
+functions with this attribute lead to FSA checks.
+</p>
+
+<p>
+A naive implementation of FSA would be a notable cost, so <span>Alloy</span> uses several optimisations. As
+alluded to above, FSA caches the results of various checks to avoid pointlessly repeating work. We also
+extend <code>FinalizerSafe</code> with negative implementations for <code>&amp;T</code>, and <code>&amp;mut T</code>. If a type <code>T</code> implements all of
+<code>FinalizerSafe</code>, <code>Send</code>, and <code>Sync</code>, we know that there can be no unsafe projections used in a destructor,
+and can bypass most FSA checks entirely (though we still need to check for thread local accesses).
+Across our benchmark suite, FSA increases compilation time in release mode by a modest
+0.8–1.6%.
+</p>
+
+<p>
+Algorithm <a href="#x1-19002r2">2</a> also captures <span>Alloy</span>&#39;s approach to error messages. Rather than just inform a user that
+&#39;your drop method has not passed FSA&#39;, <span>Alloy</span> pinpoints which field or line in a drop method caused FSA
+to fail: <code>EmitReferenceError</code> informs the user when a reference in a type is used in a way that violates
+FSA (see Section <a href="#x1-160007.1">7.1</a>); and <code>EmitFinalizerUnsafeError</code> when a drop method contains code which is
+unsafe (e.g. references a <code>Gc&lt;T&gt;</code> type, an opaque function, etc.). Listing <a href="#x1-19052r7">7</a> shows an example of the errors
+reported by <span>Alloy</span>: note that it pinpoints the line within a drop method that caused an FSA
+error.
+</p>
+
+<figure>
+<pre><code>error: `RefCell::new(GcNode{value: 2, nbr: None})` cannot be safely finalized.
+   --&gt; finalization_cycle.rs:11:21
+   |
+7  |   fn drop(&amp;mut self) { self.value = 0; println!(&#34;{}&#34;, self.nbr.unwrap().borrow().value); }
+   |                                                       <span>^^^^^^^^</span>
+   |                                                       <span>a finalizer cannot safely dereference this</span>
+   |                                                       <span>because it might have already been finalized.</span>
+...
+11 |   let gc2 = Gc::new(RefCell::new(GcNode{value: 2, nbr: None}));
+   |       <span>^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^</span>
+   |       <span>has a drop method which cannot be safely finalized.</span></code></pre>
+
+<figcaption><span>Listing 7. </span><span>The compiler error produced by <span>Alloy</span> for the example in Listing <a href="#x1-16001r5">5</a>. This extends
+<code>rustc</code>&#39;s normal error messages: note that both the use of a type with a FSA-incompatible drop
+method (&#39;has a drop method&#39;) and the line in the drop method (&#39;caused by the expression&#39;) are
+highlighted to the user.</span></figcaption>
+</figure>
+
+    <p><span>7.4.1    </span> <a id="x1-200007.4.1"></a>Awkward Kinds of Functions</p>
+
+<p>FSA can encounter two kinds of &#39;awkward&#39; functions.</p>
+
+<p>
+First, some functions (e.g. due to use of trait objects, or FFIs) do not have a body available when FSA
+runs: using such a function necessarily causes an FSA check to fail. One common class of functions
+which causes this are Rust intrinsics (e.g. <code>min_align_of</code> etc.): we audited the most frequently used of
+these and annotated those which are FSA-safe with a new <code>rustc_fsa_safe_fn</code> attribute. Other functions
+whose bodies are unknown cause FSA to fail.
+</p>
+
+<p>
+Second, in most cases, FSA runs on Rust functions whose generic types have been replaced with
+concrete types (in Rust terminology, functions have been &#39;monomorphised&#39;). Sometimes, however, FSA
+encounters functions (e.g. intrinsics or functions with certain annotations) whose generic types have not
+yet been replaced. FSA can still run on such functions, but will reject them unless all generic types imply
+the <code>FinalizerSafe</code>, <code>Send</code>, and <code>Sync</code> traits. Note that calling a method on a generically typed value will
+lead to FSA finding a method without a body: as in the first case above, this will cause FSA to
+fail.
+</p>
+
+<p>
+The common theme to both is that we wish FSA to be sound, at which point we forego completeness.
+This can cause users frustration when FSA raises an error on code they know is FSA safe. As is common
+in Rust, we therefore provide an unsafe escape hatch which allows users to silence FSA errors when they
+can prove to their satisfaction that doing so does undermine correctness. We experimented
+with a per-type approach, but found that unduly restrictive: we therefore provide a per-value
+escape hatch with the <code>unsafe FinalizerUnchecked&lt;T&gt;</code> type. Values wrapped in this type are
+considered safe to use at all points in FSA. Our aim is that users should rarely need to resort to this
+escape hatch, but, as is not uncommon in Rust, there are valid idioms of use where we found it
+necessary.
+</p>
+
+    <h3><span>8    </span> <a id="x1-210008"></a>Evaluation</h3>
+
+<figure>
+<a id="x1-21001r1"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Version</th>
+<th>Description</th>
+<th>#benchmarks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><span>Binary Trees</span></td>
+<td>Debian CLBG Rust#2</td>
+<td>Heap allocation microbenchmark</td>
+<td>1</td>
+</tr>
+<tr>
+<td><span>Regex-Redux</span></td>
+<td>Debian CLBG Rust#1</td>
+<td>Regular expression matching</td>
+<td>1</td>
+</tr>
+<tr>
+<td><span>Alacritty</span></td>
+<td>v0.15.0-dev</td>
+<td>Terminal emulator</td>
+<td>10</td>
+</tr>
+<tr>
+<td><span>fd</span></td>
+<td>v9.0.0</td>
+<td>Unix find replacement</td>
+<td>7</td>
+</tr>
+<tr>
+<td><span>grmtools</span></td>
+<td>v0.13.4</td>
+<td>Lexer / parser library</td>
+<td>4</td>
+</tr>
+<tr>
+<td><span>Ripgrep</span></td>
+<td>v14.1.1</td>
+<td>Fast grep replacement</td>
+<td>13</td>
+</tr>
+<tr>
+<td><span>som-rs-ast</span></td>
+<td>git #35b780</td>
+<td>SOM AST VM</td>
+<td>26</td>
+</tr>
+<tr>
+<td><span>som-rs-bc</span></td>
+<td>git #35b780</td>
+<td>SOM bytecode VM</td>
+<td>26</td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 1.  </span><span>The benchmarks (top) and benchmark suites (bottom) that form our experiment. We altered them
+to use different memory allocation strategies (<span>Alloy</span>, <code>Rc&lt;T&gt;</code>, etc.). <span>Binary Trees</span> and <span>Regex-Redux</span> are classic
+stand-alone GC benchmarks; the other &#39;benchmarks&#39; represent benchmark suites (e.g. <span>Ripgrep</span> contains 13
+benchmarks). The middle portion of the table shows a variety of &#39;normal&#39; Rust programs; the bottom portion
+of the program shows three implementations of the SOM programming language.</span></figcaption>
+</figure>
+
+<p>In this section we explain our methodology and our experimental results.</p>
+
+<p><span>8.1    </span> <a id="x1-220008.1"></a>Methodology</p>
+
+<p><span>8.1.1    </span> <a id="x1-230008.1.1"></a>The Benchmark Suite</p>
+
+<p>There is no existing benchmark suite for GCs for Rust. Even if such a suite did exist, it may not have
+been suitable for our purposes because in experiment <span>E<sub>GCvs</sub></span> we want to compare programs using
+existing shared ownership approaches. We searched through roughly the 100 most popular Rust libraries
+on <code>crates.io</code> (the <em>de facto</em> standard Rust package system) looking for suitable candidates. In
+practise this meant we looked for crates using reference counting. In the interests of brevity,
+for the rest of this section we use &#39;<code>Rc&lt;T&gt;</code>&#39; to cover both <code>Rc&lt;T&gt;</code> and its thread-safe cousin
+<code>Arc&lt;T&gt;</code>.
+</p>
+
+<figure>
+<a id="x1-23001r2"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>Gc&lt;T&gt;</code></th>
+<th><code>Rc&lt;T&gt;</code></th>
+<th>Weak&lt;T&gt;</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><span>Alacritty</span></td>
+<td>107</td>
+<td>9,450</td>
+<td>1,970</td>
+</tr>
+<tr>
+<td><span>Binary Trees</span></td>
+<td>2</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td><span>fd</span></td>
+<td>7</td>
+<td>421</td>
+<td>1</td>
+</tr>
+<tr>
+<td><span>grmtools</span></td>
+<td>299</td>
+<td>1,825</td>
+<td>23</td>
+</tr>
+<tr>
+<td><span>Regex-Redux</span></td>
+<td>108</td>
+<td>109</td>
+<td>0</td>
+</tr>
+<tr>
+<td><span>Ripgrep</span></td>
+<td>104</td>
+<td>249</td>
+<td>4</td>
+</tr>
+<tr>
+<td><span>som-rs-ast</span></td>
+<td>206</td>
+<td>35</td>
+<td>0</td>
+</tr>
+<tr>
+<td><span>som-rs-bc</span></td>
+<td>464</td>
+<td>39</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 2.  </span><span>How often relevant types are referenced in source code after our porting. For <code>Rc&lt;T&gt;</code>, we also show
+how many weak references are left in: this is a proxy both for partial porting, and also how the extent weak
+references. This is a proxy for the extent of changes that cyclic data-structures impose upon source code.</span></figcaption>
+</figure>
+
+<p>
+Table <a href="#x1-21001r1">1</a> shows the resulting suite: note that, except for <span>Binary Trees</span> and <span>Regex-Redux</span>, the
+&#39;benchmarks&#39; are themselves benchmark suites. Collectively, our suite contains – depending on whether
+you count the SOM implementations&#39; (identical) benchmark suites collectively or separately – 62 or 88
+benchmarks. Table <a href="#x1-23001r2">2</a> shows how often relevant types are used after porting. Table <a href="#x1-23002r3">3</a> shows the
+distribution of heap data at run-time. This shows that our suite contains benchmarks with a variety of
+memory patterns.
+</p>
+
+<p>
+<span>Binary Trees</span> is allocation intensive and sufficiently simple that it can be easily and meaningfully
+ported to additional shared ownership strategies: <span>Rust-GC</span>, a user library for GC for Rust [<a href="#Xmanish15rustgc">14</a>]; and
+<code>Arena&lt;T&gt;</code>, a non-GC memory arena [<a href="#Xchiovoloni15typed">10</a>]. <span>Alacritty</span>, <span>fd</span>, and <span>Ripgrep</span> are well known Rust programs, all
+of which have their own benchmark suites. <span>grmtools</span> is a parsing library which uses <code>Rc&lt;T&gt;</code> extensively
+in error recovery: we benchmarked it using 28KLoC of real Java source code, which we mutated with
+syntax errors.
+</p>
+
+<p>
+SOM is a small, but complete, language in the Smalltalk mould, which has a wide variety of
+implementations. Our suite includes two of these: <span>som-rs-ast</span> (which represents programs as ASTs); and
+<span>som-rs-bc</span> (which represents programs as bytecode). Both are existing ports of a Java SOM VM into Rust
+and use <code>Rc&lt;T&gt;</code>. We use the same SOM <code>core-lib</code> benchmarks for both, derived from git commit
+#afd5a6.
+</p>
+
+<p>
+We were not able to port all parts of all programs. In particular, some programs make extensive use of
+the <code>make_mut</code> and <code>get_mut</code> functions in <code>Rc&lt;T&gt;</code>, which allow a programmer to mutate their contents if, at
+run-time, they only have a single owner. There is not, and cannot be, equivalent functionality with a
+copyable <code>Gc&lt;T&gt;</code> type. In some cases we were able to successfully use alternative mechanisms. In others
+we judged the usages to either be rare at run-time (i.e. not worth porting), or too difficult to port (i.e. too
+much of the program is built around the resulting assumptions). In a small number of cases we
+ended up introducing bugs. <span>Alacritty</span>&#39;s UTF-8 support is an example, resulting in deadlocks.
+Whenever we encountered a bug in our porting, we reverted back to <code>Rc&lt;T&gt;</code> for that portion of the
+port.
+</p>
+
+<figure>
+<a id="x1-23002r3"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th colspan="3">Allocated (#)</th>
+<th>GC owned (%)</th>
+</tr>
+<tr>
+<th></th>
+<th><code>Rc&lt;T&gt;</code></th>
+<th>Box&lt;T&gt;</th>
+<th><code>Gc&lt;T&gt;</code></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><span>Alacritty</span></td>
+<td>125</td>
+<td>8,770</td>
+<td>2</td>
+<td>2.70</td>
+</tr>
+<tr>
+<td><span>Binary Trees</span></td>
+<td>0</td>
+<td>3,222,201</td>
+<td>3,222,190</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td><span>fd</span></td>
+<td>17,821</td>
+<td>306,902</td>
+<td>61</td>
+<td>1.23</td>
+</tr>
+<tr>
+<td><span>grmtools</span></td>
+<td>2,283</td>
+<td>19,859,431</td>
+<td>4,038,605</td>
+<td>44.19</td>
+</tr>
+<tr>
+<td><span>Regex-Redux</span></td>
+<td>45</td>
+<td>3,132</td>
+<td>78</td>
+<td>15.39</td>
+</tr>
+<tr>
+<td><span>Ripgrep</span></td>
+<td>12,786</td>
+<td>521,366</td>
+<td>26,069</td>
+<td>17.97</td>
+</tr>
+<tr>
+<td><span>som-rs-ast</span></td>
+<td>15</td>
+<td>8,586,976</td>
+<td>1,533,728</td>
+<td>76.95</td>
+</tr>
+<tr>
+<td><span>som-rs-bc</span></td>
+<td>15</td>
+<td>2,397,931</td>
+<td>1,530,325</td>
+<td>99.71</td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 3.  </span><span>Run-time heap distributions. The &#39;Allocated (#)&#39; columns shows the number of values of each type
+that are allocated (note that most programs also allocate values of other types, but those are not shown
+directly here). The &#39;GC Owned&#39; columns shows the proportion of allocated values that are owned, directly
+and indirectly, by <code>Gc&lt;T&gt;</code> values. For example, a program consisting of a single <code>Gc&lt;Box&lt;T&gt;&gt;</code> would have a
+&#39;GC Owned&#39; value of 100% because the <code>Box&lt;T&gt;</code> is owned by the <code>Gc&lt;T&gt;</code>. As we shall see later, there can be a
+number of knock-on effects when a <code>Gc&lt;T&gt;</code> owns other such values.</span></figcaption>
+</figure>
+
+<p><span>8.1.2    </span> <a id="x1-240008.1.2"></a>What We Couldn&#39;t Include in the Benchmark Suite</p>
+
+<p>We tried porting 10 other programs that are not included in our benchmark suite. To avoid readers
+wondering if we have &#39;cherry-picked&#39; our eventual benchmark suite, we briefly report why those
+other programs have been excluded. All excluded benchmarks are shown in Table 4 in the
+Appendix.
+</p>
+
+<p>
+Several programs (e.g. numbat, mini-moka, and salsa), once ported, turned out to be uninteresting
+from a GC benchmarking perspective. Irrespective of the number of source locations that reference
+memory allocation types, the benchmarks we could run from them allocated sufficiently little memory
+that there are no worthwhile differences between different allocation strategies. Put another way: these
+programs are in a sense &#39;the same&#39; from our evaluation perspective.
+</p>
+
+<p>
+Two programs (bevy and rust-analyzer) did not run correctly after porting. Both extensively use the
+<code>make_mut</code> or <code>get_mut</code> functions in <code>Rc&lt;T&gt;</code> and reverting those changes made the benchmarks
+uninteresting.
+</p>
+
+<p>
+We also ported RustPython, but were unable to adjust it to faithfully implement Python-level
+destructors. In essence, in RustPython&#39;s default configuration, its representation of objects is
+not compatible with FSA. This means that we can not run Python <code>__del__</code> methods in the
+finalizer thread. Although technically this is still compatible with Python&#39;s semantics, we
+felt this would be a misleading comparison, as our port of RustPython would be doing less
+work.
+</p>
+
+
+<p><span>8.1.3    </span> <a id="x1-250008.1.3"></a>Running the Experiment</p>
+
+<p>Our experiment can be seen as a comparison of <span>Alloy</span> against &#39;normal&#39; Rust. Fortunately, <span>Alloy</span> is a
+strict superset of &#39;normal&#39; Rust: only if users explicitly opt into GC does <span>Alloy</span> really become a &#39;GC
+for Rust&#39;. This allows us to use the same compiler, standard library, and so on, removing
+several potential confounding factor in our results. We compile two binaries: one without
+logging features compiled and one with. We only use the latter when reporting collector related
+metrics.
+</p>
+
+<p>
+A challenge in our experiment is that different allocation strategies can use different underlying
+allocators. In particular, <span>Alloy</span> has to use <span>BDWGC</span>, but, for example, <code>Rc&lt;T&gt;</code> can use a modern allocator
+such as jemalloc. Much has changed in the performance of allocators since <span>BDWGC</span>&#39;s 1980s roots: in
+<code>Rc&lt;T&gt;</code>-only benchmarks, we observe an inherent overhead from <span>BDWGC</span> of 2–26% relative to jemalloc
+(see Table 6 in the Appendix), which is a significant, and variable, confounding factor. Fortunately,
+<span>BDWGC</span> can be used as a &#39;traditional&#39; allocator that allocates and frees on demand (i.e. no
+conservative GC occurs): in the main experiment, we thus use <span>BDWGC</span> as the allocator for all
+benchmarks.
+</p>
+
+<p>
+We want to understand the memory usage of different allocation strategies over the lifetime of a
+benchmark. However, there is no single metric which captures &#39;memory usage&#39;, nor even an agreed set of
+metrics [<a href="#Xdacapo25">5</a>]. We use two metrics to capture different facets: (1) <em>heap footprint</em>, the
+amount of live heap memory recorded by by Heaptrack [<a href="#Xwolff14heaptrack">34</a>] at every allocation and deallocation; and (2)
+<em>Resident Set Size</em> (RSS), the total physical memory in RAM used by the process (including
+memory-mapped files, stack, and code/text segments), sampled at 10Hz. The overhead of recording
+heap footprint is much greater than RSS, but it provides a more detailed view of memory
+usage.
+</p>
+
+<p>
+Another pair of confounding factors are the initial and maximum sizes of the GC heap: too-small
+values can lead to frequent resizing and/or &#39;thrashing&#39;; large values to unrealistically few collections.
+What &#39;small&#39; and &#39;large&#39; are varies by benchmark, and &#39;careful&#39; (or thoughtless) choices can significantly
+distort one&#39;s view of performance. <span>BDWGC</span> uses an adaptive strategy by default, growing the
+heap size as it detects that it would benefit from doing so. To give some sense of whether a
+different strategy and/or heap size would make a difference, we ran our benchmarks with
+three different fixed heap sizes. Doing so either has little effect or speeds benchmarks up;
+when it does so, the impact is generally under 10% and is at most 28% (the detailed results
+are presented in Table 9 in the Appendix). Broadly speaking, this suggests that <span>BDWGC</span>&#39;s
+default heap sizing approach, at least in our context, is not significantly distorting our view of
+performance.
+</p>
+
+<p>
+We ran each benchmark in our suite 30 times. We report wall-clock times as returned by the
+standard Unix <code>time</code> utility. The SOM benchmarks are run using its conventional <em>rebench</em>
+tool; we adjusted <em>rebench</em> to use <code>time</code> for consistency with our other benchmarks. We ran
+all benchmarks on an AMD EPYC 7773X 64-Core 3.5GHz CPU with 128GiB RAM, running
+Debian 12 (&#39;bookworm&#39;). We turned off turbo boost and hyper-threading, as both can colour
+results.
+</p>
+
+<p><span>8.1.4    </span> <a id="x1-260008.1.4"></a>Data Presentation</p>
+
+<p>Except where otherwise stated, we report means and 99% confidence intervals for all metrics. We
+use the arithmetic mean for individual benchmarks and the geometric mean for benchmark
+suites.
+</p>
+
+<p>
+When plotting time-series (i.e. sampled) memory metrics, we face the challenge that different
+configurations of the same benchmark can execute at different speeds. We thus resample each
+benchmark&#39;s data to 1000 evenly spaced points using linear interpolation. We chose 1000 samples
+because it is considerably above the visual resolution of our plots. After normalization, we calculate the
+arithmetic mean of the memory footprint measurement at each grid point (and not the raw underlying
+data) across all runs of the same benchmark. We record 99% confidence intervals at each point and show
+the result as shaded regions around the mean.
+</p>
+
+<figure>
+<img src="https://soft-dev.org/pubs/html/hughes_tratt__garbage_collection_for_rust_the_finalizer_frontier/images/gcvs_perf.svg" alt="performance comparison chart"/>
+<a id="x1-27001r1"></a>
+
+<figcaption><span>Figure 1.  </span><span>comparing the effects of <code>gc&lt;t&gt;</code> and <code>rc&lt;t&gt;</code> on wall-clock time; heap footprint (i.e. the size of the
+live set); and rss. the baseline at 1 is <code>rc&lt;t&gt;</code>; values less than 1 show <code>gc&lt;t&gt;</code> as better than <code>rc&lt;t&gt;</code>; and the blue
+vertical line shows the geometric mean of ratios. the wall-clock times of <code>gc&lt;t&gt;</code> and <code>rc&lt;t&gt;</code> are similar; the rss
+somewhat similar; and the average heap footprint often very different. broadly speaking, <code>gc&lt;t&gt;</code> increases the
+average heap footprint because gc, and especially finalization, causes values to live for longer. benchmarks
+which allocate relatively little memory (particularly <span>ripgrep</span> as shown in table <a href="#x1-23002r3">3</a>) can exaggerate this effect.
+perhaps surprisingly, the heap footprint and rss do not correlate. this is partly because the sample rate for
+rss is rather low (which notably affects fast running benchmarks such as those for <span>fd</span>) and partly because
+rss necessarily includes headroom, that is memory beyond that needed for the live set (and which may later
+be returned to the os).</span></figcaption>
+</figure>
+
+<p><span>8.2    </span> <a id="x1-270008.2"></a>Results</p>
+
+<p>
+The main results for <span>E<sub>GCvs</sub></span> can be seen in Fig. <a href="#x1-27001r1">1</a>. Though there is variation, <span>Alloy</span> has an overhead
+on wall-clock time of 5% on our benchmark suite. The effect on memory is more variable though,
+unsurprisingly, <span>Alloy</span> typically has a larger average heap footprint (i.e. allocated memory lives for
+longer). This metric needs to treated with slight caution: benchmarks which allocate relatively small
+amounts of memory (see Table <a href="#x1-23002r3">3</a>) can make the relative effect of average heap footprint seem much
+worse than it is in absolute terms.
+</p>
+
+<p>
+<span>Binary Trees</span> is sufficiently simple that we also used it to compare against <code>Arena&lt;T&gt;</code> and <span>Rust-GC</span>.
+The time-series data in Fig. <a href="#x1-27002r2">2</a> is particularly illuminating (for completeness, Table 5 in the Appendix has
+the raw timings). <span>Alloy</span> is around 3.5× slower than <code>Arena&lt;T&gt;</code>. The time-series data for the latter shows it
+going through distinct phases: a (relatively long) allocation phase, a (relatively moderate) &#39;work&#39; phase,
+and a (relatively short) deallocation phase. Put another way: these clear phases make <span>Binary Trees</span> a
+perfect match for an arena. In the other approaches, the &#39;work&#39; phase occupies a much greater proportion
+of their execution, because it also incorporates allocator work. <span>Alloy</span> is around 1.3× faster than <code>Rc&lt;T&gt;</code>,
+but both have similar memory profiles. <span>Alloy</span> is around 3× faster than <span>Rust-GC</span> and has an
+average heap footprint around 4× smaller, reflecting <span>Alloy</span>&#39;s advantage in not being a user-land
+library that relies in part on <code>Rc&lt;T&gt;</code>. Although we caution against over-interpreting a single
+benchmark, this does give us at least some idea of the performance ceiling and floor for different
+approaches.
+</p>
+
+<figure>
+<img src="https://soft-dev.org/pubs/html/hughes_tratt__garbage_collection_for_rust_the_finalizer_frontier/images/time_series.svg" alt="Time-series comparison chart"/>
+<a id="x1-27002r2"></a>
+
+<figcaption><span>Figure 2.  </span><span>A selection of time-series data with various GC approaches, showing normalised time on the <em>x</em>-axis
+and heap footprint (with 99% confidence intervals shaded) on the <em>y</em>-axis. (i.e. the amount of live memory)
+over time. <span>Binary Trees</span> shows an example of <span>Alloy</span> having a comparable heap footprint to <code>Rc&lt;T&gt;</code>; <span>Rust-GC</span>&#39;s
+heap footprint is around 4× greater. <span>Binary Trees</span> is a perfect fit to <code>Arena&lt;T&gt;</code>: it frees memory in one batch at
+the end, and because it is 3× faster than <span>Alloy</span>, this &#39;wind down&#39; period is a substantial portion of the overall
+(quick!) execution. <span>Ripgrep</span> Alternates may seem to be an example of a memory leak in <span>Alloy</span>, but it is really
+the result of the inevitable delay that GC imposes on noticing that values are lived, which is exacerbated by
+the presence of finalizers. The frequent plateaus and dips show that memory is being freed, but at a later
+point than one might initially expect. In contrast, <span>som-rs-bc</span> JSON Small shows a real memory leak due to
+cyclic objects in <code>Rc&lt;T&gt;</code>, where <span>Alloy</span>&#39;s heap footprint remains steady.
+</span></figcaption>
+</figure>
+
+<p>
+The time-series data in Fig. <a href="#x1-27002r2">2</a> helps explain other factors. For example, it shows that <span>som-rs-bc</span> leaks
+memory on the JSON Small benchmark (we suspect it also leaks in some other benchmarks, though
+rarely as visibly). This is because <code>Rc&lt;T&gt;</code> keeps alive values in cycles; <span>Alloy</span> does not leak memory on
+<span>som-rs-bc</span>, as it naturally deals correctly with cycles.
+</p>
+
+<p>
+We can see from the time-series data that <span>Ripgrep</span> has a complex heap footprint pattern.
+This may suggest a memory leak, but in fact it is a consequence of the inevitable delay in
+freeing memory in a GC. In general, GC notices that memory is unused later than reference
+counting, but this is exacerbated further by finalizers. Surprisingly, finalizers can lengthen or
+shorten an allocation&#39;s lifetime. GCed values with finalizers tend to have longer lifetimes,
+because they have to wait in the finalizer queue. However, when a finalizer calls <code>free</code> on
+indirectly owned values, those are immediately marked as not live, rather than having to
+wait until the next collection to be discovered as such. This, albeit indirectly, explains the
+seemingly random peaks and troughs in memory usage one can observe in <span>Ripgrep</span>&#39;s time-series
+data.
+</p>
+
+<figure>
+<img src="https://soft-dev.org/pubs/html/hughes_tratt__garbage_collection_for_rust_the_finalizer_frontier/images/elision_metrics.svg" alt="Finalizer elision effects chart"/>
+<a id="x1-27003r3"></a>
+
+<figcaption><span>Figure 3.  </span><span>The  effects  of  finalizer  elision  on  various  metrics.  The  top-left  chart  shows  the  proportion  of
+run-time <code>Gc&lt;T&gt;</code> values that: have had their finalizers elided; cannot have their finalizers elided; have no
+finalizers to elide. This chart is best read in conjunction in Table <a href="#x1-23002r3">3</a> to (a) get a sense of the quantity of
+run-time memory involved (b) how much indirectly owned memory the <code>Gc&lt;T&gt;</code> values have. The other plots
+use &#39;no finalizer elision&#39; as the normalization base (i.e. values below 1 show that finalizer elision improves a
+metric). Total GC pause time is the cumulative time spent in stop-the-world collections. User time captures
+the time spent in all threads, including the finalizer thread. Broadly speaking, the more finalizers are elided,
+and the greater the proportion of the overall heap the memory owned by <code>Gc&lt;T&gt;</code>, the better the metrics
+become.</span></figcaption>
+</figure>
+
+<p>
+The results of <span>E<sub>Elision</sub></span> are shown in Fig. <a href="#x1-27003r3">3</a>. In general, there is a fairly clear correlation: the more
+finalizers are removed, and the greater the proportion of the overall heap the memory owned by <code>Gc&lt;T&gt;</code> is,
+the better the metrics become. However, there are several caveats. First, when all finalizers are removed,
+<span>BDWGC</span> does not start a finalizer thread or invoke locking related to it, unduly flattering the time-based
+metrics. Second, the quantity of finalizers is only a partial proxy for cost: some finalizers free
+up large graphs of indirectly owned values, which can take some time to run. Third, some
+benchmarks change the work they do: <span>grmtools</span> speeds up so much that its error recovery
+algorithm has time to do more work, so while finalizer hugely benefits its GC pause time,
+its wall-clock time changes much less. Finally, since finalizers can cause indirectly owned
+allocations to be freed earlier than the GC itself does naturally, removing them can cause
+indirectly owned values to live for longer: <span>Ripgrep</span>&#39;s average heap footprint highlights this
+issue.
+</p>
+
+<p>
+The results for <span>E<sub>PremOpt</sub></span> are shown in Fig. <a href="#x1-28001r4">4</a>. We created three configurations of <span>Alloy</span>. <em>None</em> has no
+fences, and thus is unsound, but allows us to approximate (allowing for possible vagaries from running
+unsound code!) the best possible outcome. <em>Naive</em> inserts all possible fences. <em>Optimised</em> inserts only
+necessary fences. Once confidence intervals are taken into account, there are no statistically
+significant results for this experiment. Although it is possible that benchmarking &#39;noise&#39; is hiding a
+meaningful result, our data suggests that any such differences are likely to be minimal. To
+make up for this disappointment, the fact that there is no difference between any of these
+suggests that, on non-artificial benchmarks, premature finalizer prevention is not a noticeable
+cost.
+</p>
+
+<figure>
+<img src="https://soft-dev.org/pubs/html/hughes_tratt__garbage_collection_for_rust_the_finalizer_frontier/images/premopt_perf.svg" alt="Premature finalization optimization chart"/>
+<a id="x1-28001r4"></a>
+
+<figcaption><span>Figure 4.  </span><span>The effect of premature finalization optimisation, normalised to <em>None</em> (i.e. no fences). Grey bars
+represent  the  ratio  for  <em>naive</em>  (all  possible  fences)  and  blue  bars  <em>optimised</em>  (obviously  unnecessary  fences
+removed). Unfortunately, this attempted optimisation has no statistically significant effects.</span></figcaption>
+</figure>
+
+<p>
+Any performance judgements we make are necessarily contingent on our methodology the benchmark
+suite we chose, including the proportion of benchmarks that we ported, and the way we process and
+present data. For example, we did not port external libraries to use <code>Gc&lt;T&gt;</code> so many benchmarks use a
+variety of allocation strategies. Even had we ported everything, we would not be able to say, for example,
+that finalizer elision will always improve performance by exactly the factor we see in our experiment:
+there undoubtedly exist reasonable, non-pathological, programs which will see performance changes
+outside the ranges that our results suggest.
+</p>
+
+<p>
+Using <span>BDWGC</span> as the allocator for all benchmarks has the advantage of removing &#39;pure&#39; allocator
+performance as a confounding factor, but does mean that some of the performance characteristics of
+benchmarks will be changed (e.g due to the portion of time we spend in the allocator; or <span>BDWGC</span>&#39;s
+adaptive heap sizing strategy). A generic, modern conservative GC, using the insights of recent non-GC
+allocators, would almost certainly give different – though we suspect not profoundly different
+– results. To the best of our knowledge there is currently no production-quality modern,
+generic conservative, GC we could use instead, though we are aware of at least one attempt to
+create such an alternative: it will be interesting to rerun our experiments if and when that
+arrives.
+</p>
+
+<p>
+The RSS memory metric we collect is at Linux&#39;s whim: if it does not update as frequently
+as we expect, we will see artificially &#39;smoothed&#39; data that may miss out peaks and troughs.
+Similar, our interpolation of time-series data onto a normalised grid can also smooth data. We
+manually checked a large quantity of data to ensure this was not a significant effect; by running
+benchmarks 30 times means it is also less more likely that peaks and troughs are caught at least
+sometimes.
+</p>
+
+<h3><span>10    </span> <a id="x1-2900010"></a>Related Work</h3>
+
+<p>In this paper we hope to have given sufficient background on GC and the use of destructors and finalizers
+in general. In this section we mostly survey the major parts of the GC for Rust landscape more widely.
+Our survey is inevitably incomplete, in part because this is a rapidly evolving field (a number of changes
+have occurred since the most recent equivalent survey we are aware of [<a href="#Xmanish21arena">16</a>]). We also cover some
+relevant non-Rust GC work not mentioned elsewhere.
+</p>
+
+<p>
+Early versions of Rust had &#39;managed pointers&#39; (using the <code>@T</code> syntax) which were intended to
+represent GC types [<a href="#Xmanish21arena">16</a>]. The core implementation used reference counting though there
+were several, sometimes short-lived, cycle detectors [<a href="#Xhoare22cycles">17</a>]. Managed pointer support was
+removed<a id="x1-29001f9"></a> 
+around a year before the first stable release of Rust. This was not the end of the story for
+&#39;GC as a core part of Rust&#39;, with core Rust developers exploring the problem space in more
+detail [<a href="#Xmanish16gc">15</a>, <a href="#Xfelix15specifying">21</a>, <a href="#Xfelix16roots">22</a>]. Over time these efforts dwindled, and those interested in GC for Rust largely
+moved from anticipating <code>rustc</code> support to expecting to have to do everything in user-level
+libraries.
+</p>
+
+<p>
+One of the earliest user-level GC for Rust libraries is <span>Bacon-Rajan-CC</span> [<a href="#Xrustbacon">12</a>]. This provides a type <code>Cc&lt;T&gt;</code>
+which is similar in intention to <span>Alloy</span>&#39;s <code>Gc&lt;T&gt;</code>. The mechanism by which objects are collected is rather
+different: they have a naive reference count, which causes objects outside a cycle to have deterministic
+destruction; and users can manually invoke a cycle detector, which uses trial deletion in the style of Bacon and
+Rajan [<a href="#Xbacon01concurrent">4</a>]<a id="x1-29003f10"></a> 
+to identify objects in unused cycles. Cycle detection requires users manually implementing a <code>Trace</code> trait
+which traverses a type&#39;s fields. Destructors are used as finalizers: to avoid the problems with Rust
+references we solved in Section <a href="#x1-160007.1">7.1</a>, <span>Bacon-Rajan-CC</span> imposes a <code>T:&#39;static</code> lifetime bound on the type
+parameter passed to <code>Cc&lt;T&gt;</code>. Simplifying slightly, this means that any references in such a type must be
+valid for the remaining lifetime of the program, a severe restriction. Unlike our approach to the access of
+already-finalized values (Section <a href="#x1-170007.2">7.2</a>), it can only detect such accesses at runtime, leading to a (safe) Rust
+<code>panic</code>.
+</p>
+
+<p>
+Probably the best known GC for Rust is <span>Rust-GC</span> [<a href="#Xmanish15rustgc">14</a>] (partly covered in Section <a href="#x1-80004">4</a>). <span>Rust-GC</span>&#39;s <code>Gc&lt;T&gt;</code>
+provides a similar API to <span>Alloy</span>, with the notable exception that its <code>Gc&lt;T&gt;</code> is not, and cannot be, copyable,
+thus always requiring calls to <code>Gc::clone</code>. Although, like <span>Alloy</span>, <span>Rust-GC</span> allows <code>Gc&lt;T&gt;</code> values to be
+converted into pointers, its lack of conservative GC means that users must ensure that a <code>Gc&lt;T&gt;</code> wrapper
+is kept alive for the entire lifetime of pointers derived from it. Similarly to <span>Bacon-Rajan-CC</span>,
+GCed values are reference counted, with occasional tracing sweeps to identify cycles, though
+<span>Rust-GC</span> performs cycle detection automatically (i.e. it doesn&#39;t require manual calls to a
+function such as <code>collect_cycles</code>). Drop methods are not used as finalizers: if a finalizer is
+required, a manual implementation of the <code>Finalize</code> trait must be provided; finalizer glue can be
+largely, though not fully (see Section <a href="#x1-80004">4</a>), automatically created by the provided <code>Trace</code> macro.
+<span>Rust-GC</span> detects accesses to already-finalized values dynamically at run-time, panicking
+if they occur. Unlike <span>Bacon-Rajan-CC</span>, these accesses are detected by recording what the
+collector&#39;s state is in: if the collector is in a &#39;sweep&#39; phase, any access of a <code>Gc&lt;T&gt;</code> leads to a
+panic. We have not yet verified whether cross-thread collection / sweeping can evade this
+check.
+</p>
+
+<p>
+An example of moving beyond reference counting in a GC for Rust is <span>Shifgrethor</span> [<a href="#Xshifgrethor">2</a>]. It requires <code>Gc</code>
+values to be created by a <code>Root&lt;&#39;root&gt;</code>: the resulting <code>Gc&lt;&#39;root, T&gt;</code> is then tied to the lifetime of the
+<code>Root&lt;&#39;root&gt;</code>. This allows roots to be precisely identified, but requires explicitly having access to a
+<code>Root&lt;&#39;root&gt;</code> whenever a <code>Gc&lt;&#39;root, T&gt;</code> is used. As with <span>Rust-GC</span>, <span>Shifgrethor</span> requires users to
+manually implement a <code>Finalize</code> trait, though <span>Shifgrethor</span>&#39;s is more restrictive: not only can other
+GCed values not be accessed (implicitly solving the same problem as Section <a href="#x1-170007.2">7.2</a>) but any other
+type without the same <code>&#39;root</code> lifetime as the GCed value is forbidden. This means that many
+seemingly safe finalizers require implementing the unsafe <code>UnsafeFinalize</code> trait. We view
+<span>Shifgrethor</span> as proof that accurately tracking GC roots in normal Rust without reference
+counting is possible, though it cannot deal with references being converted into pointers and
+<code>usize</code>s.
+</p>
+
+<p>
+A different means of tackling the root-finding problem is <span>GcArena</span> [<a href="#Xgcarena">32</a>], which uses branding in a
+similar way to <code>GhostCell</code>s (see Section <a href="#x1-20002">2</a>). In essence, users provide a special &#39;root&#39; type which is the
+only place where roots can be stored. Mutating the heap can only be done in the context
+of functions that are passed a branded reference to the GCed heap. Once such a function
+has completed, <span>GcArena</span> is in full control of the GC heap, and knows that only the root
+type needs to be scanned for roots. This leads to a precise guarantee about GC reference
+lifetimes. However, if code executes in an arena for too long, the system can find itself starved of
+resources, with no way of recovering, even if much of the arena is no longer used. <span>GcArena</span>
+was originally part of the <em>Piccolo</em> VM (which was itself previously called <em>Luster</em>), a Lua VM
+written in Rust. Such VMs have a frequently executed main loop which is a natural point for a
+program to relinquish references to the GCed heap, but this is not true of many other GCed
+programs.
+</p>
+
+<p>
+One attempt to improve upon <span>Rust-GC</span> is <span>Bronze</span> 
+[<a href="#Xcoblenz21bronze">11</a>], though it shows how challenging it can be to meaningfully improve GC for
+Rust: both of its main advances have subsequently been disabled because they are not just unsound but
+actively lead to crashes. First, <span>Bronze</span> tried to solve the root-finding problem by using LLVM&#39;s <code>gc.root</code>
+intrinsic at function entries to generate stack-maps (a run-time mechanism for accurately tracking active
+pointers). This rules out the false positives that are inevitable in conservative GC. However, <span>Bronze</span>
+could not track nested references: if a <code>Gc&lt;T&gt;</code> was used as a field in a struct, it was not tracked
+by the GC. Second, <span>Bronze</span> tried to give GC in Rust similar semantics to non-ownership
+languages such as Java. It did this by allowing shared mutation, undermining Rust&#39;s borrow
+checker.
+</p>
+
+<p>
+Chrome&#39;s rendering engine <em>Blink</em> uses the conservative GC <span>Oilpan</span>. It has the interesting
+property that it has two classes of finalizers. &#39;Full finalizers&#39; are similar to finalizers in <span>Alloy</span>,
+running on a finalizer thread at an indeterminate future point, but with the difference that they
+can only reference parts of a GCed value. To mitigate this, &#39;pre-finalizers&#39; are run by the
+collector on the same thread as mutator as soon as an object as recognised as unused, and can
+access all of a GCed value. Pre-finalizers are necessary, but not encouraged, because they
+implicitly pause the stop-the-world phase of the collector. This reflects the fact that latency is a
+fundamental concern for a rendering engine: <span>Alloy</span> currently makes no pretences to being low
+latency.
+</p>
+
+<h3><span>11    </span> <a id="x1-3000011"></a>Conclusions</h3>
+
+<p>We introduced a novel design for GC in Rust that solves a number of outstanding challenges in GC for
+Rust, as well as – by taking advantage of Rust&#39;s unusual static guarantees – some classical GC finalizer
+problems. By making integration with existing Rust code easier than previous GCs for Rust, we hope to
+have shown a pragmatic route for partial or wholesale migration of Rust code that would benefit from
+GC.
+</p>
+
+<p>
+Challenges and future opportunities remain. For example, <span>Alloy</span> is an &#39;all or nothing&#39; cost: if you
+want to use <code>Gc&lt;T&gt;</code> in a single location, you must pay the costs of the GC runtime and so
+on. <span>Alloy</span>&#39;s absolute speed is, we believe, limited by <span>BDWGC</span>: it is probable that using a
+semi-precise GC and/or a faster conservative GC could change our view of the absolute performance
+speed
+</p>
+
+<p>
+In summary, we do not claim that <span>Alloy</span> is the ultimate design for GC in Rust – reasonable people
+may, for example, disagree on whether the costs of conservative GC are worth the gains –
+but it does show what can be achieved if one is willing to alter the language&#39;s design and
+<code>rustc</code>.
+</p>
+
+<h3>Data Availability Statement</h3>
+<p>
+The accompanying artefact [<a href="#Xhughes25garbageartefact">18</a>] contains: the source code necessary to run this paper&#39;s experiment
+(including generating figures etc.) from scratch; and data from a run of the experiment that we used in
+this paper.
+</p>
+
+<h3>Acknowledgments<a id="likesection.2"></a><a id="x1-30001x11"></a><a id="Q1-1-44"></a></h3>
+<p>
+This work was funded by an EPSRC PhD studentship and the Shopify / Royal
+Academy of Engineering Research Chair in Language Engineering. We thank Steve Klabnik and Andy
+Wingo for comments.
+</p>
+
+    <h3><a id="likesection.3"></a><a id="x1-30002x11"></a><a id="Q1-1-44"></a>References</h3>
+
+<ol>
+  <li id="Xager13oilpan">
+    <span>[1]</span>
+    Mads Ager, Erik Corry, Vyacheslav Egorov, Kentaro Hara, Gustav Wibling, and Ian Zerny. 2013. Oilpan: tracing garbage collection for Blink. <a href="https://docs.google.com/document/d/1y7_0ni0E_kxvrah-QtnreMlzCDKN3QP4BN1Aw7eSLfY">https://docs.google.com/document/d/1y7_0ni0E_kxvrah-QtnreMlzCDKN3QP4BN1Aw7eSLfY</a>. Accessed on 2024-10-15.
+  </li>
+
+  <li id="Xshifgrethor">
+    <span>[2]</span>
+    Saoirse Aronson. 2018. shifgrethor. <a href="https://github.com/withoutboats/shifgrethor/">https://github.com/withoutboats/shifgrethor/</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xbacon04unified">
+    <span>[3]</span>
+    David F Bacon, Perry Cheng, and VT Rajan. 2004. A unified theory of garbage collection. In <em>OOPSLA</em>. 50–68.
+  </li>
+
+  <li id="Xbacon01concurrent">
+    <span>[4]</span>
+    David F Bacon and Vadakkedathu T Rajan. 2001. Concurrent cycle collection in reference counted systems. In <em>ECOOP</em>. 207–235. <a href="https://doi.org/10.1007/3-540-45337-7_12">doi:10.1007/3-540-45337-7_12</a>
+  </li>
+
+  <li id="Xdacapo25">
+    <span>[5]</span>
+    Stephen M. Blackburn, Zixian Cai, Rui Chen, Xi Yang, John Zhang, and John Zigman. 2025. Rethinking Java Performance Analysis. In <em>ASPLOS</em>. 940–954. <a href="https://doi.org/10.1145/3669940.3707217">doi:10.1145/3669940.3707217</a>
+  </li>
+
+  <li id="Xboehm03destructors">
+    <span>[6]</span>
+    Hans-J Boehm. 2003. Destructors, finalizers, and synchronization. In <em>POPL</em>. <a href="https://doi.org/10.1145/604131.604153">doi:10.1145/604131.604153</a>
+  </li>
+
+  <li id="Xboehm07optimization">
+    <span>[7]</span>
+    Hans-J Boehm and Mike Spertus. 2007. Optimization-robust finalization. <a href="https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2007/n2261.html">https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2007/n2261.html</a>. Accessed: 2024-08-08.
+  </li>
+
+  <li id="Xboehm09garbage">
+    <span>[8]</span>
+    Hans-J Boehm and Mike Spertus. 2009. Garbage collection in the next C++ standard. In <em>ISMM</em>. 30–38. <a href="https://doi.org/10.1145/1542431.1542437">doi:10.1145/1542431.1542437</a>
+  </li>
+
+  <li id="Xboehm88garbage">
+    <span>[9]</span>
+    Hans-Juergen Boehm and Mark Weiser. 1988. Garbage collection in an uncooperative environment. <em>SPE</em> 18, 9 (Sept. 1988), 807–820. <a href="https://doi.org/10.1002/spe.4380180902">doi:10.1002/spe.4380180902</a>
+  </li>
+
+  <li id="Xchiovoloni15typed">
+    <span>[10]</span>
+    Thom Chiovoloni. 2015. Typed Arena. <a href="https://github.com/thomcc/rust-typed-arena/">https://github.com/thomcc/rust-typed-arena/</a>. Accessed: 2025-03-25.
+  </li>
+
+  <li id="Xcoblenz21bronze">
+    <span>[11]</span>
+    Michael Coblenz, Michelle Mazurek, and Michael Hicks. 2022. Does the Bronze Garbage Collector Make Rust Easier to Use? A Controlled Experiment. In <em>ICSE</em>. <a href="https://doi.org/10.1145/3510003.3510107">doi:10.1145/3510003.3510107</a>
+  </li>
+
+  <li id="Xrustbacon">
+    <span>[12]</span>
+    Nick Fitzgerald. 2015. bacon-rajan-cc: A reference counted type with cycle collection for Rust. <a href="https://github.com/fitzgen/bacon-rajan-cc">https://github.com/fitzgen/bacon-rajan-cc</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xgoetz21deprecated">
+    <span>[13]</span>
+    Brian Goetz and Mikael Vidstedt. 2021. JEP 421: Deprecate Finalization for Removal. <a href="https://openjdk.org/jeps/421">https://openjdk.org/jeps/421</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xmanish15rustgc">
+    <span>[14]</span>
+    Manish Goregaokar. 2015. rust-gc. <a href="https://github.com/Manishearth/rust-gc/">https://github.com/Manishearth/rust-gc/</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xmanish16gc">
+    <span>[15]</span>
+    Manish Goregaokar. 2016. GC support in Rust: API design. <a href="https://manishearth.github.io/blog/2016/08/18/gc-support-in-rust-api-design/">https://manishearth.github.io/blog/2016/08/18/gc-support-in-rust-api-design/</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xmanish21arena">
+    <span>[16]</span>
+    Manish Goregaokar. 2021. A tour of safe tracing GC designs in Rust. <a href="https://manishearth.github.io/blog/2021/03/15/arenas-in-rust/">https://manishearth.github.io/blog/2021/03/15/arenas-in-rust/</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xhoare22cycles">
+    <span>[17]</span>
+    Graydon Hoare. 2022. Reply to &#39;What should be included in a history of the Rust language?&#39;. <a href="https://www.reddit.com/r/rust/comments/za5lh5/comment/iyp0ptm/">https://www.reddit.com/r/rust/comments/za5lh5/comment/iyp0ptm/</a>.
+  </li>
+
+  <li id="Xhughes25garbageartefact">
+    <span>[18]</span>
+    Jacob Hughes and Laurence Tratt. 2025. Reproduction Package for Article &#39;Garbage Collection for Rust: The Finalizer Frontier&#39;. Zenodo. <a href="https://doi.org/10.5281/zenodo.17013382">doi:10.5281/zenodo.17013382</a>
+  </li>
+
+  <li id="Xjones23garbage">
+    <span>[19]</span>
+    Richard Jones, Antony Hosking, and Eliot Moss. 2023. <em>The Garbage Collection Handbook: the Art of Automatic Memory Management</em> (second ed.). Chapman and Hall/CRC. <a href="https://doi.org/10.1201/9781003276142">doi:10.1201/9781003276142</a>
+  </li>
+
+  <li id="Xklabnik18rust">
+    <span>[20]</span>
+    Steve Klabnik and Carol Nichols. 2018. <em>The Rust Programming Language</em>. No Starch Press. <a href="https://doi.org/10.5555/3271463">doi:10.5555/3271463</a>
+  </li>
+
+  <li id="Xfelix15specifying">
+    <span>[21]</span>
+    Felix S. Klock. 2015. GC and Rust: specifying the problem. <a href="http://blog.pnkfx.org/blog/2015/11/10/gc-and-rust-part-1-specing-the-problem/">http://blog.pnkfx.org/blog/2015/11/10/gc-and-rust-part-1-specing-the-problem/</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xfelix16roots">
+    <span>[22]</span>
+    Felix S. Klock. 2016. GC and Rust: The roots of the problem. <a href="http://blog.pnkfx.org/blog/2016/01/01/gc-and-rust-part-2-roots-of-the-problem/">http://blog.pnkfx.org/blog/2016/01/01/gc-and-rust-part-2-roots-of-the-problem/</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xllvm14statepoints">
+    <span>[23]</span>
+    LLVM. 2014. Garbage collection with LLVM. <a href="https://llvm.org/docs/GarbageCollection.html">https://llvm.org/docs/GarbageCollection.html</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xniko13destructors">
+    <span>[24]</span>
+    Niko Matsakis. 2013. Destructors and finalizers in Rust. <a href="http://smallcultfollowing.com/babysteps/blog/2013/01/17/destructors-and-finalizers-in-rust/">http://smallcultfollowing.com/babysteps/blog/2013/01/17/destructors-and-finalizers-in-rust/</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xpierce04advanced">
+    <span>[25]</span>
+    Benjamin C Pierce. 2004. <em>Advanced topics in Types and Programming Languages</em>. MIT press. <a href="https://doi.org/10.7551/mitpress/1104.001.0001">doi:10.7551/mitpress/1104.001.0001</a>
+  </li>
+
+  <li id="Xpizlo17riptide">
+    <span>[26]</span>
+    Filip Pizlo. 2017. Introducing Riptide: WebKit&#39;s retreating wavefront concurrent garbage collector. <a href="https://webkit.org/blog/7122/introducing-riptide-webkits-retreating-wavefront-concurrent-garbage-collector/">https://webkit.org/blog/7122/introducing-riptide-webkits-retreating-wavefront-concurrent-garbage-collector/</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xrustlangref">
+    <span>[27]</span>
+    Rust. 2014. The Rust language reference. <a href="https://doc.rust-lang.org/reference/">https://doc.rust-lang.org/reference/</a>. Accessed: 2024-10-01.
+  </li>
+
+  <li id="Xshahriyar14fast">
+    <span>[28]</span>
+    Rifat Shahriyar, Stephen M. Blackburn, and Kathryn S. McKinley. 2014. Fast conservative garbage collection. In <em>OOPSLA</em>. 121–139. <a href="https://doi.org/10.1145/2660193.2660198">doi:10.1145/2660193.2660198</a>
+  </li>
+
+  <li id="Xshipilev20local">
+    <span>[29]</span>
+    Alekesy Shpilëv. 2020. JVM Anatomy Quark #8: Local Variable Reachability. <a href="https://shipilev.net/jvm/anatomy-quarks/8-local-var-reachability/">https://shipilev.net/jvm/anatomy-quarks/8-local-var-reachability/</a>. Accessed: 2024-10-08.
+  </li>
+
+  <li id="Xstroustrup97c++">
+    <span>[30]</span>
+    Bjarne Stroustrup. 1997. <em>The C++ Programming Language</em> (third ed.). Addison-Wesley.
+  </li>
+
+  <li id="Xwang06escape">
+    <span>[31]</span>
+    Lei Wang and Xikun Sun. 2006. Escape analysis for synchronization removal. In <em>SAC</em>. 1419–1423. <a href="https://doi.org/10.1145/1141277.1141607">doi:10.1145/1141277.1141607</a>
+  </li>
+
+  <li id="Xgcarena">
+    <span>[32]</span>
+    Catherine West. 2019. gc-arena: An experimental system for Rust garbage collection. <a href="https://github.com/kyren/gc-arena/">https://github.com/kyren/gc-arena/</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xboa">
+    <span>[33]</span>
+    Jason Williams. 2018. Boa: an experimental JavaScript lexer, parser and interpreter written in Rust. <a href="https://github.com/boa-dev/boa">https://github.com/boa-dev/boa</a>. Accessed: 2024-10-15.
+  </li>
+
+  <li id="Xwolff14heaptrack">
+    <span>[34]</span>
+    Milian Wolff. 2014. Heaptrack - A Heap Memory Profiler for Linux. <a href="https://milianw.de/blog/heaptrack-a-heap-memory-profiler-for-linux.html">https://milianw.de/blog/heaptrack-a-heap-memory-profiler-for-linux.html</a>. Accessed: 2025-03-25.
+  </li>
+
+  <li id="Xyanovski21ghostcell">
+    <span>[35]</span>
+    Joshua Yanovski, Hoang-Hai Dang, Ralf Jung, and Derek Dreyer. 2021. GhostCell: separating permissions from data in Rust. 5 (Aug. 2021), 1–30. <a href="https://doi.org/10.1145/3473597">doi:10.1145/3473597</a>
+  </li>
+</ol>
+
+
+<h3>Appendix<a id="x1-30003r3"></a></h3>
+
+<figure>
+<pre><code>function RemoveElidableDrops(func):
+
+    for each basic_block ∈ func do
+        if IsDropTerminator(basic_block.terminator.kind) then
+            ty ← GetTypeOfDroppedValue(block.terminator);
+            if IsGcType(ty) then
+                if not RequiresFinalizer(ty) then
+                    ReplaceTerminator(basic_block);
+
+function ReplaceTerminator(basic_block):
+
+    drop_func ← GetDropFunc(basic_block.terminator);
+    last_block ← GetLastBasicBlock(drop_func);
+    block.terminator ← last_block.terminator;</code></pre>
+
+<figcaption>
+            <p><span>Algorithm 3: </span>
+                <span>Removing elidable drops</span></p>
+</figcaption>
+</figure>
+
+<h3><a id="x1-30007A"></a>Additional Experimental Data</h3>
+
+<figure>
+<a id="x1-30029r4"></a>
+<table>
+<thead>
+<tr>
+<th>Benchmark</th>
+<th>Description</th>
+<th>Reason for exclusion</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><span>bevy</span></td>
+<td>ECS game engine in Rust</td>
+<td>Unable to port successfully (see Section <a href="#x1-240008.1.2">8.1.2</a>)</td>
+</tr>
+<tr>
+<td><span>dyon</span></td>
+<td>Scripting language in Rust</td>
+<td>Unable to port successfully (see Section <a href="#x1-240008.1.2">8.1.2</a>)</td>
+</tr>
+<tr>
+<td><span>jiff</span></td>
+<td>A datetime library for Rust</td>
+<td>Too few allocations to measure</td>
+</tr>
+<tr>
+<td><span>mini-moka</span></td>
+<td>Concurrent in-memory cache library</td>
+<td>Too few allocations to measure</td>
+</tr>
+<tr>
+<td><span>numbat</span></td>
+<td>Math search engine</td>
+<td>Too few allocations to measure</td>
+</tr>
+<tr>
+<td><span>rkyv</span></td>
+<td>Zero-copy deserialization framework</td>
+<td>Insufficient <code>Gc&lt;T&gt;</code> coverage in benchmarks</td>
+</tr>
+<tr>
+<td><span>RustPython</span></td>
+<td>Python interpreter written in Rust</td>
+<td>Difficulty retro-fitting <code>__del__</code> semantics (see Section <a href="#x1-240008.1.2">8.1.2</a>)</td>
+</tr>
+<tr>
+<td><span>rust-analyzer</span></td>
+<td>Language server for Rust</td>
+<td>Unable to port successfully (see Section <a href="#x1-240008.1.2">8.1.2</a>)</td>
+</tr>
+<tr>
+<td><span>salsa</span></td>
+<td>Incremental recomputation library</td>
+<td>Too few allocations to measure</td>
+</tr>
+<tr>
+<td><span>WLambda</span></td>
+<td>Scripting language written in Rust</td>
+<td>Insufficient <code>Gc&lt;T&gt;</code> coverage in benchmarks</td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 4.  </span><span>Rust programs excluded from our benchmark suite after attempted porting to <span>Alloy</span>.</span></figcaption>
+</figure>
+
+<figure>
+<a id="x1-30030r5"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th colspan="4">Wall-clock time (s)</th>
+</tr>
+<tr>
+<th></th>
+<th><code>Gc&lt;T&gt;</code></th>
+<th><code>Rc&lt;T&gt;</code></th>
+<th><code>Gc&lt;T&gt;</code> (<span>Rust-GC</span>)</th>
+<th><code>Arena&lt;T&gt;</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><span>Alacritty</span></td>
+<td>0.41 [0.39, 0.45]</td>
+<td>0.40 [0.38, 0.44]</td>
+<td>–</td>
+<td>–</td>
+</tr>
+<tr>
+<td><span>Binary Trees</span></td>
+<td>0.11 [0.11, 0.11]</td>
+<td>0.15 [0.14, 0.15]</td>
+<td>0.33 [0.32, 0.33]</td>
+<td>0.03 [0.03, 0.04]</td>
+</tr>
+<tr>
+<td><span>fd</span></td>
+<td>0.33 [0.29, 0.38]</td>
+<td>0.31 [0.26, 0.37]</td>
+<td>–</td>
+<td>–</td>
+</tr>
+<tr>
+<td><span>grmtools</span></td>
+<td>3.06 [3.00, 3.14]</td>
+<td>3.24 [3.17, 3.31]</td>
+<td>–</td>
+<td>–</td>
+</tr>
+<tr>
+<td><span>Regex-Redux</span></td>
+<td>0.47 [0.47, 0.47]</td>
+<td>0.45 [0.45, 0.46]</td>
+<td>–</td>
+<td>–</td>
+</tr>
+<tr>
+<td><span>Ripgrep</span></td>
+<td>1.61 [1.55, 1.69]</td>
+<td>1.52 [1.45, 1.59]</td>
+<td>–</td>
+<td>–</td>
+</tr>
+<tr>
+<td><span>som-rs-ast</span></td>
+<td>0.92 [0.88, 0.95]</td>
+<td>0.79 [0.76, 0.82]</td>
+<td>–</td>
+<td>–</td>
+</tr>
+<tr>
+<td><span>som-rs-bc</span></td>
+<td>0.28 [0.27, 0.29]</td>
+<td>0.29 [0.28, 0.30]</td>
+<td>–</td>
+<td>–</td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 5.  </span><span>Wall-clock times (in seconds) with 99% confidence intervals for the <span>E<sub>GCvs</sub></span> experiment comparing different memory management strategies. Strategies not supported by a given benchmark are marked with &#34;–&#34;.</span></figcaption>
+</figure>
+
+<figure>
+<a id="x1-30031r6"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th colspan="2">Wall-clock time (s)</th>
+<th>Ratio</th>
+</tr>
+<tr>
+<th></th>
+<th>jemalloc</th>
+<th><span>BDWGC</span></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><span>Alacritty</span></td>
+<td>0.36 <span>[0.33, 0.40]</span></td>
+<td>0.40 <span>[0.38, 0.44]</span></td>
+<td>1.11</td>
+</tr>
+<tr>
+<td><span>Binary Trees</span></td>
+<td>0.12 <span>[0.12, 0.12]</span></td>
+<td>0.15 <span>[0.14, 0.15]</span></td>
+<td>1.26</td>
+</tr>
+<tr>
+<td><span>fd</span></td>
+<td>0.30 <span>[0.25, 0.36]</span></td>
+<td>0.31 <span>[0.26, 0.37]</span></td>
+<td>1.02</td>
+</tr>
+<tr>
+<td><span>grmtools</span></td>
+<td>3.09 <span>[3.01, 3.17]</span></td>
+<td>3.24 <span>[3.17, 3.31]</span></td>
+<td>1.05</td>
+</tr>
+<tr>
+<td><span>Regex-Redux</span></td>
+<td>0.45 <span>[0.44, 0.45]</span></td>
+<td>0.45 <span>[0.45, 0.46]</span></td>
+<td>1.01</td>
+</tr>
+<tr>
+<td><span>Ripgrep</span></td>
+<td>1.46 <span>[1.40, 1.53]</span></td>
+<td>1.52 <span>[1.45, 1.59]</span></td>
+<td>1.04</td>
+</tr>
+<tr>
+<td><span>som-rs-ast</span></td>
+<td>0.77 <span>[0.74, 0.80]</span></td>
+<td>0.79 <span>[0.76, 0.82]</span></td>
+<td>1.02</td>
+</tr>
+<tr>
+<td><span>som-rs-bc</span></td>
+<td>0.28 <span>[0.27, 0.29]</span></td>
+<td>0.29 <span>[0.28, 0.30]</span></td>
+<td>1.02</td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 6.  </span><span>Wall-clock times comparing jemalloc and <span>BDWGC</span> as allocators for <code>Rc&lt;T&gt;</code>-only code (i.e., no GC). The ratio column shows <span>BDWGC</span> time divided by jemalloc time.</span></figcaption>
+</figure>
+
+<figure>
+<a id="x1-30032r7"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th colspan="3">Wall-clock time (s)</th>
+</tr>
+<tr>
+<th></th>
+<th>jemalloc</th>
+<th colspan="2"><span>BDWGC</span></th>
+</tr>
+<tr>
+<th></th>
+<th><code>Rc&lt;T&gt;</code></th>
+<th><code>Gc&lt;T&gt;</code></th>
+<th><code>Rc&lt;T&gt;</code></th>
+</tr>
+</thead>
+<tbody>
+<tr data-suite="alacritty">
+<td colspan="4"><span>Alacritty</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cur. Motion</td>
+<td>0.65 <span>±0.02</span></td>
+<td>0.66 <span>±0.01</span></td>
+<td>0.66 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Dense Cells</td>
+<td>2.16 <span>±0.03</span></td>
+<td>2.16 <span>±0.02</span></td>
+<td>2.14 <span>±0.04</span></td>
+</tr>
+<tr>
+<td>Light Cells</td>
+<td>0.37 <span>±0.01</span></td>
+<td>0.37 <span>±0.01</span></td>
+<td>0.38 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll</td>
+<td>0.25 <span>±0.01</span></td>
+<td>0.26 <span>±0.02</span></td>
+<td>0.26 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll (fullscreen)</td>
+<td>0.38 <span>±0.01</span></td>
+<td>0.39 <span>±0.01</span></td>
+<td>0.38 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll Btm</td>
+<td>0.32 <span>±0.00</span></td>
+<td>0.33 <span>±0.00</span></td>
+<td>0.32 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll Btm (small)</td>
+<td>0.32 <span>±0.01</span></td>
+<td>0.33 <span>±0.00</span></td>
+<td>0.32 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll Top</td>
+<td>0.25 <span>±0.02</span></td>
+<td>0.26 <span>±0.02</span></td>
+<td>0.24 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Scroll Top (small)</td>
+<td>0.32 <span>±0.01</span></td>
+<td>0.32 <span>±0.01</span></td>
+<td>0.33 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Unicode</td>
+<td>0.23 <span>±0.02</span></td>
+<td>0.27 <span>±0.01</span></td>
+<td>0.27 <span>±0.02</span></td>
+</tr>
+
+<tr data-suite="fd">
+<td colspan="4"><span>fd</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cmd Exec.</td>
+<td>1.29 <span>±0.01</span></td>
+<td>1.28 <span>±0.01</span></td>
+<td>1.29 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Cmd Exec. (large)</td>
+<td>1.24 <span>±0.01</span></td>
+<td>1.25 <span>±0.03</span></td>
+<td>1.26 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>File Extension</td>
+<td>0.13 <span>±0.00</span></td>
+<td>0.15 <span>±0.01</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>File Type</td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.13 <span>±0.01</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>No Pattern</td>
+<td>0.18 <span>±0.00</span></td>
+<td>0.29 <span>±0.02</span></td>
+<td>0.22 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Simple</td>
+<td>0.27 <span>±0.01</span></td>
+<td>0.33 <span>±0.01</span></td>
+<td>0.32 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Simple (-HI)</td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.15 <span>±0.00</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+
+<tr data-suite="som-rs-ast">
+<td colspan="4"><span>som-rs-ast</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>0.62 <span>±0.00</span></td>
+<td>0.96 <span>±0.02</span></td>
+<td>0.80 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>0.56 <span>±0.01</span></td>
+<td>0.84 <span>±0.01</span></td>
+<td>0.71 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>0.77 <span>±0.00</span></td>
+<td>1.09 <span>±0.01</span></td>
+<td>0.98 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>0.59 <span>±0.01</span></td>
+<td>0.97 <span>±0.00</span></td>
+<td>0.77 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>0.65 <span>±0.00</span></td>
+<td>1.01 <span>±0.06</span></td>
+<td>0.81 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>0.83 <span>±0.00</span></td>
+<td>1.41 <span>±0.01</span></td>
+<td>1.08 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>0.94 <span>±0.00</span></td>
+<td>1.20 <span>±0.01</span></td>
+<td>1.07 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>0.31 <span>±0.00</span></td>
+<td>0.43 <span>±0.01</span></td>
+<td>0.38 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>0.52 <span>±0.01</span></td>
+<td>0.84 <span>±0.00</span></td>
+<td>0.67 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>0.86 <span>±0.00</span></td>
+<td>1.22 <span>±0.01</span></td>
+<td>1.10 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>List</td>
+<td>0.38 <span>±0.00</span></td>
+<td>0.53 <span>±0.01</span></td>
+<td>0.48 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>0.53 <span>±0.01</span></td>
+<td>0.86 <span>±0.01</span></td>
+<td>0.70 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>0.46 <span>±0.00</span></td>
+<td>0.69 <span>±0.01</span></td>
+<td>0.57 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>0.31 <span>±0.00</span></td>
+<td>0.38 <span>±0.01</span></td>
+<td>0.34 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>0.31 <span>±0.00</span></td>
+<td>0.44 <span>±0.00</span></td>
+<td>0.39 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>0.67 <span>±0.00</span></td>
+<td>0.90 <span>±0.02</span></td>
+<td>0.82 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>0.77 <span>±0.01</span></td>
+<td>1.18 <span>±0.02</span></td>
+<td>0.98 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>0.98 <span>±0.00</span></td>
+<td>1.27 <span>±0.02</span></td>
+<td>1.26 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>0.60 <span>±0.00</span></td>
+<td>0.92 <span>±0.00</span></td>
+<td>0.79 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>2.48 <span>±0.02</span></td>
+<td>3.72 <span>±0.11</span></td>
+<td>3.13 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>0.67 <span>±0.00</span></td>
+<td>0.94 <span>±0.01</span></td>
+<td>0.87 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>0.56 <span>±0.00</span></td>
+<td>0.70 <span>±0.01</span></td>
+<td>0.69 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>0.52 <span>±0.01</span></td>
+<td>0.83 <span>±0.01</span></td>
+<td>0.67 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>0.31 <span>±0.00</span></td>
+<td>0.46 <span>±0.01</span></td>
+<td>0.38 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>0.32 <span>±0.00</span></td>
+<td>0.41 <span>±0.01</span></td>
+<td>0.40 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>0.48 <span>±0.00</span></td>
+<td>0.72 <span>±0.00</span></td>
+<td>0.60 <span>±0.00</span></td>
+</tr>
+<tr data-suite="grmtools">
+<td colspan="4"><span>grmtools</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Eclipse</td>
+<td>3.48 <span>±0.03</span></td>
+<td>3.44 <span>±0.03</span></td>
+<td>3.74 <span>±0.04</span></td>
+</tr>
+<tr>
+<td>Hadoop</td>
+<td>2.86 <span>±0.01</span></td>
+<td>2.92 <span>±0.01</span></td>
+<td>3.09 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Jenkins</td>
+<td>2.90 <span>±0.00</span></td>
+<td>2.99 <span>±0.05</span></td>
+<td>3.02 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Spring</td>
+<td>2.43 <span>±0.00</span></td>
+<td>2.51 <span>±0.01</span></td>
+<td>2.63 <span>±0.02</span></td>
+</tr>
+
+<tr data-suite="ripgrep">
+<td colspan="4"><span>Ripgrep</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Alternates</td>
+<td>1.18 <span>±0.01</span></td>
+<td>1.29 <span>±0.02</span></td>
+<td>1.21 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Alternates (-i)</td>
+<td>1.31 <span>±0.01</span></td>
+<td>1.42 <span>±0.01</span></td>
+<td>1.33 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal</td>
+<td>1.12 <span>±0.01</span></td>
+<td>1.23 <span>±0.01</span></td>
+<td>1.15 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (-i)</td>
+<td>1.19 <span>±0.00</span></td>
+<td>1.27 <span>±0.01</span></td>
+<td>1.20 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (default)</td>
+<td>1.08 <span>±0.01</span></td>
+<td>1.19 <span>±0.01</span></td>
+<td>1.10 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (mmap)</td>
+<td>1.64 <span>±0.01</span></td>
+<td>1.75 <span>±0.02</span></td>
+<td>1.67 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (mmap, -i)</td>
+<td>1.67 <span>±0.01</span></td>
+<td>1.80 <span>±0.01</span></td>
+<td>1.72 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (regex)</td>
+<td>1.13 <span>±0.01</span></td>
+<td>1.25 <span>±0.01</span></td>
+<td>1.15 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>UTF Greek</td>
+<td>3.29 <span>±0.01</span></td>
+<td>3.41 <span>±0.01</span></td>
+<td>3.33 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>UTF Greek (-i)</td>
+<td>3.30 <span>±0.01</span></td>
+<td>3.42 <span>±0.03</span></td>
+<td>3.33 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>UTF Word</td>
+<td>1.09 <span>±0.01</span></td>
+<td>1.21 <span>±0.01</span></td>
+<td>1.14 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>UTF Word (alt.)</td>
+<td>1.11 <span>±0.01</span></td>
+<td>1.21 <span>±0.01</span></td>
+<td>1.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Word</td>
+<td>1.12 <span>±0.00</span></td>
+<td>1.22 <span>±0.02</span></td>
+<td>1.14 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="som-rs-bc">
+<td colspan="4"><span>som-rs-bc</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.28 <span>±0.00</span></td>
+<td>0.30 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>0.23 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>0.30 <span>±0.00</span></td>
+<td>0.34 <span>±0.00</span></td>
+<td>0.36 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.28 <span>±0.00</span></td>
+<td>0.29 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.29 <span>±0.00</span></td>
+<td>0.29 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>0.30 <span>±0.01</span></td>
+<td>0.37 <span>±0.00</span></td>
+<td>0.36 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>0.49 <span>±0.00</span></td>
+<td>0.43 <span>±0.00</span></td>
+<td>0.54 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.15 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.24 <span>±0.00</span></td>
+<td>0.26 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>0.37 <span>±0.00</span></td>
+<td>0.39 <span>±0.01</span></td>
+<td>0.44 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>List</td>
+<td>0.18 <span>±0.00</span></td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.21 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>0.23 <span>±0.00</span></td>
+<td>0.26 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>0.20 <span>±0.00</span></td>
+<td>0.22 <span>±0.01</span></td>
+<td>0.23 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>0.11 <span>±0.00</span></td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>0.13 <span>±0.00</span></td>
+<td>0.13 <span>±0.00</span></td>
+<td>0.14 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>0.24 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>0.28 <span>±0.01</span></td>
+<td>0.33 <span>±0.00</span></td>
+<td>0.33 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>0.36 <span>±0.00</span></td>
+<td>0.38 <span>±0.00</span></td>
+<td>0.43 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.31 <span>±0.00</span></td>
+<td>0.30 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>0.92 <span>±0.00</span></td>
+<td>1.20 <span>±0.01</span></td>
+<td>1.10 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.26 <span>±0.00</span></td>
+<td>0.30 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.21 <span>±0.00</span></td>
+<td>0.25 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>0.13 <span>±0.00</span></td>
+<td>0.15 <span>±0.00</span></td>
+<td>0.15 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>0.11 <span>±0.00</span></td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.23 <span>±0.00</span></td>
+<td>0.25 <span>±0.00</span></td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 7.  </span><span>Wall-clock execution times (in seconds) for each benchmark in the <span>E<sub>GCvs</sub></span> experiment. Values show arithmetic means over 30 runs and include 99% confidence intervals. Because <span>Binary Trees</span> and <span>Regex-Redux</span> are stand-alone benchmarks they are omitted here; their timings appear in Table <a href="#x1-30030r5">5</a>.</span></figcaption>
+</figure>
+
+<figure>
+<a id="x1-30033r8"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th colspan="3">User time (s)</th>
+</tr>
+<tr>
+<th></th>
+<th>jemalloc</th>
+<th colspan="2"><span>BDWGC</span></th>
+</tr>
+<tr>
+<th></th>
+<th><code>Rc&lt;T&gt;</code></th>
+<th><code>Gc&lt;T&gt;</code></th>
+<th><code>Rc&lt;T&gt;</code></th>
+</tr>
+</thead>
+<tbody>
+<tr data-suite="alacritty">
+<td colspan="4"><span>Alacritty</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cur. Motion</td>
+<td>1.08 <span>±0.05</span></td>
+<td>1.09 <span>±0.04</span></td>
+<td>1.09 <span>±0.04</span></td>
+</tr>
+<tr>
+<td>Dense Cells</td>
+<td>6.66 <span>±0.13</span></td>
+<td>6.62 <span>±0.12</span></td>
+<td>6.58 <span>±0.15</span></td>
+</tr>
+<tr>
+<td>Light Cells</td>
+<td>0.34 <span>±0.03</span></td>
+<td>0.34 <span>±0.03</span></td>
+<td>0.34 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>Scroll</td>
+<td>0.11 <span>±0.01</span></td>
+<td>0.11 <span>±0.01</span></td>
+<td>0.12 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Scroll (fullscreen)</td>
+<td>0.24 <span>±0.02</span></td>
+<td>0.28 <span>±0.03</span></td>
+<td>0.22 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Scroll Btm</td>
+<td>0.14 <span>±0.01</span></td>
+<td>0.14 <span>±0.01</span></td>
+<td>0.14 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll Btm (small)</td>
+<td>0.14 <span>±0.01</span></td>
+<td>0.15 <span>±0.01</span></td>
+<td>0.14 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll Top</td>
+<td>0.12 <span>±0.01</span></td>
+<td>0.12 <span>±0.02</span></td>
+<td>0.11 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll Top (small)</td>
+<td>0.14 <span>±0.01</span></td>
+<td>0.14 <span>±0.01</span></td>
+<td>0.15 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Unicode</td>
+<td>0.10 <span>±0.01</span></td>
+<td>0.13 <span>±0.01</span></td>
+<td>0.12 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="fd">
+<td colspan="4"><span>fd</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cmd Exec.</td>
+<td>1.05 <span>±0.01</span></td>
+<td>1.12 <span>±0.02</span></td>
+<td>1.12 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Cmd Exec. (large)</td>
+<td>1.02 <span>±0.01</span></td>
+<td>1.10 <span>±0.03</span></td>
+<td>1.11 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>File Extension</td>
+<td>0.04 <span>±0.00</span></td>
+<td>0.04 <span>±0.01</span></td>
+<td>0.04 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>File Type</td>
+<td>0.03 <span>±0.01</span></td>
+<td>0.04 <span>±0.01</span></td>
+<td>0.04 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>No Pattern</td>
+<td>0.16 <span>±0.01</span></td>
+<td>0.29 <span>±0.02</span></td>
+<td>0.23 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Simple</td>
+<td>0.14 <span>±0.01</span></td>
+<td>0.18 <span>±0.01</span></td>
+<td>0.16 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Simple (-HI)</td>
+<td>0.03 <span>±0.01</span></td>
+<td>0.04 <span>±0.01</span></td>
+<td>0.04 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="som-rs-ast">
+<td colspan="4"><span>som-rs-ast</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>0.62 <span>±0.00</span></td>
+<td>0.96 <span>±0.02</span></td>
+<td>0.79 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>0.56 <span>±0.00</span></td>
+<td>0.83 <span>±0.01</span></td>
+<td>0.71 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>0.77 <span>±0.00</span></td>
+<td>1.07 <span>±0.01</span></td>
+<td>0.97 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>0.59 <span>±0.01</span></td>
+<td>0.96 <span>±0.01</span></td>
+<td>0.76 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>0.64 <span>±0.00</span></td>
+<td>0.98 <span>±0.05</span></td>
+<td>0.80 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>0.82 <span>±0.00</span></td>
+<td>1.40 <span>±0.01</span></td>
+<td>1.07 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>0.94 <span>±0.00</span></td>
+<td>1.20 <span>±0.01</span></td>
+<td>1.07 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>0.30 <span>±0.00</span></td>
+<td>0.41 <span>±0.01</span></td>
+<td>0.37 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>0.52 <span>±0.01</span></td>
+<td>0.83 <span>±0.00</span></td>
+<td>0.66 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>0.85 <span>±0.00</span></td>
+<td>1.21 <span>±0.01</span></td>
+<td>1.10 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>List</td>
+<td>0.38 <span>±0.00</span></td>
+<td>0.52 <span>±0.01</span></td>
+<td>0.47 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>0.52 <span>±0.01</span></td>
+<td>0.85 <span>±0.01</span></td>
+<td>0.70 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>0.45 <span>±0.00</span></td>
+<td>0.69 <span>±0.01</span></td>
+<td>0.57 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>0.31 <span>±0.00</span></td>
+<td>0.38 <span>±0.01</span></td>
+<td>0.34 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>0.30 <span>±0.00</span></td>
+<td>0.43 <span>±0.01</span></td>
+<td>0.38 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>0.66 <span>±0.00</span></td>
+<td>0.89 <span>±0.02</span></td>
+<td>0.82 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>0.77 <span>±0.00</span></td>
+<td>1.18 <span>±0.02</span></td>
+<td>0.97 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>0.98 <span>±0.00</span></td>
+<td>1.26 <span>±0.02</span></td>
+<td>1.26 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>0.60 <span>±0.00</span></td>
+<td>0.91 <span>±0.00</span></td>
+<td>0.79 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>2.47 <span>±0.02</span></td>
+<td>3.72 <span>±0.11</span></td>
+<td>3.13 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>0.66 <span>±0.00</span></td>
+<td>0.94 <span>±0.01</span></td>
+<td>0.87 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>0.55 <span>±0.00</span></td>
+<td>0.69 <span>±0.01</span></td>
+<td>0.68 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>0.52 <span>±0.00</span></td>
+<td>0.82 <span>±0.01</span></td>
+<td>0.67 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>0.31 <span>±0.00</span></td>
+<td>0.46 <span>±0.01</span></td>
+<td>0.38 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>0.31 <span>±0.00</span></td>
+<td>0.40 <span>±0.01</span></td>
+<td>0.40 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>0.47 <span>±0.00</span></td>
+<td>0.72 <span>±0.00</span></td>
+<td>0.59 <span>±0.00</span></td>
+</tr>
+<tr data-suite="grmtools">
+<td colspan="4"><span>grmtools</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Eclipse</td>
+<td>3.32 <span>±0.03</span></td>
+<td>3.28 <span>±0.03</span></td>
+<td>3.59 <span>±0.04</span></td>
+</tr>
+<tr>
+<td>Hadoop</td>
+<td>2.77 <span>±0.01</span></td>
+<td>2.80 <span>±0.01</span></td>
+<td>2.99 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Jenkins</td>
+<td>2.74 <span>±0.01</span></td>
+<td>2.81 <span>±0.04</span></td>
+<td>2.90 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Spring</td>
+<td>2.35 <span>±0.01</span></td>
+<td>2.40 <span>±0.01</span></td>
+<td>2.54 <span>±0.02</span></td>
+</tr>
+
+<tr data-suite="ripgrep">
+<td colspan="4"><span>Ripgrep</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Alternates</td>
+<td>0.42 <span>±0.02</span></td>
+<td>0.51 <span>±0.02</span></td>
+<td>0.43 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Alternates (-i)</td>
+<td>0.54 <span>±0.02</span></td>
+<td>0.65 <span>±0.02</span></td>
+<td>0.57 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Literal</td>
+<td>0.34 <span>±0.02</span></td>
+<td>0.44 <span>±0.01</span></td>
+<td>0.36 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (-i)</td>
+<td>0.41 <span>±0.02</span></td>
+<td>0.50 <span>±0.02</span></td>
+<td>0.44 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Literal (default)</td>
+<td>0.30 <span>±0.02</span></td>
+<td>0.40 <span>±0.01</span></td>
+<td>0.32 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (mmap)</td>
+<td>0.43 <span>±0.02</span></td>
+<td>0.52 <span>±0.02</span></td>
+<td>0.46 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Literal (mmap, -i)</td>
+<td>0.48 <span>±0.02</span></td>
+<td>0.58 <span>±0.02</span></td>
+<td>0.50 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Literal (regex)</td>
+<td>0.35 <span>±0.02</span></td>
+<td>0.44 <span>±0.02</span></td>
+<td>0.36 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>UTF Greek</td>
+<td>2.55 <span>±0.02</span></td>
+<td>2.64 <span>±0.02</span></td>
+<td>2.58 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>UTF Greek (-i)</td>
+<td>2.56 <span>±0.03</span></td>
+<td>2.66 <span>±0.03</span></td>
+<td>2.56 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>UTF Word</td>
+<td>0.35 <span>±0.02</span></td>
+<td>0.42 <span>±0.02</span></td>
+<td>0.37 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>UTF Word (alt.)</td>
+<td>0.33 <span>±0.02</span></td>
+<td>0.43 <span>±0.02</span></td>
+<td>0.35 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Word</td>
+<td>0.35 <span>±0.02</span></td>
+<td>0.43 <span>±0.02</span></td>
+<td>0.36 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="som-rs-bc">
+<td colspan="4"><span>som-rs-bc</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.28 <span>±0.00</span></td>
+<td>0.29 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>0.30 <span>±0.00</span></td>
+<td>0.34 <span>±0.00</span></td>
+<td>0.35 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>0.24 <span>±0.00</span></td>
+<td>0.28 <span>±0.00</span></td>
+<td>0.29 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>0.24 <span>±0.00</span></td>
+<td>0.28 <span>±0.00</span></td>
+<td>0.28 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>0.30 <span>±0.00</span></td>
+<td>0.36 <span>±0.00</span></td>
+<td>0.36 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>0.48 <span>±0.00</span></td>
+<td>0.42 <span>±0.01</span></td>
+<td>0.53 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.11 <span>±0.00</span></td>
+<td>0.14 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.24 <span>±0.00</span></td>
+<td>0.26 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>0.36 <span>±0.00</span></td>
+<td>0.39 <span>±0.01</span></td>
+<td>0.44 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>List</td>
+<td>0.17 <span>±0.00</span></td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.21 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>0.19 <span>±0.00</span></td>
+<td>0.21 <span>±0.01</span></td>
+<td>0.23 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>0.11 <span>±0.00</span></td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.14 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>0.23 <span>±0.00</span></td>
+<td>0.26 <span>±0.00</span></td>
+<td>0.27 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>0.27 <span>±0.01</span></td>
+<td>0.33 <span>±0.00</span></td>
+<td>0.33 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>0.35 <span>±0.00</span></td>
+<td>0.38 <span>±0.00</span></td>
+<td>0.42 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.31 <span>±0.00</span></td>
+<td>0.30 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>0.92 <span>±0.00</span></td>
+<td>1.20 <span>±0.01</span></td>
+<td>1.10 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>0.25 <span>±0.00</span></td>
+<td>0.26 <span>±0.00</span></td>
+<td>0.30 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.20 <span>±0.00</span></td>
+<td>0.25 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.24 <span>±0.00</span></td>
+<td>0.26 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>0.12 <span>±0.00</span></td>
+<td>0.15 <span>±0.00</span></td>
+<td>0.14 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>0.11 <span>±0.00</span></td>
+<td>0.11 <span>±0.00</span></td>
+<td>0.12 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>0.21 <span>±0.00</span></td>
+<td>0.22 <span>±0.00</span></td>
+<td>0.25 <span>±0.00</span></td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 8.  </span><span>User times (in seconds) for each benchmark in the <span>E<sub>GCvs</sub></span> experiment. Values show arithmetic means over 30 runs and include 99% confidence intervals.</span></figcaption>
+</figure>
+
+<figure>
+<a id="x1-30034r9"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Heap Size (MiB)</th>
+<th>Relative wall-clock time</th>
+<th>Benchmarks failed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td rowspan="3"><span>Alacritty</span></td>
+<td>16</td>
+<td>0.96 <span>[0.91, 0.99]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>32</td>
+<td>0.98 <span>[0.95, 1.02]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>64</td>
+<td>0.94 <span>[0.89, 0.98]</span></td>
+<td></td>
+</tr>
+
+<tr>
+<td rowspan="3"><span>Binary Trees</span></td>
+<td>4</td>
+<td>0.88 <span>[0.82, 1.02]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>8</td>
+<td>0.90 <span>[0.80, 1.01]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>16</td>
+<td>0.87 <span>[0.82, 0.94]</span></td>
+<td></td>
+</tr>
+
+<tr>
+<td rowspan="3"><span>fd</span></td>
+<td>16</td>
+<td>0.94 <span>[0.90, 0.99]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>32</td>
+<td>0.94 <span>[0.88, 0.98]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>64</td>
+<td>0.94 <span>[0.89, 1.00]</span></td>
+<td></td>
+</tr>
+
+<tr>
+<td rowspan="3"><span>grmtools</span></td>
+<td>1024</td>
+<td>1.01 <span>[1.00, 1.02]</span></td>
+<td>2/4 (Eclipse, Jenkins)</td>
+</tr>
+<tr>
+<td>2048</td>
+<td>1.00 <span>[1.00, 1.01]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>4096</td>
+<td>1.01 <span>[1.00, 1.02]</span></td>
+<td></td>
+</tr>
+
+<tr>
+<td rowspan="3"><span>Regex-Redux</span></td>
+<td>256</td>
+<td>0.94 <span>[0.92, 0.95]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>512</td>
+<td>0.93 <span>[0.90, 0.94]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>1024</td>
+<td>0.96 <span>[0.92, 1.07]</span></td>
+<td></td>
+</tr>
+
+<tr>
+<td rowspan="3"><span>Ripgrep</span></td>
+<td>32</td>
+<td>0.96 <span>[0.95, 0.96]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>64</td>
+<td>0.95 <span>[0.94, 0.95]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>128</td>
+<td>0.94 <span>[0.93, 0.95]</span></td>
+<td></td>
+</tr>
+
+<tr>
+<td rowspan="3"><span>som-rs-ast</span></td>
+<td>64</td>
+<td>0.72 <span>[0.71, 0.74]</span></td>
+<td>2/4 (Fannkuch, TreeSort)</td>
+</tr>
+<tr>
+<td>96</td>
+<td>0.74 <span>[0.73, 0.75]</span></td>
+<td>2/4 (Fannkuch, TreeSort)</td>
+</tr>
+<tr>
+<td>128</td>
+<td>0.75 <span>[0.74, 0.76]</span></td>
+<td></td>
+</tr>
+
+<tr>
+<td rowspan="3"><span>som-rs-bc</span></td>
+<td>32</td>
+<td>0.79 <span>[0.78, 0.80]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>64</td>
+<td>0.79 <span>[0.77, 0.80]</span></td>
+<td></td>
+</tr>
+<tr>
+<td>128</td>
+<td>0.84 <span>[0.83, 0.86]</span></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 9.  </span><span>The effects of fixing the heap size (see Section 8.1.3) on wall-clock time, reported as ratios relative to <span>BDWGC</span>&#39;s default adaptive RSS strategy. We chose per-benchmark heap sizes based on our observations of their memory usage, though some benchmarks fail at smaller values. Broadly speaking, these results show that the performance differences due to different heap sizes are relatively minor, and that <span>BDWGC</span>&#39;s adaptive strategy has not unduly coloured our results.</span></figcaption>
+</figure>
+
+
+<figure>
+<a id="x1-30035r10"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Fin. elided (%)</th>
+</tr>
+</thead>
+<tbody>
+<tr data-suite="alacritty">
+<td colspan="2"><span>Alacritty</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cur. Motion</td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>Dense Cells</td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>Light Cells</td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>Scroll</td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>Scroll Btm</td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>Scroll Btm (small)</td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>Scroll (fullscreen)</td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>Scroll Top</td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>Scroll Top (small)</td>
+<td>0.00</td>
+</tr>
+<tr>
+<td>Unicode</td>
+<td>0.00</td>
+</tr>
+
+<tr data-suite="fd">
+<td colspan="2"><span>fd</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cmd Exec.</td>
+<td>8.93</td>
+</tr>
+<tr>
+<td>Cmd Exec. (large)</td>
+<td>9.09</td>
+</tr>
+<tr>
+<td>File Extension</td>
+<td>72.73</td>
+</tr>
+<tr>
+<td>File Type</td>
+<td>24.54</td>
+</tr>
+<tr>
+<td>No Pattern</td>
+<td>0.04</td>
+</tr>
+<tr>
+<td>Simple</td>
+<td>61.54</td>
+</tr>
+<tr>
+<td>Simple (-HI)</td>
+<td>61.54</td>
+</tr>
+
+<tr data-suite="som-rs-ast">
+<td colspan="2"><span>som-rs-ast</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>99.99</td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>List</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>99.99</td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>99.99</td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>100.00</td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>99.99</td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>99.99</td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>100.00</td>
+</tr>
+<tr data-suite="grmtools">
+<td colspan="2"><span>grmtools</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Eclipse</td>
+<td>11.79</td>
+</tr>
+<tr>
+<td>Hadoop</td>
+<td>32.99</td>
+</tr>
+<tr>
+<td>Jenkins</td>
+<td>26.74</td>
+</tr>
+<tr>
+<td>Spring</td>
+<td>37.25</td>
+</tr>
+
+<tr data-suite="ripgrep">
+<td colspan="2"><span>Ripgrep</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Alternates</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>Alternates (-i)</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>Literal</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>Literal (-i)</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>Literal (mmap, -i)</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>Literal (default)</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>Literal (mmap)</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>Literal (regex)</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>UTF Greek</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>UTF Greek (-i)</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>UTF Word</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>UTF Word (alt.)</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>Word</td>
+<td>79.04</td>
+</tr>
+
+<tr data-suite="som-rs-bc">
+<td colspan="2"><span>som-rs-bc</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>72.50</td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>76.34</td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>73.86</td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>77.78</td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>72.74</td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>70.37</td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>83.33</td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>76.56</td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>75.00</td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>71.85</td>
+</tr>
+<tr>
+<td>List</td>
+<td>79.41</td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>74.82</td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>70.93</td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>86.17</td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>70.95</td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>79.23</td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>79.04</td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>69.33</td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>82.61</td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>71.17</td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>73.15</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>73.84</td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>75.00</td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>78.29</td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>65.19</td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>74.98</td>
+</tr>
+</tbody>
+</table>
+        <figcaption><p><span>Table 10.  </span><span>Percentage of finalizers <span>Alloy</span> was able to elide for each benchmark.</span></p></figcaption>
+</figure>
+
+<figure>
+<a id="x1-30036r5"></a>
+<p><img src="https://soft-dev.org/pubs/html/hughes_tratt__garbage_collection_for_rust_the_finalizer_frontier/images/appendix_elision_wallclock.svg" alt="Wall-clock time performance comparison" width="100%"/>
+</p>
+<p><img src="https://soft-dev.org/pubs/html/hughes_tratt__garbage_collection_for_rust_the_finalizer_frontier/images/appendix_elision_user.svg" alt="User time performance comparison" width="100%"/>
+</p>
+<figcaption>
+<span>Figure 5.  </span>
+<span>Wall-clock and user time performance comparison for finalizer elision on each benchmark. The bars show the relative performance of <span>Alloy</span> after applying our elision optimization, normalized against the baseline (solid black line). The vertical blue line marks the overall geometric mean (with shaded area for CIs). User time often shows greater improvement than wall-clock time, as elision reduces the CPU overhead of the finalization thread.</span>
+</figcaption>
+</figure>
+
+
+<figure>
+<a id="x1-30037r11"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th colspan="2">Wall-clock time (s)</th>
+</tr>
+<tr>
+<th></th>
+<th>Before elision</th>
+<th>After elision</th>
+</tr>
+</thead>
+<tbody>
+<tr data-suite="alacritty">
+<td colspan="3"><span>Alacritty</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cur. Motion</td>
+<td>0.66 <span>±0.01</span></td>
+<td>0.66 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Dense Cells</td>
+<td>2.17 <span>±0.03</span></td>
+<td>2.17 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Light Cells</td>
+<td>0.39 <span>±0.01</span></td>
+<td>0.38 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll</td>
+<td>0.27 <span>±0.01</span></td>
+<td>0.27 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll (fullscreen)</td>
+<td>0.39 <span>±0.01</span></td>
+<td>0.39 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll Btm</td>
+<td>0.33 <span>±0.00</span></td>
+<td>0.33 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Scroll Btm (small)</td>
+<td>0.33 <span>±0.00</span></td>
+<td>0.33 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Scroll Top</td>
+<td>0.25 <span>±0.01</span></td>
+<td>0.24 <span>±0.04</span></td>
+</tr>
+<tr>
+<td>Scroll Top (small)</td>
+<td>0.33 <span>±0.00</span></td>
+<td>0.33 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Unicode</td>
+<td>0.26 <span>±0.02</span></td>
+<td>0.26 <span>±0.02</span></td>
+</tr>
+
+<tr data-suite="fd">
+<td colspan="3"><span>fd</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cmd Exec.</td>
+<td>1.29 <span>±0.02</span></td>
+<td>1.29 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Cmd Exec. (large)</td>
+<td>1.25 <span>±0.01</span></td>
+<td>1.25 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>File Extension</td>
+<td>0.15 <span>±0.00</span></td>
+<td>0.14 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>File Type</td>
+<td>0.13 <span>±0.01</span></td>
+<td>0.13 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>No Pattern</td>
+<td>0.28 <span>±0.02</span></td>
+<td>0.29 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Simple</td>
+<td>0.34 <span>±0.01</span></td>
+<td>0.35 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Simple (-HI)</td>
+<td>0.14 <span>±0.01</span></td>
+<td>0.14 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="som-rs-ast">
+<td colspan="3"><span>som-rs-ast</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>7.68 <span>±0.40</span></td>
+<td>1.03 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>5.27 <span>±0.29</span></td>
+<td>0.92 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>7.84 <span>±0.19</span></td>
+<td>1.17 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>6.52 <span>±0.46</span></td>
+<td>1.04 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>6.76 <span>±0.09</span></td>
+<td>1.15 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>22.16 <span>±1.87</span></td>
+<td>1.54 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>5.14 <span>±0.16</span></td>
+<td>1.25 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>2.82 <span>±0.06</span></td>
+<td>0.47 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>5.88 <span>±0.11</span></td>
+<td>0.90 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>11.37 <span>±0.77</span></td>
+<td>1.33 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>List</td>
+<td>4.06 <span>±0.06</span></td>
+<td>0.58 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>6.02 <span>±0.14</span></td>
+<td>0.90 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>4.67 <span>±0.11</span></td>
+<td>0.74 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>2.91 <span>±0.16</span></td>
+<td>0.40 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>2.44 <span>±0.05</span></td>
+<td>0.47 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>6.69 <span>±0.35</span></td>
+<td>0.97 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>9.07 <span>±0.34</span></td>
+<td>1.28 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>10.86 <span>±0.66</span></td>
+<td>1.39 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>7.66 <span>±0.24</span></td>
+<td>0.98 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>97.40 <span>±10.46</span></td>
+<td>3.95 <span>±0.08</span></td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>7.06 <span>±0.13</span></td>
+<td>1.01 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>5.06 <span>±0.10</span></td>
+<td>0.75 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>5.91 <span>±0.12</span></td>
+<td>0.89 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>3.20 <span>±0.14</span></td>
+<td>0.50 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>4.65 <span>±0.32</span></td>
+<td>0.45 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>5.03 <span>±0.21</span></td>
+<td>0.76 <span>±0.01</span></td>
+</tr>
+<tr data-suite="grmtools">
+<td colspan="3"><span>grmtools</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Eclipse</td>
+<td>5.09 <span>±0.05</span></td>
+<td>3.59 <span>±0.06</span></td>
+</tr>
+<tr>
+<td>Hadoop</td>
+<td>4.49 <span>±0.03</span></td>
+<td>3.07 <span>±0.05</span></td>
+</tr>
+<tr>
+<td>Jenkins</td>
+<td>4.45 <span>±0.02</span></td>
+<td>3.02 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Spring</td>
+<td>4.11 <span>±0.03</span></td>
+<td>2.65 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="ripgrep">
+<td colspan="3"><span>Ripgrep</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Alternates</td>
+<td>1.44 <span>±0.03</span></td>
+<td>1.39 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Alternates (-i)</td>
+<td>1.55 <span>±0.02</span></td>
+<td>1.50 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal</td>
+<td>1.38 <span>±0.03</span></td>
+<td>1.32 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (-i)</td>
+<td>1.45 <span>±0.02</span></td>
+<td>1.38 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (default)</td>
+<td>1.38 <span>±0.02</span></td>
+<td>1.30 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (mmap)</td>
+<td>1.90 <span>±0.02</span></td>
+<td>1.81 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (mmap, -i)</td>
+<td>1.90 <span>±0.03</span></td>
+<td>1.84 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (regex)</td>
+<td>1.36 <span>±0.03</span></td>
+<td>1.33 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>UTF Greek</td>
+<td>3.53 <span>±0.01</span></td>
+<td>3.50 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>UTF Greek (-i)</td>
+<td>3.51 <span>±0.02</span></td>
+<td>3.52 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>UTF Word</td>
+<td>1.39 <span>±0.02</span></td>
+<td>1.30 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>UTF Word (alt.)</td>
+<td>1.36 <span>±0.02</span></td>
+<td>1.31 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Word</td>
+<td>1.36 <span>±0.02</span></td>
+<td>1.31 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="som-rs-bc">
+<td colspan="3"><span>som-rs-bc</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>3.03 <span>±0.04</span></td>
+<td>0.31 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>2.64 <span>±0.04</span></td>
+<td>0.29 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>4.19 <span>±0.08</span></td>
+<td>0.37 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>3.80 <span>±0.36</span></td>
+<td>0.30 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>2.86 <span>±0.23</span></td>
+<td>0.31 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>4.34 <span>±0.20</span></td>
+<td>0.40 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>2.45 <span>±0.16</span></td>
+<td>0.45 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>1.15 <span>±0.03</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>3.00 <span>±0.16</span></td>
+<td>0.26 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>4.96 <span>±0.80</span></td>
+<td>0.42 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>List</td>
+<td>2.69 <span>±0.09</span></td>
+<td>0.24 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>3.07 <span>±0.18</span></td>
+<td>0.28 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>2.21 <span>±0.15</span></td>
+<td>0.23 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>1.23 <span>±0.06</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>1.06 <span>±0.01</span></td>
+<td>0.14 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>2.72 <span>±0.09</span></td>
+<td>0.29 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>3.19 <span>±0.07</span></td>
+<td>0.35 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>3.62 <span>±0.05</span></td>
+<td>0.41 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>4.27 <span>±1.91</span></td>
+<td>0.33 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>15.51 <span>±0.89</span></td>
+<td>1.31 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>2.57 <span>±0.07</span></td>
+<td>0.28 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>2.45 <span>±0.05</span></td>
+<td>0.22 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>3.06 <span>±0.37</span></td>
+<td>0.27 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>1.59 <span>±0.05</span></td>
+<td>0.16 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>1.19 <span>±0.02</span></td>
+<td>0.13</td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>3.26 <span>±0.08</span></td>
+<td>0.24 <span>±0.01</span></td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 11.  </span><span>Wall-clock execution times (seconds) for each benchmark in the <span>E<sub>Elision</sub></span> experiment, shown before and after applying <span>Alloy</span>&#39;s finalizer elision optimisation. Values show arithmetic means over 30 runs, with 99% confidence intervals.</span></figcaption>
+</figure>
+
+
+<figure>
+<a id="x1-30038r12"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th colspan="2">User time (s)</th>
+</tr>
+<tr>
+<th></th>
+<th>Before elision</th>
+<th>After elision</th>
+</tr>
+</thead>
+<tbody>
+<tr data-suite="alacritty">
+<td colspan="3"><span>Alacritty</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cur. Motion</td>
+<td>1.08 <span>±0.06</span></td>
+<td>1.12 <span>±0.05</span></td>
+</tr>
+<tr>
+<td>Dense Cells</td>
+<td>6.70 <span>±0.12</span></td>
+<td>6.68 <span>±0.13</span></td>
+</tr>
+<tr>
+<td>Light Cells</td>
+<td>0.34 <span>±0.04</span></td>
+<td>0.33 <span>±0.04</span></td>
+</tr>
+<tr>
+<td>Scroll</td>
+<td>0.12 <span>±0.01</span></td>
+<td>0.12 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll (fullscreen)</td>
+<td>0.27 <span>±0.03</span></td>
+<td>0.26 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>Scroll Btm</td>
+<td>0.15 <span>±0.01</span></td>
+<td>0.15 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll Btm (small)</td>
+<td>0.15 <span>±0.01</span></td>
+<td>0.14 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Scroll Top</td>
+<td>0.12 <span>±0.01</span></td>
+<td>0.12 <span>±0.06</span></td>
+</tr>
+<tr>
+<td>Scroll Top (small)</td>
+<td>0.15 <span>±0.01</span></td>
+<td>0.14 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Unicode</td>
+<td>0.13 <span>±0.02</span></td>
+<td>0.13 <span>±0.02</span></td>
+</tr>
+
+<tr data-suite="fd">
+<td colspan="3"><span>fd</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cmd Exec.</td>
+<td>1.13 <span>±0.01</span></td>
+<td>1.13 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Cmd Exec. (large)</td>
+<td>1.10 <span>±0.02</span></td>
+<td>1.11 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>File Extension</td>
+<td>0.05 <span>±0.01</span></td>
+<td>0.04 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>File Type</td>
+<td>0.04 <span>±0.00</span></td>
+<td>0.04 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>No Pattern</td>
+<td>0.27 <span>±0.02</span></td>
+<td>0.30 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Simple</td>
+<td>0.19 <span>±0.01</span></td>
+<td>0.20 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Simple (-HI)</td>
+<td>0.04 <span>±0.01</span></td>
+<td>0.04 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="som-rs-ast">
+<td colspan="3"><span>som-rs-ast</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>11.15 <span>±0.41</span></td>
+<td>1.02 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>7.88 <span>±0.40</span></td>
+<td>0.90 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>11.72 <span>±0.21</span></td>
+<td>1.15 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>9.15 <span>±0.63</span></td>
+<td>1.03 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>9.60 <span>±0.12</span></td>
+<td>1.12 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>26.41 <span>±1.82</span></td>
+<td>1.53 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>6.42 <span>±0.17</span></td>
+<td>1.25 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>3.92 <span>±0.07</span></td>
+<td>0.45 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>8.23 <span>±0.13</span></td>
+<td>0.90 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>16.08 <span>±0.75</span></td>
+<td>1.32 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>List</td>
+<td>5.79 <span>±0.09</span></td>
+<td>0.57 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>8.51 <span>±0.17</span></td>
+<td>0.89 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>6.62 <span>±0.12</span></td>
+<td>0.73 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>3.98 <span>±0.15</span></td>
+<td>0.40 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>3.73 <span>±0.07</span></td>
+<td>0.47 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>9.96 <span>±0.34</span></td>
+<td>0.96 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>13.04 <span>±0.33</span></td>
+<td>1.27 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>16.43 <span>±0.65</span></td>
+<td>1.38 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>11.18 <span>±0.28</span></td>
+<td>0.98 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>109.49 <span>±10.34</span></td>
+<td>3.95 <span>±0.08</span></td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>10.49 <span>±0.18</span></td>
+<td>1.00 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>7.70 <span>±0.12</span></td>
+<td>0.74 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>8.27 <span>±0.14</span></td>
+<td>0.89 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>4.61 <span>±0.14</span></td>
+<td>0.49 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>5.90 <span>±0.35</span></td>
+<td>0.44 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>6.74 <span>±0.20</span></td>
+<td>0.76 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="grmtools">
+<td colspan="3"><span>grmtools</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Eclipse</td>
+<td>5.81 <span>±0.07</span></td>
+<td>3.42 <span>±0.06</span></td>
+</tr>
+<tr>
+<td>Hadoop</td>
+<td>5.27 <span>±0.04</span></td>
+<td>2.96 <span>±0.05</span></td>
+</tr>
+<tr>
+<td>Jenkins</td>
+<td>5.21 <span>±0.04</span></td>
+<td>2.86 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Spring</td>
+<td>4.94 <span>±0.05</span></td>
+<td>2.54 <span>±0.01</span></td>
+</tr>
+
+<tr data-suite="ripgrep">
+<td colspan="3"><span>Ripgrep</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Alternates</td>
+<td>0.58 <span>±0.02</span></td>
+<td>0.50 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Alternates (-i)</td>
+<td>0.72 <span>±0.02</span></td>
+<td>0.64 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Literal</td>
+<td>0.53 <span>±0.02</span></td>
+<td>0.44 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Literal (-i)</td>
+<td>0.59 <span>±0.02</span></td>
+<td>0.51 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Literal (default)</td>
+<td>0.48 <span>±0.02</span></td>
+<td>0.40 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Literal (mmap)</td>
+<td>0.63 <span>±0.02</span></td>
+<td>0.53 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Literal (mmap, -i)</td>
+<td>0.65 <span>±0.02</span></td>
+<td>0.57 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Literal (regex)</td>
+<td>0.52 <span>±0.02</span></td>
+<td>0.43 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>UTF Greek</td>
+<td>2.70 <span>±0.02</span></td>
+<td>2.66 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>UTF Greek (-i)</td>
+<td>2.71 <span>±0.03</span></td>
+<td>2.67 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>UTF Word</td>
+<td>0.53 <span>±0.02</span></td>
+<td>0.42 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>UTF Word (alt.)</td>
+<td>0.52 <span>±0.02</span></td>
+<td>0.43 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>Word</td>
+<td>0.51 <span>±0.02</span></td>
+<td>0.44 <span>±0.02</span></td>
+</tr>
+
+<tr data-suite="som-rs-bc">
+<td colspan="3"><span>som-rs-bc</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Bounce</td>
+<td>4.34 <span>±0.04</span></td>
+<td>0.30 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>BubbleSort</td>
+<td>3.76 <span>±0.05</span></td>
+<td>0.29 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>DeltaBlue</td>
+<td>5.76 <span>±0.11</span></td>
+<td>0.36 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td>4.91 <span>±0.35</span></td>
+<td>0.29 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Fannkuch</td>
+<td>3.85 <span>±0.29</span></td>
+<td>0.30 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Fibonacci</td>
+<td>6.15 <span>±0.17</span></td>
+<td>0.40 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>FieldLoop</td>
+<td>3.14 <span>±0.15</span></td>
+<td>0.45 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>GraphSearch</td>
+<td>1.54 <span>±0.03</span></td>
+<td>0.12 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>IntegerLoop</td>
+<td>3.94 <span>±0.15</span></td>
+<td>0.26 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>JsonSmall</td>
+<td>6.70 <span>±0.73</span></td>
+<td>0.41 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>List</td>
+<td>3.72 <span>±0.09</span></td>
+<td>0.24 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Loop</td>
+<td>4.11 <span>±0.17</span></td>
+<td>0.28 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Mandelbrot</td>
+<td>2.91 <span>±0.13</span></td>
+<td>0.23 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>NBody</td>
+<td>1.72 <span>±0.06</span></td>
+<td>0.12 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>PageRank</td>
+<td>1.51 <span>±0.02</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Permute</td>
+<td>3.84 <span>±0.09</span></td>
+<td>0.28 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Queens</td>
+<td>4.53 <span>±0.07</span></td>
+<td>0.35 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>QuickSort</td>
+<td>5.28 <span>±0.09</span></td>
+<td>0.40 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Recurse</td>
+<td>5.84 <span>±1.85</span></td>
+<td>0.33 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Richards</td>
+<td>20.23 <span>±0.81</span></td>
+<td>1.30 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Sieve</td>
+<td>3.76 <span>±0.12</span></td>
+<td>0.27 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>3.23 <span>±0.05</span></td>
+<td>0.22 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Sum</td>
+<td>4.03 <span>±0.36</span></td>
+<td>0.26 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>Towers</td>
+<td>2.20 <span>±0.05</span></td>
+<td>0.16 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>TreeSort</td>
+<td>1.71 <span>±0.03</span></td>
+<td>0.13 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>WhileLoop</td>
+<td>3.90 <span>±0.09</span></td>
+<td>0.24 <span>±0.01</span></td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 12.  </span><span>User times (seconds) for each benchmark in the <span>E<sub>Elision</sub></span> experiment, shown before and after applying <span>Alloy</span>&#39;s finalizer elision optimisation. Values show arithmetic means over 30 runs, with 99% confidence intervals.</span></figcaption>
+</figure>
+
+<figure>
+<a id="x1-30039r13"></a>
+<table>
+<thead>
+<tr>
+<th></th>
+<th colspan="2">Avg. heap footprint (MiB)</th>
+</tr>
+<tr>
+<th></th>
+<th>Before elision</th>
+<th>After elision</th>
+</tr>
+</thead>
+<tbody>
+<tr data-suite="alacritty">
+<td colspan="3"><span>Alacritty</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Cur. Motion</td>
+<td>3.76 <span>±0.06</span></td>
+<td>3.79 <span>±0.06</span></td>
+</tr>
+<tr>
+<td>Dense Cells</td>
+<td>3.74 <span>±0.06</span></td>
+<td>3.74 <span>±0.06</span></td>
+</tr>
+<tr>
+<td>Light Cells</td>
+<td>3.76 <span>±0.08</span></td>
+<td>3.73 <span>±0.07</span></td>
+</tr>
+<tr>
+<td>Scroll</td>
+<td>3.88 <span>±0.13</span></td>
+<td>3.87 <span>±0.12</span></td>
+</tr>
+<tr>
+<td>Scroll (fullscreen)</td>
+<td>6.46 <span>±0.28</span></td>
+<td>6.46 <span>±0.34</span></td>
+</tr>
+<tr>
+<td>Scroll Btm</td>
+<td>3.72 <span>±0.07</span></td>
+<td>3.73 <span>±0.07</span></td>
+</tr>
+<tr>
+<td>Scroll Btm (small)</td>
+<td>3.75 <span>±0.05</span></td>
+<td>3.74 <span>±0.07</span></td>
+</tr>
+<tr>
+<td>Scroll Top</td>
+<td>3.78 <span>±0.08</span></td>
+<td>3.75 <span>±0.10</span></td>
+</tr>
+<tr>
+<td>Scroll Top (small)</td>
+<td>3.76 <span>±0.06</span></td>
+<td>3.71 <span>±0.08</span></td>
+</tr>
+<tr>
+<td>Unicode</td>
+<td>3.73 <span>±0.15</span></td>
+<td>3.77 <span>±0.09</span></td>
+</tr>
+
+<tr data-suite="fd">
+<td colspan="3"><span>fd</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>execution</td>
+<td>17.18 <span>±0.33</span></td>
+<td>17.89 <span>±0.87</span></td>
+</tr>
+<tr>
+<td>extension</td>
+<td>13.52 <span>±0.75</span></td>
+<td>13.68 <span>±0.84</span></td>
+</tr>
+<tr>
+<td>hi</td>
+<td>15.14 <span>±0.36</span></td>
+<td>14.99 <span>±0.59</span></td>
+</tr>
+<tr>
+<td>output</td>
+<td>17.54 <span>±0.65</span></td>
+<td>17.47 <span>±0.53</span></td>
+</tr>
+<tr>
+<td>pattern</td>
+<td>37.79 <span>±5.22</span></td>
+<td>38.03 <span>±5.25</span></td>
+</tr>
+<tr>
+<td>type</td>
+<td>15.80 <span>±0.40</span></td>
+<td>15.84 <span>±0.38</span></td>
+</tr>
+
+<tr data-suite="som-rs-ast">
+<td colspan="3"><span>som-rs-ast</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>bounce</td>
+<td>309.85 <span>±43.90</span></td>
+<td>362.44 <span>±7.24</span></td>
+</tr>
+<tr>
+<td>bubblesort</td>
+<td>334.97 <span>±6.55</span></td>
+<td>209.99 <span>±3.88</span></td>
+</tr>
+<tr>
+<td>deltablue</td>
+<td>305.24 <span>±31.74</span></td>
+<td>310.83 <span>±5.32</span></td>
+</tr>
+<tr>
+<td>dispatch</td>
+<td>345.26 <span>±18.67</span></td>
+<td>329.90 <span>±4.22</span></td>
+</tr>
+<tr>
+<td>fannkuch</td>
+<td>412.43 <span>±5.54</span></td>
+<td>363.19 <span>±8.31</span></td>
+</tr>
+<tr>
+<td>fibonacci</td>
+<td>382.32 <span>±22.98</span></td>
+<td>587.04 <span>±4.00</span></td>
+</tr>
+<tr>
+<td>fieldloop</td>
+<td>326.47 <span>±8.38</span></td>
+<td>300.93 <span>±5.66</span></td>
+</tr>
+<tr>
+<td>graphsearch</td>
+<td>100.82 <span>±4.86</span></td>
+<td>61.15 <span>±0.26</span></td>
+</tr>
+<tr>
+<td>integerloop</td>
+<td>323.50 <span>±16.42</span></td>
+<td>320.62 <span>±0.44</span></td>
+</tr>
+<tr>
+<td>jsonsmall</td>
+<td>257.67 <span>±34.84</span></td>
+<td>316.56 <span>±0.93</span></td>
+</tr>
+<tr>
+<td>list</td>
+<td>236.78 <span>±5.27</span></td>
+<td>156.13 <span>±4.11</span></td>
+</tr>
+<tr>
+<td>loop</td>
+<td>332.20 <span>±14.75</span></td>
+<td>326.89 <span>±7.76</span></td>
+</tr>
+<tr>
+<td>mandelbrot</td>
+<td>276.68 <span>±4.14</span></td>
+<td>236.49 <span>±2.42</span></td>
+</tr>
+<tr>
+<td>nbody</td>
+<td>151.00 <span>±2.63</span></td>
+<td>137.42 <span>±2.78</span></td>
+</tr>
+<tr>
+<td>pagerank</td>
+<td>193.25 <span>±1.12</span></td>
+<td>168.02 <span>±0.95</span></td>
+</tr>
+<tr>
+<td>permute</td>
+<td>284.84 <span>±43.08</span></td>
+<td>371.67 <span>±11.43</span></td>
+</tr>
+<tr>
+<td>queens</td>
+<td>278.89 <span>±12.36</span></td>
+<td>288.03 <span>±2.63</span></td>
+</tr>
+<tr>
+<td>quicksort</td>
+<td>515.72 <span>±20.82</span></td>
+<td>424.56 <span>±18.48</span></td>
+</tr>
+<tr>
+<td>recurse</td>
+<td>429.81 <span>±12.37</span></td>
+<td>410.97 <span>±5.30</span></td>
+</tr>
+<tr>
+<td>richards</td>
+<td>1187.31 <span>±98.12</span></td>
+<td>1472.67 <span>±31.17</span></td>
+</tr>
+<tr>
+<td>sieve</td>
+<td>355.11 <span>±17.79</span></td>
+<td>360.95 <span>±6.06</span></td>
+</tr>
+<tr>
+<td>storage</td>
+<td>196.36 <span>±9.70</span></td>
+<td>193.06 <span>±6.60</span></td>
+</tr>
+<tr>
+<td>sum</td>
+<td>320.61 <span>±11.55</span></td>
+<td>298.24 <span>±2.27</span></td>
+</tr>
+<tr>
+<td>towers</td>
+<td>174.90 <span>±4.23</span></td>
+<td>175.82 <span>±0.26</span></td>
+</tr>
+<tr>
+<td>treesort</td>
+<td>92.65 <span>±4.87</span></td>
+<td>98.82 <span>±0.92</span></td>
+</tr>
+<tr>
+<td>whileloop</td>
+<td>272.66 <span>±10.05</span></td>
+<td>253.07 <span>±3.60</span></td>
+</tr>
+<tr data-suite="grmtools">
+<td colspan="3"><span>grmtools</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Eclipse</td>
+<td>1993.86 <span>±9.04</span></td>
+<td>1069.95 <span>±28.40</span></td>
+</tr>
+<tr>
+<td>Hadoop</td>
+<td>1882.88 <span>±1.55</span></td>
+<td>800.15 <span>±48.62</span></td>
+</tr>
+<tr>
+<td>Jenkins</td>
+<td>1876.35 <span>±14.92</span></td>
+<td>962.16 <span>±29.20</span></td>
+</tr>
+<tr>
+<td>Spring</td>
+<td>1752.72 <span>±1.68</span></td>
+<td>1036.27 <span>±19.48</span></td>
+</tr>
+
+<tr data-suite="ripgrep">
+<td colspan="3"><span>Ripgrep</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>Alternates</td>
+<td>28.23 <span>±1.59</span></td>
+<td>15.80 <span>±0.40</span></td>
+</tr>
+<tr>
+<td>Alternates (-i)</td>
+<td>29.52 <span>±1.66</span></td>
+<td>17.50 <span>±0.66</span></td>
+</tr>
+<tr>
+<td>Literal</td>
+<td>25.14 <span>±1.52</span></td>
+<td>15.26 <span>±0.33</span></td>
+</tr>
+<tr>
+<td>Literal (-i)</td>
+<td>26.69 <span>±1.56</span></td>
+<td>18.17 <span>±0.41</span></td>
+</tr>
+<tr>
+<td>Literal (default)</td>
+<td>25.62 <span>±1.59</span></td>
+<td>15.25 <span>±0.39</span></td>
+</tr>
+<tr>
+<td>Literal (mmap)</td>
+<td>26.91 <span>±1.78</span></td>
+<td>16.03 <span>±0.39</span></td>
+</tr>
+<tr>
+<td>Literal (mmap, -i)</td>
+<td>28.72 <span>±1.66</span></td>
+<td>17.34 <span>±0.24</span></td>
+</tr>
+<tr>
+<td>Literal (regex)</td>
+<td>25.87 <span>±2.01</span></td>
+<td>15.05 <span>±0.46</span></td>
+</tr>
+<tr>
+<td>UTF Greek</td>
+<td>26.57 <span>±1.40</span></td>
+<td>17.43 <span>±0.47</span></td>
+</tr>
+<tr>
+<td>UTF Greek (-i)</td>
+<td>26.85 <span>±1.54</span></td>
+<td>18.04 <span>±0.65</span></td>
+</tr>
+<tr>
+<td>UTF Word</td>
+<td>28.03 <span>±1.57</span></td>
+<td>18.13 <span>±0.14</span></td>
+</tr>
+<tr>
+<td>UTF Word (alt.)</td>
+<td>25.56 <span>±1.60</span></td>
+<td>15.48 <span>±0.46</span></td>
+</tr>
+<tr>
+<td>Word</td>
+<td>29.35 <span>±2.05</span></td>
+<td>15.82 <span>±0.51</span></td>
+</tr>
+
+<tr data-suite="som-rs-bc">
+<td colspan="3"><span>som-rs-bc</span> <span>▶</span></td>
+</tr>
+<tr>
+<td>bounce</td>
+<td>138.59 <span>±5.18</span></td>
+<td>134.24 <span>±0.22</span></td>
+</tr>
+<tr>
+<td>bubblesort</td>
+<td>121.69 <span>±6.72</span></td>
+<td>115.25 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>deltablue</td>
+<td>186.12 <span>±1.32</span></td>
+<td>135.10 <span>±2.09</span></td>
+</tr>
+<tr>
+<td>dispatch</td>
+<td>168.63 <span>±7.00</span></td>
+<td>137.08 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>fannkuch</td>
+<td>139.94 <span>±5.95</span></td>
+<td>115.98 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>fibonacci</td>
+<td>205.88 <span>±10.08</span></td>
+<td>175.88 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>fieldloop</td>
+<td>98.52 <span>±4.07</span></td>
+<td>89.07 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>graphsearch</td>
+<td>45.81 <span>±1.21</span></td>
+<td>24.33 <span>±0.74</span></td>
+</tr>
+<tr>
+<td>integerloop</td>
+<td>133.10 <span>±6.16</span></td>
+<td>117.24 <span>±0.01</span></td>
+</tr>
+<tr>
+<td>jsonsmall</td>
+<td>164.80 <span>±5.83</span></td>
+<td>142.20 <span>±5.29</span></td>
+</tr>
+<tr>
+<td>list</td>
+<td>106.38 <span>±7.84</span></td>
+<td>98.95 <span>±0.04</span></td>
+</tr>
+<tr>
+<td>loop</td>
+<td>144.73 <span>±6.09</span></td>
+<td>120.89 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>mandelbrot</td>
+<td>90.31 <span>±4.84</span></td>
+<td>80.51 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>nbody</td>
+<td>58.61 <span>±1.77</span></td>
+<td>48.15 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>pagerank</td>
+<td>69.21 <span>±0.08</span></td>
+<td>51.90 <span>±0.46</span></td>
+</tr>
+<tr>
+<td>permute</td>
+<td>126.65 <span>±5.94</span></td>
+<td>109.74 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>queens</td>
+<td>157.93 <span>±5.89</span></td>
+<td>134.31 <span>±0.02</span></td>
+</tr>
+<tr>
+<td>quicksort</td>
+<td>183.42 <span>±4.54</span></td>
+<td>175.50 <span>±0.04</span></td>
+</tr>
+<tr>
+<td>recurse</td>
+<td>169.34 <span>±7.22</span></td>
+<td>146.41 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>richards</td>
+<td>582.34 <span>±41.87</span></td>
+<td>487.95 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>sieve</td>
+<td>131.11 <span>±5.83</span></td>
+<td>114.14 <span>±3.04</span></td>
+</tr>
+<tr>
+<td>storage</td>
+<td>71.95 <span>±2.32</span></td>
+<td>85.36 <span>±3.26</span></td>
+</tr>
+<tr>
+<td>sum</td>
+<td>136.99 <span>±5.40</span></td>
+<td>117.56 <span>±0.00</span></td>
+</tr>
+<tr>
+<td>towers</td>
+<td>71.09 <span>±3.09</span></td>
+<td>58.84 <span>±0.03</span></td>
+</tr>
+<tr>
+<td>treesort</td>
+<td>57.12 <span>±2.12</span></td>
+<td>44.90 <span>±1.02</span></td>
+</tr>
+<tr>
+<td>whileloop</td>
+<td>132.37 <span>±2.45</span></td>
+<td>96.28 <span>±0.02</span></td>
+</tr>
+</tbody>
+</table>
+<figcaption><span>Table 13.  </span><span>Average heap footprint (MiB) across benchmarks in the <span>E<sub>Elision</sub></span> experiment, measured before and after applying <span>Alloy</span>&#39;s finalizer elision optimisation. Values are arithmetic means over 30 runs with resampled traces from heaptrack, with 99% confidence intervals (see Section 8.1.4 for details).</span></figcaption>
+</figure>
+
+
+</div></div>
+  </body>
+</html>
