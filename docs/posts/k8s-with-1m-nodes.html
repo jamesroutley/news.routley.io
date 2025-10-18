@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://bchess.github.io/k8s-1m/">Original</a>
+    <h1>K8s with 1M nodes</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+<p>Early on in this project, I asked ChatGPT “I want to scale Kubernetes to 1 million nodes. What types of problems would I need to overcome?”</p>
+<p>Here’s a portion of what I got:</p>
+<div>
+<blockquote>
+<p>Scaling Kubernetes to 1 million nodes is a formidable challenge and involves overcoming a variety of technical hurdles. Here are the key areas you would need to address:</p>
+<p><strong>etcd Scalability and Performance</strong>: etcd is the backbone of Kubernetes&#39; storage, handling all API object data. With 1 million nodes, the volume of data managed by etcd will increase significantly. Optimizing etcd’s performance, including efficient data partitioning, tuning the database to handle high loads, and possibly looking into alternatives or supplements to etcd for certain types of data, is crucial.</p>
+<p><strong>kube-apiserver Performance</strong>: The Kubernetes kube-apiserver would face enormous loads in a cluster of this size. Optimizing its performance includes horizontal scaling (running multiple kube-apiserver instances), rate limiting, and efficient caching mechanisms. Also, minimizing the watch events and reducing the overall number of requests to the kube-apiserver is important.</p>
+<p><strong>Networking</strong>: Handling network traffic for 1 million nodes is extremely challenging. This includes the management of IP addresses, efficient routing, and possibly segmenting the network to prevent it from becoming a bottleneck. Solutions like Cilium, which uses eBPF technology for networking and security, might be necessary.</p>
+<p><strong>Scheduling and Resource Management</strong>: The scheduler will have increased latency as it tries to place pods optimally across a vast number of nodes. Enhancing the scheduler to handle large scale operations efficiently, possibly by implementing custom schedulers for specific tasks, is required.</p>
+</blockquote>
+</div>
+<p>It goes on to list other challenges, including Logging &amp; Monitoring, Security, and Storage management.</p>
+<p>I think these first items are the most critical. There are a wide range of options for support for logging or PVCs, but if you can’t run etcd or schedule pods or have the pods talk to one another, you’re not getting anywhere.</p>
+<p>Below I’m going to discuss the three major areas I tackled.</p>
+<div>
+<h3 id="_networking">Networking</h3>
+<p>The common challenges with networking in Kubernetes are IP address space, service discovery, and network policies (aka firewalling). Compared to later challenges, configuring networking to support 1M nodes turned out to be relatively easy.</p>
+<div>
+<h4 id="_pod_ips">Pod IPs</h4>
+<p>It can be a challenge to plan IP address space in large clusters. Efficient routing usually means routing a contiguous CIDR to each individual node, which means you’re pre-allocating how many IP addresses (and thus pods) each node can serve. Some nodes that are intended for lots of small workloads end up constrained by the number of available IP addresses before they run out of other hardware resources. A 10.0.0.0/8 has 16 million IPs. For a 1-million node cluster, that leaves just 15 pod IPs per node, which is likely not enough.</p>
+<p>The answer is to use IPv6 thoroughly and exclusively. The enormous IPv6 address space means that there’s plenty of room for every pod to have its own globally accessible IP address.</p>
+<p>Kubernetes has great support for IPv6, and it requires no code changes to create a fully functioning Kubernetes cluster that uses IPv6 exclusively.</p>
+<p>My goal is for each node to have an IPv6 address prefix with a range large enough so each pod on that node can have its own IP out of that range. Plus, of course, at least one for the host itself.</p>
+<p>Of course, using IPv6 requires support from your compute vendor. All of the major cloud providers (and even many less-major) support IPv6 to some degree or another. And with public IPv6, it’s trivial to create a single cluster that spans multiple clouds.</p>
+<p>I primarily focused on AWS, GCP, and Vultr. (Scoff if you want at Vultr, but they have cheap compute and I am self-bootstrapping this project.) But each one has slightly different twists on its support for IPv6 addressing inside a VM. To give a sense of the range of situations, let me briefly describe each below:</p>
+<p><strong>Vultr</strong>: Each node gets a /64. The primary IP of the node is the ::1 of that range, and the server automatically receives all traffic for any IP in the full /64 range.</p>
+<p><strong>GCP:</strong> Each node gets a /96. The primary IP of the node is some random IP within that range. The server must send valid NDP RA packets for the IPs that it wants to receive traffic for.</p>
+<p><strong>AWS:</strong> Each node gets a /128. You can add a /80 prefix (that comes from a different range) via an API call to an existing NIC or VM. (The ‘Create’ API looks like it can support setting both an IPv6 address and an IPv6 range at creation time, but you’ll get an error). The server must send valid NDP RA packets for the IPs it wants to receive traffic for, and all outgoing packets must use the one MAC address that matches the primary IP.</p>
+<p>To satisfy the intersection of these requirements, particularly the requirement about MAC addresses, I create one bridge for all of the pods&#39; interfaces to share. But leave the host interface separate, and enable forwarding to handle traffic between the bridge and the host interface. A host-local IPAM is set to a /96 IPv6 prefix of what I get from the provider. This gives us a full 2^32 IPs per node, plenty of space for pods.</p>
+<p>Because these are global public IPv6 addresses, no special routing is necessary. No packet encapsulation or NAT is used. Traffic from each pod is correctly sourced from its true origin pod IP, regardless of destination.</p>
+</div>
+<div>
+<h4 id="_ipv4_only_external_service_dependencies">IPv4-only external service dependencies</h4>
+<p>If you only have an IPv6 address, then you can only reach other IPv6 addresses on the internet. Anything that is IPv4-only isn’t directly accessible.</p>
+<p>Most services I used in this project worked fine: Ubuntu packages, PyPi packages, the docker.io registry. The main exception was GitHub. Github.com remains stubbornly IPv4-only. Tsk tsk.</p>
+<p>Many AWS services have dual-stack endpoints but notably for this project Elastic Container Registry (ECR) does not. Tsk tsk to them as well.</p>
+<p>For IPv6 devices to reach IPv4 hosts, most cloud providers offer some sort of NAT64 gateway. You can also roll your own gateway on a Linux VM. I over-engineered this a bit with a custom WireGuard server. All VMs connect via WireGuard to this server and use it as an IPv4 gateway.</p>
+</div>
+<div>
+<h4 id="_network_policies">Network Policies</h4>
+<p>High-level, I hand-waved over this problem and did not use network policies between workloads.</p>
+<p>1 million nodes would have 1 million separate IPv6 prefixes, which is far too many individual entries for any firewall solution to support. Security-minded folks: clutch your pearls when I say that I do not use extensive firewalling to prevent access into the cluster from the Internet. I <em>do</em> use firewall rules to limit to a select few number of ports that I know need to be reached, but otherwise we must rely on other techniques to safeguard unauthorized inbound access to servers and pods.</p>
+<p>Thorough use of TLS covers most use cases for this project. The enormous size of the IPv6 address space also makes scanning impractical. Cilium, kube-proxy, or other network plugins could also limit which pods can reach which pods, but at significant cost of additional watches on the control plane.</p>
+<p>If you’re using one single vendor for all of your nodes, it may be plausible that all nodes still get ipv6 ranges out of 1 or a few larger spaces, a count low enough that could be reasonably installed as firewall rules.</p>
+</div>
+<div>
+<h4 id="_network_flow_needs_of_tcp_connections">Network flow needs (# of TCP connections)</h4>
+<p>Both kube-apiservers and etcd support both HTTP/2 and gRPC. Many individual requests and streams are multiplexed over a single TCP connection. Kubernetes sets a default HTTP/2 limit of 100 concurrent requests (or technically streams) per TCP connection. (HTTP/2 can support far more than that, but as you add more streams you run into performance problems like <a href="https://en.wikipedia.org/wiki/Head-of-line_blocking">head-of-line blocking</a>). So each kubelet needs at least 1 connection to the kube-apiserver control plane. And you can expect 1 more connection for kube-proxy, or any similar CNI like Cilium or Calico.  With 1M nodes, that means each kube-apiserver is supporting at least 2 million TCP connections. With 8 kube-apiservers, each server would be supporting 250K connections to kubelets.</p>
+<p>Linux itself can support this number of connections with some light tuning. And of course make sure you have allowed yourself enough file descriptors. Nevertheless it may be more than your network provider can support. Azure, for example, documents that it can support a maximum of 500k inbound and 500k outbound connections per VM. GCP and AWS do not publish limits, but there <em>are</em> limits in any system to both the total number of concurrent connections as well as the <em>rate</em> of new connections being made.</p>
+</div>
+</div>
+<div>
+<h3 id="_managing_state">Managing state</h3>
+<p>When I talk about “managing state,” I mean the API surface that Kubernetes exposes for interacting with resources. With careful tuning, the kube-apiserver can scale to sufficiently high levels of throughput. etcd, however, is the bottleneck. In this section, I’ll outline why that is and describe a replacement implementation that can meet the demands of a million-node cluster.</p>
+<div>
+<h4 id="_kube_apiservers_vs_etcd">kube-apiservers vs etcd</h4>
+<p>First a quick overview about the ways you work with state in Kubernetes. Any number of clients interact with kube-apiservers, which then in turn interact with etcd.</p>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/doc_images/image19.png" alt="image19"/>
+</p>
+</div>
+<p>kube-apiservers are stateless. etcd is the persistent store for all of Kubernetes resources. All CRUD operations you send to a kube-apiserver are actually persisted by etcd.</p>
+<p>kube-apiservers have seven common verbs for state:</p>
+<div>
+<ul>
+<li>
+<p><code>create</code></p>
+</li>
+<li>
+<p><code>get</code></p>
+</li>
+<li>
+<p><code>list</code></p>
+</li>
+<li>
+<p><code>update</code> (aka <code>replace</code>)</p>
+</li>
+<li>
+<p><code>patch</code></p>
+</li>
+<li>
+<p><code>delete</code></p>
+</li>
+<li>
+<p><code>watch</code></p>
+</li>
+</ul>
+</div>
+<p>etcd has four:</p>
+<div>
+<ul>
+<li>
+<p><code>put</code></p>
+</li>
+<li>
+<p><code>range</code> - includes <code>get</code> with a null <code>range_end</code></p>
+</li>
+<li>
+<p><code>deleteRange</code></p>
+</li>
+<li>
+<p><code>watch</code></p>
+</li>
+</ul>
+</div>
+<p>kube-apiserver <code>create</code>, <code>update</code>, <code>patch</code>, and <code>delete</code> all result in an etcd <code>put</code> operation. (A <code>delete</code> is just a <code>put</code> with a null value). etcd doesn’t support any partial updates of values, only putting the entire value. So all operations that involve modifying a resource result in a new etcd <code>put</code> of the entire resource contents.</p>
+<p>kube-apiserver <code>watch</code> can, but often doesn’t, result in an etcd <code>watch</code>. More on that below.</p>
+</div>
+<div>
+<h4 id="_meeting_the_qps_needs_for_a_1m_node_cluster">Meeting the QPS needs for a 1M node cluster</h4>
+<p>Kubelets interact with the kube-apiserver primarily through two resource types:</p>
+<div>
+<ul>
+<li>
+<p><code>Node</code> - the resource representing a server for running pods</p>
+</li>
+<li>
+<p><code>Lease</code> - a lightweight heartbeat object updated by <code>kubelet`</code> to signal liveness</p>
+</li>
+</ul>
+</div>
+<p>The Lease is critical: if it isn’t refreshed in time, the NodeController marks the node as <code>NotReady</code>. By default, each kubelet updates its <code>Lease</code> every 10 seconds. At a scale of 1 million nodes, that alone translates to 100K writes per second just to keep the nodes &#34;alive.&#34;</p>
+<p>Adding in the constant churn of other resources, the system needs to sustain on the order of <strong>many hundreds of thousands of writes per second</strong>, plus a significant volume of reads.</p>
+<p>For kube-apiserver, this is manageable. It’s stateless, so QPS can be scaled out simply by running more replicas. If one instance can’t handle the load, more can be added, and traffic will spread across them.</p>
+<p>For etcd, things are different. Etcd is stateful, which makes scaling QPS much harder.</p>
+</div>
+<div>
+<h4 id="_etcd_is_too_slow">etcd is too slow</h4>
+<p>Using the <a href="https://github.com/etcd-io/etcd/tree/main/tools/benchmark">etcd-benchmark</a> tool, I measured about 50K writes/sec out of a single etcd instance backed by NVMe storage. Importantly, adding replicas doesn’t help. <strong>Write throughput actually drops with more members</strong> since each write must be coordinated across a quorum of replicas to maintain consistency. So with the typical 3-replica setup, effective write QPS is even lower than the benchmarked 50K/s. That’s nowhere near what’s needed to support a 1M-node cluster.</p>
+<p>At first glance, 50K QPS seems surprisingly low given modern hardware capabilities. A single NVMe drive can do over 1M 4K writes per second, and a single DDR5 DIMM can push 10x more than that. So why is etcd is far behind raw hardware limits?</p>
+<p>The answer lies in etcd’s <strong>interface and guarantees</strong>. For one thing, etcd is ensuring that all writes are durable to disk. For every <code>put</code> or <code>delete</code> call, etcd ensures the change is written to disk via <code>fsync</code> before acknowledging success. This helps ensure that there is never any data loss if the host crashes or loses power. But that durability drastically reduces the number of IOPS that a modern NVMe drive can support.</p>
+<p>Plus, etcd has a pretty broad interface surface area:</p>
+<div>
+<ul>
+<li>
+<p>It is a key value store and so of course supports reads, writes, and deletes of single objects.</p>
+</li>
+<li>
+<p>It can support querying a range of sorted keys.</p>
+</li>
+<li>
+<p>It keeps history for all changes, so you can query for an older version of a particular key, or even a range of keys. Older changes eventually get “compacted” to reduce state size.</p>
+</li>
+<li>
+<p>It has a notion of “watches”, meaning it can stream out all of the changes that affect a particular key or range of keys.</p>
+</li>
+<li>
+<p>It also has a “lease” API, where keys can be attached to a TTL that will cause them to expire if not renewed.</p>
+</li>
+<li>
+<p>It supports transactions, supporting an atomic If/Then/Else.</p>
+</li>
+</ul>
+</div>
+<p>Implementing all of those interfaces can make for complex software. Beyond simple puts and deletes, etcd must support transactions, maintain multi-versioned history, and enforce Raft-based consensus across replicas.</p>
+<p>These features are what give Kubernetes its consistency and reliability, but they also impose strict constraints on performance. Intuitively, strong consistency means more serialization: operations can’t always be parallelized freely. Writes often need to follow a carefully ordered path through Raft, the WAL, and compaction, ensuring that every replica agrees on state before acknowledging success.</p>
+<p>The result is raw hardware capable of millions of writes per second, but etcd delivering orders of magnitude less due to the interfaces and guarantees it must uphold.</p>
+<p>But <strong>do we need all of these things?</strong></p>
+<div>
+<h5 id="_reduce_durability_and_eliminate_replicas">Reduce durability and eliminate replicas</h5>
+<p>Perhaps my spiciest take from this entire project: <strong>most clusters don’t actually need the level of reliability and durability that etcd provides</strong>.</p>
+<p>As we’ll see in the next section, the majority of writes in a Kubernetes cluster are for <strong>ephemeral resources</strong>.</p>
+<div>
+<ul>
+<li>
+<p>Kubernetes <code>Events</code> may only stick around for minutes.</p>
+</li>
+<li>
+<p><code>Lease</code> objects typically expire within tens of seconds.</p>
+</li>
+</ul>
+</div>
+<p>If the cluster is disrupted, restoring these objects is almost never useful, and certainly not to the precision of their last few milliseconds of updates.
+Even for longer-lived objects, Kubernetes is designed to reconcile automatically:</p>
+<div>
+<ul>
+<li>
+<p><code>Nodes</code> continually refresh status via <code>kubelet</code></p>
+</li>
+<li>
+<p>Controllers will bring <code>DaemonSet</code> and <code>Deployment</code> status back in sync with actual <code>Pods</code>.</p>
+</li>
+</ul>
+</div>
+<p>If we stopped <code>fsync</code>-ing these ephemeral writes, or even stopped writing them altogether and just relied on RAM, clusters could process far more operations and perform substantially better.</p>
+<p>In fact, even <strong>full control plane data loss isn’t catastrophic in some environments</strong>. Many clusters are ephemeral themselves, with all configuration encoded in Terraform, Helm, or GitOps. In those cases, rebuilding is often easier than preserving every last write. Some organizations already treat Kubernetes clusters as cattle.</p>
+<p>If you’re not mad yet, let me push you a little further: <strong>you probably don’t need etcd replicas at all</strong>.</p>
+<p>In the 5 years I ran Kubernetes clusters at OpenAI, we never once had an unplanned VM outage on an etcd VM. etcd’s resource needs are tiny. The database is limited to 8GB. CPU is no more than 2-4 cores. Most cloud providers can do live migration on VMs this small. With network-attached storage like EBS, recovery is straightforward: spin up a replacement VM, attach the volume, and resume operation with zero data loss.</p>
+<p>If you had just 1 etcd instance and that went down, your Kubernetes cluster control plane would go down. Pods would still stay running. Nodes would still be reachable. It’s possible that you could still serve traffic. If etcd used EBS, recovery would be the time to start a new VM and attach the volume, with no data loss.</p>
+<p>Yes, running a single etcd instance is a single point of failure. But failures are rare and the practical impact is often negligible. Meanwhile, etcd replicas come with a significant performance cost. For many workloads, that tradeoff simply isn’t worth it.</p>
+<p>Always stop writing <code>Event</code> and <code>Lease</code> to disk. Beyond that, you have some options:</p>
+<div>
+<ol>
+<li>
+<p><strong>You don’t need durability</strong>: Run one replica, keep all state in memory.</p>
+</li>
+<li>
+<p><strong>You can tolerate losing a few ms of updates</strong>: Run a single replica with a network-attached disk, but without <code>fsync</code>.</p>
+</li>
+<li>
+<p><strong>You’d rather avoid data loss</strong>: Run multiple replicas in case one goes down, but don’t bother writing changes to disk. Rely on the uptime of the other replicas to keep from losing data.</p>
+</li>
+<li>
+<p><strong>You’re paranoid about data loss</strong>: Run a single replica with a network-attached disk, and enable <code>fsync</code>.</p>
+</li>
+</ol>
+</div>
+</div>
+<div>
+<h5 id="_reduce_the_interface">Reduce the interface</h5>
+<p>As I described, etcd has a pretty broad interface surface area. But does Kubernetes actually use all of those features?</p>
+<p>To measure this, I wrote a small tool called <a href="https://github.com/bchess/etcd_proxy">etcd proxy,</a> The proxy sits between Kubernetes and etcd, transparently forwarding all traffic while logging every request and response.</p>
+<p>With that in place, I spun up a Kubernetes cluster and ran <a href="https://github.com/vmware-tanzu/sonobuoy">Sonobuoy</a>, the standard conformance test suite of Kubernetes. Sonobuoy systematically exercises the full API surface of Kubernetes, ensuring compliance with upstream expectations. Running it through the proxy produced a complete, real-world trace of the requests and workloads that etcd must handle in a conforming cluster.</p>
+<p>It turns out that Kubernetes actually uses just a small amount of the etcd interface.</p>
+<p>There’s of course <code>read</code>, <code>write</code>, <code>range</code>, and <code>watch</code> queries, but they all follow a few patterns.</p>
+<div>
+<h6 id="_txn_put">Txn-Put</h6>
+<p>Kubernetes does do Txn queries, but they’re always of this form:</p>
+<div>
+<div>
+<pre><code data-lang="json"><span>{</span><span>
+  </span><span>&#34;method&#34;</span><span>:</span><span> </span><span>&#34;/etcdserverpb.KV/Txn&#34;</span><span>,</span><span>
+  </span><span>&#34;request&#34;</span><span>:</span><span> </span><span>{</span><span>
+    </span><span>&#34;compare&#34;</span><span>:</span><span> </span><span>[</span><span>
+      </span><span>{</span><span>
+        </span><span>&#34;key&#34;</span><span>:</span><span> </span><span>&#34;SOMEKEY&#34;</span><span>,</span><span>
+        </span><span>&#34;modRevision&#34;</span><span>:</span><span> </span><span>&#34;SOMEREV&#34;</span><span>,</span><span>
+        </span><span>&#34;target&#34;</span><span>:</span><span> </span><span>&#34;MOD&#34;</span><span>
+      </span><span>}</span><span>
+    </span><span>],</span><span>
+    </span><span>&#34;success&#34;</span><span>:</span><span> </span><span>[</span><span>
+      </span><span>{</span><span>
+        </span><span>&#34;requestPut&#34;</span><span>:</span><span> </span><span>{</span><span>
+          </span><span>&#34;key&#34;</span><span>:</span><span> </span><span>&#34;SOMEKEY&#34;</span><span>,</span><span>
+          </span><span>&#34;value&#34;</span><span>:</span><span> </span><span>&#34;...&#34;</span><span>
+        </span><span>}</span><span>
+      </span><span>}</span><span>
+    </span><span>],</span><span>
+    </span><span>&#34;failure&#34;</span><span>:</span><span> </span><span>[</span><span>
+      </span><span>{</span><span>
+        </span><span>&#34;requestRange&#34;</span><span>:</span><span> </span><span>{</span><span>
+          </span><span>&#34;key&#34;</span><span>:</span><span> </span><span>&#34;SOMEKEY&#34;</span><span>
+        </span><span>}</span><span>
+      </span><span>}</span><span>
+    </span><span>]</span><span>
+  </span><span>}</span><span>
+</span><span>}</span></code></pre>
+</div>
+</div>
+<p>In other words, do a <code>put</code> if the <code>modRev</code> of this key is set to this particular value, otherwise just return me the current version. And this makes sense, because Kubernetes is often patching or updating existing resources but turning that into a <code>put</code> of the full resource safely means that the underlying resource must not have changed in between.</p>
+<h6 id="_leases">Leases</h6>
+<p>Note that Kubernetes Leases are not the same as etcd Leases. Kubernetes leases are implemented as regular K/V’s in etcd. Kubernetes makes very few etcd Leases.</p>
+<p>The main area where Kubernetes uses etcd leases is on Events objects, e.g.:</p>
+<div>
+<div>
+<pre><code data-lang="json"><span>{</span><span>
+  </span><span>&#34;method&#34;</span><span>:</span><span> </span><span>&#34;/etcdserverpb.Lease/LeaseGrant&#34;</span><span>,</span><span>
+  </span><span>&#34;request&#34;</span><span>:</span><span> </span><span>{</span><span>
+    </span><span>&#34;TTL&#34;</span><span>:</span><span> </span><span>&#34;3660&#34;</span><span>
+  </span><span>},</span><span>
+  </span><span>&#34;response&#34;</span><span>:</span><span> </span><span>{</span><span>
+    </span><span>&#34;ID&#34;</span><span>:</span><span> </span><span>&#34;<strong>7587883212297104637</strong>&#34;</span><span>,</span><span>
+    </span><span>&#34;TTL&#34;</span><span>:</span><span> </span><span>&#34;3660&#34;</span><span>
+  </span><span>}</span><span>
+</span><span>}</span><span>
+</span><span>{</span><span>
+  </span><span>&#34;method&#34;</span><span>:</span><span> </span><span>&#34;/etcdserverpb.KV/Txn&#34;</span><span>,</span><span>
+  </span><span>&#34;request&#34;</span><span>:</span><span> </span><span>{</span><span>
+    </span><span>&#34;compare&#34;</span><span>:</span><span> </span><span>[</span><span>
+      </span><span>{</span><span>
+        </span><span>&#34;key&#34;</span><span>:</span><span> </span><span>&#34;/registry/events/NAMESPACE/SOMEEVENT&#34;</span><span>,</span><span>
+        </span><span>&#34;modRevision&#34;</span><span>:</span><span> </span><span>&#34;205&#34;</span><span>,</span><span>
+        </span><span>&#34;target&#34;</span><span>:</span><span> </span><span>&#34;MOD&#34;</span><span>
+      </span><span>}</span><span>
+    </span><span>],</span><span>
+    </span><span>&#34;failure&#34;</span><span>:</span><span> </span><span>[</span><span>
+      </span><span>{</span><span>
+        </span><span>&#34;requestRange&#34;</span><span>:</span><span> </span><span>{</span><span>
+          </span><span>&#34;key&#34;</span><span>:</span><span> </span><span>&#34;/registry/events/NAMESPACE/SOMEEVENT&#34;</span><span>,</span><span>
+        </span><span>}</span><span>
+      </span><span>}</span><span>
+    </span><span>],</span><span>
+    </span><span>&#34;success&#34;</span><span>:</span><span> </span><span>[</span><span>
+      </span><span>{</span><span>
+        </span><span>&#34;requestPut&#34;</span><span>:</span><span> </span><span>{</span><span>
+          </span><span>&#34;key&#34;</span><span>:</span><span> </span><span>&#34;/registry/events/NAMESPACE/SOMEEVENT&#34;</span><span>,</span><span>
+          </span><span>&#34;lease&#34;</span><span>:</span><span> </span><span>&#34;<strong>7587883212297104637</strong>&#34;</span><span>,</span><span>
+          </span><span>&#34;value&#34;</span><span>:</span><span> </span><span>&#34;...&#34;</span><span>
+        </span><span>}</span><span>
+      </span><span>}</span><span>
+    </span><span>]</span><span>
+  </span><span>}</span><span>
+</span><span>}</span></code></pre>
+</div>
+</div>
+<p>The purpose of this is to manage some sane TTL on events. It’s not critical to the consistency model of Kubernetes.</p>
+<h6 id="_ranges">Ranges</h6>
+<p>etcd could be implemented as a simple hash-table with O(1) insertion time, if it weren’t for range queries. Range queries return a sorted list of keys within a given span, which requires storing data in a sorted structure. Inserting into a sorted list or B-Tree is O(log n). In my view, supporting Range is thus the most difficult constraint that etcd must implement to be Kubernetes compatible. Nevertheless, it is critical.</p>
+<p>Fortunately, we can take advantage of the predictable structure of the keyspace:</p>
+<p><code>/registry/[$APIGROUP/]$APIKIND/[$NAMESPACE/]$NAME</code></p>
+<p>Range queries are typically scoped to be either within a particular namespace, or across all namespaces for a given resource Kind. Kubernetes never performs a range query that spans across multiple resource Kinds (e.g., Pods and ConfigMaps together).</p>
+<p>This introduces an opportunity: rather than one global B-tree for the entire keyspace, we can maintain separate B-trees per resource Kind. That shrinks the effective <em>n</em> in O(log n) to just the number of objects of a single kind, improving both inserts and queries.</p>
+<p>Another wrinkle is the use of <code>limit</code> on range queries. Kubernetes rarely needs to retrieve all objects at once; queries often return only 500, 1,000, or 10,000 results at a time. However, range responses are also expected to include a count field representing the total number of remaining objects. This undermines the benefit of <code>limit</code>, since even merely counting all remaining keys can still be expensive.</p>
+<p>In practice, though, Kubernetes doesn’t rely on <code>count</code> being exact. It only needs to know that there are more than <code>limit</code> results available. This looser requirement leaves room for approximation, and is one area where further optimizations are possible.</p>
+</div>
+</div>
+</div>
+<div>
+<h4 id="_mem_etcd_custom_in_memory_etcd">mem_etcd: custom in-memory etcd</h4>
+<p>I built a new program called <strong>mem_etcd</strong> that implements the etcd interface but with the simplifications described above. Written in Rust, it provides fully correct semantics for the etcd APIs that Kubernetes depends on.</p>
+<p>mem_etcd maintains two main data structures:</p>
+<div>
+<ul>
+<li>
+<p>A hash map storing the full keyspace</p>
+</li>
+<li>
+<p>A B-tree indexing the keys within each prefix.</p>
+</li>
+</ul>
+</div>
+<p>Each value also stores the non-compacted revision history for that key. This design makes writes to existing keys <strong>O(1)</strong>, while writes to new keys and range queries are <strong>O(log n)</strong> (where n is the number of resources of that <code>Kind</code>). <code>Range</code> queries also require additional linear work up to the query’s limit.</p>
+<p>Despite its name, mem_etcd can provide durability by writing a write-ahead log (WAL) to disk. Each prefix of <code>/registry/[$APIGROUP/]$APIKIND/[$NAMESPACE/]</code> is written to its own separate file. By default, files are written in <code>buffered</code> mode, so <code>put</code> calls can complete before the data is durably written to disk. This behavior can be changed with a CLI flag that enables <code>fsync</code>, forcing all writes to be flushed to disk before the <code>put</code> completes.  You can also configure some prefixes to not be written to disk at all.</p>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/doc_images/mem_etcd_throughput.png" alt="mem etcd throughput"/>
+</p>
+<p>Figure 1. etcd vs mem_etcd throughput. fsync caps performance at about 100K, while buffering to disk grows above 1M. etcd struggles at large scales even when writing to ramdisk where fsync should be a no-op</p>
+</div>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/doc_images/mem_etcd_latency.png" alt="mem etcd latency"/>
+</p>
+<p>Figure 2. etcd vs mem_etcd average latency per put. fsync causes big increases in latency as writes get queued up</p>
+</div>
+<div>
+<div>
+<pre><code data-lang="bash">% <span>(</span><span>cd</span> /tmpfs <span>;</span> etcd-3.5.16 <span>--snapshot-count</span><span>=</span>9999999999 <span>--quota-backend-bytes</span><span>=</span>9999999999<span>)</span> &amp;
+% parallel <span>-j</span> <span>$X</span> <span>--results</span> out_<span>{</span><span>#}.txt &#39;./benchmark put --total 10000000 --clients 1000 --conns 10 --key-space-size 10000000 --key-size=48 --val-size=1024&#39; ::: {1..$X}</span></code></pre>
+</div>
+</div>
+<p>These tests were run on a pair of <code>c4d-standard-192-lssd</code> instances, with one VM running mem_etcd and the other running the client benchmark. In these results, you can easily observe how badly enabling <code>fsync</code> negatively impacts throughput and latency. Note that the baseline comparison of etcd is a single replica of etcd v3.5.16 running on a tmpfs (ram-based) disk. This should be an optimal environment for etcd as there is no actual disk involved and <code>fsync</code>, while still being a syscall, is otherwise a no-op. mem_etcd is storing its WAL on a local NVMe, what GCE calls <a href="https://cloud.google.com/compute/docs/disks/local-ssd#local_ssd_types">Titanium SSD</a>. Though the instance type has 16 local disks, only 1 is used for this test.</p>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/doc_images/etcd_lease_flood.png" alt="etcd lease flood"/>
+</p>
+<p>Figure 3. etcd-lease-flood test results</p>
+</div>
+<div>
+<div>
+<pre><code data-lang="bash">% <span>timeout </span>10 parallel <span>-j</span> <span>$X</span> <span>--results</span> out_<span>{</span><span>#}.txt   &#39;./etcd-lease-flood -num-keys 1000 -workers 100 -key-prefix {#}&#39; ::: {1..$X}</span></code></pre>
+</div>
+</div>
+<p><code>etcd-lease-flood</code> is a custom benchmark designed to simulate the dominant type of load in a large Kubernetes cluster. Each client creates 100 <code>Lease</code> objects directly in etcd, using the same protobuf encoding as Kubernetes. For each <code>Lease</code>, the client repeatedly issues <code>put</code> updates in a tight loop, attempting to update the <code>Lease</code> as quickly as possible.</p>
+</div>
+<div>
+<h4 id="_watch">Watch()</h4>
+<p>There are several different types of watches and each has different performance characteristics. Let’s unpack them.</p>
+
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/doc_images/image14.png" alt="image14"/>
+</p>
+</div>
+<div>
+<blockquote>
+<p><strong>resourceVersion unset: Get State and Start at Most Recent</strong></p>
+<p><strong>resourceVersion=`&#34;0`&#34;: Get State and Start at Any</strong></p>
+<p><strong>resourceVersion=`&#34;{value other than 0}`&#34;: Start at Exact</strong></p>
+</blockquote>
+</div>
+<p>Let’s re-format the important points into a table:</p>
+<table>
+<colgroup>
+<col/>
+<col/>
+<col/>
+<col/>
+</colgroup>
+<thead>
+<tr>
+<th></th>
+<th>resourceVersion unset</th>
+<th>resourceVersion=0</th>
+<th>resourceVersion&gt;0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><p>Served from kube-apiserver state (instead of etcd)</p></td>
+<td><p>❌</p></td>
+<td><p>✅</p></td>
+<td><p>✅</p></td>
+</tr>
+<tr>
+<td><p>Includes an initial list</p></td>
+<td><p>✅</p></td>
+<td><p>✅</p></td>
+<td><p>❌</p></td>
+</tr>
+</tbody>
+</table>
+<p>So a <code>watch</code> is often preceded by a <code>list</code>. The <code>list</code> provides a snapshot-in-time of a set of resources, marked with a revision number. Then you start a watch from that revision number, which will then stream to you all of the changes that have occurred since that revision.</p>
+<p>When <code>resourceVersion</code> is set, a watch against the kube-apiserver does <em>not</em> create a new watch against etcd. At startup time, a kube-apiserver creates <code>watch</code> streams against etcd for each of the well-known standard resources. Any time a client creates a watch, the kube-apiserver handles that stream itself based on the one etcd watch stream it maintains. So while client watches can be expensive for kube-apiservers, it adds no additional load to etcd. You can horizontally scale more kube-apiservers.</p>
+<p>Furthermore, watches are not really that bad for etcd. A watch has a beginning and an end range, and those ranges fit within the same prefixes as Range queries. With each Put we need to do a log(n) lookup in the list of watches to find watches that could match that key. But there are far far fewer watches than objects. The n is small and is done asynchronously after the write is committed anyway, so it does not affect the request time to complete a write.</p>
+<p>Watches do create network amplification. For each write into etcd, there may be N corresponding watches for that object. That results in a lot of outbound network traffic from etcd. The kube-apiservers are on the receiving end of these watches. kube-apiservers are consolidating their own watches, but etcd is still sending a copy of the data to each kube-apiserver. While adding more kube-apiserver replicas does help with many Kubernetes scalability problems, each replica does put additional pressure on the etcd NIC. <strong>The network throughput of etcd is the most immediate hardware bottleneck of large-scale Kubernetes clusters</strong>. However, these demands are limited to just between etcd and the kube-apiservers. In a single datacenter with modern hardware there’s still plenty of potential interconnect that could be established amongst these servers.</p>
+<div>
+<h5 id="_watches_per_node">Watches per node</h5>
+<p>By scaling up the number of nodes I was able to observe how many watches each node creates. Per kubelet + kube-proxy, I observe:</p>
+<div>
+<ul>
+<li>
+<p>4 watches of <code>configmaps</code><br/></p>
+</li>
+<li>
+<p>2 watches each of <code>pods</code>, <code>secrets</code>, <code>services</code>, <code>nodes</code><br/></p>
+</li>
+<li>
+<p>1 watch each of <code>namespaces</code>, <code>endpoints</code>, <code>csidrivers</code>, <code>runtimeclasses</code>, <code>endpointslices</code>, <code>networkpolicies</code></p>
+</li>
+</ul>
+</div>
+<p>That’s 18 watches per node, so 18M watches for 1M nodes. These are only against the kube-apiserver and do not passthrough to etcd directly. With enough kube-apiservers we should be fine.</p>
+</div>
+</div>
+<div>
+<h4 id="_update">Update()</h4>
+<p>Let’s revisit our 1M kubelet Lease requirement. Kubelet is issuing an <code>Update</code> (aka <code>Replace</code>, aka PUT) of its Lease resource every 10 seconds.</p>
+<p>This is an old Lease:</p>
+<div>
+<div>
+<pre><code data-lang="yaml"><span>apiVersion</span><span>:</span> <span>coordination.k8s.io/v1</span>
+<span>kind</span><span>:</span> <span>Lease</span>
+<span>metadata</span><span>:</span>
+  <span>creationTimestamp</span><span>:</span> <span>&#34;</span><span>2025-06-26T18:27:28Z&#34;</span>
+  <span>name</span><span>:</span> <span>my-node</span>
+  <span>namespace</span><span>:</span> <span>kube-node-lease</span>
+  <span>ownerReferences</span><span>:</span>
+  <span>-</span> <span>apiVersion</span><span>:</span> <span>v1</span>
+    <span>kind</span><span>:</span> <span>Node</span>
+    <span>name</span><span>:</span> <span>my-node</span>
+    <span>uid</span><span>:</span> <span>ef4d9943-841b-49cc-9fc2-a5faab77e63f</span>
+  <span>resourceVersion</span><span>:</span> <span>&#34;</span><span><strong>1556549</strong>&#34;</span>
+  <span>uid</span><span>:</span> <span>7e2ec4e2-263f-4350-9397-76f37ceb83cd</span>
+<span>spec</span><span>:</span>
+  <span>holderIdentity</span><span>:</span> <span>my-node</span>
+  <span>leaseDurationSeconds</span><span>:</span> <span>40</span>
+  <span>renewTime</span><span>:</span> <span>&#34;</span><span>2025-07-01T21:41:50.646654Z&#34;</span></code></pre>
+</div>
+</div>
+<p>This is the body of calling Update() when renewing that Lease:</p>
+<div>
+<div>
+<pre><code data-lang="yaml"><span>apiVersion</span><span>:</span> <span>coordination.k8s.io/v1</span>
+<span>kind</span><span>:</span> <span>Lease</span>
+<span>metadata</span><span>:</span>
+  <span>creationTimestamp</span><span>:</span> <span>&#34;</span><span>2025-06-26T18:27:28Z&#34;</span>
+  <span>name</span><span>:</span> <span>my-node</span>
+  <span>namespace</span><span>:</span> <span>kube-node-lease</span>
+  <span>ownerReferences</span><span>:</span>
+  <span>-</span> <span>apiVersion</span><span>:</span> <span>v1</span>
+    <span>kind</span><span>:</span> <span>Node</span>
+    <span>name</span><span>:</span> <span>my-node</span>
+    <span>uid</span><span>:</span> <span>ef4d9943-841b-49cc-9fc2-a5faab77e63f</span>
+  <span>resourceVersion</span><span>:</span> <span>&#34;</span><span><strong>1556549</strong>&#34;</span>
+  <span>uid</span><span>:</span> <span>7e2ec4e2-263f-4350-9397-76f37ceb83cd</span>
+<span>spec</span><span>:</span>
+  <span>holderIdentity</span><span>:</span> <span>my-node</span>
+  <span>leaseDurationSeconds</span><span>:</span> <span>40</span>
+  <span>renewTime</span><span>:</span> <span>&#34;</span><span><strong>2025-07-01T21:51:50.650000Z</strong>&#34;</span></code></pre>
+</div>
+</div>
+<p>Note the <code>renewTime</code> has been updated  to something 10 seconds later. (<code>renewTime</code> is in fact always set to 40 seconds in the future, so we can tolerate some amount of failed or slow lease updates).</p>
+<p>The other key field is the <code>resourceVersion</code>. When a client sends an <code>Update()</code> to a kube-apiserver, it includes the same <code>resourceVersion</code> from the previous version of the resource it’s updating. This is for safety to ensure that no other client has updated the resource in-between.  Every time a resource is updated on the server, the server assigns the new resource a monotonically-increasing new resourceVersion.  An Update operation must include a resourceVersion that indicates what the <em>old</em> version of the resource it thinks it’s replacing. That way we’re not accidentally overwriting some other change that has happened in-between.</p>
+<p>You’d think that kube-apiserver could simply convert this Update operation into a <code>Txn-Put</code> operation in etcd, passing through this command in a straightforward and stateless way. Unfortunately kube-apiserver’s Update implementation also always needs to obtain the entire <em>Old</em> version of this resource. There’s a few reasons for this:</p>
+<div>
+<ol>
+<li>
+<p>Server-side fields: some resources have fields such as ‘status’ and ‘managedFields’ that are only ever updated by the server.</p>
+</li>
+<li>
+<p>Admission checks: the Admission check interface takes both the old and the new resource.</p>
+</li>
+</ol>
+</div>
+<p>So to keep Update calls performant, kube-apiserver will maintain Watch caches of most commonly-used resources. When an Update occurs, it’ll pull the old version from its local watch cache. If for some reason the old version is <em>not</em> in the watch cache, then kube-apiserver will first issue a <em>Range</em> to etcd to get the old resource before calling <code>Txn-Put</code>.</p>
+<p>Having to do two synchronous calls to etcd for each Update would double our QPS needs and latency, so it’s much better if we can rely on an up-to-date watch cache.</p>
+<p>However this introduces a new requirement and constraint for 1M nodes: kube-apiservers must be able to “Watch” at a rate of at least 100K events/sec.</p>
+<p>In my testing this is where things get a little tight.</p>
+<div>
+<h5 id="_caching_and_locking">Caching and locking</h5>
+<p>kube-apiserver is deserializing (and, more critically, allocating memory for) 100K nested dictionaries per second. It stores these in a cache, backed by a B-Tree protected with a RWMutex. That RWMutex is under heavy contention:</p>
+<div>
+<ul>
+<li>
+<p><code>Update()</code> calls that are attempting to read the cache for the old objects.</p>
+</li>
+<li>
+<p><code>Update()</code> calls that complete (<code>GuaranteedUpdate()</code> finalizer) are writing the new value into the cache</p>
+</li>
+<li>
+<p>Events from the etcd Watch stream is also writing new values into the cache</p>
+</li>
+</ul>
+</div>
+<p>Adding more kube-apiservers helps reduce the contention caused by Update, but it doesn’t reduce the watch load - each kube-apiserver still needs to be able to keep up with the full watch stream of every change that occurs. And adding more kube-apiserver replicas puts additional strain on etcd - most critically its ability to push copies of the watch stream out to the network to each kube-apiserver.</p>
+<p>It’s a relatively recent change that the kube-apiserver cache is backed by a B-Tree. Previously it was backed by a hash map. This was enabled with feature flag <code>BtreeWatchCache</code> which became <code>true</code> by default in Kubernetes 1.32. As far as I can tell, the motivation to move to B-Tree was for faster <code>List()</code> response. Remember that <code>List()</code> needs to return items in sorted order, so keeping the items in a B-Tree will make that much faster. But <code>Get()</code> and <code>Update()</code> of existing items is now O(n log n) instead of O(1).</p>
+<p>In my testing, I was unable to get the B-Tree-based cache to scale much more beyond 40K updates per second on a c4a-standard-72 GCP instance. The cache gets stale, unable to keep up with the stream of watch events, too much time being spent waiting for cache lock.</p>
+<p>With the old hashmap-based cache and 11x kube-apiservers there’s enough replicas to handle the Update() load of 100K Lease updates per second.</p>
+</div>
+<div>
+<h5 id="_garbage_collection">Garbage collection</h5>
+<p>kube-apiservers parse and decode all resources into their individual fields. Resources with lots of fields thus create a lot of tiny objects in Go, and that puts pressure on garbage collection. Adding more kube-apiserver replicas won’t help if they all are watching the same resource event streams. There’s no real cure, but setting <code>GOMEMLIMIT</code> and <code>GOGC</code> can help.</p>
+<p>I set <code>GOMEMLIMIT</code> to a number 10-20% less than memory I have on-hand, and set <code>GOGC</code> up to a few hundred.</p>
+</div>
+</div>
+</div>
+<div>
+<h3 id="_scheduler">Scheduler</h3>
+<p>It doesn’t do any good to have a 1-million node cluster if you can’t schedule pods on it. The Kubernetes scheduler is a pretty common bottleneck for large jobs. I ran a benchmark, scheduling 50K pods on 50K nodes, and it took about 4.5 minutes. That’s already uncomfortably long.</p>
+<div>
+<table>
+<tbody><tr>
+<td>
+<p>Warning</p>
+</td>
+<td>
+<p>If you’re creating pods with some sort of replication controller like Deployment, DaemonSet, or StatefulSet, which can be a bottleneck even before the scheduler. DaemonSet creates a burst of 500 pods at a time and then waits for the Watch stream to show that those are created before proceeding (the rate depends on many factors but expect &lt;5K/sec). The scheduler doesn’t even get a chance to run until those pods are created.</p>
+</td>
+</tr>
+</tbody></table>
+</div>
+<p>For this 1-million node cluster project, I set an ambitious goal of being able to <strong>schedule 1 million pods in 1 minute</strong>. Admittedly the number is somewhat arbitrary, but the symmetry with all those <em>m</em>&#39;s seemed nice.</p>
+<p>I also wanted to keep full compatibility with the standard kube-scheduler. It would be far easier to write a simplified scheduler from scratch that scales impressively in narrow scenarios but then fails spectacularly in real-world use cases. There’s a lot of complexity in the existing scheduler that arises from being battle-tested across lots of different production environments. Stripping away those pesky features to make a “faster” scheduler would be misleading.</p>
+<p>So, we’re going to preserve the functionality and implementation of the kube-scheduler as much as we can. What’s getting in our way to making it more scalable?</p>
+<p>kube-scheduler works by keeping state of all nodes, and then has a O(n*p) loop, where for each pod it evaluates it against every node. First it filters out nodes that the pod wouldn’t fit at all. Then, for each remaining node, it calculates a score on how well that node would match the pod. The pod is then scheduled to the highest-scoring node, or a random choice among the highest-scoring nodes if there’s a tie.</p>
+<div>
+<table>
+<tbody><tr>
+<td>
+<p>Tip</p>
+</td>
+<td>
+<p>The kube-scheduler has some techniques to improve performance:</p>
+<div>
+<ul>
+<li>
+<p>When there is a large number of eligible nodes, it only scores a fraction of them, down to 5% for large clusters.</p>
+</li>
+<li>
+<p>It parallelizes the filtering of ineligible nodes, as well as the scoring of nodes against a particular pod.</p>
+</li>
+</ul>
+</div>
+</td>
+</tr>
+</tbody></table>
+</div>
+<p>This is parallelizable. And to be fair, the scheduler does parallelize the filtering and generation of scores of nodes against a particular pod. But the scheduler is still burdened by having to do it for <em>all</em> nodes. This isn’t just parallelizable, this can also be distributable.</p>
+<div>
+<h4 id="_basic_design_shard_on_nodes">Basic design: shard on nodes</h4>
+<p>It’s akin to the classic scatter/gather design of a distributed search system. Think of each <strong>node</strong> as a document in the corpus, and each <strong>pod</strong> as a search query. The query is fanned out to many shards, each responsible for a fraction of the documents. Each shard selects its top candidate(s) and sends them back to a central gatherer to ultimately identify the overall top result.</p>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/diag-mermaid-md5-2a94b82758fec39a8b97c0690856d963.png" alt="Diagram" width="490" height="486"/>
+</p>
+</div>
+<p><em>Generic scatter-gather design pattern</em></p>
+<p>The key difference is that in search, documents are read-only and thus queries can be evaluated in parallel without conflicts. In scheduling, however, executing a decision actually modifies the documents (i.e. allocates node resources). If two pods are scheduled in parallel to the same node, one may succeed while the other must fail due to insufficient resources.</p>
+<p>Nevertheless, for a large cluster it’s reasonable to design for “optimistic concurrency”. That is, presume that multiple pods can be scheduled at the same time without conflicts. We still check to see if a conflict arises before committing. And if a conflict occurs, we still do the correct thing by “rolling back” the other pod, e.g. it has to be re-scheduled. But the chance and resulting impact of this happening is low - low enough that you get much higher throughput by running in parallel and absorbing the wasted effort if it does happen.</p>
+<p>So my initial architecture idea of the distributed scheduler:</p>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/diag-mermaid-md5-fe7fb5cadc0088229e9102a3bdbf72f5.png" alt="Diagram" width="577" height="397"/>
+</p>
+</div>
+<p><em>Scatter-gather as a Kubernetes pod scheduler pattern</em></p>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/diag-mermaid-md5-a85e97726215fbdfd6cc11d6758af76f.png" alt="Diagram" width="784" height="620"/>
+</p>
+</div>
+<p>The Relay starts a watch on unscheduled pods against the kube-apiserver. As streams of pods come in, the Relay forwards them to different schedulers.</p>
+<p>The Relay then aggregates these scores, picks the overall winner, sends a true/false back to the Scheduler, and that true/false dictates whether the scheduler should actually bind the pod to that node.</p>
+<p>The scheduler here is thus a slightly modified version of the upstream kube-scheduler. It has a custom gRPC server endpoint for receiving the new pod. It has custom code to know which of the overall nodes it is responsible for. And it has a custom Permit extension point for sending the proposed node back to the Relay. The Permit extension point runs after the nodes are filtered and scored, but before the pod is bound. Permit extensions return ‘true’ or ‘false’ to approve whether or not the pod should be scheduled on the specified node.</p>
+<p>This is the basic design and it works pretty well. It doesn’t quite work up to 1M node scale - we’ll talk about that next - but it delivers a much more scalable scheduler solution than what exists today, while preserving all of the nuanced complex battle-tested logic of the current system.</p>
+<p>Today’s scheduler is effectively O(n x p), where <em>n</em> is the number of nodes and <em>p</em> the number of pods. That complexity becomes untenable as <em>n</em> grows. The sharded approach helps counteract the scaling problem: if you have <em>n</em> nodes, then you can shard the work across <em>r</em> replicas where <em>r</em> is some factor of <em>n</em>, turning that large factor back into something more tractable.</p>
+<p>I should mention there’s one fairly large exception, and that’s <strong>pod evictions</strong>. Pod eviction can occur when there’s a new pod to schedule, but there’s not enough available resources currently on the cluster to schedule that pod. When this occurs, the scheduler does a scan across <em>all</em> pods currently running in the cluster, trying to identify a set of lower-priority pods that, if they were to be killed, would leave enough space for this new pod. To be fair, I didn’t implement this. You could squint at the current approach and imagine how we could also distribute the work of eviction calculation, but I didn’t do it.</p>
+</div>
+<div>
+<h4 id="_the_painful_long_tail_running_large_distributed_systems_in_reality">The painful long tail: running large distributed systems in reality</h4>
+<p>On my hardware, a single scheduler was able to filter and score a pod against 1K nodes in about 1ms. So we could do 1K pods on 1K nodes in 1s. Remember the goal was <strong>1M pods on 1M nodes in 60s</strong>. Recall that the overall work is O(n x p) (each pod has to be evaluated against each node), so going from 1K pods and nodes to 1M pods &amp; 1M nodes is not a factor of 1K more work, but 1K*1K, or <strong>1 million times</strong> more work. Even allowing ourselves 60s instead of 1s, we’re going to need a <em>lot</em> more schedulers.</p>
+<div>
+<h5 id="_add_more_relays_and_distribute_the_score_gathering">Add more relays and distribute the score gathering</h5>
+<p>In fact, we’re going to need so many schedulers that a single relay simply doesn’t have enough network bandwidth to send to all of them in enough time. <strong>We need multiple relays</strong>. In fact we actually need multiple levels of relays to reach all of the schedulers.</p>
+<p>Similarly the gathering stage, of collecting all scores and determining a winner, can also be distributed. Each scheduler and relay has a Score <code>Gather`</code> endpoint, and it’s determined via a hash of the pod name to determine which scheduler is responsible for gathering the scores of a particular pod.</p>
+<p>Here is a simplified example of what more relays looks like. This is with a fanout of 3, while in reality I used a fanout of 10. I was aiming to maximize but not exceed the maximum transmit throughput of each NIC to transmit 1M * 4K of Pod data in 60 seconds.</p>
+<p>Note that it’s packed. Not all schedulers are on the same level.</p>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/diag-mermaid-md5-71fb2ba7b1e00a4adf1501a7e5f7aa8c.png" alt="Diagram" width="763" height="1370"/>
+</p>
+</div>
+</div>
+<div>
+<h5 id="_fight_long_tail_latency">Fight long-tail latency</h5>
+<p>My goal was to see linear time reductions as I added more replicas. In reality, I started hitting a plateau, where no matter how many more replicas I added, things remained the same or even got worse. While on average, most of the schedulers were doing less work and thus finishing more quickly, it became more frequent to see one or two stragglers that were not faster at all. This was a problem because I needed all schedulers to report back their best node before we could pick a winner.</p>
+<p>There’s a well-known Google paper by Jeff Dean called <a href="https://research.google/pubs/the-tail-at-scale/">The Tail of Scale</a> that talks about exactly this problem. Our servers aren’t running real-time OSes and software. They are busy with all sorts of miscellaneous background tasks; observability, upgrades, garbage collection. Garbage collection is a big problem in Golang if you’re trying to write tightly coordinated software. It interrupts a currently-running task or defers a queued one. Suddenly a task that usually takes 300 microseconds spikes to take 1 millisecond. With enough individual servers, inevitably someone is always taking that 1 millisecond. If you have tightly timed coordinated systems that rely on everyone to respond before proceeding, 99% of your servers are waiting for that long-tail 1% to finish.</p>
+<p>So I implemented a few things to reduce this problem:</p>
+<p><strong>Use pinned CPUs</strong>. It’s a way to ensure that cpu cores are dedicated to one single container’s processes, not context switching between various random processes. In kubelet this is done via “CPU Manager Policy”. Just specifying this made my tasks much more consistently performing.</p>
+<p><strong>Tweak garbage collection</strong>. Increasing GOGC above 100 can reduce the amount of overall time spent in garbage collection at the expense of using more memory. Using an aggressive GOGC plus a GOMEMLIMIT near towards your actual memory limit is a fantastic way to ensure that you only do GC when you really need to. I use a GOGC value of 800 and a GOMEMLIMIT set to 90% of the container’s memory limit.</p>
+<p><strong>Give up on stragglers</strong>. Simply don’t wait for the last N% to respond. This can effectively cut off your long tail. Beware that if there’s one <em>consistently</em> <em>slow node,</em> then this can create a feedback loop, hammering that server with more and more requests will just make it slower until it totally melts down.</p>
+<p>Really you should just go read the <a href="https://research.google/pubs/the-tail-at-scale/">The Tail of Scale</a> paper, it covers several other possible scenarios and fixes.</p>
+<p>One thing that I did <em>not</em> do is overlap workloads across multiple servers. I could’ve assigned each kube node to <em>multiple</em> shards, so that any one of them can calculate and score the pods on that node. I worried this would result in too many cases of data inconsistency, where the node became over-subscribed with pods because the various shards were not consistent with one-another about which pods had been scheduled on that node.</p>
+</div>
+<div>
+<h5 id="_replace_watcher_with_admissionwebhook">Replace watcher with AdmissionWebHook</h5>
+<p>This one remains a bit of a mystery. The kube-scheduler typically learns about pods to schedule by doing a watch with fieldSelector ‘spec.nodeName=’ (meaning, pods that have no current nodeName set). When creating a lot of pods quickly (over &gt;5K/sec), the watch stream would frequently stall for tens of seconds at a time.</p>
+<p>This was one particularly bad example:</p>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/doc_images/image22.png" alt="image22"/>
+</p>
+<p>Figure 4. Large gaps in time between pods being observed. <em>(Note the y-axis scale is 1/100th of actual pod count)</em></p>
+</div>
+<p>Sometimes even though there’d be plenty of pods to schedule, the watch stream had stalled so badly that the scheduler would be starved of pods to process.</p>
+<p>To overcome this, I made the scheduler take a rather extreme change of interface. Rather than creating a watch, I made the scheduler a ValidatingWebhook. This made it so the kube-apiserver would hit an HTTP endpoint on the scheduler with every new pod that was created, in line with the create request. Typical Validating Webhooks are used for security, to approve or deny some resource fields from being set by particular clients. In this case, the scheduler approved all pods. It was merely a way for it to learn about every new pod faster (and synchronously) than by using a watch stream.</p>
+</div>
+</div>
+<div>
+<h4 id="_results">Results</h4>
+<p>Created a 100K node cluster and then timed how long it takes to schedule 100K pods. The pods have no nodeSelector or affinity.</p>
+<p>Each scheduler ran on a dedicated c4d-standard-32; that is 32 AMD Turin cores and 128GB of DDR5 RAM. Experiments where dist-schedulers that had more than 1 replica also had 1 dedicated dist-scheduler-relay VM.</p>
+<p>Each dist-scheduler replica is configured to run 30 separate internal schedulers, each with a parallelism setting of ‘2’.</p>
+<p>The default-scheduler is kube-scheduler 1.32.3 with no modifications.</p>
+<div>
+<p><img src="https://bchess.github.io/k8s-1m/doc_images/image8.png" alt="image8"/>
+</p>
+</div>
+<p>One puzzling result is how much better a 1x dist-scheduler performed than the default-scheduler. Adjusting the <code>parallelism</code> setting had no impact on the performance nor the CPU-seconds, which seemed to peak at about 20 (leaving 12 cores free).</p>
+<p>Note that adding replicas to dist-scheduler did result in a more-or-less linear time improvement. In other words, doubling the number of dist-scheduler replicas results in a halving of the time to completion. This trend continues to the 256x replica/1M pod scale as we’ll see in the next section.</p>
+</div>
+</div>
+</div></div>
+  </body>
+</html>
