@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.xtxmarkets.com/tech/2025-ternfs/#posix-shaped">Original</a>
+    <h1>TernFS – an exabyte scale, multi-region distributed filesystem</h1>
+    
+    <div id="readability-page-1" class="page"><div id="maincontent">
+    
+<p><strong>September 2025</strong></p>
+<p>XTX is an algorithmic trading firm: it builds statistical models that produce price forecasts for over 50,000 financial instruments worldwide. We use those forecasts to make trades. As XTX&#39;s research efforts to build better models ramped up, the demand for resources kept increasing.</p>
+<p>The firm started out with a couple of desktops and an NFS server, and 10 years later ended up with tens of thousands of high-end GPUs, hundreds of thousands of CPUs, and hundreds of petabytes of storage.</p>
+<p>As compute grew, storage struggled to keep up. We rapidly outgrew NFS first and existing open-source and commercial filesystems later. After evaluating a variety of third-party solutions, we made the decision to implement our own filesystem, which we called TernFS<sup><a href="#f1">[1]</a></sup>.</p>
+
+<p>We have decided to open source our efforts: TernFS is <a href="https://github.com/XTXMarkets/ternfs">available as free software on our public GitHub.</a> This post <a href="#another-filesystem">motivates TernFS</a>, explains its <a href="#high-level">high-level architecture</a>, and then explores some <a href="#important-details">key implementation details</a>. If you just want to spin up a local TernFS cluster, head to the <a href="https://github.com/XTXMarkets/ternfs?tab=readme-ov-file#playing-with-a-local-ternfs-instance">README</a>.</p>
+
+<h2>Another filesystem?</h2>
+<p>There&#39;s a reason why every major tech company has developed its own distributed filesystem — they&#39;re crucial to running large-scale compute efforts, and liable to cause intense disruption if they malfunction. <sup><a href="#f2">[2]</a></sup></p>
+
+<p>XTX was in the same position, so we designed TernFS to be a one-stop solution for most of our storage needs, going from relatively &#39;cold&#39; storage of raw market data to short-lived random-access data used to communicate between GPU jobs running on our cluster.</p>
+<p>TernFS:</p>
+<ul>
+<li>Is designed to scale up to tens of exabytes, trillions of files, millions of concurrent clients.</li>
+<li>Stores file contents redundantly to protect against drive failures.</li>
+<li>Has no single point of failure in its metadata services.</li>
+<li>Supports file snapshot to protect against accidental file deletion.</li>
+<li>Can span across multiple regions.</li>
+<li>Is hardware agnostic and uses TCP/IP to communicate.</li>
+<li>Utilizes different types of storage (such as flash vs. hard disks) cost effectively.</li>
+<li>Exposes read/write access through its own API over TCP and UDP, and a Linux kernel filesystem module.</li>
+<li>Requires no external service and has a minimal set of build dependencies. <sup><a href="#f3">[3]</a></sup></li>
+</ul>
+
+<p>Naturally, there are some limitations, the main ones being:</p>
+<ul>
+<li>Files are immutable — once they&#39;re written they can&#39;t be modified.</li>
+<li>TernFS should not be used for tiny files — our median file size is 2MB.</li>
+<li>The throughput of directory creation and removal is significantly constrained compared to other operations.</li>
+<li>TernFS is permissionless, deferring that responsibility to other services.</li>
+</ul>
+<p>We started designing TernFS in early 2022 and began putting it into production in summer 2023. By mid-2024 all of our machine learning efforts were driven out of TernFS, and we&#39;re migrating the rest of the firm&#39;s storage needs onto it as well.</p>
+<p>As of September 2025, our TernFS deployment stores more than 500PB across 30,000 disks, 10,000 flash drives, and three data centres. At peak we serve multiple terabytes per second. To this day, we haven&#39;t lost a single byte.</p>
+
+<h2>High-level overview</h2>
+<p>Now that the stage is set, we&#39;re ready to explain the various components that make up TernFS. TernFS&#39; core API is implemented by four services:</p>
+<ul>
+<li><em>Metadata shards</em> store the directory structure and file metadata.</li>
+<li>The <em>cross-directory coordinator</em> (or CDC) executes cross-shard transactions.</li>
+<li><em>Block services</em> store file contents.</li>
+<li>The <em>registry</em> stores information about all the other services and monitors them.</li>
+</ul>
+<pre><code>
+ A ──► B means &#34;A sends requests to B&#34; 
+                                       
+                                       
+ ┌────────────────┐                    
+ │ Metadata Shard ◄─────────┐          
+ └─┬────▲─────────┘         │          
+   │    │                   │          
+   │    │                   │          
+   │ ┌──┴──┐                │          
+   │ │ CDC ◄──────────┐     │          
+   │ └──┬──┘          │     │          
+   │    │             │ ┌───┴────┐     
+   │    │             └─┤        │     
+ ┌─▼────▼────┐          │ Client │     
+ │ Registry  ◄──────────┤        │     
+ └──────▲────┘          └─┬──────┘     
+        │                 │            
+        │                 │            
+ ┌──────┴────────┐        │            
+ │ Block Service ◄────────┘            
+ └───────────────┘
+
+</code></pre>
+
+<p>In the next few sections, we&#39;ll describe the high-level design of each service and then give more background on <a href="#important-details">other relevant implementation details</a>.<sup><a href="#f4">[4]</a></sup></p>
+
+<h3>Metadata</h3>
+<p>To talk about metadata, we first need to explain what metadata <em>is</em> in TernFS. The short answer is: &#39;everything that is not file contents.&#39; The slightly longer answer is:</p>
+<ul>
+<li>Directory entries, including all files and directory names.</li>
+<li>File metadata including creation/modification/access time, logical file size, and so on.</li>
+<li>The mapping between files and the <a href="#block-services">blocks containing their contents</a>.</li>
+<li>Other ancillary data structures to facilitate maintenance operations.</li>
+</ul>
+<p>TernFS&#39; metadata is split into 256 logical <em>shards</em>. Shards never communicate with each other. This is a general principle in TernFS: each service is disaggregated from the others, deferring to the clients to communicate with each service directly.<sup><a href="#f5">[5]</a></sup></p>
+
+<p>A logical shard is further split into five physical instances, one leader and four followers, in a typical distributed consensus setup. The distributed consensus engine is provided by a purpose-built Raft-like implementation, which we call LogsDB, while RocksDB is used to implement read/write capabilities within a shard instance.</p>
+<p>Currently all reads and writes go through the leader, but it would be trivial to allow clients to read from followers, and with a bit more effort to switch to a write-write setup.</p>
+<pre><code>    ┌─────────┐ ┌─────────┐       ┌───────────┐ 
+    │ Shard 0 │ │ Shard 1 │  ...  │ Shard 255 │ 
+    └─────────┘ │         │       └───────────┘ 
+            ┌───┘         └───────────────────┐ 
+            │                                 │ 
+            │                  ┌────────────┐ │ 
+            │ ┌───────────┐    │ Replica 0  │ │ 
+            │ │           ◄────► (follower) │ │ 
+ ┌────────┐ │ │ Replica 3 ◄──┐ └────────────┘ │ 
+ │ Client ├─┼─► (leader)  ◄─┐│ ┌────────────┐ │ 
+ └────────┘ │ │           ◄┐│└─► Replica 1  │ │ 
+            │ └───────────┘││  │ (follower) │ │ 
+            │              ││  └────────────┘ │ 
+            │              ││  ┌────────────┐ │ 
+            │              │└──► Replica 2  │ │ 
+            │              │   │ (follower) │ │ 
+            │              │   └────────────┘ │ 
+            │              │   ┌────────────┐ │ 
+            │              └───► Replica 4  │ │ 
+            │                  │ (follower) │ │ 
+            │                  └────────────┘ │ 
+            └─────────────────────────────────┘ 
+</code></pre>
+
+<p>Splitting the metadata into 256 shards from the get-go simplifies the design, given that horizontal scaling of metadata requires no rebalancing, just the addition of more metadata servers.</p>
+<p>For instance, our current deployment can serve hundreds of petabytes and more than 100,000 compute nodes with just 10 metadata servers per data centre, with each server housing roughly 25 shard leaders and 100 shard followers.</p>
+<p>Given that the metadata servers are totally decoupled from one another, this means that we can scale metadata performance by 25× trivially, and by 100× if we were to start offloading metadata requests to followers.</p>
+<p>TernFS shards metadata by assigning each directory to a single shard. This is done in a simple round-robin fashion by the <a href="#cdc">cross-directory coordinator</a>. Once a directory is created, all its directory entries and the files in it are housed in the same shard.</p>
+<p>This design decision has downsides: TernFS assumes that the load will be spread across the 256 logical shards naturally. This is not a problem in large deployments, given that they will contain many directories, but it is something to keep in mind.<sup><a href="#f6">[6]</a></sup></p>
+
+
+<h3>Cross-directory transactions</h3>
+<p>Most of the metadata activity is contained within a single shard:</p>
+<ul>
+<li>File creation, same-directory renames, and deletion.</li>
+<li>Listing directory contents.</li>
+<li>Getting attributes of files or directories.</li>
+</ul>
+<p>However, some operations do require coordination between shards, namely directory creation, directory removal, and moving directory entries across different directories.</p>
+<p>The <em>cross-directory coordinator</em> (CDC) performs these distributed transactions using a privileged metadata shard API. The CDC transactions are stateful, and therefore the CDC uses RocksDB and LogsDB much like the metadata shards themselves to persist its state safely.</p>
+<pre><code> ┌────────┐    ┌──────────┐ ┌───────────┐ 
+ │ Client ├─┐  │ Shard 32 │ │ Shard 103 │ 
+ └────────┘ │  └────────▲─┘ └─▲─────────┘ 
+ ┌─────┬────┼───────────┼─────┼─┐         
+ │ CDC │  ┌─▼──────┐    │     │ │         
+ ├─────┘  │ Leader ├────┴─────┘ │         
+ │        └─────▲──┘            │         
+ │              │               │         
+ │       ┌──────┴───────┐       │         
+ │       │              │       │         
+ │ ┌─────▼────┐    ┌────▼─────┐ │         
+ │ │ Follower │ .. │ Follower │ │         
+ │ └──────────┘    └──────────┘ │         
+ └──────────────────────────────┘   
+</code></pre>
+
+<p>The CDC executes transactions in parallel, which increases throughput considerably, but it is still a bottleneck when it comes to creating, removing, or moving directories. This means that TernFS has a relatively low throughput when it comes to CDC operations.<sup><a href="#f7">[7]</a></sup> <a name="block-services"></a></p>
+
+<h3>Block services, or file contents</h3>
+<p>In TernFS, files are split into chunks of data called <em>blocks</em>. Blocks are read and written to by <em>block services</em>. A block service is typically a single drive (be it a hard disk or a flash drive) storing blocks. At XTX a typical storage server will contain around 100 hard disks or 25 flash drives — or in TernFS parlance 100 or 25 block services.<sup><a href="#f8">[8]</a></sup></p>
+
+<p>Read/write access to the block service is provided using a simple TCP API currently implemented by a Go process. This process is hardware agnostic and uses the Go standard library to read and write blocks to a conventional local file system. We originally planned to rewrite the Go process in C++, and possibly write to block devices directly, but the idiomatic Go implementation has proven performant enough for our needs so far. <a name="registry"></a></p>
+<h3>The registry</h3>
+<p>The final piece of the TernFS puzzle is the <em>registry</em>. The registry stores the location of each instance of service (be it a metadata shard, the CDC, or a block storage node). A client only needs to know the address of the registry to mount TernFS — it&#39;ll then gather the locations of the other services from it.</p>
+<p>In TernFS all locations are IPv4 addresses. Working with IPv4 directly simplifies the kernel module considerably, since DNS lookups are quite awkward in the Linux kernel. The exception to this rule is addressing the registry itself, for which DNS is used.</p>
+<p>The registry also stores additional information, such as the capacity and available size of each drive, who is a follower or a leader in LogsDB clusters, and so on.</p>
+<p>Predictably, the registry itself is a RocksDB and LogsDB C++ process, given its statefulness. <a name="going-global"></a></p>
+<h3>Going global</h3>
+<p>TernFS tries very hard not to lose data, by storing both metadata and file contents on many different drives and servers. However, we also want to be resilient to the temporary or even permanent loss of one entire data centre. Therefore, TernFS can transparently scale across multiple <em>locations</em>.</p>
+<p>The intended use for TernFS locations is for each location to converge to the same dataset. This means that each location will have to be provisioned with roughly equal resources.<sup><a href="#f9">[9]</a></sup> Both metadata and file contents replication are asynchronous. In general, we judge the event of losing an entire data centre rare enough to tolerate a time window where data is not fully replicated across locations.</p>
+
+<p>Metadata replication is set up so that one location is the metadata primary. Write operations in non-primary locations pay a latency price since they are acknowledged only after they are written to the primary location, replicated, and applied in the originating location. In practice this hasn&#39;t been an issue since metadata write latencies are generally overshadowed by writing file contents.</p>
+<p>There is no automated procedure to migrate off a metadata primary location — again, we deem it a rare enough occurrence to tolerate manual intervention. In the future we plan to move from the current protocol to a multi-master protocol where each location can commit writes independently, which would reduce write latencies on secondary locations and remove the privileged status of the primary location.</p>
+<p>File contents, unlike metadata, are written locally to the location the client is writing from. Replication to other locations happens in two ways: proactively and on-demand. Proactive replication is performed by tailing the metadata log and replicating new file contents. On-demand replication happens when a client requests file content which has not been replicated yet. <a name="important-details"></a> <a name="speaking-ternfs"></a></p>
+<h2>Important Details</h2>
+<p>Now that we&#39;ve laid down the high-level design of TernFS, we can talk about several key implementation details that make TernFS safer, more performant, and more flexible.</p>
+<h3>Talking to TernFS</h3>
+<h4>Speaking TernFS&#39; language</h4>
+<p>The most direct way to talk to TernFS is by using its own API. All TernFS messages are defined using a custom serialization format we call <em>bincode</em>. We chose to develop a custom serialization format since we needed it to work within the confines of the <a href="#posix-shaped">Linux kernel</a> and to be easily chopped into UDP packets.</p>
+<p>We intentionally kept the TernFS API stateless, in the sense that each request executes without regard to previous requests made by the same client. This is in contrast to protocols like NFS, whereby each connection is very stateful, holding resources such as open files, locks, and so on.</p>
+<p>A stateless API dramatically simplifies the state machines that make up the TernFS core services, therefore simplifying their testing. It also forces each request to be idempotent, or in any case have clear retry semantics, since they might have to be replayed, which facilitates testing further.</p>
+<p>It also allows the metadata shards and CDC API to be based on UDP rather than TCP, which makes the server and clients (especially the kernel module) simpler, due to doing away with the need for keeping TCP connections. The block service API is TCP based, since it is used to stream large amounts of contiguous data, and any UDP implementation would have to re-implement a reliable stream protocol. The registry API is also TCP-based, given that it is rarely used by clients, and occasionally needs to return large amounts of data.</p>
+<p>While the TernFS API is simple out-of-the-box, we provide a permissively licensed Go library implementing common tasks that clients might want to perform, such as caching directory policies and retrying requests. This library is used to implement many TernFS processes that are not part of the core TernFS services, such as <a href="#scrubbing">scrubbing</a>, <a href="#snapshots">garbage collection</a>, <a href="#migrations">migrations</a>, and the <a href="#web-ui">web UI</a>.</p>
+
+<h4>Making TernFS POSIX-shaped</h4>
+<p>While the Go library is used for most ancillary tasks, some with high performance requirements, the main way to access TernFS at XTX is through its Linux kernel module.</p>
+<p>This is because, when migrating our machine learning workflows to TernFS, we needed to support a vast codebase working with files directly. This not only meant that we needed to expose TernFS as a normal filesystem, but also that said normal filesystem API needed to be robust and performant enough for our machine learning needs.<sup><a href="#f10">[10]</a></sup></p>
+
+<p>For this reason, we opted to work with Linux directly, rather than using FUSE. Working directly with the Linux kernel not only gave us the confidence that we could achieve our performance requirements but also allowed us to bend the POSIX API to our needs, something that would have been more difficult if we had used FUSE.<sup><a href="#f11">[11]</a></sup></p>
+
+<p>The main obstacle when exposing TernFS as a &#39;normal&#39; filesystem is that TernFS files are immutable. More specifically, TernFS files are fully written before being &#39;linked&#39; into the filesystem as a directory entry. This is intentional: it lets us cleanly separate the API for &#39;under construction&#39; files and &#39;completed files&#39;, and it means that half-written files are not visible.</p>
+<p>However this design is essentially incompatible with POSIX, which endows the user with near-absolute freedom when it comes to manipulating a file. Therefore, the TernFS kernel module is <em>not</em> POSIX-compliant, but rather exposes enough POSIX to allow many programs to work without modifications, but not all.</p>
+<p>In practice this means that programs which write files left-to-right and never modify the files&#39; contents will work out-of-the-box. While this might seem very restrictive, we found that a surprising number of programs worked just fine.<sup><a href="#f12">[12]</a></sup> Programs that did not follow this pattern were modified to first write to a temporary file and then copy the finished file to TernFS.</p>
+
+<p>While we feel that writing our own kernel module was the right approach, it proved to be the trickiest part of TernFS, and we would not have been able to implement it without <a href="#block-proofs">some important safety checks</a> in the TernFS core services.<sup><a href="#f13">[13]</a></sup></p>
+
+<h4>S3 gateway</h4>
+<p>Almost all the storage-related activity at XTX is due to our machine-learning efforts, and for those purposes the TernFS&#39; kernel module has served us well. However, as TernFS proved itself there, we started to look into offering TernFS to the broader firm.</p>
+<p>Doing so through the kernel module presented multiple challenges. For starters installing a custom kernel module on every machine that needed to reach TernFS is operationally cumbersome. Moreover, while all machine-learning happens in clusters housed in the same data centre as TernFS itself, we wanted to expose TernFS in a way that&#39;s more amenable to less local networks, for instance by removing the need for UDP. Finally, TernFS does not have any built-in support for permissions or authentication, which is a requirement in multi-tenant scenarios.</p>
+<p>To solve all these problems, we implemented a gateway for TernFS, which exposes a TernFS subtree using the S3 API. The gateway is a simple Go process turning S3 calls into TernFS API calls. The S3 gateway is not currently open sourced since it is coupled to authentication services internal to XTX, but we have open sourced a minimal S3 gateway to serve as a starting point for third-party contributors to build their own.</p>
+<p>We&#39;ve also planned an NFS gateway to TernFS, but we haven&#39;t had a pressing enough need yet to complete it.</p>
+
+<h4>The web UI and the JSON interface</h4>
+<p>Finally, a view of TernFS is provided by its web UI. The web UI is a stateless Go program which exposes most of the state of TernFS in an easy-to-use interface. This state includes the full filesystem contents (both metadata and file contents), the status of each service including information about decommissioned block services, and so on.</p>
+<p>Moreover, the web UI also exposes the <a href="#speaking-ternfs">direct TernFS API</a> in JSON form, which is very useful for small scripts and curl-style automation that does not warrant a full-blown Go program.</p>
+
+<h3>Directory Policies</h3>
+<p>To implement some of the functionality we&#39;ll describe below, TernFS adopts a system of per-directory policies.</p>
+<p>Policies are used for all sorts of decisions, including:</p>
+<ul>
+<li><a href="#reed-solomon">How to redundantly store files.</a></li>
+<li><a href="#drive-type-picking">On which type of drive to store files.</a></li>
+<li><a href="#snapshots">How long to keep files around after deletion.</a></li>
+</ul>
+<p>Each of the topics above (and a few more we haven&#39;t mentioned) correspond to a certain policy <em>tag</em>. The body of the policies are stored in the metadata together with the other directory attributes.</p>
+<p>Policies are inherited: if a directory does not contain a certain policy tag, it transitively inherits from the parent directory. TernFS clients store a cache of policies to allow for traversal-free policy lookup for most directories.</p>
+<h3>Keeping blocks in check</h3>
+<p>A filesystem is no good if it loses, leaks, corrupts, or otherwise messes up its data. TernFS deploys a host of measures to minimize the chance of anything going wrong. So far, these have worked: we&#39;ve never lost data in our production deployment of TernFS. This section focuses on the measures in place to specifically safeguard files&#39; blocks.</p>
+<h4>Against bitrot, or CRC32-C</h4>
+<p>The first and possibly most obvious measure consists of aggressively checksumming all TernFS&#39; data. The metadata is automatically checksummed by RocksDB, and every block is stored in a format interleaving 4KiB pages with 4byte CRC32-C checksums.</p>
+<p>CRC32-C was picked since it is a high-quality checksum and implemented on most modern silicon.<sup><a href="#f14">[14]</a></sup> It also exhibits some desirable properties when used together with <a href="#block-proofs">Reed-Solomon coding</a>.</p>
+
+<p>4KiB was picked since it is the read boundary used by Linux filesystems and is fine-grained while still being large enough to render the storage overhead of the 4byte checksums negligible.</p>
+<p>Interleaving the CRCs with the block contents does not add any safety, but it does improve operations in two important ways. First, it allows for safe partial reads: clients can demand only a few pages from a block which is many megabytes in size and still check the reads against its checksum. Second, it allows <a href="#scrubbing">scrubbing</a> files locally on the server which hosts the blocks, without communicating with other services at all.</p>
+
+<h4>Storing files redundantly, or Reed-Solomon codes</h4>
+<p>We&#39;ve been talking about files being split into blocks, but we haven&#39;t really explained <em>how</em> files become blocks.</p>
+<p>The first thing we do to a file is split it into <em>spans</em>. Spans are at most 100MiB and are present just to divide files into sections of a manageable size.</p>
+<p>Then each span is divided into D <em>data blocks</em>, and P <em>parity blocks</em>. D and P are determined by the corresponding <a href="#directory-policies">directory policy</a> in which the file is created. When D is 1, the entire contents of the span become a single block, and that block is stored D+P times. This scheme is equivalent to a simple mirroring scheme and allows it to lose up to P blocks before losing file data.</p>
+<p>While wasteful, mirroring the entire contents of the file can be useful for very hot files, since TernFS clients will pick a block at random to read from, thereby sharing the read load across many block services. And naturally files which we do not care much for can be stored with D = 1 and P = 0, without any redundancy.</p>
+<p>That said, most files will not be stored using mirroring but rather using Reed-Solomon coding. Other resources can be consulted to understand the <a href="https://mazzo.li/posts/reed-solomon.html">high-level idea</a> and the <a href="https://www.corsix.org/content/reed-solomon-for-software-raid">low-level details</a> of Reed-Solomon coding, but the gist is it allows us to split a span into D equally sized blocks (some padding might be necessary), and then generate P blocks of equal size such that up to any P blocks can be lost while retaining the ability to reconstruct all the other blocks.</p>
+<p>As mentioned, D and P are fully configurable, but at XTX we tend to use D = 10 and P = 4, which allows us to lose up to any four drives for any file.</p>
+
+<h4>Drive type picking</h4>
+<p>We now know how to split files into a bunch of blocks. The next question is: which drives to pick to store the blocks on. The first decision is which kind of drive to use. At XTX we separate drives into two broad categories for this purpose — flash and spinning disks.</p>
+<p>When picking between these two, we want to balance two needs: minimizing the cost of hardware by utilizing hard disks if we can <sup><a href="#f15">[15]</a></sup>, and maximizing hard disk productivity by having them reading data most of the time, rather than seeking.</p>
+
+<p>To achieve that, directory policies offer a way to tune how large each block will be, and to tune which drives will be picked based on block size. This allows us to configure TernFS so that larger files that can be read sequentially are stored on hard disks, while random-access or small files are stored on flash. <sup><a href="#f16">[16]</a></sup></p>
+
+<p>Currently this system is not adaptive, but we found that in practice it&#39;s easy to carve out sections of the filesystem which are not read sequentially. We have a default configuration which assumes sequential reads and then uses hard disks down to roughly 2.5MB blocks, below which hard disks stop being productive enough and blocks start needing to be written to flash. <a name="block-service-picking"></a></p>
+<h4>Block service picking</h4>
+<p>OK, we now know what type of drive to select for our files, but we still have tens of thousands of individual drives to pick from. Picking the &#39;right&#39; individual drive requires some sophistication.</p>
+<p>The first thing to note is that drive failures or unavailability are often correlated. For instance, at XTX a single server handles 102 spinning disks. If the server is down, faulty, or needs to be decommissioned, it&#39;ll render its 102 disks temporarily or permanently unavailable.</p>
+<p>It&#39;s therefore wise to spread a file&#39;s blocks across many servers. To achieve this, each TernFS block service (which generally corresponds to a single drive) has a <em>failure domain</em>. When picking block services in which to store the blocks for a given file, TernFS will make sure that each block is in a separate failure domain. In our TernFS deployment a failure domain corresponds to a server, but other users might wish to tie it to some other factor as appropriate.</p>
+<p>TernFS also tries hard to avoid write bottlenecks by spreading the current write load across many disks. Moreover, since new drives can be added at any time, it tries to converge to a situation where each drive is roughly equally filled by assigning writing more to drives with more available space.</p>
+<p>Mechanically this is achieved by having each shard periodically request a set of block services to use for writing from the registry. When handing out block services to shards, the registry selects block services according to several constraints:</p>
+<ul>
+<li>It never gives block services from the same failure domain to the same shard</li>
+<li>It minimizes the variance in how many shards each block service is currently assigned to</li>
+<li>It prioritizes block services which have more available space.</li>
+</ul>
+<p>Then when a client wants to write a new span, requiring D+P blocks, the shard simply selects D+P block services randomly amongst the ones it last received from the registry.</p>
+<p>One concept currently absent from TernFS is what is often known as &#39;copyset replication&#39;. When assigning disks to files at random (even with the caveat of failure domains) the probability of rendering at least one file unreadable quickly becomes a certainty as more and more drives fail:</p>
+<p><img src="https://nickdrozd.github.io/assets/tech/2025-ternfs-faileddisks.png" alt="Probability of data loss vs Failed disks" title="Probability of data loss vs Failed disks"/></p>
+
+<p>Copysets reduce the likelihood of data loss occurring by choosing blocks out of a limited number of sets of drives, as opposed to picking the drives randomly. This dramatically reduces the probability of data loss<sup><a href="#f17">[17]</a></sup>.  They are generally a good idea, but we haven&#39;t found them to be worthwhile, for a few reasons.</p>
+
+<p>First, evacuating a 20TB drive takes just a few minutes, and in the presence of multiple failed drives the migrator process evacuates first the files which are present in multiple failed drives to get ahead of possible data loss. This means that for TernFS to lose data within a single data centre tens of drives would have to fail within a matter of seconds.</p>
+<p>More importantly, our TernFS deployment is replicated across three data centres. This replication eliminates the chance of losing data due to &#39;independent&#39; drive failures — thousands of drives would need to fail at once. Obviously, data centre wide events <em>can</em> cause a large proportion of the drives within it to fail, but having such an event in three data centres at once is exceedingly unlikely.</p>
+<p>Finally, copysets are not without drawbacks or complications. Assigning drives at random is an optimal strategy when it comes to evacuating drives quickly, since the files with blocks in the drives to be evacuated will be evenly spread over the rest of the filesystem, and since we only ever need to replace the failed blocks given that we&#39;re not constrained by fitting the new set of blocks in predetermined copysets. This means that the evacuation procedure will not be bottlenecked by drive throughput, which is what enables evacuation to finish in a matter of minutes. Moreover, the algorithm to distribute drives to shards is significantly simpler and more flexible than if it needed to care about copysets.</p>
+<p>However, users that wish to deploy TernFS within a single data centre might wish to implement some form of copyset replication. Such a change would be entirely contained to the registry and would not change any other component.</p>
+
+<h4>Block Proofs</h4>
+<p>We now have a solid scheme to store files redundantly (thanks to Reed-Solomon codes) and protect against bitrot (thanks to the checksums). However, said schemes are only as good as their implementation.</p>
+<p>As previously mentioned, TernFS clients communicate their intention to write a file to metadata servers, the metadata servers select block services that the blocks should be written to, and the clients then write the blocks to block services independently of the metadata services. The same happens when a client wants to erase blocks: the client first communicates its intentions to delete the blocks to the right metadata shard and then performs the erasing itself.</p>
+<p>This poses a challenge. While verifying the correctness of the core TernFS services is feasible, verifying all clients is not, but we&#39;d still like to prevent buggy clients from breaking key invariants of the filesystem.</p>
+<p>Buggy clients can wreak havoc in several ways:</p>
+<ul>
+<li>They can <em>leak data</em> by writing blocks to block services that are not referenced anywhere in the metadata.</li>
+<li>They can <em>lose data</em> by erasing blocks which are still referenced in metadata.</li>
+<li>They can <em>corrupt data</em> by telling the metadata services they&#39;ll write something and then writing something else.</li>
+</ul>
+<p>We address all these points by using what we call <em>block proofs</em>. To illustrate how block proofs work, it&#39;s helpful to go through the steps required to write new data to a file.</p>
+<ol>
+<li>When a client is creating a file, it&#39;ll do so by adding its <a href="#reed-solomon">file spans</a> one-by-one. For each span the client wants to add it sends an &#39;initiate span creation&#39; request to the right metadata shard. This request contains both the overall checksum of the span, and the checksum of each block in it (including parity blocks).</li>
+<li>The metadata shard checks the consistency of the checksum of the span and of its blocks, something it can do thanks to <a href="https://mazzo.li/posts/rs-crc.html">some desirable mathematical properties</a> of CRCs.</li>
+<li>The shard picks block services for the blocks to be written in and returns this information to the client together with a signature for each &#39;block write&#39; instruction.</li>
+<li>The client forwards this signature to the block services, which will refuse to write the block without it. Crucially, the cryptographic signature ranges over a unique identity for the block (ensuring we only write the block we mean to write), together with its checksum, ensuring we don&#39;t write the wrong data.<sup><a href="#f18">[18]</a></sup></li>
+<li>After committing the block to disk, the block service returns a &#39;block written&#39; signature to the client.</li>
+<li>Finally, the client forwards the block written signature back to the shard, which certifies that the span has been written only when it has received the signatures for all the blocks that make up the span. <sup><a href="#f19">[19]</a></sup></li>
+</ol>
+
+<p>Similarly, when a client wants to delete a span, it first asks the metadata shard to start doing so. The metadata shard marks the span as &#39;in deletion&#39; and returns a bunch of &#39;block erase&#39; signatures to the client. The client then forwards the signatures to the block services that hold the blocks, which delete the blocks, and return a &#39;block erased&#39; signature. The clients forward these signatures back to the metadata shards, which can then forget about the span entirely.</p>
+
+<p>We use AES to generate the signatures for simplicity but note that the goal here is not protecting ourselves from malicious clients — just buggy ones. The keys used for the signature are not kept secret, and CRC32-C is not a secure checksum. That said, we&#39;ve found this scheme enormously valuable in the presence of <a href="#posix-shaped">complex clients</a>. We spent considerable efforts making the core services very simple so we could then take more implementation risks in the clients, with the knowledge that we would have a very low chance of corrupting the filesystem itself.</p>
+
+<h4>Scrubbing</h4>
+<p>Finally, if things go wrong, we need to notice. The most common failure mode for a drive is for it to fail entirely, in which case our internal hardware monitoring system will pick it up and migrate from it automatically. The more insidious (and still very common) case is a single sector failing in a drive, which will only be noticed when we try to read the block involving that sector.</p>
+<p>This is acceptable for files which are read frequently, but some files might be very &#39;cold&#39; but still very important.</p>
+<p>Consider the case of raw market data taps which are immediately converted to some processed, lossy format. While we generally will use the file containing the processed data, it&#39;s paramount to store the raw market data forever so that if we ever want to include more information from the original market data, we can. So important cold files might go months or even years without anyone reading them, and in the meantime, we might find that enough blocks have been corrupted to render them unreadable.<sup><a href="#f20">[20]</a></sup></p>
+
+<p>To make sure this does not happen, a process called the <em>scrubber</em> continuously reads every block that TernFS stores, and replaces blocks with bad sectors before they can cause too much damage.</p>
+
+<h3>Snapshots and garbage collection</h3>
+<p>We&#39;ve talked at length about what TernFS does to try to prevent data loss due to hardware failure or bugs in clients. However, the most common type of data loss is due to human error — the <code>rm —rf / home/alice/notes.txt</code> scenario.</p>
+<p>To protect against these scenarios, TernFS implements a lightweight snapshotting system. When files or directories are deleted, their contents aren&#39;t actually deleted. Instead, a weak reference to them is created. We call such weak references <em>snapshot</em> directory entries.</p>
+<p>Snapshot entries are not be visible through the kernel module or the S3 gateway, but are visible through <a href="#speaking-ternfs">the direct API</a>, and at XTX we have developed internal tooling to easily recover deleted files through it.<sup><a href="#f21">[21]</a></sup> Deleted files are also visible through the TernFS web UI.</p>
+
+<p>Given that &#39;normal&#39; file operations do not delete files, but rather make them a snapshot, the task of freeing up space is delegated to an external Go process, the <em>garbage collector</em>. The garbage collector traverses the filesystem and removes expired snapshots, which involves deleting their blocks permanently. Snapshot expiry is predictably regulated by <a href="#directory-policies">directory policies</a>.</p>
+<h3>Keeping TernFS healthy</h3>
+<p>This last section covers how we (humans of XTX) notice problems in TernFS, and how TernFS self-heals when things go wrong — both key topics if we want to ensure no data loss and notice performance problems early.</p>
+<h4>Performance metrics</h4>
+<p>TernFS exposes a plethora of performance metrics through the HTTP <a href="https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/">InfluxDB line protocol</a>. While connecting TernFS to a service which ingests these metrics is optional, it is <em>highly</em> recommended for any production service.</p>
+<p>Moreover, the kernel module exposes many performance metrics itself through DebugFS.</p>
+<p>Both types of metrics, especially when used in tandem, have proved invaluable to resolve performance problems quickly.</p>
+<h4>Logging and alerts</h4>
+<p>TernFS services log their output to files in a simple line-based format. The internal logging API is extremely simple and includes support for syslog levels out-of-the-box. At XTX we run TernFS as normal systemd services and use journalctl to view logs.</p>
+<p>As with metrics, the kernel module includes various logging facilities as well. The first type of logging is just through dmesg, but the kernel module also includes numerous tracepoints for low-overhead opt-in logging of many operations.</p>
+<p>TernFS is also integrated with XTX&#39;s internal alerting system, called <em>XMon</em>, to page on call developers when things go wrong. XMon is not open source, but all the alerts are also rendered as error lines in logs. <sup><a href="#f22">[22]</a></sup> We plan to eventually move to having alerts feed off performance metrics, which would make them independent from XMon, although we don&#39;t have plans to do so in the short-term. <a name="migrations"></a></p>
+
+<h4>Migrations</h4>
+<p>Finally, there&#39;s the question of what to do when drives die — and they will die, frequently, when you have 50,000 of them. While drives dying is not surprising, we&#39;ve been surprised at the variety of different drive failures. <sup><a href="#f23">[23]</a></sup> A malfunctioning drive might:</p>
+
+<ul>
+<li>Produce IO errors when reading specific files. This is probably due to a single bad sector.</li>
+<li>Produce IO errors when reading or writing anything. This might happen because enough bad sectors have gone bad and the drive cannot remap them, or for a variety of other reasons.</li>
+<li>Return wrong data. This is usually caught by the built-in error correction codes in the hard drives, but not always.</li>
+<li>Lie about data being successfully persisted. This can manifest in a variety of ways: file size being wrong on open, file contents being partially zero&#39;d out, and so on.</li>
+<li>Disappear from the mount list, only to reappear when the machine is rebooted, but missing some data.</li>
+</ul>
+<p>When clients fail to read from a drive, they&#39;ll automatically fall back on other drives to reconstruct the missing data, which is extremely effective in hiding failures from the end-user. That said, something needs to be done about the bad drives, and <a href="#block-service-picking">done quickly to avoid permanent data loss</a>.</p>
+<p>The TernFS registry allows marking drives as faulty. Faulty drives are then picked up by the <em>migrator</em>, a Go process which waits for bad drives and then stores all its blocks onto freshly picked block services.</p>
+<p>TernFS also tries to mark drives as bad automatically using a simple heuristic based on the rate of IO errors the drive is experiencing. The number of drives automatically marked as faulty is throttled to avoid having this check go awry and mark the whole cluster as faulty, which would not be catastrophic but would still be messy to deal with.</p>
+<p>Moreover, drives that are faulty in subtle ways might not be picked up by the heuristics, which means that occasionally a sysadmin will need to mark a drive as faulty manually, after which the migrator will evacuate them.</p>
+<h2>Closing thoughts</h2>
+<p>At XTX we feel strongly about utilizing our resources efficiently. When it comes to software, this means having software that gets close to some theoretical optimum when it comes to total cost of ownership. This culture was borne out by competing hard for technological excellence when doing on-exchange trading at first, and by our ever-growing hardware costs as our business has grown later.</p>
+<p>Such idealized tools might not exist or be available yet, in which case we&#39;re happy to be the tool makers. TernFS is a perfect example of this and we&#39;re excited to open source this component of our business for the community.</p>
+<p>Crucially, the cost of implementation of a new solution is often overblown compared to the cost of tying yourself to an ill-fitting, expensive third-party solution. Designing and implementing a solution serving exactly your needs allows for much greater simplicity. If the requirements do change, as often happens, changes can be implemented very quickly, again only catering to your needs.</p>
+<p>That said, we believe that TernFS&#39; set of trade-offs are widely shared across many organizations dealing with large-scale storage workloads, and we hope we&#39;ll contribute to <a href="https://xkcd.com/927/">at least slowing down the seemingly constant stream of new filesystems</a>.</p>
+
+  </div></div>
+  </body>
+</html>
