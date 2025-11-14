@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://wingolog.org/archives/2025/11/13/the-last-couple-years-in-v8s-garbage-collector">Original</a>
+    <h1>V8 Garbage Collector</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>Let’s talk about memory management!  Following up on my article about <a href="https://wingolog.org/archives/2023/12/07/the-last-5-years-of-v8s-garbage-collector">5 years of developments in V8’s garbage
+collector</a>, today I’d like to bring that up to date with what went down in V8’s GC over the last couple years.</p><h3>methodololology</h3><p>I selected all of the commits to <a href="https://source.chromium.org/chromium/chromium/src/+/main:v8/src/heap/"><tt>src/heap</tt></a> since my previous roundup.
+There were 1600 of them, including reverts and relands.  I read all of
+the commit logs, some of the changes, some of the linked bugs, and any
+design document I could get my hands on.  From what I can tell, there
+have been about 4 FTE from Google over this period, and the commit rate
+is fairly constant.  There are very occasional patches from Igalia,
+Cloudflare, Intel, and Red Hat, but it’s mostly a Google affair.</p><p>Then, by the very rigorous process of, um, just writing things down and
+thinking about it, I see three big stories for V8’s GC over this time,
+and I’m going to give them to you with some made-up numbers for how much
+of the effort was spent on them.  Firstly, the effort to improve memory
+safety via the sandbox: this is around 20% of the time.  Secondly, the
+Oilpan odyssey: maybe 40%.  Third, preparation for multiple JavaScript
+and WebAssembly mutator threads: 20%.  Then there are a number of lesser
+side quests: heuristics wrangling (10%!!!!), and a long list of
+miscellanea.  Let’s take a deeper look at each of these in turn.</p><h3>the sandbox</h3><p>There was a nice blog post in June last year summarizing the <a href="https://v8.dev/blog/sandbox">sandbox
+effort</a>: basically, the goal is to prevent
+user-controlled writes from corrupting memory outside the JavaScript
+heap.  We start from the assumption that the user is
+somehow able to obtain a write-anywhere primitive, and we work to mitigate
+the effect of such writes.  The most fundamental way is to reduce the
+range of addressable memory, notably by encoding pointers as 32-bit
+offsets and then ensuring that no host memory is within the addressable
+virtual memory that an attacker can write.  The sandbox also uses some
+40-bit offsets for references to larger objects, with similar
+guarantees.  (Yes, a sandbox really does reserve a terabyte of virtual memory).</p><p>But there are many, many details.  Access to external objects is
+intermediated via type-checked <a href="https://wingolog.org/archives/2024/05/13/partitioning-pitfalls-for-generational-collectors">external pointer
+tables</a>.
+Some objects that should never be directly referenced by user code go in
+a separate “trusted space”, which is outside the sandbox.  Then you have
+read-only spaces, used to allocate data that might be shared between
+different isolates, <a href="https://dbezhetskov.dev/multi-sandboxes/">you might want multiple
+cages</a>, there are “shared”
+variants of the other spaces, for use in shared-memory multi-threading,
+executable code spaces with embedded object references, and so on and so
+on.  Tweaking, elaborating, and maintaining all of these details has
+taken a lot of V8 GC developer time.</p><p>I think it has paid off, though, because the new development is that <a href="https://issues.chromium.org/issues/350324877">V8
+has managed to turn on hardware memory protection for the
+sandbox</a>: sandboxed code
+is prevented by the hardware from writing memory outside the sandbox.</p><p>Leaning into the “attacker can write anything in their address space”
+threat model has led to some funny patches.  For example, sometimes code
+needs to check flags about the page that an object is on, as part of a
+write barrier.  So some GC-managed metadata needs to be in the sandbox.
+However, the garbage collector itself, which is outside the sandbox,
+can’t trust that the metadata is valid.  We end up having two copies of
+state in some cases: in the sandbox, for use by sandboxed code, and
+outside, for use by the collector.</p><p>The best and most amusing instance of this phenomenon is related to
+integers.  <a href="https://google.github.io/styleguide/cppguide.html#Integer_Types">Google’s style guide recommends signed integers by
+default</a>,
+so you end up with on-heap data structures with <tt>int32_t len</tt> and such.
+But if an attacker overwrites a length with a negative number, there are
+a couple funny things that can happen.  The first is a <a href="https://issues.chromium.org/issues/425896305">sign-extending
+conversion to <tt>size_t</tt> by run-time
+code</a>, which can lead to
+sandbox escapes.  The other is <a href="https://chromium-review.googlesource.com/c/v8/v8/+/5335156">mistakenly concluding that an object is
+small, because its length is less than a limit, because it is
+unexpectedly
+negative</a>.
+Good times!</p><h3>oilpan</h3><p>It took 10 years for Odysseus to get back from Troy, which is about as
+long as it has taken for conservative stack scanning to make it from
+<a href="https://chromium.googlesource.com/v8/v8/+/main/include/cppgc/README.md">Oilpan</a>
+into V8 proper.  Basically, Oilpan is garbage collection for C++ as used
+in Blink and Chromium.  Sometimes it runs when the stack is empty; then
+it can be precise.  But sometimes it runs when there might be references
+to GC-managed objects on the stack; in that case it runs conservatively.</p><p>Last time I <a href="https://wingolog.org/archives/2023/12/07/the-last-5-years-of-v8s-garbage-collector">described how V8 would like to add support for generational
+garbage collection to
+Oilpan</a>,
+but that for that, you’d need a way to promote objects to the old
+generation that is compatible with the ambiguous references visited by
+conservative stack scanning.  I thought V8 had a chance at success with
+their new <a href="https://wingolog.org/archives/2023/12/08/v8s-mark-sweep-nursery">mark-sweep
+nursery</a>,
+but that seems to have turned out to be a lose relative to the copying
+nursery.  They even tried <a href="https://wingolog.org/archives/2022/10/22/the-sticky-mark-bit-algorithm">sticky mark-bit generational
+collection</a>,
+but it <a href="https://issues.chromium.org/issues/333906585">didn’t work out</a>.
+Oh well; one good thing about Google is that they seem willing to try
+projects that have uncertain payoff, though I hope that the hackers
+involved came through their OKR reviews with their mental health intact.</p><p>Instead, <a href="https://docs.google.com/document/d/1UHe6Ac60lnOshlgfP4XG6GXeh7szqbxPl4uu1x4i1EY/edit?tab=t.0#heading=h.n1atlriavj6v">V8 added support for pinning to the Scavenger copying nursery
+implementation</a>.
+If a page has incoming ambiguous edges, it will be placed in a kind of
+quarantine area for a while.  I am not sure what the difference is
+between a quarantined page, which logically belongs to the nursery, and
+a pinned page from the mark-compact old-space; they seem to require
+similar treatment.  In any case, we seem to have settled into a design
+that was mostly the same as before, but in which any given page can opt
+out of evacuation-based collection.</p><p>What do we get out of all of this?  Well, not only can we get
+generational collection for Oilpan, but also we unlock cheaper, less
+bug-prone <a href="https://issues.chromium.org/issues/42203211">“direct
+handles”</a> in V8 itself.</p><p>The funny thing is that I don’t think any of this is shipping yet; or,
+if it is, it’s only in a <a href="https://developer.chrome.com/docs/web-platform/chrome-finch">Finch
+trial</a> to a
+minority of users or something.  I am looking forward in interest to
+seeing a post from upstream V8 folks; <a href="https://kclpure.kcl.ac.uk/portal/en/studentTheses/retro-fitting-conservative-garbage-collection/">whole doctoral theses have been
+written on this
+topic</a>,
+and it would be a delight to see some actual numbers.</p><h3>shared-memory multi-threading</h3><p>JavaScript implementations have had the luxury of a single-threadedness:
+with just one mutator, garbage collection is a lot simpler.  But this is
+ending.  I don’t know what the state of <a href="https://github.com/tc39/proposal-structs">shared-memory multi-threading
+is in JS</a>, but in WebAssembly
+it <a href="https://github.com/WebAssembly/shared-everything-threads">seems to be moving
+apace</a>, and
+Wasm uses the JS GC.  Maybe I am overstating the effort here—probably it
+doesn’t come to 20%—but <a href="https://issues.chromium.org/issues/42204563">wiring this up has been a whole
+thing</a>.</p><p>I will mention just one patch here that I found to be funny.  So with
+pointer compression, an object’s fields are mostly 32-bit words, with
+the exception of 64-bit doubles, so we can reduce the alignment on most
+objects to 4 bytes.  <a href="https://issues.chromium.org/issues/40644235">V8 has had a bug open forever about alignment of
+double-holding objects</a>
+that it mostly ignores via unaligned loads.</p><p>Thing is, if you have an object visible to multiple threads, and that
+object might have a 64-bit field, then the field should be 64-bit
+aligned to prevent tearing during atomic access, which usually means the
+object should be 64-bit aligned.  <a href="https://chromium-review.googlesource.com/c/v8/v8/+/6540510">That is now the
+case</a> for
+Wasm structs and arrays in the shared space.</p><h3>side quests</h3><p>Right, we’ve covered what to me are the main stories of V8’s GC over the
+past couple years.  But let me mention a few funny side quests that I
+saw.</p><h4>the heuristics two-step</h4><p>This one I find to be hilariousad.  Tragicomical.  Anyway I am amused.
+So any real GC has a bunch of heuristics: when to promote an object or a
+page, when to kick off incremental marking, how to use background
+threads, when to grow the heap, how to choose whether to make a minor or
+major collection, when to aggressively reduce memory, how much virtual
+address space can you reasonably reserve, what to do on hard
+out-of-memory situations, how to account for off-heap mallocated memory,
+how to compute whether concurrent marking is going to finish in time or if you need to pause... and V8 needs to do
+this all in all its many configurations, with pointer compression off or
+on, on desktop, high-end Android, low-end Android, iOS where everything
+is weird, something called Starboard which is apparently part of Cobalt
+which is apparently a whole new platform that Youtube uses to show
+videos on set-top boxes, on machines with different memory models and
+operating systems with different interfaces, and on and on and on.
+Simply tuning the system appears to involve a dose of science, a dose of
+flailing around and trying things, and a whole cauldron of witchcraft.
+There appears to be one person whose full-time job it is to implement
+and monitor metrics on V8 memory performance and implement appropriate
+tweaks.  Good grief!</p><h4>mutex mayhem</h4><p>Toon Verwaest noticed that V8 was exhibiting many more context switches
+on MacOS than Safari, and identified V8’s use of platform mutexes as the
+problem.  So he rewrote them to use
+<a href="https://developer.apple.com/documentation/os/os_unfair_lock"><tt>os_unfair_lock</tt></a>
+on MacOS.  Then <a href="https://issues.chromium.org/issues/384940357">implemented adaptive locking on all
+platforms</a>.
+Then... <a href="https://chromium-review.googlesource.com/c/v8/v8/+/6175168">removed it all and switched to
+abseil</a>.</p><p>Personally, I am delighted to see this patch series, I wouldn’t have
+thought that there was juice to squeeze in V8’s use of locking.  It
+gives me hope that I will find a place to do the same in one of my
+projects :)</p><h4>ta-ta, third-party heap</h4><p>It used to be that <a href="https://mmtk.io">MMTk</a> was trying to get a number of
+production language virtual machines to support abstract APIs so that
+MMTk could slot in a garbage collector implementation.  Though this
+seems to work with OpenJDK, with V8 I think the churn rate and
+laser-like focus on the browser use-case makes an interstitial API
+abstraction a lose.  V8 <a href="https://chromium-review.googlesource.com/c/v8/v8/+/5797605">removed it a little more than a year
+ago</a>.</p><h3>fin</h3><p>So what’s next?  I don’t know; it’s been a while since I have been to Munich to drink from the source.  That said, shared-memory multithreading and <a href="https://wasmfx.dev/">wasm effect handlers</a> will extend the memory management hacker’s full employment act indefinitely, not to mention actually landing and shipping conservative stack scanning.  There is a lot to be done in non-browser V8 environments, whether in Node or on the edge, but it is admittedly harder to read the future than the past.</p><p>In any case, it was fun taking this look back, and perhaps I will have the opportunity to do this again
+in a few years.  Until then, happy hacking!</p></div></div>
+  </body>
+</html>
