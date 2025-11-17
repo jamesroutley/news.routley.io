@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://peterullrich.com/listen-to-database-changes-through-the-postgres-wal">Original</a>
+    <h1>Listen to Database Changes Through the Postgres WAL</h1>
+    
+    <div id="readability-page-1" class="page"><div phx-hook="AddAnchorLinks" id="blog-content">
+      <p>Welcome back, friends!</p>
+<pre><code translate="no" tabindex="0"><p>Did you hear the news about the inventor of the Knock-Knock joke?
+</p><p>He got a No-bell prize.
+</p></code></pre>
+<p>Alright, this post will be a bit longer since we&#39;ll dive deeply into the Postgres WAL and will explore how to listen for database changes through it.</p>
+<h2><a href="#the-problem" aria-hidden="true" id="the-problem"></a>The Problem</h2>
+<p>Let&#39;s say you want to react to changes in your Postgres database, for example to send out realtime notifications or to track the changes in an audit log. You consult Google (or let&#39;s be honest: your favorite LLM) and learn about <a href="https://www.postgresql.org/docs/current/sql-notify.html">NOTIFY/pg_notify</a> and <a href="https://peterullrich.com/listen-to-database-changes-with-postgres-triggers-and-elixir">triggers</a>.</p>
+<h3><a href="#notifypg_notify" aria-hidden="true" id="notifypg_notify"></a>NOTIFY/pg_notify</h3>
+<p>You decide to try <a href="https://www.postgresql.org/docs/current/sql-notify.html">pg_notify</a> on a small, not so active database table. It works! Great.</p>
+<p>You roll it out to a larger, much more active database table. It works, but suddenly your query times explode! Instead of doing 1 million transactions per second* you can now do only 3 (<em>*These numbers were exaggerated for dramatic effect</em>)</p>
+<p>So, what happened?</p>
+<p><strong>The problem with Postgres&#39; <code>NOTIFY</code> is that all notifications go through a single queue!</strong></p>
+<p>Even if you have 20 database connections making 20 transactions in parallel, all of them need to wait for their turn to lock the notification queue, add their notification, and unlock the queue again. This creates a bottleneck especially in high-throughput databases.</p>
+<p><code>pg_notify</code> also has other limitations:</p>
+<ul>
+<li>Its notification size is limited to <code>8000 bytes</code>. This might not be enough to send all the data in the notification and you&#39;ll need to query the database for the full dataset which adds additional load to your database.</li>
+<li>It does not wait for an acknowledgment of the listener and does not retry messages which means if your listener is dead or can&#39;t receive the message, the notification is lost.</li>
+<li>If you call <code>pg_notify</code> or <code>NOTIFY</code> inside a trigger, it will get called 100,000 times and send out 100,000 notifications if you change 100,000 rows in a single transaction which from a performance perspective is ... not ideal.</li>
+</ul>
+<p>You realize that <code>pg_notify</code> doesn&#39;t work for you. But there must be another way, right?</p>
+<p>There is and it&#39;s called the Postgres <a href="https://www.postgresql.org/docs/current/wal-intro.html">Write-Ahead Log (WAL)</a>.</p>
+<h2><a href="#the-wal-" aria-hidden="true" id="the-wal-"></a>The WAL 🐳</h2>
+<p>In short, the <a href="https://www.postgresql.org/docs/18/runtime-config-wal.html">WAL</a> is a log of every change to your database. Every transaction must save its changes to both the WAL and the data pages, or it will be rolled back.</p>
+<p>The WAL&#39;s main benefit is that it lets Postgres delay writing data pages to disk after a transaction finishes. Without the WAL, Postgres would have to save all changes to disk right after a transaction completes. If it didn&#39;t and the system crashed, the changes would be lost.</p>
+<p>With the WAL, Postgres only needs to write one file to disk (the WAL) and can wait to write the data pages later. If a crash happens, it can recreate the data pages from their latest version on disk and the changes tracked in the WAL. This significantly reduces the writes to disk, which are slow compared to changing a row in memory, and it allows Postgres to support much higher transaction throughputs.</p>
+<p>The WAL allows Postgres to support a range of other functionalities as well like:</p>
+<ul>
+<li><strong>Database replication</strong> - replaying the WAL&#39;s changes on a follower database is the most common method for creating database replicas</li>
+<li><strong>Online/streamed backups</strong> - following the WAL means you can have database backups that are always up-to-date. Without the WAL, you&#39;d need to take snapshots at a high frequency and would still miss the latest changes!</li>
+<li><strong>Point-in-time recovery (PITR)</strong> - did you ever wonder how a database provider can rebuild your database at a specific point in time? By recording the WAL and rebuilding your database based on its changes up to that time!</li>
+<li><strong>Change Data Capture (CDC)</strong> - the WAL enables listening to database changes in real-time, which is what this post is all about! You can use it to send notifications and maintain audit logs, all without having to change your application code.</li>
+</ul>
+<p>Now, let&#39;s see how we can listen to the WAL using Elixir.</p>
+<h2><a href="#previous-art" aria-hidden="true" id="previous-art"></a>Previous Art</h2>
+<p>The following code was heavily inspired by <a href="https://github.com/filipecabaco/postgres_replication/blob/main/lib/postgres_replication.ex">this exploration</a>, written by my friend <a href="https://www.linkedin.com/in/filipecabaco">Filipe Cabaço</a>, who nerd-sniped me into this topic, which caused me to write about it, which eventually forced you to read about it! So, now you know who to blame if you&#39;re unhappy with this post ;-)</p>
+<p>Also, a warning that the following code wasn&#39;t tested in production. See <a href="https://github.com/supabase/realtime/blob/7f28e0fbe7f13f144ab57f123ef50aa67c94449d/lib/realtime/tenants/replication_connection.ex">Supabase&#39;s Realtime</a> repo for a production-ready solution (and blame Filipe for any bugs who has written a large chunk of it).</p>
+<p>I&#39;ll introduce the solution piece-by-piece but you can find the complete and final version on <a href="https://github.com/PJUllrich/PeterAndCode/blob/main/wal/lib/wal/replication.ex">my GitHub</a></p>
+<h2><a href="#the-database" aria-hidden="true" id="the-database"></a>The Database</h2>
+<p>Creating a listener for the WAL requires a few steps. The first is to configure your Postgres database to store <code>logical</code> WAL records as well. We will do that by setting the <code>wal_level</code> of your database.</p>
+<p>The <a href="https://www.postgresql.org/docs/18/runtime-config-wal.html#RUNTIME-CONFIG-WAL-SETTINGS">wal_level</a> is similar to a log level and it determines how much information is written to the WAL.</p>
+<p>By default, it is set to <code>replica</code> which stores enough information to replicate the database, recover lost state after a crash, and enable point-in-time recovery. It balances overhead with functionality and serves well as a default.</p>
+<p>If you don&#39;t need the functionality of the <code>replica</code> level, you can set your database to track only <code>minimal</code> records. This level supports crash recovery, but not database replication or point-in-time recovery. It is faster than <code>replica</code> though.</p>
+<p>For our use-case, we need the third level, <code>logical</code>. This level stores the same data as <code>replica</code> but also tracks changes in a more high-level format of <em>what</em> changed (e.g. &#34;a row with these values was inserted into this table&#34;) rather than <em>how</em> it changed (e.g. &#34;these bytes were written to this page&#34;). It can lead to significantly more overhead, especially if you configured tables with <code>REPLICA IDENTITY FULL</code> or make many <code>UPDATE</code> or <code>DELETE</code> calls, so keep an eye on your database usage levels after changing the <code>wal_level</code>.</p>
+<hr/>
+<h4><a href="#side-note" aria-hidden="true" id="side-note"></a>Side-note</h4>
+<p>If you read up on the WAL, you might encounter the topic of <code>physical</code> vs <code>logical</code> database replication. These terms are related to the <code>wal_level</code> but are not exactly the same.</p>
+<p><code>Physical</code> replication means to replicate a database byte-by-byte based on the <code>replica</code> WAL records. These records track low-level operations like removing stale objects (e.g. <code>VACUUM</code>) or updating indices (e.g. <code>INSERT_LEAF</code>) as well as the <code>INSERT</code> etc. operations that actually change the data. If you replicate a database &#34;physically&#34;, it means that your replica database will perform the exact same actions (e.g. removing old WAL records) as the primary database which gives you as close to a &#34;physical&#34; copy of the original database as possible.</p>
+<p><code>Logical</code> replication means that your replica database only applies the high-level <code>logical</code> WAL records to its state but does its own housekeeping like vacuuming or creating indices. This doesn&#39;t give you a perfect clone which is always in exactly the same state as your primary database, but it gives you a copy of the data.</p>
+<p>Both replication types have their trade-offs. <code>Physical</code> replication is faster and creates a perfect byte-for-byte copy. However, it requires the replica to run the same Postgres version and architecture as the primary. <code>Logical</code> replication works across different Postgres versions, lets you replicate only specific tables, and allows the replica to have different indexes or even additional tables. But it comes with more overhead and requires the <code>logical</code> wal_level which stores more data in the WAL. It also requires you to run migrations against the replica database yourself since it does not replicate changes to the database structure.</p>
+<hr/>
+<p>Now, back to the <code>wal_level</code>. Let&#39;s first change the <code>wal_level</code> of our database to <code>logical</code>. Open up an editor connection to your database and run:</p>
+<pre><code translate="no" tabindex="0"><p><span>-- Check the current level</span>
+</p><p>SHOW wal_level<span>;</span>
+</p><p><span>-- Change the level to &#39;logical&#39;</span>
+</p><p><span>ALTER</span> SYSTEM <span>SET</span> <span>wal_level</span><span>=</span><span>&#39;logical&#39;</span><span>;</span>
+</p></code></pre>
+<p>You need to restart your database for the configuration to take effect. Once it&#39;s restarted, you can check the <code>wal_level</code> with:</p>
+<pre><code translate="no" tabindex="0"><p>SHOW wal_level<span>;</span>
+</p></code></pre>
+<p>It should now return <code>logical</code>.</p>
+<h3><a href="#ci-and-docker-configuration" aria-hidden="true" id="ci-and-docker-configuration"></a>CI and Docker Configuration</h3>
+<p>If you run Postgres using Docker, you need to add a startup command to configure the <code>wal_level</code>:</p>
+<pre><code translate="no" tabindex="0"><p><span>services</span><span>:</span>
+</p><p><span>postgres</span><span>:</span>
+</p><p><span>image</span><span>:</span> <span>postgres:18</span>
+</p><p><span>env</span><span>:</span>
+</p><p><span>...</span>
+</p><p><span>command</span><span>:</span> <span>[</span><span>&#34;postgres&#34;</span><span>,</span> <span>&#34;-c&#34;</span><span>,</span> <span>&#34;wal_level=logical&#34;</span><span>]</span>
+</p></code></pre>
+<p>In your CI, you can start the database like this:</p>
+<pre><code translate="no" tabindex="0"><p><span>-</span> <span>name</span><span>:</span> <span>&#34;Set PG settings&#34;</span>
+</p><p><span>run</span><span>:</span> <span><span>|</span></span>
+</p><p><span>    <span>docker</span> <span>exec</span> ${{ job.services.postgres.id <span>}</span><span>}</span> <span>sh</span> <span>-c</span> <span>&#39;echo &#34;wal_level=logical&#34; &gt;&gt; /var/lib/postgresql/data/postgresql.conf&#39;</span></span>
+</p><p><span>    <span>docker</span> <span>restart</span> ${{ job.services.pg.id <span>}</span><span>}</span></span>
+</p></code></pre>
+<p><em>Code snippets come from the <a href="https://hexdocs.pm/postgrex/Postgrex.ReplicationConnection.html">Postgrex.ReplicationConnection</a> documentation</em></p>
+<h2><a href="#interlude" aria-hidden="true" id="interlude"></a>Interlude</h2>
+<p>Before we continue, I need to tell you about <code>publications</code> and <code>replication slots</code> and about the difference between <code>temporary</code> and <code>persistent</code> replication slots.</p>
+<h3><a href="#publications" aria-hidden="true" id="publications"></a>Publications</h3>
+<p>First, a <a href="https://www.postgresql.org/docs/18/logical-replication-publication.html">Publication</a> is a way to tell Postgres which tables and operations (inserts, updates, deletes) you want to track. Think of it as an event &#34;topic&#34; which will only broadcast events for the tables and operations you have specified. Here&#39;s an example:</p>
+<pre><code translate="no" tabindex="0"><p><span>CREATE</span> PUBLICATION active_user_publication
+</p><p><span>FOR</span> <span>TABLE</span> <span>users</span>
+</p><p><span>-- Filters are available only from Postgres 15+</span>
+</p><p>    WHERE <span>(</span><span>active</span> <span>IS</span> TRUE<span>)</span>
+</p><p><span>WITH</span> <span>(</span>publish <span>=</span> <span>&#39;insert,delete&#39;</span><span>)</span><span>;</span>
+</p></code></pre>
+<p>The publication above will publish only the <code>INSERT</code>, <code>DELETE</code>, <code>BEGIN</code>, and <code>COMMIT</code> events for the <code>active</code> users in the <code>users</code> table.</p>
+<p>Here&#39;s another example:</p>
+<pre><code translate="no" tabindex="0"><p><span>CREATE</span> PUBLICATION everything_publication <span>FOR</span> <span>ALL</span> <span>TABLES</span><span>;</span>
+</p></code></pre>
+<p>This publication will publish <strong>all</strong> events (<code>BEGIN</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, and <code>COMMIT</code>) for <strong>all</strong> rows and tables. It might be a lot, so when you add your listener, rather restrict the publication to only what you need. You can always change a publication later with a <code>ALTER PUBLICATION</code> call.</p>
+<p>Alright, now you know about publications and how to create them. Next, let&#39;s dive into <code>replication slots</code>.</p>
+<h3><a href="#replication-slots" aria-hidden="true" id="replication-slots"></a>Replication Slots</h3>
+<p>A <a href="https://www.postgresql.org/docs/18/warm-standby.html#STREAMING-REPLICATION-SLOTS">Replication Slot</a> is a separate copy of the WAL just for our use-case, which is a WAL listener. It tracks how far the listener has read through the WAL and removes WAL records only once the listener has acknowledged them. By using a separate copy of the WAL, we can keep records that the listener hasn&#39;t processed yet, even if they&#39;ve been deleted from the original WAL. It also lets us resend records if the listener crashes.</p>
+<p>Now, if you had a peek at Filipe&#39;s or Supabase&#39;s implementation above, you might have spotted that they use a <code>temporary</code> replication slot. The reason for this is that replication slots can create serious problems for the database if we don&#39;t consume them. They will keep on growing until they fill up all disk space allocated to the WAL because Postgres deletes their WAL records only after we consume them.</p>
+<p>A <code>temporary</code> replication slot avoids this issue because Postgres deletes it whenever we lose connection to the database. So, if our listener crashes or we remove the listener from our application, Postgres will automatically clean up the replication slot for us which is great from a not-taking-down-the-database perspective.</p>
+<p>The downside of using a temporary replication slot is that we have to keep the listener online at all times if we want to listen to all database changes. You might see the problem with this already. If the listener is offline, it will miss change events which is not great from a not-missing-any-events perspective.</p>
+<p>If never missing a database change is important to you, a <code>persistent</code> replication slot might be the better choice. Postgres will always write WAL records to it, even if your listener is offline. When it comes back online, the replication slot will send the WAL records it has missed. If the listener crashes before it can acknowledge the records, the replication slot will resend them when the listener restarts.</p>
+<p>Be warned though that <code>persistent</code> replication slots allow only one connection, so you can have only one listener at a time. Also, every implementation I&#39;ve seen in my research for this post has warned against using a <code>persistent</code> slot, but other than filling up the disk, I have yet to understand what other downsides it brings.</p>
+<p>Alright, now with these pros and cons in mind, let&#39;s continue. I will show you how to create a <code>persistent</code> replication slot. If you want a <code>temporary</code> one, have a look at Supabase&#39;s implementation above.</p>
+<h2><a href="#the-migrations" aria-hidden="true" id="the-migrations"></a>The Migrations</h2>
+<p>We need two migrations, one to create the publication and one to create the replication slot. We can&#39;t use a single migration for both because we must create the replication slot in its own transaction and Ecto wraps a migration into a single transaction. So, two migrations it is.</p>
+<p>First, create the publication migration with:</p>
+<pre><code translate="no" tabindex="0"><p><span>mix</span> <span>ecto.gen.migration</span> <span>create_wal_publication</span>
+</p></code></pre>
+<p>In there, create your publication:</p>
+<pre><code translate="no" tabindex="0"><p><span>defmodule</span> <span>Wal.Repo.Migrations.CreateWalPublication</span> <span>do</span>
+</p><p><span>use</span> <span>Ecto.Migration</span>
+</p><p><span>def</span> <span>change</span> <span>do</span>
+</p><p><span># Adding this extension is optional but helps with</span>
+</p><p><span># debugging WAL messages inside Postgres.</span>
+</p><p><span>#</span>
+</p><p><span># It&#39;s not needed to listen to the WAL but we&#39;ll use</span>
+</p><p><span># it for debugging purposes. It is available from</span>
+</p><p><span># Postgres 15 onwards. If you&#39;re on an older version</span>
+</p><p><span># of Postgres: Why?</span>
+</p><p><span>execute</span> <span>&#34;&#34;&#34;</span>
+</p><p><span>            CREATE EXTENSION IF NOT EXISTS pg_walinspect;</span>
+</p><p><span>            &#34;&#34;&#34;</span><span>,</span>
+</p><p><span>&#34;&#34;&#34;</span>
+</p><p><span>            DROP EXTENSION IF EXISTS pg_walinspect;</span>
+</p><p><span>            &#34;&#34;&#34;</span>
+</p><p><span># Define your publication below:</span>
+</p><p><span>execute</span> <span>&#34;&#34;&#34;</span>
+</p><p><span>            CREATE PUBLICATION wal_listener_publication FOR ALL TABLES;</span>
+</p><p><span>            &#34;&#34;&#34;</span><span>,</span>
+</p><p><span>&#34;&#34;&#34;</span>
+</p><p><span>            DROP PUBLICATION IF EXISTS wal_listener_publication;</span>
+</p><p><span>            &#34;&#34;&#34;</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p></code></pre>
+<p>Alright, now let&#39;s create the persistent replication slot with:</p>
+<pre><code translate="no" tabindex="0"><p><span>mix</span> <span>ecto.gen.migration</span> <span>create_wal_replication_slot</span>
+</p></code></pre>
+<p>And add the following to the new file:</p>
+<pre><code translate="no" tabindex="0"><p><span>defmodule</span> <span>Wal.Repo.Migrations.CreateWalReplicationSlot</span> <span>do</span>
+</p><p><span>use</span> <span>Ecto.Migration</span>
+</p><p><span>def</span> <span>change</span> <span>do</span>
+</p><p><span>execute</span> <span>&#34;&#34;&#34;</span>
+</p><p><span>            SELECT pg_create_logical_replication_slot(&#39;wal_listener&#39;, &#39;pgoutput&#39;, false);</span>
+</p><p><span>            &#34;&#34;&#34;</span><span>,</span>
+</p><p><span>&#34;&#34;&#34;</span>
+</p><p><span>            SELECT pg_drop_replication_slot(&#39;wal_listener&#39;);</span>
+</p><p><span>            &#34;&#34;&#34;</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p></code></pre>
+<p>Let&#39;s take a look at the arguments of the <code>pg_create_logical_replication_slot/3</code> call.</p>
+<p>The first argument (<code>wal_listener</code>) is the name of your replication slot. Next, the argument (<code>pgoutput</code>) defines the <a href="https://www.postgresql.org/docs/18/functions-admin.html">output plugin</a> the replication slot should use to convert the raw WAL record to a readable output format. <code>pgoutput</code> is the default and comes with Postgres but we could also use other plugins like <a href="https://github.com/eulerto/wal2json">wal2json</a>. The third argument <code>false</code> means that this replication slot is <strong>not</strong> temporary.</p>
+<p>Alright. Now, if you execute these two migrations with <code>mix ecto.migrate</code>, you should see the following records in your database:</p>
+<pre><code translate="no" tabindex="0"><p><span>&gt;</span> <span>SELECT</span> <span>*</span> <span>FROM</span> <span>pg_publication</span><span>;</span>
+</p><p>oid   pubname                  pubowner puballtables pubinsert pubupdate pubdelete pubtruncate pubviaroot pubgencols
+</p><p>16409 wal_listener_publication 10       <span>TRUE</span>         <span>TRUE</span>      <span>TRUE</span>      <span>TRUE</span>      <span>TRUE</span>        <span>FALSE</span>      n
+</p><p><span>&gt;</span> <span>SELECT</span> <span>*</span> <span>FROM</span> <span>pg_replication_slots</span><span>;</span>
+</p><p>slot_name    plugin   slot_type datoid <span>database</span> <span>temporary</span> active active_pid xmin catalog_xmin restart_lsn confirmed_flush_lsn wal_status safe_wal_size two_phase two_phase_at inactive_since               conflicting invalidation_reason failover synced
+</p><p>wal_listener pgoutput logical   26370  wal_dev  <span>FALSE</span>     <span>FALSE</span>  <span>NULL</span>       <span>NULL</span> 142253       4<span>/</span>4FC8CB80  4<span>/</span>4FC8CBB9          reserved   <span>NULL</span>          <span>FALSE</span>     <span>NULL</span>         2025<span>-</span>10<span>-</span>27 14:30:54<span>.</span>98639<span>+</span>00 <span>FALSE</span>       <span>NULL</span>                <span>FALSE</span>    <span>FALSE</span>
+</p></code></pre>
+<p>If you see an output similar to the one above, your migrations successfully created the publication and replication slot we need to listen to the WAL. So, let&#39;s do that next.</p>
+<h2><a href="#the-listener" aria-hidden="true" id="the-listener"></a>The Listener</h2>
+<p>As with so many things in the BEAM ecosystem, we can build our WAL listener on top of the shoulder of giants, in this case the <a href="https://hexdocs.pm/postgrex/Postgrex.ReplicationConnection.html">Postgrex.ReplicationConnection</a> which handles the low-level communication with Postgres for us. Here is the first part of our Listener module:</p>
+<pre><code translate="no" tabindex="0"><p><span>defmodule</span> <span>Wal.Replication</span> <span>do</span>
+</p><p><span>use</span> <span>Postgrex.ReplicationConnection</span>
+</p><p><span>require</span> <span>Logger</span>
+</p><p><span>def</span> <span>start_link</span><span>(</span><span>_opts</span><span>)</span> <span>do</span>
+</p><p><span>config</span> <span>=</span> <span>Wal.Repo</span><span>.</span><span>config</span><span>(</span><span>)</span>
+</p><p><span># Automatically reconnect if we lose connection.</span>
+</p><p><span>extra_opts</span> <span>=</span> <span>[</span>
+</p><p><span>auto_reconnect: </span><span>true</span>
+</p><p><span>]</span>
+</p><p><span>Postgrex.ReplicationConnection</span><span>.</span><span>start_link</span><span>(</span>
+</p><p><span>__MODULE__</span><span>,</span>
+</p><p><span>:ok</span><span>,</span>
+</p><p><span>extra_opts</span> <span>++</span> <span>config</span>
+</p><p><span>)</span>
+</p><p><span>end</span>
+</p><p><span><span>@<span><span>impl <span>Postgrex.ReplicationConnection</span></span></span></span></span>
+</p><p><span>def</span> <span>init</span><span>(</span><span>:ok</span><span>)</span> <span>do</span>
+</p><p><span>{</span><span>:ok</span><span>,</span> <span>%</span><span>{</span><span>messages: </span><span>[</span><span>]</span><span>,</span> <span>relations: </span><span>%</span><span>{</span><span>}</span><span>}</span><span>}</span>
+</p><p><span>end</span>
+</p><p><span><span>@<span><span>impl <span>Postgrex.ReplicationConnection</span></span></span></span></span>
+</p><p><span>def</span> <span>handle_connect</span><span>(</span><span>state</span><span>)</span> <span>do</span>
+</p><p><span>query</span> <span>=</span>
+</p><p><span>&#34;&#34;&#34;</span>
+</p><p><span>      START_REPLICATION SLOT wal_listener</span>
+</p><p><span>      LOGICAL 0/0</span>
+</p><p><span>      (proto_version &#39;1&#39;, publication_names &#39;wal_listener_publication&#39;)</span>
+</p><p><span>      &#34;&#34;&#34;</span>
+</p><p><span>Logger</span><span>.</span><span>debug</span><span>(</span><span>query</span><span>)</span>
+</p><p><span>{</span><span>:stream</span><span>,</span> <span>query</span><span>,</span> <span>[</span><span>]</span><span>,</span> <span>state</span><span>}</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p></code></pre>
+<p>Now, what happens here?</p>
+<p>First, we pull in all the nitty-gritty low-level logic necessary to connect, reconnect, query, and stream from Postgres with just one line:</p>
+<pre><code translate="no" tabindex="0"><p><span>use</span> <span>Postgrex.ReplicationConnection</span>
+</p></code></pre>
+<p>Next, we define the <code>start_link/1</code> function to start the listener. We pull in the already existing database configuration from our Repo with <code>Wal.Repo.config()</code>. This allows us to connect the WAL listener to our application database without having to duplicate the connection configuration but you could also provide your own connection details.</p>
+<p>We add the extra option <code>auto_reconnect: true</code> to instruct Postgrex to automatically reconnect our ReplicationConnection. And lastly, we call the <code>start_link/3</code> function on <code>Postgrex.ReplicationConnection</code> which uses <code>:gen_statem</code> and the <code>Postgrex.Protocol</code> to create a database connection for us.</p>
+<p>Now that we defined how to start the listener, we must implement the <code>init/1</code> callback. It simply returns our initial state with is <code>%{messages: [], relations: %{}}</code>. The <code>messages</code> list will hold the WAL messages we receive from Postgres until we can handle them and the <code>relations</code> map will hold information about the tables in which the WAL changes occurred. But more about these later.</p>
+<p>Lastly, we implement one optional callback <code>handle_connect/1</code>. This callback allows us to send a query to Postgres after the database connection was established.</p>
+<pre><code translate="no" tabindex="0"><p>START_REPLICATION SLOT wal_listener
+</p><p>    LOGICAL 0<span>/</span>0
+</p><p><span>(</span>proto_version &#39;1&#39;<span>,</span> publication_names &#39;wal_listener_publication&#39;<span>)</span>
+</p></code></pre>
+<p>With this query, we tell Postgres that it can start sending the logical WAL records from the <code>wal_listener</code> replication slot our way. We tell it to start at the Log Sequence Number (LSN) <code>0/0</code>, which is the very first record ever recorded. This doesn&#39;t mean it will send us <strong>all</strong> WAL records ever created though.</p>
+<p>Our replication slot starts tracking WAL records only after we create it and it doesn&#39;t backfill records that happened before. So, unless we create our replication slot before we store a single row, it will miss WAL records, just keep that in mind.</p>
+<p>Lastly, we provide the options <code>proto_version</code> and <code>publication_name</code>. The publication name is the publication we&#39;ve created before. As proto version, we use version <code>1</code>. You can also use proto version <a href="https://www.postgresql.org/docs/18/protocol-logical-replication.html#PROTOCOL-LOGICAL-REPLICATION-PARAMS">2, 3, or 4</a> which are useful if you have very large transactions or two-phase transactions.</p>
+<p>On proto version 1, Postgres will wait until very large transactions commit and only then send the WAL records, but in version 2 and 4, it will send the records while the transactions are still in progress, optionally in parallel on version 4. Version 3 supports <a href="https://www.postgresql.org/docs/current/two-phase.html">two-phase commits</a>, which are useful to prepare and commit distributed transactions in multiple databases at once.</p>
+<p>If you need these advanced features, make sure to also add the <code>streaming &#39;on&#39; or &#39;parallel&#39;</code> option for streaming in-progress transactions and the <code>two_phase TRUE</code> options to the <code>START_REPLICATION</code> query.</p>
+<p>Alright, now that we told Postgres to start sending WAL records our way, let&#39;s see how we can receive and decode the messages, starting with the keep-alive heartbeat.</p>
+<h2><a href="#handling-heartbeats" aria-hidden="true" id="handling-heartbeats"></a>Handling Heartbeats</h2>
+<p>If you look at the docs of <a href="https://www.postgresql.org/docs/18/protocol-replication.html#PROTOCOL-REPLICATION-START-REPLICATION">START_REPLICATION</a>, you&#39;ll see that Postgres will send us two types of messages: <code>XLogData</code> and the <code>Primary Keep-Alive Message</code>. <code>XLogData</code> contains the data of one logical WAL record in binary format. The <code>Primary Keep-Alive Message</code> is a heartbeat from Postgres to our listener and has four purposes:</p>
+<ol>
+<li>It checks that our listener is still alive, hence the name. If our listener fails to respond, Postgres will close the connection.</li>
+<li>It tells the listener that our Postgres instance is still alive and our replication slot is active.</li>
+<li>It provides the LSN of the latest WAL record our replication slot has recorded.</li>
+<li>It gives the listener the opportunity to acknowledge the <code>XLogData</code> messages it has received since the last keep-alive message by replying with a <code>Standby Status Update</code> or <code>Hot Standby Feedback</code> message.</li>
+</ol>
+<p>Let&#39;s implement the last step, which is to receive and to reply to a keep-alive message.</p>
+<p>Here&#39;s how the listener handles this:</p>
+<pre><code translate="no" tabindex="0"><p><span># Primary Keep Alive Message</span>
+</p><p><span># <span>https://www.postgresql.org/docs/current/protocol-replication.html#PROTOCOL-REPLICATION-PRIMARY-KEEPALIVE-MESSAGE</span></span>
+</p><p><span><span>@<span><span>impl <span>Postgrex.ReplicationConnection</span></span></span></span></span>
+</p><p><span>def</span> <span>handle_data</span><span>(</span><span>&lt;&lt;</span><span>?k</span><span>,</span> <span>wal_end</span><span>::</span><span>64</span><span>,</span> <span>_server_time</span><span>::</span><span>64</span><span>,</span> <span>should_reply</span><span>::</span><span>8</span><span>&gt;&gt;</span><span>,</span> <span>state</span><span>)</span> <span>do</span>
+</p><p><span>messages</span> <span>=</span>
+</p><p><span>case</span> <span>should_reply</span> <span>do</span>
+</p><p><span># Standby Status Update</span>
+</p><p><span># <span>https://www.postgresql.org/docs/current/protocol-replication.html#PROTOCOL-REPLICATION-STANDBY-STATUS-UPDATE</span></span>
+</p><p><span>1</span> <span>-&gt;</span> <span>[</span><span>&lt;&lt;</span><span>?r</span><span>,</span> <span>wal_end</span> <span>+</span> <span>1</span><span>::</span><span>64</span><span>,</span> <span>wal_end</span> <span>+</span> <span>1</span><span>::</span><span>64</span><span>,</span> <span>wal_end</span> <span>+</span> <span>1</span><span>::</span><span>64</span><span>,</span> <span>current_time</span><span>(</span><span>)</span><span>::</span><span>64</span><span>,</span> <span>0</span><span>&gt;&gt;</span><span>]</span>
+</p><p><span>0</span> <span>-&gt;</span> <span>[</span><span>]</span>
+</p><p><span>end</span>
+</p><p><span>Logger</span><span>.</span><span>debug</span><span>(</span><span>&#34;Responding to keep alive: <span>#{</span><span>should_reply</span><span>}</span> - <span>#{</span><span>inspect</span><span>(</span><span>messages</span><span>)</span><span>}</span>&#34;</span><span>)</span>
+</p><p><span>{</span><span>:noreply</span><span>,</span> <span>messages</span><span>,</span> <span>state</span><span>}</span>
+</p><p><span>end</span>
+</p></code></pre>
+<p>Our <code>handle_data/2</code> callback receives both the keep-alive and <code>XLogData</code> messages. Here, we match against the keep-alive message which starts with the character <code>k</code>. After the identifier, we receive the latest LSN our replication slot has recorded, the server time, and a one byte flag <code>should_reply</code> which Postgres might set if it wants to know that our listener is still active.</p>
+<p>If we should reply, we respond with a <code>Standby Status Update</code> message. This message starts with an <code>r</code> as identifier, followed by the LSN of the last message that we have received and written to disk (first LSN), that we have flushed to disk (second LSN), and that we have applied (third LSN). In this case, we are not too sensitive about losing messages, which is why we simply return the last LSN from the server three times, assuming that we have received and processed all messages it has sent to us successfully.</p>
+<p>However, if we wanted to be absolutely sure that we never lose a message, we could track which messages we wrote to a buffer (first LSN), which messages we flushed from the buffer to disk or other persistence method (second LSN) and which messages we applied to our database or other state (third LSN). Postgres will consider a message <code>acknowledged</code> only after we mark it as &#34;applied&#34;. We usually don&#39;t need this level of detail but it&#39;s good to know about.</p>
+<p>We respond with the simplified <code>Standby Status Update</code> message, but we could also have sent a <code>Hot Standby Feedback Message</code>. The difference between <code>Standby</code> and <code>Hot Standby</code> is that Hot Standbys run queries against their state and these queries might touch records that have been deleted on the primary but are still needed on the Hot Standby. For example, imagine that your listener receives the <code>INSERT</code> message for a record, adds it to its state, and then runs a query against that state. Now, if Postgres sends us a <code>DELETE</code> message for that record before our query completes, the listener cannot apply that message until the query completes. Otherwise, it would &#34;pull the rug&#34; from underneath the query so to speak.</p>
+<p>So, the listener buffers the message and waits for the query to complete. While it is waiting, it would reply to Postgres with a <code>Hot Standby Feedback Message</code> that tells Postgres <em>&#34;Hey, hang on a sec. I first gotta finish this work before I can acknowledge all the new messages you&#39;ve sent me&#34;</em>. Postgres would then keep the WAL records that it has sent until the listener sends a regular <code>Standby Status Update</code> which acknowledges the old WAL records. Again, you probably won&#39;t ever need to send a <code>Hot Standby Feedback Message</code>, but it&#39;s good to know about.</p>
+<h2><a href="#decoding-messages" aria-hidden="true" id="decoding-messages"></a>Decoding Messages</h2>
+<p>Now that we can receive and respond to keep-alive messages, let&#39;s see how our listener can receive and decode the logical WAL records received as <code>XLogData</code> messages.</p>
+<p>First, we need to create a second <code>handle_data/2</code> function which matches against the <code>XLogData</code> format:</p>
+<pre><code translate="no" tabindex="0"><p><span># XLogData</span>
+</p><p><span># <span>https://www.postgresql.org/docs/current/protocol-replication.html#PROTOCOL-REPLICATION-STANDBY-STATUS-UPDATE</span></span>
+</p><p><span>def</span> <span>handle_data</span><span>(</span><span>&lt;&lt;</span><span>?w</span><span>,</span> <span>raw_lsn</span><span>::</span><span>64</span><span>,</span> <span>_latest_lsn</span><span>::</span><span>64</span><span>,</span> <span>_server_time</span><span>::</span><span>64</span><span>,</span> <span>payload</span><span>::</span><span>bytes</span><span>&gt;&gt;</span><span>,</span> <span>state</span><span>)</span> <span>do</span>
+</p><p><span>payload</span> <span>=</span> <span>Wal.Decoder</span><span>.</span><span>parse</span><span>(</span><span>payload</span><span>)</span>
+</p><p><span>lsn</span> <span>=</span> <span>Wal.Decoder</span><span>.</span><span>to_lsn</span><span>(</span><span>raw_lsn</span><span>)</span>
+</p><p><span>message</span> <span>=</span> <span>%</span><span>{</span>
+</p><p><span>lsn: </span><span>lsn</span><span>,</span>
+</p><p><span>type: </span><span>payload</span><span>.</span><span>type</span><span>,</span>
+</p><p><span>payload: </span><span>payload</span>
+</p><p><span>}</span>
+</p><p><span>Logger</span><span>.</span><span>debug</span><span>(</span><span>message</span><span>)</span>
+</p><p><span>state</span> <span>=</span> <span>handle_message</span><span>(</span><span>message</span><span>,</span> <span>state</span><span>)</span>
+</p><p><span>{</span><span>:noreply</span><span>,</span> <span>state</span><span>}</span>
+</p><p><span>end</span>
+</p><p><span># Will be implemented later</span>
+</p><p><span>defp</span> <span>handle_message</span><span>(</span><span>_message</span><span>,</span> <span>state</span><span>)</span><span>,</span> <span>do: </span><span>state</span>
+</p></code></pre>
+<p><code>XLogData</code> messages start with a <code>w</code> as identifier followed by the LSN of the WAL record, the latest WAL record in the replication slot, the server timestamp, and the message payload in bytes. For our use-case, we&#39;re only interested in the payload, but we could use the latest LSN to see how far our listener runs behind and we could use the timestamp to calculate the latency with the server.</p>
+<p>But for now, let&#39;s focus on decoding the message payload. I will show you how to decode a few messages yourself, but for a complete decoder of all possible messages, have a look at Supabase&#39;s <a href="https://github.com/supabase/realtime/blob/main/lib/realtime/adapters/postgres/decoder.ex">Realtime</a> decoder or the <a href="https://github.com/cainophile/pgoutput_decoder">PgoutputDecoder</a> project.</p>
+<p>Now, here&#39;s how to decode the <code>BEGIN</code>, <code>INSERT</code>, and <code>COMMIT</code> messages:</p>
+<pre><code translate="no" tabindex="0"><p><span>defmodule</span> <span>Wal.Decoder</span> <span>do</span>
+</p><p><span># Begin</span>
+</p><p><span># <span>https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-BEGIN</span></span>
+</p><p><span>def</span> <span>parse</span><span>(</span><span>&lt;&lt;</span><span>?B</span><span>,</span> <span>lsn_end</span><span>::</span><span>64</span><span>,</span> <span>_timestamp</span><span>::</span><span>64</span><span>,</span> <span>tx_id</span><span>::</span><span>32</span><span>&gt;&gt;</span><span>)</span> <span>do</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:begin</span><span>,</span> <span>lsn_end: </span><span>to_lsn</span><span>(</span><span>lsn_end</span><span>)</span><span>,</span> <span>tx_id: </span><span>tx_id</span><span>}</span>
+</p><p><span>end</span>
+</p><p><span># Insert</span>
+</p><p><span># Without transaction_id because we are not streaming transactions</span>
+</p><p><span># <span>https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-INSERT</span></span>
+</p><p><span>def</span> <span>parse</span><span>(</span><span>&lt;&lt;</span><span>?I</span><span>,</span> <span>relation_id</span><span>::</span><span>32</span><span>,</span> <span>?N</span><span>,</span> <span>tuple_data</span><span>::</span><span>bytes</span><span>&gt;&gt;</span><span>)</span> <span>do</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:insert</span><span>,</span> <span>relation_id: </span><span>relation_id</span><span>,</span> <span>data: </span><span>parse_tuple_data</span><span>(</span><span>tuple_data</span><span>)</span><span>}</span>
+</p><p><span>end</span>
+</p><p><span># Commit</span>
+</p><p><span># <span>https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-COMMIT</span></span>
+</p><p><span>def</span> <span>parse</span><span>(</span><span>&lt;&lt;</span><span>?C</span><span>,</span> <span>_flags</span><span>::</span><span>8</span><span>,</span> <span>lsn</span><span>::</span><span>64</span><span>,</span> <span>lsn_end</span><span>::</span><span>64</span><span>,</span> <span>_timestamp</span><span>::</span><span>64</span><span>&gt;&gt;</span><span>)</span> <span>do</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:commit</span><span>,</span> <span>commit_lsn: </span><span>to_lsn</span><span>(</span><span>lsn</span><span>)</span><span>,</span> <span>tx_end_lsn: </span><span>to_lsn</span><span>(</span><span>lsn_end</span><span>)</span><span>}</span>
+</p><p><span>end</span>
+</p><p><span># Relation</span>
+</p><p><span># <span>https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html#PROTOCOL-LOGICALREP-MESSAGE-FORMATS-RELATION</span></span>
+</p><p><span>def</span> <span>parse</span><span>(</span><span>&lt;&lt;</span><span>?R</span><span>,</span> <span>relation_id</span><span>::</span><span>32</span><span>,</span> <span>rest</span><span>::</span><span>bytes</span><span>&gt;&gt;</span><span>)</span> <span>do</span>
+</p><p><span># Parses a Relation message</span>
+</p><p><span>end</span>
+</p><p><span>defp</span> <span>parse_tuple_data</span><span>(</span><span>data</span><span>)</span> <span>do</span>
+</p><p><span># Parses a TupleData struct</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>to_lsn</span><span>(</span><span>lsn_int</span><span>)</span> <span>do</span>
+</p><p><span># Converts an integer LSN to the hex format &#34;<span>XXX</span>/<span>XXX</span>&#34;</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p></code></pre>
+<p>As you can see, every message starts with an identifiying character and otherwise follows the <a href="https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html">specs in the docs</a>. I only stubbed the <code>parse_tuple_data/1</code> and <code>to_lsn/1</code> functions and the <code>Relation</code> parser, since this post is already long enough. Please see my partial <a href="https://github.com/PJUllrich/PeterAndCode/blob/main/wal/lib/wal/decoder.ex">Decoder</a> on GitHub for more details on the actual implementation.</p>
+<p>Alright, now our listener can receive and decode WAL messages. Let&#39;s take it for a spin and see what events we receive for a typical <code>insert</code> transaction.</p>
+<h2><a href="#receiving-messages" aria-hidden="true" id="receiving-messages"></a>Receiving Messages</h2>
+<p>First, we need to start the listener in our <code>Application</code> just after we start the Repo connection:</p>
+<pre><code translate="no" tabindex="0"><p><span>defmodule</span> <span>Wal.Application</span> <span>do</span>
+</p><p><span>use</span> <span>Application</span>
+</p><p><span><span>@<span><span>impl <span>true</span></span></span></span></span>
+</p><p><span>def</span> <span>start</span><span>(</span><span>_type</span><span>,</span> <span>_args</span><span>)</span> <span>do</span>
+</p><p><span>children</span> <span>=</span> <span>[</span>
+</p><p><span>WalWeb.Telemetry</span><span>,</span>
+</p><p><span>Wal.Repo</span><span>,</span>
+</p><p><span>Wal.Replication</span><span>,</span>
+</p><p><span># Others</span>
+</p><p><span>]</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p></code></pre>
+<p>Let&#39;s start the application with <code>iex -S mix phx.server</code> and create a test record. I will create a test <code>Meeting</code> record which has a <code>title</code> and a <code>from</code> and <code>until</code> timestamp.</p>
+<pre><code translate="no" tabindex="0"><p><span>iex</span><span>&gt;</span> <span>Wal.Meetings</span><span>.</span><span>create_meeting</span><span>(</span><span>%</span><span>{</span>
+</p><p><span>title: </span><span>&#34;Test Meeting&#34;</span><span>,</span>
+</p><p><span>from: </span><span>~</span>U<span>[</span>2025-01-01 10:00:00Z<span>]</span><span>,</span>
+</p><p><span>until: </span><span>~</span>U<span>[</span>2025-01-01 11:00:00Z<span>]</span>
+</p><p><span>}</span><span>)</span>
+</p><p><span>{</span><span>:ok</span><span>,</span> <span>meeting</span><span>}</span>
+</p></code></pre>
+<p>These are the WAL messages our listener has received:</p>
+<pre><code translate="no" tabindex="0"><p><span>[</span><span>type: </span><span>:begin</span><span>,</span> <span>payload: </span><span>%</span><span>{</span>
+</p><p><span>type: </span><span>:begin</span><span>,</span>
+</p><p><span>lsn_end: </span><span>&#34;4/5A7D7E10&#34;</span><span>,</span>
+</p><p><span>tx_id: </span><span>385169</span>
+</p><p><span>}</span><span>,</span> <span>lsn: </span><span>&#34;4/5A7D6730&#34;</span><span>,</span> <span>latest_lsn: </span><span>&#34;4/5A7D6730&#34;</span><span>]</span>
+</p><p><span>[</span><span>type: </span><span>:relation</span><span>,</span> <span>payload: </span><span>%</span><span>{</span>
+</p><p><span>type: </span><span>:relation</span><span>,</span> <span>columns: </span><span>[</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;id&#34;</span><span>,</span> <span>flag: </span><span>1</span><span>,</span> <span>data_type_oid: </span><span>20</span><span>,</span> <span>type_modifier: </span><span>4294967295</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;title&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1043</span><span>,</span> <span>type_modifier: </span><span>259</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;from&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1114</span><span>,</span> <span>type_modifier: </span><span>0</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;until&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1114</span><span>,</span> <span>type_modifier: </span><span>0</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;inserted_at&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1114</span><span>,</span> <span>type_modifier: </span><span>0</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;updated_at&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1114</span><span>,</span> <span>type_modifier: </span><span>0</span><span>}</span>
+</p><p><span>]</span><span>,</span>
+</p><p><span>relation_id: </span><span>26378</span><span>,</span>
+</p><p><span>namespace: </span><span>&#34;public&#34;</span><span>,</span>
+</p><p><span>relation_name: </span><span>&#34;meetings&#34;</span><span>,</span>
+</p><p><span>replica_identity_setting: </span><span>:default</span>
+</p><p><span>}</span><span>,</span> <span>lsn: </span><span>&#34;0/0&#34;</span><span>,</span> <span>latest_lsn: </span><span>&#34;0/0&#34;</span><span>]</span>
+</p><p><span>[</span><span>type: </span><span>:insert</span><span>,</span> <span>payload: </span><span>%</span><span>{</span>
+</p><p><span>data: </span><span>[</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;55&#34;</span><span>,</span> <span>length: </span><span>2</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;Test Meeting&#34;</span><span>,</span> <span>length: </span><span>12</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;2025-01-01 10:00:00&#34;</span><span>,</span> <span>length: </span><span>19</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;2025-01-01 11:00:00&#34;</span><span>,</span> <span>length: </span><span>19</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;2025-11-03 14:18:03&#34;</span><span>,</span> <span>length: </span><span>19</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;2025-11-03 14:18:03&#34;</span><span>,</span> <span>length: </span><span>19</span><span>}</span>
+</p><p><span>]</span><span>,</span>
+</p><p><span>type: </span><span>:insert</span><span>,</span> <span>relation_id: </span><span>26378</span>
+</p><p><span>}</span><span>,</span> <span>lsn: </span><span>&#34;4/5A7D6730&#34;</span><span>,</span> <span>latest_lsn: </span><span>&#34;4/5A7D6730&#34;</span><span>]</span>
+</p><p><span>[</span><span>type: </span><span>:commit</span><span>,</span> <span>payload: </span><span>%</span><span>{</span>
+</p><p><span>type: </span><span>:commit</span><span>,</span>
+</p><p><span>commit_lsn: </span><span>&#34;4/5A7D7E10&#34;</span><span>,</span>
+</p><p><span>tx_end_lsn: </span><span>&#34;4/5A7D7E40&#34;</span>
+</p><p><span>}</span><span>,</span> <span>lsn: </span><span>&#34;4/5A7D7E40&#34;</span><span>,</span> <span>latest_lsn: </span><span>&#34;4/5A7D7E40&#34;</span><span>]</span>
+</p></code></pre>
+<p>Let&#39;s discuss them in detail, starting at the top.</p>
+<h3><a href="#the-begin" aria-hidden="true" id="the-begin"></a>The BEGIN</h3>
+<pre><code translate="no" tabindex="0"><p><span>[</span><span>type: </span><span>:begin</span><span>,</span> <span>payload: </span><span>%</span><span>{</span>
+</p><p><span>type: </span><span>:begin</span><span>,</span>
+</p><p><span>lsn_end: </span><span>&#34;4/5A7D7E10&#34;</span><span>,</span>
+</p><p><span>tx_id: </span><span>385169</span>
+</p><p><span>}</span><span>,</span> <span>lsn: </span><span>&#34;4/5A7D6730&#34;</span><span>,</span> <span>latest_lsn: </span><span>&#34;4/5A7D6730&#34;</span><span>]</span>
+</p></code></pre>
+<p>The <code>BEGIN</code> message starts the transaction, but if you compare the <code>lsn_end</code> and <code>commit_lsn</code> fields in the <code>BEGIN</code> and <code>COMMIT</code> message, you&#39;ll see that it already contains the LSN of the <code>COMMIT</code> message!</p>
+<p>So, how does the <code>BEGIN</code> message know when the transaction will commit?</p>
+<p>The reason for this is Postgres&#39; <a href="https://github.com/postgres/postgres/blob/cf8be022538937fe9fe22de776fb8cfe6460a784/src/backend/replication/logical/reorderbuffer.c#L14">ReorderBuffer</a> which buffers WAL records before forwarding them to <code>pgoutput</code>.</p>
+<p>The ReorderBuffer doesn&#39;t send the WAL records as they come in, but it first buffers and reorders them - hence the name - and only sends them to <code>pgoutput</code> when the transaction commits. If a transaction is rolled back, it won&#39;t forward the messages <a href="https://www.postgresql.org/docs/15/logicaldecoding-output-plugin.html">(see 49.6.4)</a> and we&#39;ll never receive them either. The ReorderBuffer forwards messages in sequence one transaction at a time, not in parallel. When <code>pgoutput</code> receives these messages, it prepends a <code>BEGIN</code> message to indicate the beginning of a transaction, and sends them our way.</p>
+<p>All of this means you don&#39;t have to worry about receiving messages out-of-order or interleaved with messages from other transactions (at least not if you use <code>proto_version &#39;1&#39;</code>), or handling rolled back vs committed transactions. Our listener will always receive ordered messages for one committed transaction at a time. Thank you Postgres!</p>
+<h3><a href="#the-relation" aria-hidden="true" id="the-relation"></a>The RELATION</h3>
+<pre><code translate="no" tabindex="0"><p><span>[</span><span>type: </span><span>:relation</span><span>,</span> <span>payload: </span><span>%</span><span>{</span>
+</p><p><span>type: </span><span>:relation</span><span>,</span> <span>columns: </span><span>[</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;id&#34;</span><span>,</span> <span>flag: </span><span>1</span><span>,</span> <span>data_type_oid: </span><span>20</span><span>,</span> <span>type_modifier: </span><span>4294967295</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;title&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1043</span><span>,</span> <span>type_modifier: </span><span>259</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;from&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1114</span><span>,</span> <span>type_modifier: </span><span>0</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;until&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1114</span><span>,</span> <span>type_modifier: </span><span>0</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;inserted_at&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1114</span><span>,</span> <span>type_modifier: </span><span>0</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>name: </span><span>&#34;updated_at&#34;</span><span>,</span> <span>flag: </span><span>0</span><span>,</span> <span>data_type_oid: </span><span>1114</span><span>,</span> <span>type_modifier: </span><span>0</span><span>}</span>
+</p><p><span>]</span><span>,</span>
+</p><p><span>relation_id: </span><span>26378</span><span>,</span>
+</p><p><span>namespace: </span><span>&#34;public&#34;</span><span>,</span>
+</p><p><span>relation_name: </span><span>&#34;meetings&#34;</span><span>,</span>
+</p><p><span>replica_identity_setting: </span><span>:default</span>
+</p><p><span>}</span><span>,</span> <span>lsn: </span><span>&#34;0/0&#34;</span><span>,</span> <span>latest_lsn: </span><span>&#34;0/0&#34;</span><span>]</span>
+</p></code></pre>
+<p><code>pgoutput</code> is so kind to send us the schema of the table before sending us the changes that were applied to it. It only sends it once per session but whenever we restart our connection, it will send it again.</p>
+<p>The <code>Relation</code> message contains basic information of our table columns like their <code>name</code>, whether they are part of the primary key (<code>flag: 1</code>), which data type they use (<code>data_type_oid</code>), and whether their data type is modified (<code>type_modifier</code> which is equal to <code>atttypmod</code>), for example if a varchar column has a maximum length modifier.</p>
+<p>It also contains the namespace and table name which is handy to connect the relation to an Ecto Schema. It also contains the <code>relation_id</code>, which is the table <code>Object Identifier (OID)</code>. This OID is useful to connect a table with the <code>INSERT</code> message we will look at next.</p>
+<h3><a href="#the-insert" aria-hidden="true" id="the-insert"></a>The INSERT</h3>
+<pre><code translate="no" tabindex="0"><p><span>[</span><span>type: </span><span>:insert</span><span>,</span> <span>payload: </span><span>%</span><span>{</span>
+</p><p><span>data: </span><span>[</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;55&#34;</span><span>,</span> <span>length: </span><span>2</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;Test Meeting&#34;</span><span>,</span> <span>length: </span><span>12</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;2025-01-01 10:00:00&#34;</span><span>,</span> <span>length: </span><span>19</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;2025-01-01 11:00:00&#34;</span><span>,</span> <span>length: </span><span>19</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;2025-11-03 14:18:03&#34;</span><span>,</span> <span>length: </span><span>19</span><span>}</span><span>,</span>
+</p><p><span>%</span><span>{</span><span>type: </span><span>:text</span><span>,</span> <span>value: </span><span>&#34;2025-11-03 14:18:03&#34;</span><span>,</span> <span>length: </span><span>19</span><span>}</span>
+</p><p><span>]</span><span>,</span>
+</p><p><span>type: </span><span>:insert</span><span>,</span> <span>relation_id: </span><span>26378</span>
+</p><p><span>}</span><span>,</span> <span>lsn: </span><span>&#34;4/5A7D6730&#34;</span><span>,</span> <span>latest_lsn: </span><span>&#34;4/5A7D6730&#34;</span><span>]</span>
+</p></code></pre>
+<p>The <code>Insert</code> message is pretty straightforward. It contains the inserted data per column. It points to the table into which the data was inserted through the <code>relation_id</code> field, which is the same OID of the relation that we received before.</p>
+<p>If you match the data rows with the relation column rows, you&#39;ll see that the first value was inserted into the <code>ID</code> field, the second value into the <code>title</code> field, and so on. Postgres splits the relation data from the change data to minimize bandwidth. We really don&#39;t need to receive the same table specs with every single event.</p>
+<h3><a href="#the-commit" aria-hidden="true" id="the-commit"></a>The COMMIT</h3>
+<pre><code translate="no" tabindex="0"><p><span>[</span><span>type: </span><span>:commit</span><span>,</span> <span>payload: </span><span>%</span><span>{</span>
+</p><p><span>type: </span><span>:commit</span><span>,</span>
+</p><p><span>commit_lsn: </span><span>&#34;4/5A7D7E10&#34;</span><span>,</span>
+</p><p><span>tx_end_lsn: </span><span>&#34;4/5A7D7E40&#34;</span>
+</p><p><span>}</span><span>,</span> <span>lsn: </span><span>&#34;4/5A7D7E40&#34;</span><span>,</span> <span>latest_lsn: </span><span>&#34;4/5A7D7E40&#34;</span><span>]</span>
+</p></code></pre>
+<p>Lastly, the <code>COMMIT</code> indicates the end of a transaction. Its <code>commit_lsn</code> points to the <code>BEGIN</code> message that started the transaction and its <code>tx_end_lsn</code> points to itself. At this point, we know the transaction is complete and can process the messages we&#39;ve received if we haven&#39;t done so already.</p>
+<h3><a href="#what-to-do-with-the-data-tho" aria-hidden="true" id="what-to-do-with-the-data-tho"></a>What to do with the data tho?</h3>
+<p>It&#39;s up to you! You can buffer the messages until you receive the final <code>COMMIT</code>, zip the data columns with the relation column definitions, and ... print them out? I guess? At least that&#39;s what I&#39;ve done <a href="https://github.com/PJUllrich/PeterAndCode/blob/626acbb63a310e0a874991cbdfcdf0050b1a6ee1/wal/lib/wal/replication.ex#L73">here</a>. What <strong>you</strong> do with the data depends on your use-case. Be creative!</p>
+<h2><a href="#crash-recovery" aria-hidden="true" id="crash-recovery"></a>Crash Recovery</h2>
+<p>We&#39;re almost at the end of this post, but one topic is important enough to delay that sweet sweet relief of closing the tab, feeling like you&#39;ve learned something, and then to forget everything you&#39;ve just read. Just, bear with me.</p>
+<p>One major consideration when tracking changes through the WAL is how to never miss a message, even if your listener crashes. Luckily, Postgres has got our back! As mentioned in the keep-alive message handler, Postgres will keep the WAL records until we acknowledge them either as response to the keep-alive message, after we receive each message, or once we&#39;ve received the final <code>COMMIT</code> message. Postgres calls these acknowledgments &#34;checkpoints&#34; by the way.</p>
+<p>In any case, if your listener crashes before it can acknowledge the messages, Postgres will just send them again the next time our listener connects! At least if you use a persistent replication slot. You can test this by starting your application, creating a record, waiting for the WAL messages to come in, and then quickly stopping your application before the next keep-alive message comes in. If you now start your application again, your listener will receive the same messages once more!</p>
+<p>This message recovery is great, but it also means that you must handle duplicate messages gracefully. So, however you process the messages, it must be <code>idempotent</code>.</p>
+<p>And that&#39;s it! Enough about the WAL!</p>
+<h2><a href="#further-considerations" aria-hidden="true" id="further-considerations"></a>Further Considerations</h2>
+<p>Ha! I tricked you! Kind of.</p>
+<p>Although this blog post was incredibly long, there&#39;s always more to learn about Postgres. Here are some pointers:</p>
+<ol>
+<li>Try out <a href="https://github.com/cpursley/walex">Walex</a> or <a href="https://github.com/cainophile/cainophile">Cainophile</a> which use the WAL for <code>Change Data Capture (CDC)</code> in Elixir.</li>
+<li>Peruse the <a href="https://github.com/supabase/realtime">Supabase Realtime</a> for inspiration.</li>
+<li>Look into creating a <code>Snapshot</code> when creating the <a href="https://www.postgresql.org/docs/18/protocol-replication.html#PROTOCOL-REPLICATION-CREATE-REPLICATION-SLOT">Replication Slot</a> which saves the current state of the database when you create your replication slot.</li>
+<li>Call me a liar or how much this post inspired you over on <a href="https://bsky.app/profile/peterullrich.com">Bluesky</a>. Your choice.</li>
+</ol>
+<h2><a href="#conclusion" aria-hidden="true" id="conclusion"></a>Conclusion</h2>
+<p>And that&#39;s it! I hope you enjoyed this article! If you want to support me, you can buy my <a href="https://pragprog.com/titles/puphoe/building-table-views-with-phoenix-liveview/">book</a> or video courses (<a href="https://indiecourses.com/catalog/build-an-mvp-with-elixir-6i4V9yOqLL54GuG0HkV9HR">one</a> and <a href="https://indiecourses.com/catalog/building-forms-with-phoenix-liveview-2OPYIqaekkZwrpgLUZOyZV">two</a>). Follow me on <a href="https://bsky.app/profile/peterullrich.com">Bluesky</a> or subscribe to my newsletter below if you want to get notified when I publish the next blog post. Until next time! Cheerio 👋</p>
+    </div></div>
+  </body>
+</html>
