@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://skoredin.pro/blog/golang/event-sourcing-go">Original</a>
+    <h1>Event Sourcing in Go: From Zero to Production</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        <article>
+            <header>
+                <p><span>Go &amp; Backend</span>
+                    <time datetime="2025-11-02">November 2, 2025</time>
+                    <span>22 min read</span>
+                </p>
+                
+                <p>Event sourcing: append-only architecture processing 10K events/sec with complete history, time travel debugging, and CQRS. From theory to production implementation.</p>
+            </header>
+
+            <section>
+                <div>
+                    <h2>Key Takeaways</h2>
+                    <ul>
+                        <li>Event sourcing provides complete audit trail and time-travel debugging capabilities</li>
+                        <li>CQRS separation enables independent scaling of reads and writes</li>
+                        <li>Snapshots are essential for performance with large event streams</li>
+                        <li>Proper event versioning and migration strategies prevent production disasters</li>
+                        <li>Event streaming with Kafka enables real-time projections and system integration</li>
+                    </ul>
+                </div>
+
+                
+                <h2 id="why-event-sourcing">Why Event Sourcing?</h2>
+                
+                <p>Your database shows current state. But how did it get there? Who changed what? When? Why?</p>
+
+                <pre><code>-- Traditional: Current state only
+SELECT balance FROM accounts WHERE id = 123;
+-- Result: 1000
+
+-- Event sourced: Complete history
+SELECT * FROM events WHERE aggregate_id = 123;
+-- Shows every deposit, withdrawal, fee, interest</code></pre>
+
+                <p>We needed audit trail for financial compliance. Event sourcing gave us that plus time travel, debugging superpowers, and perfect scalability.</p>
+
+                <h2 id="core-concepts">Core Concepts in 5 Minutes</h2>
+                
+                <p>Event sourcing stores state changes as a sequence of events rather than overwriting data. Instead of UPDATE statements that destroy history, we append immutable events that tell the complete story.</p>
+                
+                <p>Traditional systems show what IS. Event sourcing shows what HAPPENED. This distinction transforms debugging, auditing, and analytics. When a bug corrupts data, we can replay events to find exactly when and how it occurred.</p>
+                
+                <p>Events are facts about the past - they cannot be changed or deleted. This immutability provides natural audit logging and enables powerful patterns like temporal queries and retroactive fixes.</p>
+                
+                <p>State becomes a left-fold over events. Current balance isn&#39;t stored; it&#39;s calculated by replaying all deposits and withdrawals. This sounds slow but with snapshots and projections, it&#39;s actually faster than traditional systems for many use cases.</p>
+
+                <pre><code>// Events capture business intent
+type AccountOpened struct {
+    AccountID string
+    Currency  string
+}
+
+type MoneyDeposited struct {
+    AccountID string
+    Amount    decimal.Decimal
+}
+
+// State derived from event history
+func (a *Account) Apply(event Event) {
+    // Rebuild state by replaying events
+}</code></pre>
+
+                <h2 id="production-event-store">Production Event Store</h2>
+
+                <p>A production event store needs to handle millions of events efficiently. Our PostgreSQL-based implementation processes 10K events/second with proper indexing and partitioning. The append-only nature makes it extremely fast - no updates, no deletes, just inserts.</p>
+                
+                <p>Event ordering is critical for consistency. We use database sequences per aggregate to ensure events are applied in the correct order. This prevents race conditions where concurrent operations might corrupt state.</p>
+                
+                <p>The schema design balances normalization with query performance. Event data is stored as JSON for flexibility, while frequently queried fields (aggregate_id, event_type) are indexed columns. This hybrid approach enables both fast queries and schema evolution.</p>
+                
+                <p>Metadata tracks important context: user ID, correlation ID, causation ID. This audit trail proves invaluable for debugging and compliance. Every state change is traceable to its origin.</p>
+
+                <pre><code>type EventStore struct {
+    db *sql.DB
+}
+
+type StoredEvent struct {
+    ID            uuid.UUID
+    AggregateID   string
+    EventType     string
+    EventVersion  int
+    EventData     json.RawMessage
+    Metadata      json.RawMessage
+    OccurredAt    time.Time
+}
+
+// Append-only schema with proper indexes
+const schema = `
+CREATE TABLE events (
+    id UUID PRIMARY KEY,
+    aggregate_id VARCHAR(255) NOT NULL,
+    event_type VARCHAR(255) NOT NULL,
+    event_version INT NOT NULL,
+    event_data JSONB NOT NULL,
+    metadata JSONB,
+    occurred_at TIMESTAMP NOT NULL,
+    recorded_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    
+    -- Ensure events are ordered per aggregate
+    UNIQUE(aggregate_id, event_version),
+    
+    -- Indexes for queries
+    INDEX idx_aggregate (aggregate_id, event_version),
+    INDEX idx_event_type (event_type),
+    INDEX idx_occurred_at (occurred_at)
+);
+
+-- Global event sequence for ordering
+CREATE SEQUENCE IF NOT EXISTS global_event_sequence;
+ALTER TABLE events ADD COLUMN global_sequence BIGINT DEFAULT nextval(&#39;global_event_sequence&#39;);
+CREATE INDEX idx_global_sequence ON events(global_sequence);
+`
+
+func (es *EventStore) SaveEvents(ctx context.Context, aggregateID, aggregateType string, events []Event, expectedVersion int) error {
+    tx, err := es.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
+    
+    // Check optimistic concurrency
+    var currentVersion int
+    err = tx.QueryRow(`
+        SELECT COALESCE(MAX(event_version), 0) 
+        FROM events 
+        WHERE aggregate_id = $1`,
+        aggregateID,
+    ).Scan(¤tVersion)
+    
+    if err != nil {
+        return err
+    }
+    
+    if currentVersion != expectedVersion {
+        return fmt.Errorf(&#34;concurrency conflict: expected version %d, got %d&#34;, 
+            expectedVersion, currentVersion)
+    }
+    
+    // Save events
+    version := expectedVersion
+    for _, event := range events {
+        version++
+        
+        eventData, err := json.Marshal(event)
+        if err != nil {
+            return err
+        }
+        
+        metadata := map[string]interface{}{
+            &#34;user_id&#34;:     ctx.Value(&#34;user_id&#34;),
+            &#34;trace_id&#34;:    ctx.Value(&#34;trace_id&#34;),
+            &#34;source&#34;:      ctx.Value(&#34;source&#34;),
+        }
+        metadataJSON, _ := json.Marshal(metadata)
+        
+        _, err = tx.Exec(`
+            INSERT INTO events (
+                aggregate_id, aggregate_type, event_type, 
+                event_version, event_data, metadata, occurred_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            aggregateID,
+            aggregateType,
+            event.EventType(),
+            version,
+            eventData,
+            metadataJSON,
+            event.OccurredAt(),
+        )
+        
+        if err != nil {
+            return err
+        }
+    }
+    
+    return tx.Commit()
+}
+
+func (es *EventStore) GetEvents(ctx context.Context, aggregateID string, fromVersion int) ([]StoredEvent, error) {
+    rows, err := es.db.QueryContext(ctx, `
+        SELECT 
+            id, aggregate_id, aggregate_type, event_type,
+            event_version, event_data, metadata, 
+            occurred_at, recorded_at
+        FROM events
+        WHERE aggregate_id = $1 AND event_version &gt; $2
+        ORDER BY event_version`,
+        aggregateID, fromVersion,
+    )
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    
+    var events []StoredEvent
+    for rows.Next() {
+        var e StoredEvent
+        err := rows.Scan(
+            &amp;e.ID, &amp;e.AggregateID, &amp;e.AggregateType,
+            &amp;e.EventType, &amp;e.EventVersion, &amp;e.EventData,
+            &amp;e.Metadata, &amp;e.OccurredAt, &amp;e.RecordedAt,
+        )
+        if err != nil {
+            return nil, err
+        }
+        events = append(events, e)
+    }
+    
+    return events, nil
+}</code></pre>
+
+                <h2 id="aggregate-root-pattern">Aggregate Root Pattern</h2>
+
+                <pre><code>type AggregateRoot struct {
+    ID               string
+    Version          int
+    uncommittedEvents []Event
+}
+
+func (a *AggregateRoot) RecordEvent(event Event) {
+    a.uncommittedEvents = append(a.uncommittedEvents, event)
+    a.Version++
+}
+
+func (a *AggregateRoot) GetUncommittedEvents() []Event {
+    return a.uncommittedEvents
+}
+
+func (a *AggregateRoot) MarkEventsAsCommitted() {
+    a.uncommittedEvents = []Event{}
+}
+
+// Example: Account aggregate
+type Account struct {
+    AggregateRoot
+    Balance  decimal.Decimal
+    Currency string
+    Status   string
+}
+
+func (a *Account) Deposit(amount decimal.Decimal) error {
+    if amount.LessThanOrEqual(decimal.Zero) {
+        return fmt.Errorf(&#34;invalid deposit amount: %v must be positive&#34;, amount)
+    }
+    
+    event := MoneyDeposited{
+        AccountID: a.ID,
+        Amount:    amount,
+        Timestamp: time.Now(),
+    }
+    
+    a.Apply(event)
+    a.RecordEvent(event)
+    return nil
+}
+
+func (a *Account) Withdraw(amount decimal.Decimal) error {
+    if amount.GreaterThan(a.Balance) {
+        return fmt.Errorf(&#34;insufficient funds: attempting to withdraw %v from balance %v&#34;, amount, a.Balance)
+    }
+    
+    event := MoneyWithdrawn{
+        AccountID: a.ID,
+        Amount:    amount,
+        Timestamp: time.Now(),
+    }
+    
+    a.Apply(event)
+    a.RecordEvent(event)
+    return nil
+}
+
+func (a *Account) Apply(event Event) {
+    switch e := event.(type) {
+    case MoneyDeposited:
+        a.Balance = a.Balance.Add(e.Amount)
+    case MoneyWithdrawn:
+        a.Balance = a.Balance.Sub(e.Amount)
+    }
+}</code></pre>
+
+                <h2 id="cqrs-separation">CQRS: Command and Query Separation</h2>
+
+                <pre><code>// Write side: Commands modify aggregates
+type CommandHandler struct {
+    eventStore *EventStore
+    eventBus   *EventBus
+}
+
+func (h *CommandHandler) Handle(cmd Command) error {
+    switch c := cmd.(type) {
+    case DepositMoney:
+        return h.handleDeposit(c)
+    case WithdrawMoney:
+        return h.handleWithdraw(c)
+    }
+    return errors.New(&#34;unknown command&#34;)
+}
+
+func (h *CommandHandler) handleDeposit(cmd DepositMoney) error {
+    // Load aggregate from events
+    account := &amp;Account{}
+    events, err := h.eventStore.GetEvents(ctx, cmd.AccountID, 0)
+    if err != nil {
+        return err
+    }
+    
+    for _, e := range events {
+        account.Apply(e)
+    }
+    
+    // Execute business logic
+    err = account.Deposit(cmd.Amount)
+    if err != nil {
+        return err
+    }
+    
+    // Save new events
+    err = h.eventStore.SaveEvents(
+        ctx, 
+        account.ID, 
+        &#34;Account&#34;,
+        account.GetUncommittedEvents(),
+        account.Version,
+    )
+    if err != nil {
+        return err
+    }
+    
+    // Publish for projections
+    for _, event := range account.GetUncommittedEvents() {
+        h.eventBus.Publish(event)
+    }
+    
+    return nil
+}
+
+// Read side: Projections for queries
+type AccountProjection struct {
+    db *sql.DB
+}
+
+func (p *AccountProjection) Handle(event Event) error {
+    switch e := event.(type) {
+    case MoneyDeposited:
+        _, err := p.db.Exec(`
+            UPDATE account_projections 
+            SET balance = balance + $1, updated_at = NOW()
+            WHERE account_id = $2`,
+            e.Amount, e.AccountID,
+        )
+        return err
+        
+    case MoneyWithdrawn:
+        _, err := p.db.Exec(`
+            UPDATE account_projections 
+            SET balance = balance - $1, updated_at = NOW()
+            WHERE account_id = $2`,
+            e.Amount, e.AccountID,
+        )
+        return err
+    }
+    return nil
+}
+
+// Query handler reads from projections
+type QueryHandler struct {
+    db *sql.DB
+}
+
+func (q *QueryHandler) GetAccountBalance(accountID string) (decimal.Decimal, error) {
+    var balance decimal.Decimal
+    err := q.db.QueryRow(`
+        SELECT balance FROM account_projections WHERE account_id = $1`,
+        accountID,
+    ).Scan(&amp;balance)
+    return balance, err
+}</code></pre>
+
+                <div>
+                    <h3>⚠️ Eventual Consistency Tradeoff</h3>
+                    <p>CQRS introduces <strong>eventual consistency</strong> between write and read models:</p>
+                    <ul>
+                        <li>Events are written immediately to the event store</li>
+                        <li>Projections update asynchronously (typically milliseconds to seconds)</li>
+                        <li>Queries may return stale data until projections catch up</li>
+                        <li>Design your UX to handle this: optimistic UI updates, &#34;processing&#34; states, or read-your-writes guarantees where critical</li>
+                    </ul>
+                </div>
+
+                <h2 id="snapshots-performance">Snapshots for Performance</h2>
+
+                <pre><code>type Snapshot struct {
+    AggregateID string
+    Version     int
+    Data        []byte
+    CreatedAt   time.Time
+}
+
+func (es *EventStore) SaveSnapshot(ctx context.Context, snapshot Snapshot) error {
+    _, err := es.db.ExecContext(ctx, `
+        INSERT INTO snapshots (aggregate_id, version, data, created_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (aggregate_id) 
+        DO UPDATE SET version = $2, data = $3, created_at = $4`,
+        snapshot.AggregateID,
+        snapshot.Version,
+        snapshot.Data,
+        snapshot.CreatedAt,
+    )
+    return err
+}
+
+func (es *EventStore) GetSnapshot(ctx context.Context, aggregateID string) (*Snapshot, error) {
+    var s Snapshot
+    err := es.db.QueryRowContext(ctx, `
+        SELECT aggregate_id, version, data, created_at
+        FROM snapshots
+        WHERE aggregate_id = $1`,
+        aggregateID,
+    ).Scan(&amp;s.AggregateID, &amp;s.Version, &amp;s.Data, &amp;s.CreatedAt)
+    
+    if err == sql.ErrNoRows {
+        return nil, nil
+    }
+    return &amp;s, err
+}
+
+// Load aggregate with snapshot optimization
+func LoadAccount(es *EventStore, accountID string) (*Account, error) {
+    account := &amp;Account{}
+    
+    // Try to load snapshot
+    snapshot, err := es.GetSnapshot(ctx, accountID)
+    if err != nil {
+        return nil, err
+    }
+    
+    fromVersion := 0
+    if snapshot != nil {
+        // Restore from snapshot
+        err = json.Unmarshal(snapshot.Data, account)
+        if err != nil {
+            return nil, err
+        }
+        fromVersion = snapshot.Version
+    }
+    
+    // Apply events after snapshot
+    events, err := es.GetEvents(ctx, accountID, fromVersion)
+    if err != nil {
+        return nil, err
+    }
+    
+    for _, e := range events {
+        account.Apply(e)
+    }
+    
+    // Create new snapshot every 100 events
+    if len(events) &gt; 100 {
+        snapshotData, _ := json.Marshal(account)
+        es.SaveSnapshot(ctx, Snapshot{
+            AggregateID: accountID,
+            Version:     account.Version,
+            Data:        snapshotData,
+            CreatedAt:   time.Now(),
+        })
+    }
+    
+    return account, nil
+}</code></pre>
+
+                <h2 id="event-streaming-kafka">Event Streaming with Kafka</h2>
+
+                <pre><code>type EventStreamer struct {
+    eventStore *EventStore
+    producer   *kafka.Writer
+    lastSeq    int64
+}
+
+func (s *EventStreamer) StreamEvents(ctx context.Context) {
+    ticker := time.NewTicker(100 * time.Millisecond)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case &lt;-ctx.Done():
+            return
+        case &lt;-ticker.C:
+            s.publishNewEvents(ctx)
+        }
+    }
+}
+
+func (s *EventStreamer) publishNewEvents(ctx context.Context) {
+    rows, err := s.eventStore.db.QueryContext(ctx, `
+        SELECT 
+            global_sequence, aggregate_id, event_type, 
+            event_data, occurred_at
+        FROM events
+        WHERE global_sequence &gt; $1
+        ORDER BY global_sequence
+        LIMIT 1000`,
+        s.lastSeq,
+    )
+    if err != nil {
+        return
+    }
+    defer rows.Close()
+    
+    var messages []kafka.Message
+    var maxSeq int64
+    
+    for rows.Next() {
+        var seq int64
+        var aggregateID, eventType string
+        var eventData json.RawMessage
+        var occurredAt time.Time
+        
+        rows.Scan(&amp;seq, &amp;aggregateID, &amp;eventType, &amp;eventData, &amp;occurredAt)
+        
+        messages = append(messages, kafka.Message{
+            Topic: fmt.Sprintf(&#34;events.%s&#34;, eventType),
+            Key:   []byte(aggregateID),
+            Value: eventData,
+            Headers: []kafka.Header{
+                {Key: &#34;event_type&#34;, Value: []byte(eventType)},
+                {Key: &#34;occurred_at&#34;, Value: []byte(occurredAt.Format(time.RFC3339))},
+            },
+        })
+        
+        maxSeq = seq
+    }
+    
+    if len(messages) &gt; 0 {
+        err := s.producer.WriteMessages(ctx, messages...)
+        if err == nil {
+            s.lastSeq = maxSeq
+        }
+    }
+}</code></pre>
+
+                <h2 id="temporal-queries">Temporal Queries (Time Travel)</h2>
+
+                <pre><code>// Get account state at specific point in time
+func (es *EventStore) GetAggregateAtTime(ctx context.Context, aggregateID string, pointInTime time.Time) (*Account, error) {
+    events, err := es.db.QueryContext(ctx, `
+        SELECT event_type, event_data
+        FROM events
+        WHERE aggregate_id = $1 AND occurred_at &lt;= $2
+        ORDER BY event_version`,
+        aggregateID, pointInTime,
+    )
+    if err != nil {
+        return nil, err
+    }
+    defer events.Close()
+    
+    account := &amp;Account{}
+    for events.Next() {
+        var eventType string
+        var eventData json.RawMessage
+        events.Scan(&amp;eventType, &amp;eventData)
+        
+        event := deserializeEvent(eventType, eventData)
+        account.Apply(event)
+    }
+    
+    return account, nil
+}
+
+// Replay events for debugging
+func ReplayEvents(es *EventStore, from, to time.Time, handler func(Event)) error {
+    rows, err := es.db.Query(`
+        SELECT event_type, event_data, occurred_at
+        FROM events
+        WHERE occurred_at BETWEEN $1 AND $2
+        ORDER BY global_sequence`,
+        from, to,
+    )
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+    
+    for rows.Next() {
+        var eventType string
+        var eventData json.RawMessage
+        var occurredAt time.Time
+        
+        rows.Scan(&amp;eventType, &amp;eventData, &amp;occurredAt)
+        event := deserializeEvent(eventType, eventData)
+        handler(event)
+    }
+    
+    return nil
+}</code></pre>
+
+                <h2 id="saga-pattern">Saga Pattern for Distributed Transactions</h2>
+
+                <pre><code>type TransferSaga struct {
+    ID          string
+    FromAccount string
+    ToAccount   string
+    Amount      decimal.Decimal
+    State       string
+    CompletedSteps []string
+}
+
+func (s *TransferSaga) Handle(event Event) ([]Command, error) {
+    switch e := event.(type) {
+    case TransferInitiated:
+        return []Command{
+            WithdrawMoney{AccountID: e.FromAccount, Amount: e.Amount},
+        }, nil
+        
+    case MoneyWithdrawn:
+        if e.AccountID == s.FromAccount {
+            s.CompletedSteps = append(s.CompletedSteps, &#34;withdrawn&#34;)
+            return []Command{
+                DepositMoney{AccountID: s.ToAccount, Amount: s.Amount},
+            }, nil
+        }
+        
+    case MoneyDeposited:
+        if e.AccountID == s.ToAccount {
+            s.State = &#34;completed&#34;
+            return []Command{
+                MarkTransferComplete{TransferID: s.ID},
+            }, nil
+        }
+        
+    case WithdrawFailed:
+        s.State = &#34;failed&#34;
+        return nil, nil
+        
+    case DepositFailed:
+        // Compensate - refund the withdrawal
+        return []Command{
+            DepositMoney{AccountID: s.FromAccount, Amount: s.Amount},
+        }, nil
+    }
+    
+    return nil, nil
+}</code></pre>
+
+                <div>
+                    <h3> Event Store Consistency Warning</h3>
+                    <p>Event stores require careful attention to:</p>
+                    <ul>
+                        <li>Optimistic concurrency control to prevent data corruption</li>
+                        <li>Event ordering guarantees within aggregates</li>
+                        <li>Backup and recovery procedures for event streams</li>
+                        <li>Event schema evolution and versioning strategies</li>
+                    </ul>
+                </div>
+
+                <h2 id="security-considerations">Security Considerations</h2>
+                
+                <div>
+                    <h3> Event Sourcing Security Best Practices</h3>
+                    <ul>
+                        <li><strong>Event Encryption:</strong> Encrypt sensitive data in event payloads</li>
+                        <li><strong>Access Control:</strong> Role-based access to event streams and projections</li>
+                        <li><strong>Audit Trail:</strong> Include user context and authorization in event metadata</li>
+                        <li><strong>Data Privacy:</strong> Implement &#34;right to be forgotten&#34; through cryptographic erasure</li>
+                        <li><strong>Replay Security:</strong> Ensure event replay doesn&#39;t bypass current security rules</li>
+                    </ul>
+                </div>
+
+                <pre><code>// Secure event with encryption
+type SecureEvent struct {
+    BaseEvent
+    EncryptedPayload []byte
+    KeyID           string
+    Nonce           []byte
+}
+
+// GDPR-compliant cryptographic erasure
+type GDPREventStore struct {
+    *EventStore
+    keyManager *KeyManager
+}
+
+func (ges *GDPREventStore) ForgetUser(ctx context.Context, userID string) error {
+    events, err := ges.GetEventsByUser(ctx, userID)
+    if err != nil {
+        return fmt.Errorf(&#34;failed to find user events: %w&#34;, err)
+    }
+    
+    for _, event := range events {
+        if err := ges.keyManager.RevokeKey(event.KeyID); err != nil {
+            return fmt.Errorf(&#34;failed to revoke key %s: %w&#34;, event.KeyID, err)
+        }
+    }
+    
+    return ges.MarkUserForgotten(ctx, userID)
+}</code></pre>
+
+                <h2 id="testing-strategy">Testing Strategy</h2>
+                
+                <div>
+                    <h3>📊 Event Sourcing Testing Framework</h3>
+                    <p>Comprehensive testing approach for event-sourced systems:</p>
+                    <ul>
+                        <li><strong>Event Store Tests:</strong> Test consistency, concurrency, and durability</li>
+                        <li><strong>Aggregate Tests:</strong> Unit test business logic and invariants</li>
+                        <li><strong>Projection Tests:</strong> Verify read model consistency</li>
+                        <li><strong>Integration Tests:</strong> End-to-end command/query flows</li>
+                        <li><strong>Event Schema Tests:</strong> Test event evolution and migration</li>
+                    </ul>
+                </div>
+
+                <pre><code>// Event store integration test
+func TestEventStore(t *testing.T) {
+    es := setupTestEventStore(t)
+    defer es.Close()
+    
+    t.Run(&#34;ConcurrencyControl&#34;, func(t *testing.T) {
+        aggregateID := uuid.New().String()
+        
+        // First save succeeds
+        err := es.SaveEvents(context.Background(), aggregateID, &#34;Account&#34;, 
+            []Event{&amp;AccountOpened{AccountID: aggregateID}}, 0)
+        require.NoError(t, err)
+        
+        // Second save with wrong version fails
+        err = es.SaveEvents(context.Background(), aggregateID, &#34;Account&#34;, 
+            []Event{&amp;MoneyDeposited{AccountID: aggregateID}}, 0)
+        require.Error(t, err)
+        require.Contains(t, err.Error(), &#34;concurrency conflict&#34;)
+    })
+}</code></pre>
+
+                <h2 id="production-monitoring">Production Monitoring</h2>
+
+                <pre><code>// Event store metrics
+type Metrics struct {
+    EventsWritten   prometheus.Counter
+    EventsRead      prometheus.Counter
+    SnapshotCreated prometheus.Counter
+    WriteLatency    prometheus.Histogram
+    ReadLatency     prometheus.Histogram
+}
+
+// Health checks
+func (es *EventStore) HealthCheck() error {
+    // Check write capability
+    testEvent := HealthCheckEvent{
+        ID:        uuid.New().String(),
+        Timestamp: time.Now(),
+    }
+    
+    err := es.SaveEvents(ctx, &#34;health&#34;, &#34;HealthCheck&#34;, []Event{testEvent}, 0)
+    if err != nil {
+        return fmt.Errorf(&#34;write check failed: %w&#34;, err)
+    }
+    
+    // Check read capability
+    events, err := es.GetEvents(ctx, &#34;health&#34;, 0)
+    if err != nil {
+        return fmt.Errorf(&#34;read check failed: %w&#34;, err)
+    }
+    
+    if len(events) == 0 {
+        return errors.New(&#34;no events found&#34;)
+    }
+    
+    return nil
+}
+
+// Lag monitoring
+func MonitorProjectionLag(db *sql.DB) {
+    ticker := time.NewTicker(10 * time.Second)
+    for range ticker.C {
+        var lag time.Duration
+        db.QueryRow(`
+            SELECT MAX(NOW() - updated_at) 
+            FROM projection_checkpoints`
+        ).Scan(&amp;lag)
+        
+        projectionLag.Set(lag.Seconds())
+        
+        if lag &gt; 5*time.Minute {
+            alert(&#34;Projection lag exceeds 5 minutes&#34;)
+        }
+    }
+}</code></pre>
+
+                <h2 id="performance-optimizations">Performance Optimizations</h2>
+
+                <pre><code>// 1. Batch event writes
+func (es *EventStore) SaveEventsBatch(events []EventWithAggregate) error {
+    // Use COPY for bulk insert
+    stmt, err := es.db.Prepare(pq.CopyIn(&#34;events&#34;,
+        &#34;aggregate_id&#34;, &#34;aggregate_type&#34;, &#34;event_type&#34;,
+        &#34;event_version&#34;, &#34;event_data&#34;, &#34;occurred_at&#34;))
+    if err != nil {
+        return err
+    }
+    
+    for _, e := range events {
+        _, err = stmt.Exec(e.AggregateID, e.AggregateType,
+            e.EventType, e.Version, e.Data, e.OccurredAt)
+        if err != nil {
+            return err
+        }
+    }
+    
+    return stmt.Close()
+}
+
+// 2. Parallel projection updates
+func UpdateProjectionsParallel(events []Event) {
+    var wg sync.WaitGroup
+    ch := make(chan Event, 100)
+    
+    // Start workers
+    for i := 0; i &lt; 10; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for event := range ch {
+                updateProjection(event)
+            }
+        }()
+    }
+    
+    // Send events
+    for _, e := range events {
+        ch &lt;- e
+    }
+    close(ch)
+    wg.Wait()
+}
+
+// 3. Cache aggregates
+var aggregateCache = cache.New(5*time.Minute, 10*time.Minute)
+
+func LoadAccountCached(es *EventStore, accountID string) (*Account, error) {
+    if cached, found := aggregateCache.Get(accountID); found {
+        return cached.(*Account), nil
+    }
+    
+    account, err := LoadAccount(es, accountID)
+    if err != nil {
+        return nil, err
+    }
+    
+    aggregateCache.Set(accountID, account, cache.DefaultExpiration)
+    return account, nil
+}</code></pre>
+
+                <h2 id="migration-strategy">Migration from Traditional System</h2>
+
+                <pre><code>// Generate events from existing state
+func MigrateToEventSourcing(db *sql.DB, es *EventStore) error {
+    rows, err := db.Query(`
+        SELECT id, balance, created_at, updated_at
+        FROM accounts`)
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+    
+    for rows.Next() {
+        var id string
+        var balance decimal.Decimal
+        var createdAt, updatedAt time.Time
+        
+        rows.Scan(&amp;id, &amp;balance, &amp;createdAt, &amp;updatedAt)
+        
+        // Create initial event
+        events := []Event{
+            AccountOpened{
+                AccountID: id,
+                Timestamp: createdAt,
+            },
+        }
+        
+        // Infer deposit event from balance
+        if balance.GreaterThan(decimal.Zero) {
+            events = append(events, MoneyDeposited{
+                AccountID: id,
+                Amount:    balance,
+                Timestamp: updatedAt,
+            })
+        }
+        
+        es.SaveEvents(ctx, id, &#34;Account&#34;, events, 0)
+    }
+    
+    return nil
+}</code></pre>
+
+                <h2>Lessons from Production</h2>
+
+                <table>
+                    <tbody><tr>
+                        <th>Metric</th>
+                        <th>Before (CRUD)</th>
+                        <th>After (Event Sourcing)</th>
+                    </tr>
+                    <tr>
+                        <td>Write throughput</td>
+                        <td>1K/sec</td>
+                        <td>10K/sec</td>
+                    </tr>
+                    <tr>
+                        <td>Read latency p99</td>
+                        <td>5ms</td>
+                        <td>2ms (projections)</td>
+                    </tr>
+                    <tr>
+                        <td>Audit completeness</td>
+                        <td>60%</td>
+                        <td>100%</td>
+                    </tr>
+                    <tr>
+                        <td>Debug time</td>
+                        <td>Hours</td>
+                        <td>Minutes (replay)</td>
+                    </tr>
+                    <tr>
+                        <td>Storage cost</td>
+                        <td>$1K/month</td>
+                        <td>$3-5K/month</td>
+                    </tr>
+                </tbody></table>
+
+                <h2>When NOT to Use Event Sourcing</h2>
+
+                <ul>
+                    <li>CRUD is sufficient (most apps)</li>
+                    <li>No audit requirements</li>
+                    <li>Simple domain logic</li>
+                    <li>Team unfamiliar with the pattern</li>
+                    <li>Storage cost is critical</li>
+                </ul>
+
+                <h2>The Verdict</h2>
+
+                <p>Event sourcing isn&#39;t free. 3-5x storage cost (events + projections + snapshots). Complex to implement. Mental model shift.</p>
+
+                <p>But for financial systems, audit-heavy domains, or complex business logic? It&#39;s transformative. Complete history, perfect audit trail, time travel debugging, and horizontal scalability.</p>
+
+                <p><strong>Start small:</strong> Event source one aggregate. See the benefits. Then expand. Don&#39;t go all-in immediately.</p>
+            </section>
+
+            
+        </article>
+    </div></div>
+  </body>
+</html>
