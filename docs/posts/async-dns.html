@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://flak.tedunangst.com/post/async-dns">Original</a>
+    <h1>Async DNS</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+<p>curl experimented with using pthread_cancel to timeout async DNS requests and <a href="https://eissing.org/icing/posts/rip_pthread_cancel/">it blew up</a>. What else can we do?</p><p>Out of curiosity, I decided to review some alternatives and see how they work. My personal priorities are control over events; no background threads or signals or secret mechanisms.</p><h3 id="getaddrinfo">getaddrinfo</h3><p>The tried and true classic technique is to call <i>getaddrinfo</i> in a thread. Probably with more than one thread so you don’t get stuck behind a single slow request, but probably not boundless either. You can also use a separate process if you don’t use threads.</p><p>This is probably good enough for many uses.</p><h3 id="getaddrinfo-a">getaddrinfo_a</h3><p>glibc provides <i>getaddrinfo_a</i> which basically does the thread dance for you. Some of it. It comes with some caveats, and it’s distinctly non portable, and probably doesn’t mesh with your idea of an event loop. Passing.</p><h3 id="c-ares">c-ares</h3><p><a href="https://c-ares.org/">c-ares</a> is a standalone DNS library. It supports async queries via a threaded backend or an event driven system. I think the thread backend has the same issues, in that it uses a callback and then you need to push the results back into your application.</p><p>Alas, the event system uses lots of callbacks as well. This also includes some dire warnings in the documentation. “When the associated callback is called, it is called with a channel lock so care must be taken to ensure any processing is minimal to prevent DNS channel stalls.” Everyone knows the ideal callback just sets a flag, etc., but also everyone is inevitably tempted to do just one more thing, and hey look, it works fine, wait, why did it break. And thus I have a strong preference for library interfaces where you call into it, get some results, but any time you’re in your own code, you’re free to do what you want.</p><p>But worth a try. Based on the <a href="https://c-ares.org/docs.html">sample code</a> I wrote the quickest dirtiest demo I could.</p><details><summary>c-ares code</summary><pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;poll.h&gt;
+#include &lt;arpa/inet.h&gt;
+
+#include &lt;ares.h&gt;
+
+struct server {
+    char name[32];
+    char ip[16];
+    int status;
+};
+
+struct everything {
+    struct server servers[1];
+    int nservers;
+    struct pollfd pfds[4];
+    int npfds;
+};
+
+static void
+addrinfo_cb(void *arg, int status, int timeouts, struct ares_addrinfo *result)
+{
+    struct server *server = arg;
+    server-&gt;status = 3;
+    if (!result)
+        return;
+    for (struct ares_addrinfo_node *node = result-&gt;nodes; node != NULL; node = node-&gt;ai_next) {
+        if (node-&gt;ai_family == AF_INET) {
+            struct sockaddr_in *in_addr = (void *)node-&gt;ai_addr;
+            inet_ntop(node-&gt;ai_family, &amp;in_addr-&gt;sin_addr, server-&gt;ip, sizeof(server-&gt;ip));        }
+    }
+}
+
+static void
+socket_cb(void *arg, ares_socket_t fd, int readable, int writable)
+{
+    struct everything *state = arg;
+    printf(&#34;socket: %d r/w: %d %d\n&#34;, fd, readable, writable);
+
+    int idx = -1;
+    for (int i = 0; i &lt; 4; i++) {
+        if (state-&gt;pfds[i].fd == fd) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == -1) {
+        for (int i = 0; i &lt; 4; i++) {
+            if (state-&gt;pfds[i].fd == -1) {
+                idx = i;
+                state-&gt;pfds[idx].fd = fd;
+                state-&gt;npfds++;
+                break;
+            }
+        }
+    }
+    if (idx == -1)
+        abort();
+
+    if (!readable &amp;&amp; !writable) {
+        state-&gt;pfds[idx].fd = -1;
+        state-&gt;npfds--;
+        return;
+    }
+    state-&gt;pfds[idx].fd = fd;
+    state-&gt;pfds[idx].events = 0;
+    if (readable)
+        state-&gt;pfds[idx].events |= POLLIN;
+    if (writable)
+        state-&gt;pfds[idx].events |= POLLOUT;
+}
+
+int
+main(int argc, char **argv)
+{
+    struct everything state;
+    memset(&amp;state, 0, sizeof(state));
+    strlcpy(state.servers[0].name, argv[1], sizeof(state.servers[0].name));
+    state.servers[0].status = 1;
+    state.nservers = 1;
+    for (int i = 0; i &lt; 4; i++)
+        state.pfds[i].fd = -1;
+
+    ares_library_init(ARES_LIB_INIT_ALL);
+
+    struct ares_options options;
+    memset(&amp;options, 0, sizeof(options));
+    int optmask = 0;
+    options.flags = ARES_FLAG_EDNS | ARES_FLAG_DNS0x20;
+    optmask |= ARES_OPT_FLAGS;
+    options.sock_state_cb = socket_cb;
+    options.sock_state_cb_data = &amp;state;
+    optmask |= ARES_OPT_SOCK_STATE_CB;
+
+    ares_channel_t *channel;
+    ares_init_options(&amp;channel, &amp;options, optmask);
+
+    ares_fd_events_t ares_fds[1];
+
+    while (1) {
+        printf(&#34;top of loop\n&#34;);
+        for (int i = 0; i &lt; state.nservers; i++) {
+            printf(&#34;processing server %d\n&#34;, i);
+            struct server *server = &amp;state.servers[i];
+            switch (server-&gt;status) {
+            case 1:
+                {
+                    struct ares_addrinfo_hints hints;
+                    memset(&amp;hints, 0, sizeof(hints));
+                    hints.ai_family = AF_UNSPEC;
+                    hints.ai_flags  = ARES_AI_CANONNAME;
+                    ares_getaddrinfo(channel, argv[1], NULL, &amp;hints, addrinfo_cb, server);
+                    server-&gt;status = 2;
+                }
+                break;
+            case 2:
+                printf(&#34;woke up while working\n&#34;);
+                break;
+            case 3:
+                printf(&#34;got it, done: %s -&gt; %s\n&#34;, server-&gt;name, server-&gt;ip);
+                return 0;
+            }
+        }
+        if (state.npfds == 0) {
+            printf(&#34;confused. nothing to poll\n&#34;);
+            return 1;
+        }
+        int res = poll(state.pfds, 4 /* state.npfds */, 2000);
+        printf(&#34;poll results: %d\n&#34;, res);
+        if (res &gt; 0) {
+            ares_fd_events_t events[4];
+            int nevents = 0;
+            for (int i = 0; i &lt; 4 /* state.npfds */; i++) {
+                if (!state.pfds[i].revents)
+                    continue;
+                events[nevents].fd = state.pfds[i].fd;
+                events[nevents].events = 0;
+                if (state.pfds[i].revents &amp; (POLLERR|POLLHUP|POLLIN))
+                    events[nevents].events |= ARES_FD_EVENT_READ;
+                if (state.pfds[i].revents &amp; (POLLOUT))
+                    events[nevents].events |= ARES_FD_EVENT_WRITE;
+                nevents++;
+            }
+            ares_process_fds(channel, events, nevents, 0);
+        }
+    }
+}</code></pre></details></div><div><p>
+Posted 25 Sep 2025 18:33 by tedu Updated: 25 Sep 2025 18:33 
+</p></div></div>
+  </body>
+</html>
