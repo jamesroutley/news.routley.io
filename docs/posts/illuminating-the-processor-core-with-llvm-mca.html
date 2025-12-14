@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://abseil.io/fast/99">Original</a>
+    <h1>Illuminating the processor core with LLVM-mca</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+
+<p>Originally posted as Fast TotW #99 on September 29, 2025</p>
+
+<p><em>By <a href="https://abseil.io/cdn-cgi/l/email-protection#9af9f1fff4f4fff6f6e3dafdf5f5fdf6ffb4f9f5f7">Chris Kennelly</a></em></p>
+
+<p>Updated 2025-10-07</p>
+
+<p>Quicklink: <a href="https://abseil.io/fast/99">abseil.io/fast/99</a></p>
+
+<p>The <a href="https://en.wikipedia.org/wiki/Reduced_instruction_set_computer">RISC</a>
+versus <a href="https://en.wikipedia.org/wiki/Complex_instruction_set_computer">CISC</a>
+debate ended in a draw: Modern processors decompose instructions into
+<a href="https://en.wikipedia.org/wiki/Micro-operation">micro-ops</a> handled by backend
+execution units. Understanding how instructions are executed by these units can
+give us insights on optimizing key functions that are backend bound. In this
+episode, we walk through using
+<a href="https://llvm.org/docs/CommandGuide/llvm-mca.html"><code>llvm-mca</code></a> to analyze
+functions and identify performance insights from its simulation.</p>
+
+<h2 id="preliminaries-varint-optimization">Preliminaries: Varint optimization</h2>
+
+<p><code>llvm-mca</code>, short for Machine Code Analyzer, is a tool within LLVM. It uses the
+same datasets that the compiler uses for making instruction scheduling
+decisions. This ensures that improvements made to compiler optimizations
+automatically flow towards keeping <code>llvm-mca</code> representative. The flip side is
+that the tool is only as good as LLVM’s internal modeling of processor designs,
+so certain quirks of individual microarchitecture generations might be omitted.
+It also models the processor <a href="#limitations">behavior statically</a>, so cache
+misses, branch mispredictions, and other dynamic properties aren’t considered.</p>
+
+<p>Consider Protobuf’s <code>VarintSize64</code> method:</p>
+
+<pre>size_t CodedOutputStream::VarintSize64(uint64_t value) {
+#if PROTOBUF_CODED_STREAM_H_PREFER_BSR
+  // Explicit OR 0x1 to avoid calling absl::countl_zero(0), which
+  // requires a branch to check for on platforms without a clz instruction.
+  uint32_t log2value = (std::numeric_limits&lt;uint64_t&gt;::digits - 1) -
+                       absl::countl_zero(value | 0x1);
+  return static_cast&lt;size_t&gt;((log2value * 9 + (64 + 9)) / 64);
+#else
+  uint32_t clz = absl::countl_zero(value);
+  return static_cast&lt;size_t&gt;(
+      ((std::numeric_limits&lt;uint64_t&gt;::digits * 9 + 64) - (clz * 9)) / 64);
+#endif
+}
+</pre>
+
+<p>This function calculates how many bytes an encoded integer will consume in
+<a href="https://protobuf.dev/programming-guides/encoding/#varints">Protobuf’s wire
+format</a>. It first
+computes the number of bits needed to represent the value by finding the log2
+size of the input, then approximates division by 7. The size of the input can be
+calculated using the <code>absl::countl_zero</code> function. However this has two possible
+implementations depending on whether the processor has a <code>lzcnt</code> (Leading Zero
+Count) instruction available or if this operation needs to instead leverage the
+<code>bsr</code> (Bit Scan Reverse) instruction.</p>
+
+<p>Under the hood of <code>absl::countl_zero</code>, we need to check whether the argument is
+zero, since <code>__builtin_clz</code> (Count Leading Zeros) models the behavior of x86’s
+<code>bsr</code> (Bit Scan Reverse) instruction and has unspecified behavior if the input
+is 0. The <code>| 0x1</code> avoids needing a branch by ensuring the argument is non-zero
+in a way the compiler can follow.</p>
+
+<p>When we have <code>lzcnt</code> available, the compiler optimizes <code>x == 0 ? 32 :
+__builtin_clz(x)</code> in <code>absl::countl_zero</code> to <code>lzcnt</code> without branches. This makes
+the <code>| 0x1</code> unnecessary.</p>
+
+<p>Compiling this gives us two different assembly sequences depending on whether
+the <code>lzcnt</code> instruction is available or not:</p>
+
+<p><code>bsr</code> (<code>-march=ivybridge</code>):</p>
+
+<pre>orq     $1, %rdi
+bsrq    %rdi, %rax
+leal    (%rax,%rax,8), %eax
+addl    $73, %eax
+shrl    $6, %eax
+</pre>
+
+<p><code>lzcnt</code> (<code>-march=haswell</code>):</p>
+
+<pre>lzcntq  %rdi, %rax
+leal    (%rax,%rax,8), %ecx
+movl    $640, %eax
+subl    %ecx, %eax
+shrl    $6, %eax
+</pre>
+
+<h3 id="analyzing-the-code">Analyzing the code</h3>
+
+<p>We can now use <a href="https://godbolt.org/z/39EMsWq7z">Compiler Explorer</a> to run these
+sequences through <code>llvm-mca</code> and get an analysis of how they would execute on a
+simulated Skylake processor (<code>-mcpu=skylake</code>) for a single invocation
+(<code>-iterations=1</code>) and include <code>-timeline</code>:</p>
+
+<p><code>bsr</code> (<code>-march=ivybridge</code>):</p>
+
+<pre>Iterations:        1
+Instructions:      5
+Total Cycles:      10
+Total uOps:        5
+
+Dispatch Width:    6
+uOps Per Cycle:    0.50
+IPC:               0.50
+Block RThroughput: 1.0
+
+Timeline view:
+Index     0123456789
+
+[0,0]     DeER .   .   orq      $1, %rdi
+[0,1]     D=eeeER  .   bsrq     %rdi, %rax
+[0,2]     D====eER .   leal     (%rax,%rax,8), %eax
+[0,3]     D=====eER.   addl     $73, %eax
+[0,4]     D======eER   shrl     $6, %eax
+</pre>
+
+<p><code>lzcnt</code> (<code>-march=haswell</code>):</p>
+
+<pre>Iterations:        1
+Instructions:      5
+Total Cycles:      9
+Total uOps:        5
+
+Dispatch Width:    6
+uOps Per Cycle:    0.56
+IPC:               0.56
+Block RThroughput: 1.0
+
+Timeline view:
+Index     012345678
+
+[0,0]     DeeeER  .   lzcntq    %rdi, %rax
+[0,1]     D===eER .   leal      (%rax,%rax,8), %ecx
+[0,2]     DeE---R .   movl      $640, %eax
+[0,3]     D====eER.   subl      %ecx, %eax
+[0,4]     D=====eER   shrl      $6, %eax
+</pre>
+
+<p>This can also be obtained via the command line</p>
+
+<div><div><pre><code>$ clang file.cpp -O3 --target=x86_64 -S -o - | llvm-mca -mcpu=skylake -iterations=1 -timeline
+</code></pre></div></div>
+
+<p>There’s two sections to this output, the first section provides some summary
+statistics for the code, the second section covers the execution “timeline.” The
+timeline provides interesting detail about how instructions flow through the
+execution pipelines in the processor. There are three columns, and each
+instruction is shown on a separate row. The three columns are as follows:</p>
+
+<ul>
+  <li>The first column is a pair of numbers, the first number is the iteration,
+the second number is the index of the instruction. In the above example
+there’s a single iteration, number 0, so just the index of the instruction
+changes on each row.</li>
+  <li>The third column is the instruction.</li>
+  <li>The second column is the timeline. Each character in that column represents
+a cycle, and the character indicates what’s happening to the instruction in
+that cycle.</li>
+</ul>
+
+<p>The timeline is counted in cycles. Each instruction goes through several steps:</p>
+
+<ul>
+  <li><code>D</code> the instruction is dispatched by the processor; modern desktop or server
+processors can dispatch many instructions per cycle. Little Arm cores like
+the Cortex-A55 used in smartphones are more limited.</li>
+  <li><code>=</code> the instruction is waiting to execute. In this case, the instructions
+are waiting for the results of prior instructions to be available. In other
+cases, there might be a bottleneck in the processor’s backend.</li>
+  <li><code>e</code> the instruction is executing.</li>
+  <li><code>E</code> the instruction’s output is available.</li>
+  <li><code>-</code> the instruction has completed execution and is waiting to be retired.
+Instructions generally retire in program order, the order instructions
+appear in the program. An instruction will wait to retire until prior ones
+have also retired. On some architectures like the Cortex-A55, there is no
+<code>R</code> phase in the timeline as some instructions <a href="https://chipsandcheese.com/i/149874023/out-of-order-retire">retire
+out-of-order</a>.</li>
+  <li><code>R</code> the instruction has been retired, and is no longer occupying execution
+resources.</li>
+</ul>
+
+<p>The output is lengthy, but we can extract a few high-level insights from it:</p>
+
+<ul>
+  <li>The <code>lzcnt</code> implementation is quicker to execute (9 cycles) than the “bsr”
+implementation (10 cycles). This is seen under the <code>Total Cycles</code> summary as
+well as the timeline.</li>
+  <li>The routine is simple: with the exception of <code>movl</code>, the instructions depend
+on each other sequentially (<code>E</code>-finishing to <code>e</code>-starting vertically
+aligning, pairwise, in the timeline view).</li>
+  <li>Bitwise-<code>or</code> of <code>0x1</code> delays <code>bsrq</code>’s input being available by 1 cycle,
+contributing to the longer execution cost.</li>
+  <li>Note that although <code>movl</code> starts immediately in the <code>lzcnt</code> implementation,
+it can’t retire until prior instructions are retired, since we retire in
+program order.</li>
+  <li>Both sequences are 5 instructions long, but the <code>lzcnt</code> implementation has
+higher <a href="https://en.wikipedia.org/wiki/Instruction-level_parallelism">instruction-level parallelism
+(ILP)</a> because
+the <code>mov</code> has no dependencies. This demonstrates that counting instructions
+need not tell us the <a href="https://abseil.io/fast/7">cycle cost</a>.</li>
+</ul>
+
+<p><code>llvm-mca</code> is flexible and can model other processors:</p>
+
+<ul>
+  <li>AMD Zen3 (<a href="https://godbolt.org/z/xbq9PqG8z">Compiler Explorer</a>), where the
+cost difference is more stark (8 cycles versus 12 cycles).</li>
+  <li>Arm Neoverse-V2 (<a href="https://godbolt.org/z/sE3T65n8M">Compiler Explorer</a>), a
+server CPU where the difference is 7 vs 9 cycles.</li>
+  <li>Arm Cortex-A55 (<a href="https://godbolt.org/z/vPP5EPrcW">Compiler Explorer</a>), a
+popular little core used in smartphones, where the difference is 8 vs 10
+cycles. Note how the much smaller dispatch width results in the <code>D</code> phase of
+instructions starting later.</li>
+</ul>
+
+<h3 id="throughput-versus-latency">Throughput versus latency</h3>
+
+<p>When designing <a href="https://abseil.io/fast/75">microbenchmarks</a>, we sometimes want to distinguish
+between throughput and latency microbenchmarks. If the input of one benchmark
+iteration does not depend on the prior iteration, the processor can execute
+multiple iterations in parallel. Generally for code that is expected to execute
+in a loop we care more about throughput, and for code that is inlined in many
+places interspersed with other logic we care more about latency.</p>
+
+<p>We can use <code>llvm-mca</code> to model execution of the block of code in a tight loop.
+By specifying <code>-iterations=100</code> on the <code>lzcnt</code> version, we get a very different
+set of results because one iteration’s execution can overlap with the next:</p>
+
+<pre>Iterations:        100
+Instructions:      500
+Total Cycles:      134
+Total uOps:        500
+
+Dispatch Width:    6
+uOps Per Cycle:    3.73
+IPC:               3.73
+Block RThroughput: 1.0
+</pre>
+
+<p>We were able to execute 100 iterations in only 134 cycles (1.34 cycles/element)
+by achieving high ILP.</p>
+
+<p>Achieving the best performance may sometimes entail trading off the latency of a
+basic block in favor of higher throughput. Inside of the protobuf implementation
+of <code>VarintSize</code>
+(<a href="https://github.com/protocolbuffers/protobuf/tree/main/src/google/protobuf/wire_format_lite.cc">protobuf/wire_format_lite.cc</a>),
+we use a vectorized version for realizing higher throughput albeit with worse
+latency. A single iteration of the loop takes 29 cycles to process 32 elements
+(<a href="https://godbolt.org/z/TczKTaGd8">Compiler Explorer</a>) for 0.91 cycles/element,
+but 100 iterations (3200 elements) only requires 1217 cycles (0.38
+cycles/element - about 3x faster) showcasing the high throughput once setup
+costs are amortized.</p>
+
+<h2 id="understanding-dependency-chains">Understanding dependency chains</h2>
+
+<p>When we are looking at CPU profiles, we are often tracking when instructions
+<em>retire</em>. Costs are attributed to instructions that took longer to retire.
+Suppose we profile a small function that accesses memory pseudo-randomly:</p>
+
+<pre>unsigned Chains(unsigned* x) {
+   unsigned a0 = x[0];
+   unsigned b0 = x[1];
+
+   unsigned a1 = x[a0];
+   unsigned b1 = x[b0];
+
+   unsigned b2 = x[b1];
+
+   return a1 | b2;
+}
+</pre>
+
+<p><code>llvm-mca</code> models memory loads being an L1 hit (<a href="https://godbolt.org/z/6PzTPYv8T">Compiler
+Explorer</a>): It takes 5 cycles for the value of
+a load to be available after the load starts execution. The output has been
+annotated with the source code to make it easier to read.</p>
+
+<pre>Iterations:        1
+Instructions:      6
+Total Cycles:      19
+Total uOps:        9
+
+Dispatch Width:    6
+uOps Per Cycle:    0.47
+IPC:               0.32
+Block RThroughput: 3.0
+
+Timeline view:
+                    012345678
+Index     0123456789
+
+
+[0,0]     DeeeeeER  .    .  .   movl    (%rdi), %ecx         // ecx = a0 = x[0]
+[0,1]     DeeeeeER  .    .  .   movl    4(%rdi), %eax        // eax = b0 = x[1]
+[0,2]     D=====eeeeeER  .  .   movl    (%rdi,%rax,4), %eax  // eax = b1 = x[b0]
+[0,3]     D==========eeeeeER.   movl    (%rdi,%rax,4), %eax  // eax = b2 = x[b1]
+[0,4]     D==========eeeeeeER   orl     (%rdi,%rcx,4), %eax  // eax |= a1 = x[a0]
+[0,5]     .DeeeeeeeE--------R   retq
+</pre>
+
+<p>In this timeline the first two instructions load <code>a0</code> and <code>b0</code>. Both of these
+operations can happen immediately. However, the load of <code>x[b0]</code> can only happen
+once the value for <code>b0</code> is available in a register - after a 5 cycle delay. The
+load of <code>x[b1]</code> can only happen once the value for <code>b1</code> is available after
+another 5 cycle delay.</p>
+
+<p>This program has two places where we can execute loads in parallel: the pair
+<code>a0</code> and <code>b0</code> and the pair <code>a1 and b1</code> (note: <code>llvm-mca</code> does not correctly
+model the memory load uop from <code>orl</code> for <code>a1</code> starting). Since the processor
+retires instructions in program order we expect the profile weight to appear on
+the loads for <code>a0</code>, <code>b1</code>, and <code>b2</code>, even though we had parallel loads in-flight
+simultaneously.</p>
+
+<p>If we examine this profile, we might try to optimize one of the memory
+indirections because it appears in our profile. We might do this by miraculously
+replacing <code>a0</code> with a constant (<a href="https://godbolt.org/z/b68KzsKMP">Compiler
+Explorer</a>).</p>
+
+<pre>unsigned Chains(unsigned* x) {
+   unsigned a0 = 0;
+   unsigned b0 = x[1];
+
+   unsigned a1 = x[a0];
+   unsigned b1 = x[b0];
+
+   unsigned b2 = x[b1];
+
+   return a1 | b2;
+}
+</pre>
+
+<pre>Iterations:        1
+Instructions:      5
+Total Cycles:      19
+Total uOps:        8
+
+Dispatch Width:    6
+uOps Per Cycle:    0.42
+IPC:               0.26
+Block RThroughput: 2.5
+
+Timeline view:
+                    012345678
+Index     0123456789
+
+[0,0]     DeeeeeER  .    .  .   movl    4(%rdi), %eax
+[0,1]     D=====eeeeeER  .  .   movl    (%rdi,%rax,4), %eax
+[0,2]     D==========eeeeeER.   movl    (%rdi,%rax,4), %eax
+[0,3]     D==========eeeeeeER   orl     (%rdi), %eax
+[0,4]     .DeeeeeeeE--------R   retq
+</pre>
+
+<p>Even though we got rid of the “expensive” load we saw in the CPU profile, we
+didn’t actually change the overall length of the critical path that was
+dominated by the 3 load long “b” chain. The timeline view shows the critical
+path for the function, and performance can only be improved if the duration of
+the critical path is reduced.</p>
+
+<h2 id="optimizing-crc32c">Optimizing CRC32C</h2>
+
+<p>CRC32C is a common hashing function and modern architectures include dedicated
+instructions for calculating it. On short sizes, we’re largely dealing with
+handling odd numbers of bytes. For large sizes, we are constrained by repeatedly
+invoking <code>crc32q</code> (x86) or similar every few bytes of the input. By examining
+the repeated invocation, we can look at how the processor will execute it
+(<a href="https://godbolt.org/z/nEYsWWzWs">Compiler Explorer</a>):</p>
+
+<pre>uint32_t BlockHash() {
+ asm volatile(&#34;# LLVM-MCA-BEGIN&#34;);
+ uint32_t crc = 0;
+ for (int i = 0; i &lt; 16; ++i) {
+   crc = _mm_crc32_u64(crc, i);
+ }
+ asm volatile(&#34;# LLVM-MCA-END&#34; : &#34;+r&#34;(crc));
+ return crc;
+}
+</pre>
+
+<p>This function doesn’t hash anything useful, but it allows us to see the
+back-to-back usage of one <code>crc32q</code>’s output with the next <code>crc32q</code>’s inputs.</p>
+
+<pre>Iterations:        1
+Instructions:      32
+Total Cycles:      51
+Total uOps:        32
+
+Dispatch Width:    6
+uOps Per Cycle:    0.63
+IPC:               0.63
+Block RThroughput: 16.0
+
+Instruction Info:
+
+[1]: #uOps
+[2]: Latency
+[3]: RThroughput
+[4]: MayLoad
+[5]: MayStore
+[6]: HasSideEffects (U)
+
+[1]    [2]    [3]    [4]    [5]    [6]    Instructions:
+1      0     0.17                        xorl   %eax, %eax
+1      3     1.00                        crc32q %rax, %rax
+1      1     0.25                        movl   $1, %ecx
+1      3     1.00                        crc32q %rcx, %rax
+...
+
+Resources:
+[0]   - SKLDivider
+[1]   - SKLFPDivider
+[2]   - SKLPort0
+[3]   - SKLPort1
+[4]   - SKLPort2
+[5]   - SKLPort3
+[6]   - SKLPort4
+[7]   - SKLPort5
+[8]   - SKLPort6
+[9]   - SKLPort7
+
+
+Resource pressure per iteration:
+[0]    [1]    [2]    [3]    [4]    [5]    [6]    [7]    [8]    [9]
+-      -     4.00   18.00   -     1.00    -     5.00   6.00    -
+
+Resource pressure by instruction:
+[0]    [1]    [2]    [3]    [4]    [5]    [6]    [7]    [8]    [9]    Instructions:
+-      -      -      -      -      -      -      -      -      -     xorl       %eax, %eax
+-      -      -     1.00    -      -      -      -      -      -     crc32q     %rax, %rax
+-      -      -      -      -      -      -      -     1.00    -     movl       $1, %ecx
+-      -      -     1.00    -      -      -      -      -      -     crc32q     %rcx, %rax
+-      -      -      -      -      -      -     1.00    -      -     movl       $2, %ecx
+-      -      -     1.00    -      -      -      -      -      -     crc32q     %rcx, %rax
+...
+-      -      -      -      -      -      -      -     1.00    -     movl       $15, %ecx
+-      -      -     1.00    -      -      -      -      -      -     crc32q     %rcx, %rax
+-      -      -      -      -     1.00    -     1.00   1.00    -     retq
+
+
+Timeline view:
+                    0123456789          0123456789          0
+Index     0123456789          0123456789          0123456789
+
+[0,0]     DR   .    .    .    .    .    .    .    .    .    .   xorl    %eax, %eax
+[0,1]     DeeeER    .    .    .    .    .    .    .    .    .   crc32q  %rax, %rax
+[0,2]     DeE--R    .    .    .    .    .    .    .    .    .   movl    $1, %ecx
+[0,3]     D===eeeER .    .    .    .    .    .    .    .    .   crc32q  %rcx, %rax
+[0,4]     DeE-----R .    .    .    .    .    .    .    .    .   movl    $2, %ecx
+[0,5]     D======eeeER   .    .    .    .    .    .    .    .   crc32q  %rcx, %rax
+...
+[0,30]    .    DeE---------------------------------------R  .   movl    $15, %ecx
+[0,31]    .    D========================================eeeER   crc32q  %rcx, %rax
+</pre>
+
+<p>Based on the “<code>Instruction Info</code>” table, <code>crc32q</code> has latency 3 and throughput
+1: Every clock cycle, we can start processing a new invocation on port 1 (<code>[3]</code>
+in the table), but it takes 3 cycles for the result to be available.</p>
+
+<p>Instructions decompose into individual micro operations (or “uops”). The
+resources section lists the processor execution pipelines (often referred to as
+ports). Every cycle uops can be issued to these ports. There are constraints -
+no port can take every kind of uop and there is a maximum number of uops that
+can be dispatched to the processor pipelines every cycle.</p>
+
+<p>For the instructions in our function, there is a one-to-one correspondence so
+the number of instructions and the number of uops executed are equivalent (32).
+The processor has several backends for processing uops. From the resource
+pressure tables, we see that while <code>crc32</code> must execute on port 1, the <code>movl</code>
+executes on any of ports 0, 1, 5, and 6.</p>
+
+<p>In the timeline view, we see that for our back-to-back sequence, we can’t
+actually begin processing the 2nd <code>crc32q</code> for several clock cycles until the
+1st <code>crc32q</code> hasn’t completed. This tells us that we’re underutilizing port 1’s
+capabilities, since its throughput indicates that an instruction can be
+dispatched to it once per cycle.</p>
+
+<p>If we restructure <code>BlockHash</code> to compute 3 parallel streams with a simulated
+combine function (the code uses a bitwise or as a placeholder for the correct
+logic that this approach requires), we can accomplish the same amount of work in
+fewer clock cycles (<a href="https://godbolt.org/z/ha9KdYovh">Compiler Explorer</a>):</p>
+
+<pre>uint32_t ParallelBlockHash(const char* p) {
+ uint32_t crc0 = 0, crc1 = 0, crc2 = 0;
+ for (int i = 0; i &lt; 5; ++i) {
+   crc0 = _mm_crc32_u64(crc0, 3 * i + 0);
+   crc1 = _mm_crc32_u64(crc1, 3 * i + 1);
+   crc2 = _mm_crc32_u64(crc2, 3 * i + 2);
+ }
+ crc0 = _mm_crc32_u64(crc0, 15);
+ return crc0 | crc1 | crc2;
+}
+</pre>
+
+<pre>Iterations:        1
+Instructions:      36
+Total Cycles:      22
+Total uOps:        36
+
+Dispatch Width:    6
+uOps Per Cycle:    1.64
+IPC:               1.64
+Block RThroughput: 16.0
+
+Timeline view:
+                    0123456789
+Index     0123456789          01
+
+[0,0]     DR   .    .    .    ..   xorl %eax, %eax
+[0,1]     DR   .    .    .    ..   xorl %ecx, %ecx
+[0,2]     DeeeER    .    .    ..   crc32q       %rcx, %rcx
+[0,3]     DeE--R    .    .    ..   movl $1, %esi
+[0,4]     D----R    .    .    ..   xorl %edx, %edx
+[0,5]     D=eeeER   .    .    ..   crc32q       %rsi, %rdx
+[0,6]     .DeE--R   .    .    ..   movl $2, %esi
+[0,7]     .D=eeeER  .    .    ..   crc32q       %rsi, %rax
+[0,8]     .DeE---R  .    .    ..   movl $3, %esi
+[0,9]     .D==eeeER .    .    ..   crc32q       %rsi, %rcx
+[0,10]    .DeE----R .    .    ..   movl $4, %esi
+[0,11]    .D===eeeER.    .    ..   crc32q       %rsi, %rdx
+...
+[0,32]    .    DeE-----------R..   movl $15, %esi
+[0,33]    .    D==========eeeER.   crc32q       %rsi, %rcx
+[0,34]    .    D============eER.   orl  %edx, %eax
+[0,35]    .    D=============eER   orl  %ecx, %eax
+</pre>
+
+<p>The implementation invokes <code>crc32q</code> the same number of times, but the end-to-end
+latency of the block is 22 cycles instead of 51 cycles The timeline view shows
+that the processor can issue a <code>crc32</code> instruction every cycle.</p>
+
+<p>This modeling can be evidenced by <a href="https://abseil.io/fast/75">microbenchmark</a> results for
+<code>absl::ComputeCrc32c</code>
+(<a href="https://github.com/abseil/abseil-cpp/blob/master/absl/crc/crc32c_benchmark.cc">absl/crc/crc32c_benchmark.cc</a>).
+The real implementation uses multiple streams (and correctly combines them).
+Ablating these shows a regression, validating the value of the technique.</p>
+
+<pre>name                          CYCLES/op    CYCLES/op    vs base
+BM_Calculate/0                   5.007 ± 0%     5.008 ± 0%         ~ (p=0.149 n=6)
+BM_Calculate/1                   6.669 ± 1%     8.012 ± 0%   +20.14% (p=0.002 n=6)
+BM_Calculate/100                 30.82 ± 0%     30.05 ± 0%    -2.49% (p=0.002 n=6)
+BM_Calculate/2048                285.6 ± 0%     644.8 ± 0%  +125.78% (p=0.002 n=6)
+BM_Calculate/10000               906.7 ± 0%    3633.8 ± 0%  +300.78% (p=0.002 n=6)
+BM_Calculate/500000             37.77k ± 0%   187.69k ± 0%  +396.97% (p=0.002 n=6)
+</pre>
+
+<p>If we create a 4th stream for <code>ParallelBlockHash</code> (<a href="https://godbolt.org/z/eo36ejca7">Compiler
+Explorer</a>), <code>llvm-mca</code> shows that the overall
+latency is unchanged since we are bottlenecked on port 1’s throughput. Unrolling
+further adds additional overhead to combine the streams and makes prefetching
+harder without actually improving performance.</p>
+
+<p>To improve performance, many fast CRC32C implementations use other processor
+features. Instructions like the carryless multiply instruction (<code>pclmulqdq</code> on
+x86) can be used to implement another parallel stream. This allows additional
+ILP to be extracted by using the other ports of the processor without worsening
+the bottleneck on the port used by <code>crc32</code>.</p>
+
+<h2 id="limitations">Limitations</h2>
+
+<p>While <code>llvm-mca</code> can be a useful tool in many situations, its modeling has
+limits:</p>
+
+<ul>
+  <li>
+    <p>Memory accesses are modeled as L1 hits. In the real world, we can have much
+longer stalls when we need to access the L2, L3, or even <a href="https://abseil.io/fast/62">main
+memory</a>.</p>
+  </li>
+  <li>
+    <p>It cannot model branch predictor behavior.</p>
+  </li>
+  <li>
+    <p>It does not model instruction fetch and decode steps.</p>
+  </li>
+  <li>
+    <p>Its analysis is only as good as LLVM’s processor models. If these do not
+accurately model the processor, the simulation might differ from the real
+processor.</p>
+
+    <p>For example, many ARM processor models are incomplete, and <code>llvm-mca</code> picks
+a processor model that it estimates to be a good substitute; this is
+generally fine for compiler heuristics, where differences only matter if it
+would result in different generated code, but it can derail manual
+optimization efforts.</p>
+  </li>
+</ul>
+
+<h2 id="closing-words">Closing words</h2>
+
+<p>Understanding how the processor executes and retires instructions can give us
+powerful insights for optimizing functions. <code>llvm-mca</code> lets us peer into the
+processor to let us understand bottlenecks and underutilized resources.</p>
+
+<h2 id="further-reading">Further reading</h2>
+
+<ul>
+  <li><a href="https://uops.info">uops.info</a></li>
+  <li>Chandler Carruth’s “<a href="https://www.youtube.com/watch?v=2EWejmkKlxs">Going Nowhere
+Faster</a>” talk</li>
+  <li>Agner Fog’s “<a href="https://www.agner.org/optimize/">Software Optimization
+Resources</a>”</li>
+</ul>
+
+</div></div>
+  </body>
+</html>
