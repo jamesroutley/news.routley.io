@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://fil-c.org/seccomp">Original</a>
+    <h1>Linux Sandboxes and Fil-C</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        
+        <main>
+
+
+<p>Memory safety and sandboxing are two different things. It&#39;s reasonable to think of them as orthogonal: you could have memory safety but not be sandboxed, or you could be sandboxed but not memory safe.</p>
+
+<ul>
+<li><p>Example of <strong>memory safe</strong> <em>but not</em> <strong>sandboxed</strong>: a pure Java program that opens files on the filesystem for reading and writing and accepts filenames from the user. The OS will allow this program to overwrite any file that the user has access to. This program can be quite dangerous even if it is memory safe. Worse, imagine that the program didn&#39;t have any code to open files for reading and writing, but also had no sandbox to prevent those syscalls from working. If there was a bug in the memory safety enforcement of this program (say, because of a bug in the Java implementation), then an attacker could cause this program to overwrite any file if they succeeded at <a href="https://en.wikipedia.org/wiki/Weird_machine">achieving code execution via weird state</a>.</p></li>
+<li><p>Example of <strong>sandboxed</strong> <em>but not</em> <strong>memory safe</strong>: a program written in assembly that starts by requesting that the OS revoke all of its capabilities beyond just pure compute. If the program did want to open a file or write to it, then the kernel will kill the process, based on the earlier request to have this capability revoked. This program could have lots of memory safety bugs (because it&#39;s written in assembly), but even if it did, then the attacker cannot make this program overwrite any file unless they find some way to bypass the sandbox.</p></li>
+</ul>
+
+<p>In practice, sandboxes have holes by design. A typical sandbox allows the program to send and receive messages to broker processes that have higher privileges. So, an attacker may first use a memory safety bug to make the sandboxed process send malicious messages, and then use those malicious messages to break into the brokers.</p>
+
+<p><strong>The best kind of defense is to have both a sandbox and memory safety.</strong> This document describes how to combine sandboxing and Fil-C&#39;s memory safety by explaining what it takes to port OpenSSH&#39;s seccomp-based Linux sandbox code to Fil-C.</p>
+
+<h2>Background</h2>
+
+<p><a href="https://fil-c.org/how.html">Fil-C is a memory safe implementation of C and C++</a> and this site <a href="https://fil-c.org/documentation.html">has a lot of documentation about it</a>. Unlike most memory safe languages, Fil-C enforces safety down to where your code meets Linux syscalls and the <a href="https://fil-c.org/runtime.html">Fil-C runtime</a> is robust enough that it&#39;s possible to use it in <a href="https://fil-c.org/pizlix.html">low-level system components like <code>init</code> and <code>udevd</code></a>. <a href="https://fil-c.org/programs_that_work.html">Lots of programs work in Fil-C</a>, including OpenSSH, which makes use of seccomp-BPF sandboxing.</p>
+
+<p>This document focuses on how OpenSSH uses seccomp and other technologies on Linux to build a sandbox around its <a href="http://www.citi.umich.edu/u/provos/ssh/privsep.html">unprivileged <code>sshd-session</code> process</a>. Let&#39;s review what tools Linux gives us that OpenSSH uses:</p>
+
+<ul>
+<li><p><code>chroot</code> to restrict the process&#39;s view of the filesystem.</p></li>
+<li><p>Running the process with the <code>sshd</code> user and group, and giving that user/group no privileges.</p></li>
+<li><p><code>setrlimit</code> to prevent opening files, starting processes, or writing to files.</p></li>
+<li><p>seccomp-BPF syscall filter to reduce the attack surface by allowlisting only the set of syscalls that are legitimate for the unprivileged process. Syscalls not in the allowlist will crash the process with <code>SIGSYS</code>.</p></li>
+</ul>
+
+<p><a href="https://chromium.googlesource.com/chromium/src/+/0e94f26e8/docs/linux_sandboxing.md">The Chromium developers</a> and <a href="https://wiki.mozilla.org/Security/Sandbox/Seccomp">the Mozilla developers</a> both have excellent notes about how to do sandboxing on Linux using seccomp. <a href="https://www.kernel.org/doc/html/v4.19/userspace-api/seccomp_filter.html">Seccomp-BPF is a well-documented kernel feature</a> that can be used as part of a larger sandboxing story.</p>
+
+<p>Fil-C makes it easy to use <code>chroot</code> and different users and groups. The syscalls that are used for that part of the sandbox are trivially allowed by Fil-C and no special care is required to use them.</p>
+
+<p>Both <code>setrlimit</code> and seccomp-BPF require special care because the Fil-C runtime starts threads, allocates memory, and performs synchronization. This document describes what you need to know to make effective use of those sandboxing technologies in Fil-C. First, I describe how to build a sandbox that prevents thread creation without breaking Fil-C&#39;s use of threads. Then, I describe what tweaks I had to make to OpenSSH&#39;s seccomp filter. Finally, I describe how the Fil-C runtime implements the syscalls used to install seccomp filters.</p>
+
+<h2>Preventing Thread Creation Without Breaking The Fil-C Runtime</h2>
+
+<p>The Fil-C runtime uses <a href="https://fil-c.org/fugc.html">multiple background threads for garbage collection</a> and has the ability to automatically shut those threads down when they are not in use. If the program wakes up and starts allocating memory again, then those threads are automatically restarted.</p>
+
+<p>Starting threads violates the &#34;no new processes&#34; rule that OpenSSH&#39;s <code>setrlimit</code> sandbox tries to achieve (since threads are just lightweight processes on Linux). It also relies on syscalls like <code>clone3</code> that are not part of OpenSSH&#39;s seccomp filter allowlist.</p>
+
+<p>It would be a regression to the sandbox to allow process creation just because the Fil-C runtime relies on it. Instead, I added a new API to <a href="https://fil-c.org/stdfil.html"><code>&lt;stdfil.h&gt;</code></a>:</p>
+
+<pre><code>void zlock_runtime_threads(void);
+</code></pre>
+
+<p>This forces the runtime to immediately create whatever threads it needs, and to disable shutting them down on demand. Then, I added a call to <code>zlock_runtime_threads()</code> in OpenSSH&#39;s <code>ssh_sandbox_child</code> function before either the <code>setrlimit</code> or seccomp-BPF sandbox calls happen.</p>
+
+<h2>Tweaks To The OpenSSH Sandbox</h2>
+
+<p>Because the use of <code>zlock_runtime_threads()</code> prevents subsequent thread creation from happening, most of the OpenSSH sandbox just works. I did not have to change how OpenSSH uses <code>setrlimit</code>. I did change the following about the seccomp filter:</p>
+
+<ul>
+<li><p>Failure results in <code>SECCOMP_RET_KILL_PROCESS</code> rather than <code>SECCOMP_RET_KILL</code>. This ensures that Fil-C&#39;s background threads are also killed if a sandbox violation occurs.</p></li>
+<li><p><code>MAP_NORESERVE</code> is added to the <code>mmap</code> allowlist, since the Fil-C allocator uses it. This is not a meaningful regression to the filter, since <code>MAP_NORESERVE</code> is not a meaningful capability for an attacker to have.</p></li>
+<li><p><code>sched_yield</code> is allowed. This is not a dangerous syscall (it&#39;s semantically a no-op). The Fil-C runtime uses it as part of its lock implementation.</p></li>
+</ul>
+
+<p>Nothing else had to change, since the filter already allowed all of the <code>futex</code> syscalls that Fil-C uses for synchronization.</p>
+
+<h2>How Fil-C Implements <code>prctl</code></h2>
+
+<p>The OpenSSH seccomp filter is installed using two <code>prctl</code> calls. First, we <code>PR_SET_NO_NEW_PRIVS</code>:</p>
+
+<pre><code>if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) {
+        debug(&#34;%s: prctl(PR_SET_NO_NEW_PRIVS): %s&#34;,
+            __func__, strerror(errno));
+        nnp_failed = 1;
+}
+</code></pre>
+
+<p>This prevents additional privileges from being acquired via <code>execve</code>. It&#39;s required that unprivileged processes that install seccomp filters first set the <code>no_new_privs</code> bit.</p>
+
+<p>Next, we <code>PR_SET_SECCOMP, SECCOMP_MODE_FILTER</code>:</p>
+
+<pre><code>if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &amp;preauth_program) == -1)
+        debug(&#34;%s: prctl(PR_SET_SECCOMP): %s&#34;,
+            __func__, strerror(errno));
+else if (nnp_failed)
+        fatal(&#34;%s: SECCOMP_MODE_FILTER activated but &#34;
+            &#34;PR_SET_NO_NEW_PRIVS failed&#34;, __func__);
+</code></pre>
+
+<p>This installs the seccomp filter in <code>preauth_program</code>. Note that this will fail in the kernel if the <code>no_new_privs</code> bit is not set, so the fact that OpenSSH reports a fatal error if the filter is installed without <code>no_new_privs</code> is just healthy paranoia on the part of the OpenSSH authors.</p>
+
+<p>The trouble with both syscalls is that they affect the calling <em>thread</em>, not all threads in the process. Without special care, Fil-C runtime&#39;s background threads would not have the <code>no_new_privs</code> bit set and would not have the filter installed. This would mean that if an attacker busted through Fil-C&#39;s memory safety protections (in the unlikely event that they found a bug in Fil-C itself!), then they could use those other threads to execute syscalls that bypass the filter!</p>
+
+<p>To prevent even this unlikely escape, the Fil-C runtime&#39;s wrapper for <code>prctl</code> implements <code>PR_SET_NO_NEW_PRIVS</code> and <code>PR_SET_SECCOMP</code> by <em>handshaking</em> all runtime threads using this internal API:</p>
+
+<pre><code>/* Calls the callback from every runtime thread. */
+PAS_API void filc_runtime_threads_handshake(void (*callback)(void* arg), void* arg);
+</code></pre>
+
+<p>The callback performs the requested <code>prctl</code> from each runtime thread. This ensures that the <code>no_new_privs</code> bit and the filter are installed on all threads in the Fil-C process.</p>
+
+<p>Additionally, because of ambiguity about what to do if the process has multiple user threads, these two <code>prctl</code> commands will trigger a Fil-C safety error if the program has multiple user threads.</p>
+
+<h2>Conclusion</h2>
+
+<p>The best kind of protection if you&#39;re serious about security is to combine memory safety with sandboxing. This document shows how to achieve this using Fil-C and the sandbox technologies available on Linux, all without regressing the level of protection that those sandboxes enforce or the memory safety guarantees of Fil-C.</p>
+        </main>
+    </div></div>
+  </body>
+</html>
