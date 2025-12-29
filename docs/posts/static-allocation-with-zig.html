@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://nickmonad.blog/2025/static-allocation-with-zig-kv/">Original</a>
+    <h1>Static Allocation with Zig</h1>
+    
+    <div id="readability-page-1" class="page"><article>
+            <p>Over the past few months I&#39;ve been chipping away at a small Redis-compatible key/value server called
+<a rel="noopener" target="_blank" href="https://github.com/nickmonad/kv"><code>kv</code></a>. The goal is to have something (mostly) production-ready, while implementing
+only a small subset of commands. The world doesn&#39;t necessarily need another key/value store, I&#39;m just interested in
+implementing it in Zig and learning about some new (to me) techniques for systems programming.</p>
+<p>One of those techniques is static memory allocation during initialization. The idea here is that all memory is requested
+and allocated from the OS <em>at startup</em>, and held until termination. I first heard about this while learning about
+<a rel="noopener" target="_blank" href="https://tigerbeetle.com/">TigerBeetle</a>, and they reference it explicitly in their development style guide dubbed &#34;TigerStyle&#34;.</p>
+<blockquote>
+<p>All memory must be statically allocated at startup. <strong>No memory may be dynamically allocated (or freed and reallocated)
+after initialization.</strong> This avoids unpredictable behavior that can significantly affect performance, and avoids use-after-free.
+As a second-order effect, it is our experience that this also makes for more efficient, simpler designs that are more
+performant and easier to maintain and reason about, compared to designs that do not consider all possible memory usage
+patterns upfront as part of the design.</p>
+<p><a rel="noopener" target="_blank" href="https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md">TigerStyle</a></p>
+</blockquote>
+<p>Although, this isn&#39;t as straightforward as it might sound at first. The first question that comes to mind might be:
+&#34;How much memory do I allocate?&#34; Of course, the answer depends on the system. If we&#39;re writing a server, how many
+concurrent connections do we allow? How much space is each connection allowed to work with? How much data do we expect
+to process at any given time? Are there limits in response size? Do we need all the data at once, or can it streamed in
+some fashion?</p>
+<p>These are all questions that depend on the nature of the system and the context in which it will operate. I believe
+that going through the exercise of answering these questions is ultimately a good thing, as it seems to have a strong
+possibility of resulting in more stable systems, and forces us to understand the nature of our program at a deeper level.</p>
+<p>On the language front, I feel like Zig is currently the best option out there for doing this with <em>relative</em> ease,
+considering its design choices around explicit memory allocation and the <code>std.mem.Allocator</code> interface, which allows
+the standard library to ship with a variety of different allocators.</p>
+<p>Let&#39;s take a look at how we can manage static allocation in <code>kv</code>, considering three areas of request handling in
+sequence: connection handling, command parsing, and key/value storage.</p>
+<blockquote>
+<p>A lot of this is pretty new to me, and I&#39;m still wrestling with all these concepts. (And learning Zig!) I&#39;m sure
+there are better ways of handling this stuff. I&#39;m presenting this as one possible implementation completed as a
+learning exercise. I&#39;ll speak more about the trade-offs and where I think it can go further at the end of this post.</p>
+</blockquote>
+<h2 id="connection-handling">Connection Handling</h2>
+<p>The first thing we have to consider is how data comes into the system, which we&#39;ll maintain through the concept
+of a <code>Connection</code>.</p>
+<p>A connection represents the communication to a particular client that wants to access the key/value store.
+Since we&#39;re using <code>io_uring</code> for asynchronous I/O, we have to keep some information around through the life-cycle of
+a request, so the kernel can use it. The space for that information is what we&#39;ll statically allocate and re-use across
+different connections as they come and go.</p>
+<pre data-lang="zig"><code data-lang="zig"><span>const </span><span>Connection = </span><span>struct </span><span>{
+</span><span>	</span><span>completion</span><span>: </span><span>Completion </span><span>= </span><span>undefined</span><span>,
+</span><span>	</span><span>client</span><span>: </span><span>posix.socket_t </span><span>= </span><span>undefined</span><span>,
+</span><span>	
+</span><span>	</span><span>recv_buffer</span><span>: *</span><span>ByteArray</span><span>,
+</span><span>	</span><span>send_buffer</span><span>: *</span><span>ByteArray</span><span>,
+</span><span>};
+</span></code></pre>
+<blockquote>
+<p>Connections also must maintain something called a &#34;completion&#34;. This detail is related to integration with <code>io_uring</code>,
+the full details of which are outside the scope of this post. There are some good resources
+<a rel="noopener" target="_blank" href="https://unixism.net/loti/index.html">here</a> and <a rel="noopener" target="_blank" href="https://man7.org/linux/man-pages/man7/io_uring.7.html">here</a>.
+I also took some inspiration from TigerBeetle&#39;s <a rel="noopener" target="_blank" href="https://github.com/tigerbeetle/tigerbeetle/blob/522c0b9d15b112b20c57903987f140f1c16f627b/src/io/linux.zig">IO module</a>.</p>
+</blockquote>
+<p>During initialization, we create three pools: one for the Connection structs themselves, one for receive buffers
+(requests), and one for send buffers (responses). When a request comes in to the server, a Connection is pulled
+from a <code>std.heap.MemoryPool</code>, and then two buffers are associated with that <code>Connection</code>. The buffers are
+implemented as <code>ByteArray</code> structs, which are in turn allocated as part of a <code>ByteArrayPool</code>. The <code>ByteArrayPool</code>
+is custom and uses a <a rel="noopener" target="_blank" href="https://en.wikipedia.org/wiki/Free_list">free list</a> to keep track of which buffers are available
+to reserve for a new connection.</p>
+<pre data-lang="zig"><code data-lang="zig"><span>const </span><span>ConnectionPool = </span><span>struct </span><span>{
+</span><span>    </span><span>const</span><span> Pool = std.heap.</span><span>MemoryPoolExtra</span><span>(Connection, .{ .growable = </span><span>false </span><span>});
+</span><span>
+</span><span>    </span><span>recv_buffers</span><span>: </span><span>ByteArrayPool</span><span>,
+</span><span>    </span><span>send_buffers</span><span>: </span><span>ByteArrayPool</span><span>,
+</span><span>
+</span><span>    </span><span>connections</span><span>: </span><span>Pool</span><span>,
+</span><span>
+</span><span>    </span><span>fn </span><span>init</span><span>(
+</span><span>        </span><span>config</span><span>: </span><span>Config</span><span>,
+</span><span>        </span><span>gpa</span><span>: </span><span>std.mem.Allocator</span><span>,
+</span><span>    ) !</span><span>ConnectionPool </span><span>{
+</span><span>        </span><span>const</span><span> allocation = config.</span><span>allocation</span><span>();
+</span><span>        </span><span>const</span><span> recv_size = allocation.connection_recv_size;
+</span><span>        </span><span>const</span><span> send_size = allocation.connection_send_size;
+</span><span>
+</span><span>        </span><span>const</span><span> pool = </span><span>try</span><span> Pool.</span><span>initPreheated</span><span>(gpa, config.connections_max);
+</span><span>        </span><span>const</span><span> recv_buffers = </span><span>try</span><span> ByteArrayPool.</span><span>init</span><span>(gpa, config.connections_max, recv_size);
+</span><span>        </span><span>const</span><span> send_buffers = </span><span>try</span><span> ByteArrayPool.</span><span>init</span><span>(gpa, config.connections_max, send_size);
+</span><span>
+</span><span>        </span><span>return</span><span> .{
+</span><span>            .recv_buffers = recv_buffers,
+</span><span>            .send_buffers = send_buffers,
+</span><span>            .connections = pool,
+</span><span>        };
+</span><span>    }
+</span><span>	
+</span><span>...
+</span><span>};
+</span></code></pre>
+<p><img src="https://nickmonad.blog/images/kv-connection-pool.png" alt="A diagram showing how the kv connection pool works. A connection has two buffers, one for receive and one for send. Each come from a separate pool."/></p>
+<p>At runtime, connections are created and destroyed (marked as available) using these pools and no actual allocation
+needs to happen. If no <code>Connection</code> is available in the pool, the request is rejected and the client will have to try again.</p>
+<p>This does mean that the server must be configured with an upper limit on the number of connections. Each connection
+must also have a limit on how much data it can receive and send.</p>
+<p>At first this might seem limiting, but in practice, it creates a more robust system. Databases in particular will
+enforce a limit on the number of active connections for that exact reason! For a backend, networked system like <code>kv</code>,
+I would say something like 1000 active connections is a pretty reasonable limit. For a public facing system you&#39;d
+likely want more. Of course, this should all be configurable by the user.</p>
+<p>The <code>Config</code> struct given to the <code>ConnectionPool</code> represents these user-configured options. Note that the <code>Config</code>
+struct has a method <code>.allocation()</code> which is computed after the options have been set. In this case,
+the <code>connection_recv_size</code> and <code>connection_send_size</code> depend on other options, such as <code>config.key_count</code> and
+<code>config.key_size_max</code>. We&#39;ll revisit those later.</p>
+<p>Now that data can get into the system, the next step is to parse out Redis commands.</p>
+<h2 id="command-parsing">Command Parsing</h2>
+<p>In an attempt to be compatible with Redis (at least a very small subset of it), <code>kv</code> has to parse incoming commands
+following the <a rel="noopener" target="_blank" href="https://redis.io/docs/latest/develop/reference/protocol-spec/">Redis serialization protocol</a> (&#34;RESP&#34;) format.</p>
+<p>Here&#39;s an example of an incoming <code>GET key</code> command.</p>
+<pre><code><span>*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n
+</span></code></pre>
+<p>I won&#39;t go into detail on how these commands are structured, the RESP document will do a much better job there.
+Basically, what we&#39;re looking at is &#34;Here&#39;s an array with 2 elements. The first element has 3 characters,
+with the content <code>GET</code> and the second element has 3 characters, with the contenhttps://github.com/nickmonad/kvt <code>key</code>.&#34;</p>
+<p>In order to parse this command, we need to look at the buffer that contains the request data, create some kind of
+iterator over that buffer, and split each entry on the CRLF <code>\r\n</code> byte sequence. Here&#39;s the signature for <code>parse</code>,
+the function that does just that.</p>
+<pre data-lang="zig"><code data-lang="zig"><span>pub fn </span><span>parse</span><span>(</span><span>config</span><span>: </span><span>Config</span><span>, </span><span>alloc</span><span>: </span><span>std.mem.Allocator</span><span>, </span><span>buf</span><span>: []</span><span>const u8</span><span>) !</span><span>Command
+</span></code></pre>
+<p>The allocator is used to create some book-keeping structure as we parse through the command. We need to create a list
+of <code>[]const u8</code> slices that points into the whole buffer and then is given to a command&#39;s <code>parse()</code> function, once
+we know the command. This has the benefit of being a &#34;zero copy&#34; approach to parsing. No request data needs to be copied,
+only pointed to.</p>
+<p>Zig&#39;s <code>std.heap.FixedBufferAllocator</code> is perfect for this kind of operation. During initialization, we ask for buffer
+space from a general purpose allocator, and pass it to the <code>FixedBufferAllocator</code>. This allocator works as &#34;bump&#34; allocator,
+where each internal allocation happens in a linear fashion, up to the amount of available space. The trade-off here is
+that memory allocated within the fixed buffer can&#39;t be free&#39;d directly. Instead, the entire buffer is reset after use,
+which simply resets an index back to <code>0</code>. (Just about as cheap as an operation can get!)</p>
+<p>Since our server is single-threaded and processes one request at a time, we can re-use this <code>FixedBufferAllocator</code>
+across every request. After the request is processed, the response is copied to a <code>Writer</code> object backed by the
+connection&#39;s <code>send</code> buffer and the <code>FixedBufferAllocator</code> is reset for the next request.</p>
+<p><img src="https://nickmonad.blog/images/kv-parsing-state.png" alt="A diagram showing how parsing state works in kv."/></p>
+<p>Knowing how much space to give the <code>FixedBufferAllocator</code> depends again on our system configuration. We need space for
+the <code>ArrayList</code> of parsed command items, and space for any copied list items that are written back as a response during
+command execution. Parsing must be able to support the largest possible command (a list <code>PUSH</code> of maximum size/length) and
+copying has to support the largest possible response (again, a maximally sized list).</p>
+<p>Copying has the extra consideration that we have to actually store the copied list items, which are duplicated when
+read from the key/value store. During parsing, we just need to keep <em>slices</em> into the request buffer. For the copied
+items, we need to keep a list of slices that point to the items, and the items themselves. As long as we give the
+<code>FixedBufferAllocator</code> space, we can use it for all these (sub-)allocations.</p>
+<pre data-lang="zig"><code data-lang="zig"><span>pub const </span><span>Runner = </span><span>struct </span><span>{
+</span><span>    </span><span>config</span><span>: </span><span>Config</span><span>,
+</span><span>    </span><span>fba</span><span>: </span><span>std.heap.FixedBufferAllocator</span><span>,
+</span><span>    </span><span>kv</span><span>: *</span><span>Store</span><span>,
+</span><span>
+</span><span>    </span><span>pub fn </span><span>init</span><span>(</span><span>config</span><span>: </span><span>Config</span><span>, </span><span>gpa</span><span>: </span><span>std.mem.Allocator</span><span>, </span><span>kv</span><span>: *</span><span>Store</span><span>) !</span><span>Runner </span><span>{
+</span><span>        </span><span>const</span><span> L = config.list_length_max;
+</span><span>        </span><span>const</span><span> V = config.val_size_max;
+</span><span>
+</span><span>        </span><span>// ArrayList([]const u8) of largest possible command.
+</span><span>        </span><span>// &#34;[L/R]PUSH list item1 item2 ... itemL&#34;
+</span><span>        </span><span>const</span><span> parse_cap = (</span><span>1 </span><span>+ </span><span>1 </span><span>+ L);
+</span><span>        </span><span>const </span><span>parse_size</span><span>: </span><span>u64 </span><span>= (parse_cap * </span><span>@sizeOf</span><span>([]</span><span>const</span><span> u8));
+</span><span>
+</span><span>        </span><span>// ArrayList([]const u8) pointing to duplicated values.
+</span><span>        </span><span>const</span><span> copy_size = (L * </span><span>@sizeOf</span><span>([]</span><span>const</span><span> u8));
+</span><span>        </span><span>const</span><span> copy_data = (L * V);
+</span><span>
+</span><span>        </span><span>const </span><span>fba_size</span><span>: </span><span>u64 </span><span>= parse_size + copy_size + copy_data;
+</span><span>        </span><span>const</span><span> buffer = </span><span>try</span><span> gpa.</span><span>alloc</span><span>(u8, fba_size);
+</span><span>        </span><span>const</span><span> fba = std.heap.FixedBufferAllocator.</span><span>init</span><span>(buffer);
+</span><span>
+</span><span>        </span><span>return</span><span> .{
+</span><span>            .config = config,
+</span><span>            .fba = fba,
+</span><span>            .kv = kv,
+</span><span>        };
+</span><span>    }
+</span><span>...
+</span><span>};
+</span></code></pre>
+<p><img src="https://nickmonad.blog/images/kv-fixed-buffer-space.png" alt="A diagram showing how the Fixed Buffer Allocator is utilized in kv. The first section is the parse array, the second is the copy array, and the third is copy data."/></p>
+<p>The underlying <code>Store</code> will use the <code>FixedBufferAllocator</code> to allocate an <code>ArrayList</code> of fixed capacity
+(determined by <code>config.list_length_max</code>) and then use the remaining space in the allocator for the copied data.</p>
+<p>Hopefully all is clear so far! Now we can move on to the core of the system: key/value storage.</p>
+<h2 id="key-value-storage">Key/Value Storage</h2>
+<p>Perhaps obviously, the fundamental data structure in <code>kv</code> is a hash map, used to associate user provided keys with
+user provided values.</p>
+<p>Without looking too closely at the standard library, if you grab one of the provided hash map implementations,
+it will accept a <code>std.mem.Allocator</code> and hold onto the allocator for the lifetime of the map. When a key/value pair
+is added to the map, it will use that same allocator and request the appropriate amount of memory to store that data.
+This won&#39;t work for our case though, since we need to control allocation prior to adding any data to the map.</p>
+<p>Fortunately, Zig also provides an &#34;unmanaged&#34; version of a hash map. Generally, these unmanaged versions of data
+structures in the standard library mean that an allocator is not held by the structure itself. It&#39;s up to us to provide
+that allocator when needed. A cool trick we can play with an unmanaged map is ask it to ensure it has enough capacity
+up front, and then &#34;assume&#34; that capacity during runtime when adding data to it. The hashing and internal details are
+still handled by the map.</p>
+<pre data-lang="zig"><code data-lang="zig"><span>var </span><span>map</span><span>: std.</span><span>StringHashMapUnmanaged</span><span>(Value) =</span><span> .empty</span><span>;
+</span><span>try</span><span> map.</span><span>ensureTotalCapacity</span><span>(gpa, capacity);
+</span></code></pre>
+<p>The <code>ensure</code> operation can fail with <code>error.OutOfMemory</code>, which is OK during initialization. But, assuming this succeeds,
+we no longer need to pass an allocator when we store data in the map.</p>
+<pre data-lang="zig"><code data-lang="zig"><span>store.map.</span><span>putAssumeCapacity</span><span>(key, value);
+</span></code></pre>
+<p>This <em>could</em> in theory fail, in which case there would an assertion failure. It&#39;s ultimately up to us to check against
+the map&#39;s available capacity before calling this function. But, again, no allocation is required.</p>
+<p>Since the map itself doesn&#39;t do any allocation at runtime, we have to provide space for incoming keys and values. We&#39;ll
+reuse the same <code>ByteArrayPool</code> implementation that we used for connection buffers. Basically, we have a big space
+allocated for keys and values and the hash map just maintains an association of pointers from keys to values.
+The key/value data isn&#39;t literally <em>stored</em> &#34;in the map.&#34; The allocation that happens in <code>ensureTotalCapacity</code> is for
+the internal book-keeping structure of the map, not for the user data.</p>
+<h3 id="navigating-the-map">Navigating the map</h3>
+<p>At the highest level, the primary challenge with storing keys and values in a statically allocated map is that we
+could get poor utilization of the allocated space, especially when we need to support keys pointed at lists as values.</p>
+<p>To illustrate this, let&#39;s say our map is configured to allocate space for 5 keys and 5 values. If each key maps to one
+value, we get perfect utilization. At the other extreme, if one key maps to a value containing a list of 5 elements,
+we have to use all the allocated value space for this one key, preventing other keys from using any value space,
+causing the map to be &#34;biased&#34;. The store wouldn&#39;t be able to hold any more key/value pairs, even though there is
+allocated memory &#34;on the table.&#34;</p>
+<p><img src="https://nickmonad.blog/images/kv-map-utilization.png" alt="A diagram showing three different possibilities of how allocated memory can be used in a static hash map."/></p>
+<p>Basically, the only way to mitigate this is to make sure there&#39;s enough allocated space for <em>every</em> key to hold a
+list of maximum size. This definitely inflates the amount of space we have to allocate, but the alternative is a
+system that doesn&#39;t support its configured properties. Every key must be <em>able</em> to store a list of maximum size,
+even if they don&#39;t during actual use.</p>
+<p>Another issue with static allocation in the context of a map is dealing with map deletions. Our
+<code>std.StringHashMapUnmanaged</code> structure uses open-addressing and linear probing to place keys in the map when hash
+collisions occur. Deletions are tricky because they can break the map&#39;s ability to know if a key is actually present
+in the map. To handle this, a &#34;tombstone&#34; technique is used to mark a space as logically (but not physically) deleted
+in order to preserve accurate lookups.</p>
+<p>There&#39;s a lot more to figure out here, but it&#39;s my understanding that a map will have to periodically rehash the
+keys in order to reclaim space if too many tombstones pile up. When this occurs is still a bit of mystery to me.
+If it occurs when the map needs to grow to accommodate more key/value pairs, we&#39;ll never actually trigger that
+condition in a static context. If it occurs at some other point, based on number of keys compared to capacity,
+perhaps that could work. Or maybe, it&#39;s up to us to call <code>rehash()</code> whenever it appears there is no space left,
+and try the operation again.</p>
+<p>All of this considered, I think a custom map implementation is more appropriate for the context of static allocation.
+This current implementation proves the concept, but definitely leaves room for improvement!</p>
+<h2 id="revisiting-allocation-size">Revisiting allocation size</h2>
+<p>Now that we have a method for statically allocating space for these three components (connections, parsing, and storage),
+we can finally answer the first question: How much space do we allocate?</p>
+<p>In this current iteration of <code>kv</code>, the answer can really only be determined after the fact, once configuration has
+been set and all the allocations have been made. There are five options that can be configured by the user,
+and two derived properties based on those options.</p>
+<pre data-lang="zig"><code data-lang="zig"><span>pub const </span><span>Config = </span><span>struct </span><span>{
+</span><span>    </span><span>/// Allocation is a calculated set of values (in bytes), based on the given configuration.
+</span><span>    </span><span>/// This informs static allocation requested at initialization.
+</span><span>    </span><span>pub const </span><span>Allocation = </span><span>struct </span><span>{
+</span><span>        </span><span>connection_recv_size</span><span>: </span><span>u64</span><span>,
+</span><span>        </span><span>connection_send_size</span><span>: </span><span>u64</span><span>,
+</span><span>    };
+</span><span>
+</span><span>    </span><span>/// Maximum number of concurrent connections.
+</span><span>    </span><span>connections_max</span><span>: </span><span>u32</span><span>,
+</span><span>
+</span><span>    </span><span>/// Key count is the number of possible keys we can store.
+</span><span>    </span><span>/// Internally, the store will allocate (key_count * list_length_max) number
+</span><span>    </span><span>/// of values, such that each key could support the maximum number of list elements.
+</span><span>    </span><span>key_count</span><span>: </span><span>u32</span><span>,
+</span><span>
+</span><span>    </span><span>/// The maximum allowable key size in bytes.
+</span><span>    </span><span>key_size_max</span><span>: </span><span>u32</span><span>,
+</span><span>    </span><span>/// The maximum allowable value size in bytes.
+</span><span>    </span><span>val_size_max</span><span>: </span><span>u32</span><span>,
+</span><span>
+</span><span>    </span><span>/// The maximum allowable length for a list as a value.
+</span><span>    </span><span>list_length_max</span><span>: </span><span>u32</span><span>,
+</span><span>
+</span><span>    </span><span>pub fn </span><span>allocation</span><span>(</span><span>config</span><span>: </span><span>Config</span><span>) </span><span>Allocation </span><span>{
+</span><span>		</span><span>// ... calculate recv and send size ....
+</span><span>		
+</span><span>        </span><span>return</span><span> .{
+</span><span>            .connection_recv_size = connection_recv_size,
+</span><span>            .connection_send_size = connection_send_size,
+</span><span>        };
+</span><span>    }
+</span><span>};
+</span></code></pre>
+<p>The <code>connection_recv_size</code> and <code>connection_send_size</code> properties of <code>Allocation</code> depend on some details of the
+RESP protocol, but is mostly informed by our user configuration. In the interest of wrapping this post up,
+I&#39;ll gloss over those details, and encourage you to check out <a rel="noopener" target="_blank" href="https://github.com/nickmonad/kv/blob/master/src/config.zig"><code>src/config.zig</code></a>.</p>
+<p>This <code>Config</code> struct doesn&#39;t directly specify <em>every</em> aspect of allocation, but it does provide the basis for it.
+Something not listed in the <code>Config</code> struct directly is the &#34;list item pool&#34;, part of the key/value <code>Store</code> struct.
+When keys point to lists as values, there is a linked list backing that value in the hash map, and we need a pool of
+structs to assist in the construction and iteration of that linked list.</p>
+<p>With some reasonable configuration options set, let&#39;s see just how much memory we allocate!</p>
+<pre data-lang="sh"><code data-lang="sh"><span>$</span><span> zig build run
+</span><span>config
+</span><span>  </span><span>connections_max</span><span> = 1000
+</span><span>  </span><span>key_count</span><span>       = 1000
+</span><span>  </span><span>key_size_max</span><span>    = 1024
+</span><span>  </span><span>val_size_max</span><span>    = 4096
+</span><span>  </span><span>list_length_max</span><span> = 50
+</span><span>allocation
+</span><span>  </span><span>connection_recv_size</span><span> = 206299
+</span><span>  </span><span>connection_send_size</span><span> = 205255
+</span><span>map</span><span> capacity = 2048, map size = 0, available = 1638
+</span><span>total_requested_bytes</span><span> = 748213015
+</span><span>ready!
+</span></code></pre>
+<p>Everything here is measured in bytes, so we&#39;re looking at approximately <code>750 MB</code> of memory for the given configuration.
+<code>total_requested_bytes</code> is a feature of Zig&#39;s <code>std.heap.DebugAllocator</code>. The exact number of bytes will be different
+on each run, although it will hover around that value. I think the reason for this is how Zig requests <em>pages</em> of
+memory from the OS. It won&#39;t always be the same and the OS is very likely doing some fancy book-keeping of its own.</p>
+<p>If you play around with the configuration options and see how <code>total_requested_bytes</code> changes, it might be
+surprising just how much memory is allocated up-front, before any of it is actually used! For example, if we
+double <code>val_size_max</code> to <code>8192</code> and <code>list_length_max</code> to <code>100</code>, we&#39;re looking at about <code>2.8 GB</code> of allocated memory.</p>
+<p>In the context of modern servers, this isn&#39;t a lot, but it can quickly grow as we adjust these parameters.
+Should we be asking ourselves: Is this inefficient? What if we don&#39;t use all that memory?</p>
+<p>Like all good engineering decisions, we have to consider them in the context of the problem we&#39;re trying to
+solve, and the guarantees we expect from our systems. With this design, ensuring that each request and each
+key/value pair <em>can</em> utilize the maximum configured space, seems like a worthy trade-off to make.</p>
+<h2 id="final-thoughts">Final thoughts</h2>
+<p>Like most projects, this one took a lot longer than I expected! Trying to incorporate both <code>io_uring</code> and
+static allocation was something I had never done before, but I&#39;m pretty happy with the result.</p>
+<p>I&#39;m looking forward to improving the internal hash map to better fit a static context, consider alternative
+allocator implementations to improve memory utilization, and incorporate fuzz testing to find the limits of the system.</p>
+<p>Checkout the code on <a rel="noopener" target="_blank" href="https://github.com/nickmonad/kv">GitHub</a>!</p>
+<h3 id="notes">Notes</h3>
+
+
+        </article></div>
+  </body>
+</html>
