@@ -82,9 +82,10 @@ var (
 	// TODO
 	relevantDuration = 7 * 24 * time.Hour
 
-	outputDir  = "docs" // So we can host the site on GitHub Pages
-	outputFile = "index.html"
-	logFile    = path.Join(outputDir, "log.txt")
+	outputDir   = "docs" // So we can host the site on GitHub Pages
+	outputFile  = "index.html"
+	logFile     = path.Join(outputDir, "log.txt")
+	historyFile = path.Join(outputDir, "history.txt")
 
 	// Error out if fetching feeds takes longer than a minute
 	timeout = time.Minute
@@ -114,6 +115,22 @@ func run(ctx context.Context) error {
 	log.SetOutput(logF)
 
 	posts := getAllPosts(ctx, feeds)
+
+	// Read existing history
+	history, err := readHistory()
+	if err != nil {
+		return err
+	}
+
+	// Add all current links to history
+	for _, post := range posts {
+		history[post.Link] = true
+	}
+
+	// Write updated history
+	if err := writeHistory(history); err != nil {
+		return err
+	}
 
 	start := time.Now()
 	defer func() {
@@ -311,4 +328,46 @@ func executeTemplate(writer io.Writer, templateData map[string]interface{}) erro
 	}
 
 	return nil
+}
+
+// readHistory reads the existing history file and returns a set of all links
+func readHistory() (map[string]bool, error) {
+	history := make(map[string]bool)
+
+	data, err := os.ReadFile(historyFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// File doesn't exist yet, return empty set
+			return history, nil
+		}
+		return nil, err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			history[line] = true
+		}
+	}
+
+	return history, nil
+}
+
+// writeHistory writes all links to the history file, deduplicated and sorted
+func writeHistory(links map[string]bool) error {
+	// Convert map to sorted slice
+	var sortedLinks []string
+	for link := range links {
+		sortedLinks = append(sortedLinks, link)
+	}
+	sort.Strings(sortedLinks)
+
+	// Write to file
+	content := strings.Join(sortedLinks, "\n")
+	if len(sortedLinks) > 0 {
+		content += "\n"
+	}
+
+	return os.WriteFile(historyFile, []byte(content), 0644)
 }
