@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://atempleton.bearblog.dev/i-made-zig-compute-33-million-satellite-positions-in-3-seconds-no-gpu-required/">Original</a>
+    <h1>I Made Zig Compute 33M Satellite Positions in 3 Seconds. No GPU Required</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    
+
+    
+
+    
+        
+
+        <p>
+            <i>
+                <time datetime="2026-01-20T21:00Z">
+    20 Jan, 2026
+</time>
+            </i>
+        </p>
+    
+
+    <p>I&#39;ve spent the past month optimizing SGP4 propagation and ended up with something interesting: <a href="https://github.com/ATTron/astroz">astroz</a> is now the <strong>fastest general purpose SGP4 implementation</strong> I&#39;m aware of, hitting <strong>11-13M propagations per second</strong> in native Zig and <strong>~7M/s through Python</strong> with just <code>pip install astroz</code>. This post breaks down how I got there.</p>
+<p><em>A note on &#34;general purpose&#34;: <a href="https://bluescarni.github.io/heyoka.py/notebooks/sgp4_propagator.html">heyoka.py</a> can be faster for batch-processing many satellites simultaneously (16M/s vs 7.5M/s). But it&#39;s a general ODE integrator with SGP4 as a module, requiring LLVM for JIT compilation and a C++ dependency stack that <a href="https://bluescarni.github.io/heyoka.py/install.html">conda-forge recommends over pip</a>. For time batched propagation, many time points for one satellite, astroz is 2x faster (8.5M/s vs 3.8M/s). <a href="#a-note-on-heyokapy">Full comparison below.</a> I&#39;m also skipping GPU accelerated SGP4 implementations. They can be faster for massive batch workloads, but require CUDA/OpenCL setup and aren&#39;t what I&#39;d consider &#34;general purpose.&#34;</em></p>
+<h2 id="why-bother-optimizing-sgp4">Why Bother Optimizing SGP4?</h2><p>SGP4 is the standard algorithm for predicting satellite positions from TLE data. It&#39;s been around since the 80s and most implementations are straightforward ports of the original reference code. They work fine. You can read the implementation that I followed from <a href="https://celestrak.org/NORAD/documentation/spacetrk.pdf">SpaceTrack Report No. 3</a>.</p>
+<p>But &#34;fine&#34; starts to feel slow when you need dense time resolution. Generating a month of ephemeris data at one-second intervals is 2.6 million propagations per satellite. Pass prediction over a ground station network might need sub-second precision across weeks. Trajectory analysis for conjunction screening wants fine-grained time steps to catch close approaches. At 2-3M propagations per second (typical for a good implementation), these workloads take seconds per satellite—that adds up fast when you&#39;re doing iterative analysis or building interactive tools.</p>
+<p>I wanted to see how fast I could make it.</p>
+<h2 id="starting-point-already-faster-than-expected">Starting Point: Already Faster Than Expected</h2><p>Before I even started thinking about SIMD, the scalar implementation was already matching or beating the Rust sgp4 crate, the fastest open-source implementation I could find (general purpose). I hadn&#39;t done anything clever yet; the speed came from design choices that happened to play well with how Zig compiles.</p>
+<p>Two things mattered most:</p>
+<p><strong>Branchless hot paths.</strong> The SGP4 algorithm has a lot of conditionals. Deep space vs near earth, different perturbation models, and convergence checks in the Kepler solver. I wrote these as branchless expressions where possible, not for performance reasons initially, but because it made the code easier to reason about. It happened to be a happy accident that modern CPUs love predictable instruction streams.</p>
+<p><strong>Comptime precomputation.</strong> Zig&#39;s <code>comptime</code> lets you run arbitrary code at compile time. A lot of SGP4&#39;s setup work, ie. gravity constants, polynomial coefficients, derived parameters can be computed once and baked into the binary. No runtime initialization, and no repeated calculations. I didn&#39;t have to do anything special. Zig is smart enough where if you mark a variable as <code>const</code> it treats it as comptime automatically.</p>
+<div><pre><span></span><span>const</span><span> </span><span>j2</span><span>:</span><span> </span><span>comptime_float</span><span> </span><span>=</span><span> </span><span>1.082616e-3</span><span>;</span><span> </span><span>// explicit comptime (not needed)</span>
+<span>const</span><span> </span><span>j2</span><span> </span><span>=</span><span> </span><span>1.082616e-3</span><span>;</span><span> </span><span>// implied comptime because of `const` (what I used)</span>
+</pre></div>
+<p>The result was a scalar implementation running at ~5.2M propagations per second, which was already slightly faster than Rust&#39;s ~5.0M, but within a margin of error. But I started to see some room to go faster. SGP4, by design, doesn&#39;t rely on state to calculate positions: each satellite and each time point is independent. This algorithm feels tailor made for something I have always been too afraid to try: SIMD.</p>
+<h2 id="discovering-zigs-simd-superpowers">Discovering Zig&#39;s SIMD Superpowers</h2><p>I have heard the nightmares about implementing SIMD. Most of the time its never worth it, it adds too much complexity, you have to build for different platforms, and the syntax itself is weird to write and think about.</p>
+<p>I was pleasantly surprised to learn that Zig, whether on purpose or not, makes SIMD a first class citizen. This is all enabled by a powerful and sane standard library that has builtins that handle the weird stuff for me. Now I just had to tackle the thought process for the basic flow of things in SIMD.</p>
+<p>I started with this foundation; a simple type declaration:</p>
+<div><pre><span></span><span>const</span><span> </span><span>Vec4</span><span> </span><span>=</span><span> </span><span>@Vector</span><span>(</span><span>4</span><span>,</span><span> </span><span>f64</span><span>);</span>
+</pre></div>
+<p>That&#39;s all you need to start. I now have a 4-wide vector of 64-bit floats. No intrinsics, no platform detection, no conditional compilation. The LLVM backend handles targeting the right instruction set for wherever the code runs.</p>
+<p>The builtin operations for vector operations are equally simple:</p>
+<div><pre><span></span><span>// Broadcast a scalar to all lanes</span>
+<span>const</span><span> </span><span>twoPiVec</span><span>:</span><span> </span><span>Vec4</span><span> </span><span>=</span><span> </span><span>@splat</span><span>(</span><span>constants</span><span>.</span><span>twoPi</span><span>);</span>
+
+<span>// Auto-vectorized transcendentals through LLVM</span>
+<span>pub</span><span> </span><span>fn</span><span> </span><span>sinSIMD</span><span>(</span><span>x</span><span>:</span><span> </span><span>Vec4</span><span>)</span><span> </span><span>Vec4</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span> </span><span>@sin</span><span>(</span><span>x</span><span>);</span>
+<span>}</span>
+
+<span>pub</span><span> </span><span>fn</span><span> </span><span>cosSIMD</span><span>(</span><span>x</span><span>:</span><span> </span><span>Vec4</span><span>)</span><span> </span><span>Vec4</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span> </span><span>@cos</span><span>(</span><span>x</span><span>);</span>
+<span>}</span>
+</pre></div>
+<p>The <code>@sin</code> and <code>@cos</code> builtins map directly to LLVM intrinsics, which use platform optimal implementations like libmvec on Linux x86_64. No manual work required.</p>
+<h2 id="learning-to-think-in-lanes">Learning to Think in Lanes</h2><p>The arithmetic was easy. What took me a while to internalize was branching.</p>
+<p>In scalar code, you write <code>if</code> statements and the CPU takes one path or the other. In SIMD, all four lanes execute together. If lane 0 needs the &#34;true&#34; branch and lane 2 needs the &#34;false&#34; branch, you can&#39;t just branch, you have to compute <em>both</em> outcomes and then pick per lane.</p>
+<p>Here&#39;s a concrete example. The scalar SGP4 code has a check like this:</p>
+<div><pre><span></span><span>// Scalar version</span>
+<span>if</span><span> </span><span>(</span><span>eccentricity</span><span> </span><span>&lt;</span><span> </span><span>1.0e-4</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>result</span><span> </span><span>=</span><span> </span><span>simple_calculation</span><span>(</span><span>x</span><span>);</span>
+<span>}</span><span> </span><span>else</span><span> </span><span>{</span>
+<span>    </span><span>result</span><span> </span><span>=</span><span> </span><span>complex_calculation</span><span>(</span><span>x</span><span>);</span>
+<span>}</span>
+</pre></div>
+<p>In SIMD, this becomes:</p>
+<div><pre><span></span><span>// SIMD version - compute both, select per-lane</span>
+<span>const</span><span> </span><span>simple_result</span><span> </span><span>=</span><span> </span><span>simple_calculation</span><span>(</span><span>x</span><span>);</span>
+<span>const</span><span> </span><span>complex_result</span><span> </span><span>=</span><span> </span><span>complex_calculation</span><span>(</span><span>x</span><span>);</span>
+<span>const</span><span> </span><span>mask</span><span> </span><span>=</span><span> </span><span>eccentricity</span><span> </span><span>&lt;</span><span> </span><span>@as</span><span>(</span><span>Vec4</span><span>,</span><span> </span><span>@splat</span><span>(</span><span>1.0e-4</span><span>));</span>
+<span>const</span><span> </span><span>result</span><span> </span><span>=</span><span> </span><span>@select</span><span>(</span><span>f64</span><span>,</span><span> </span><span>mask</span><span>,</span><span> </span><span>simple_result</span><span>,</span><span> </span><span>complex_result</span><span>);</span>
+</pre></div>
+<p>This felt wasteful at first. Why compute both paths? But modern CPUs are so fast at arithmetic that computing both and selecting is often faster than branch misprediction. Plus, for SGP4, most satellites take the same path anyway, so we&#39;re rarely doing truly &#34;wasted&#34; work.</p>
+<p>The trickier case was convergence loops. SGP4&#39;s Kepler solver iterates until each result converges. In scalar code:</p>
+<div><pre><span></span><span>// Scalar Kepler solver</span>
+<span>while</span><span> </span><span>(</span><span>@abs</span><span>(</span><span>delta</span><span>)</span><span> </span><span>&gt;</span><span> </span><span>tolerance</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>// iterate...</span>
+<span>}</span>
+</pre></div>
+<p>But in SIMD, different lanes converge at different rates. Lane 0 might converge in 3 iterations while lane 3 needs 5. You can&#39;t exit early for just one lane. The solution is to track convergence per lane with a mask and use <code>@reduce</code> to check if everyone&#39;s done:</p>
+<div><pre><span></span><span>// SIMD Kepler solver</span>
+<span>var</span><span> </span><span>converged</span><span>:</span><span> </span><span>@Vector</span><span>(</span><span>4</span><span>,</span><span> </span><span>bool</span><span>)</span><span> </span><span>=</span><span> </span><span>@splat</span><span>(</span><span>false</span><span>);</span>
+<span>while</span><span> </span><span>(</span><span>!</span><span>@reduce</span><span>(.</span><span>And</span><span>,</span><span> </span><span>converged</span><span>))</span><span> </span><span>{</span>
+<span>    </span><span>// iterate...</span>
+<span>    </span><span>converged</span><span> </span><span>=</span><span> </span><span>@abs</span><span>(</span><span>delta</span><span>)</span><span> </span><span>&lt;=</span><span> </span><span>tolerance_vec</span><span>;</span>
+<span>}</span>
+</pre></div>
+<p>Once I understood this pattern, compute everything, mask the results, reduce to check completion, the rest of the conversion was methodical. I went through the scalar implementation line by line, keeping the original untouched so my test suite could compare outputs.</p>
+<h2 id="the-three-propagation-modes">The Three Propagation Modes</h2><p>With the core SIMD patterns figured out, I built three different propagation strategies for different use cases.</p>
+<h3 id="1-time-batched-codepropagatev4code">1. Time Batched: <code>propagateV4</code></h3><p>The first question I asked: what&#39;s the most common workload? For me, it was generating ephemeris data, and propagating a single satellite across many time points. Pass prediction, trajectory analysis, conjunction screening: they all want dense time series for one object.</p>
+<p>Time batched propagation processes 4 time points for one satellite simultaneously:</p>
+<div><pre><span></span><span>pub</span><span> </span><span>fn</span><span> </span><span>propagateV4</span><span>(</span><span>self</span><span>:</span><span> </span><span>*</span><span>const</span><span> </span><span>Sgp4</span><span>,</span><span> </span><span>times</span><span>:</span><span> </span><span>[</span><span>4</span><span>]</span><span>f64</span><span>)</span><span> </span><span>Error</span><span>!</span><span>[</span><span>4</span><span>][</span><span>2</span><span>][</span><span>3</span><span>]</span><span>f64</span><span> </span><span>{</span>
+<span>    </span><span>const</span><span> </span><span>el</span><span> </span><span>=</span><span> </span><span>&amp;</span><span>self</span><span>.</span><span>elements</span><span>;</span>
+<span>    </span><span>const</span><span> </span><span>timeV4</span><span> </span><span>=</span><span> </span><span>Vec4</span><span>{</span><span> </span><span>times</span><span>[</span><span>0</span><span>],</span><span> </span><span>times</span><span>[</span><span>1</span><span>],</span><span> </span><span>times</span><span>[</span><span>2</span><span>],</span><span> </span><span>times</span><span>[</span><span>3</span><span>]</span><span> </span><span>};</span>
+
+<span>    </span><span>const</span><span> </span><span>secular</span><span> </span><span>=</span><span> </span><span>updateSecularV4</span><span>(</span><span>el</span><span>,</span><span> </span><span>timeV4</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>nm</span><span>:</span><span> </span><span>Vec4</span><span> </span><span>=</span><span> </span><span>@as</span><span>(</span><span>Vec4</span><span>,</span><span> </span><span>@splat</span><span>(</span><span>el</span><span>.</span><span>grav</span><span>.</span><span>xke</span><span>))</span><span> </span><span>/</span><span> </span><span>simdMath</span><span>.</span><span>pow15V4</span><span>(</span><span>secular</span><span>.</span><span>a</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>kepler</span><span> </span><span>=</span><span> </span><span>solveKeplerV4</span><span>(</span><span>el</span><span>,</span><span> </span><span>secular</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>corrected</span><span> </span><span>=</span><span> </span><span>applyShortPeriodCorrectionsV4</span><span>(</span><span>el</span><span>,</span><span> </span><span>kepler</span><span>,</span><span> </span><span>nm</span><span>);</span>
+<span>    </span><span>return</span><span> </span><span>computePositionVelocityV4</span><span>(</span><span>el</span><span>,</span><span> </span><span>corrected</span><span>);</span>
+<span>}</span>
+</pre></div>
+<p>Usage is straightforward:</p>
+<div><pre><span></span><span>const</span><span> </span><span>sat</span><span> </span><span>=</span><span> </span><span>try</span><span> </span><span>Sgp4</span><span>.</span><span>init</span><span>(</span><span>tle</span><span>);</span>
+<span>const</span><span> </span><span>times</span><span> </span><span>=</span><span> </span><span>[</span><span>4</span><span>]</span><span>f64</span><span>{</span><span> </span><span>0.0</span><span>,</span><span> </span><span>1.0</span><span>,</span><span> </span><span>2.0</span><span>,</span><span> </span><span>3.0</span><span> </span><span>};</span><span> </span><span>// minutes since epoch</span>
+<span>const</span><span> </span><span>results</span><span> </span><span>=</span><span> </span><span>try</span><span> </span><span>sat</span><span>.</span><span>propagateV4</span><span>(</span><span>times</span><span>);</span>
+<span>// results[0] = position/velocity at t=0, results[1] at t=1, etc.</span>
+</pre></div>
+<p>This mode gave me the biggest initial speedup because it&#39;s the most cache friendly: the satellite&#39;s orbital elements stay in registers while we compute four outputs.</p>
+<h3 id="2-satellite-batched-codepropagatesatellitesv4code">2. Satellite Batched: <code>propagateSatellitesV4</code></h3><p>The opposite workload: what if you have many satellites and need their positions at one specific time? Collision screening snapshots, catalog-wide visibility checks, that sort of thing.</p>
+<p>Satellite batched propagation processes 4 different satellites at the same time point:</p>
+<div><pre><span></span><span>pub</span><span> </span><span>inline</span><span> </span><span>fn</span><span> </span><span>propagateSatellitesV4</span><span>(</span><span>el</span><span>:</span><span> </span><span>*</span><span>const</span><span> </span><span>ElementsV4</span><span>,</span><span> </span><span>tsince</span><span>:</span><span> </span><span>f64</span><span>)</span><span> </span><span>Error</span><span>!</span><span>[</span><span>4</span><span>][</span><span>2</span><span>][</span><span>3</span><span>]</span><span>f64</span><span> </span><span>{</span>
+<span>    </span><span>const</span><span> </span><span>tsinceVec</span><span>:</span><span> </span><span>Vec4</span><span> </span><span>=</span><span> </span><span>@splat</span><span>(</span><span>tsince</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>secular</span><span> </span><span>=</span><span> </span><span>updateSecularSatV4</span><span>(</span><span>el</span><span>,</span><span> </span><span>tsinceVec</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>nm</span><span>:</span><span> </span><span>Vec4</span><span> </span><span>=</span><span> </span><span>el</span><span>.</span><span>xke</span><span> </span><span>/</span><span> </span><span>simdMath</span><span>.</span><span>pow15V4</span><span>(</span><span>secular</span><span>.</span><span>a</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>kepler</span><span> </span><span>=</span><span> </span><span>solveKeplerSatV4</span><span>(</span><span>el</span><span>,</span><span> </span><span>secular</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>corrected</span><span> </span><span>=</span><span> </span><span>applyShortPeriodCorrectionsSatV4</span><span>(</span><span>el</span><span>,</span><span> </span><span>kepler</span><span>,</span><span> </span><span>nm</span><span>);</span>
+<span>    </span><span>return</span><span> </span><span>computePositionVelocitySatV4</span><span>(</span><span>el</span><span>,</span><span> </span><span>corrected</span><span>);</span>
+<span>}</span>
+</pre></div>
+<p>This required a different data layout. Instead of one satellite with 4 time points, I needed 4 satellites packed together. That&#39;s where <code>ElementsV4</code> comes in. Its a struct where each field is a <code>Vec4</code> holding values for 4 different satellites. More on that layout later.</p>
+<h3 id="3-constellation-mode-codepropagateconstellationv4code">3. Constellation Mode: <code>propagateConstellationV4</code></h3><p>The third workload combines both: propagate <em>many</em> satellites across <em>many</em> time points. This is what the live demo does: 13,000 satellites across 1,440 time points.</p>
+<p>The naive approach would be: for each satellite, compute all time points. But that thrashes the cache. By the time you finish satellite 1&#39;s 1,440 points and move to satellite 2, all the time related data has been evicted.</p>
+<p>Constellation mode uses cache conscious tiling:</p>
+<div><pre><span></span><span>// Time tile size tuned for L1 cache (~32KB)</span>
+<span>const</span><span> </span><span>TILE_SIZE</span><span>:</span><span> </span><span>usize</span><span> </span><span>=</span><span> </span><span>64</span><span>;</span>
+
+<span>// Process in tiles over time to keep data in L1/L2 cache</span>
+<span>var</span><span> </span><span>timeStart</span><span>:</span><span> </span><span>usize</span><span> </span><span>=</span><span> </span><span>0</span><span>;</span>
+<span>while</span><span> </span><span>(</span><span>timeStart</span><span> </span><span>&lt;</span><span> </span><span>numTimes</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>const</span><span> </span><span>timeEnd</span><span> </span><span>=</span><span> </span><span>@min</span><span>(</span><span>timeStart</span><span> </span><span>+</span><span> </span><span>TILE_SIZE</span><span>,</span><span> </span><span>numTimes</span><span>);</span>
+
+<span>    </span><span>for</span><span> </span><span>(</span><span>batches</span><span>,</span><span> </span><span>0</span><span>..)</span><span> </span><span>|*</span><span>batch</span><span>,</span><span> </span><span>batchIdx</span><span>|</span><span> </span><span>{</span>
+<span>        </span><span>for</span><span> </span><span>(</span><span>timeStart</span><span>..</span><span>timeEnd</span><span>)</span><span> </span><span>|</span><span>timeIdx</span><span>|</span><span> </span><span>{</span>
+<span>            </span><span>const</span><span> </span><span>satResults</span><span> </span><span>=</span><span> </span><span>try</span><span> </span><span>propagateSatellitesV4</span><span>(</span><span>batch</span><span>,</span><span> </span><span>times</span><span>[</span><span>timeIdx</span><span>]);</span>
+<span>            </span><span>// Store results...</span>
+<span>        </span><span>}</span>
+<span>    </span><span>}</span>
+<span>    </span><span>timeStart</span><span> </span><span>=</span><span> </span><span>timeEnd</span><span>;</span>
+<span>}</span>
+</pre></div>
+<p>The idea here is to process 64 time points for <em>all</em> satellites, then the next 64, and so on. The time values stay hot in L1 cache while we sweep through the satellite batches. The tile size (64) isn&#39;t magic, it&#39;s roughly <code>L1_size / sizeof(working_data)</code> rounded to a SIMD-friendly number.</p>
+<p>In practice, constellation mode is about 15-20% faster than calling satellite batched propagation in a naive loop for large catalogs.</p>
+<h2 id="the-atan2-problem-and-solution">The atan2 Problem (and Solution)</h2><p>Here&#39;s where things got interesting. SGP4&#39;s Kepler solver needs <code>atan2</code>, but LLVM doesn&#39;t provide a vectorized builtin for it. Calling the scalar function would break the SIMD implementation.</p>
+<p>The solution I picked: a polynomial approximation. The key insight is that for SGP4&#39;s accuracy requirements (which are inherently limited by the model), we don&#39;t need perfect precision.</p>
+<div><pre><span></span><span>pub</span><span> </span><span>fn</span><span> </span><span>atan2SIMD</span><span>(</span><span>y</span><span>:</span><span> </span><span>Vec4</span><span>,</span><span> </span><span>x</span><span>:</span><span> </span><span>Vec4</span><span>)</span><span> </span><span>Vec4</span><span> </span><span>{</span>
+<span>    </span><span>const</span><span> </span><span>abs_x</span><span> </span><span>=</span><span> </span><span>@abs</span><span>(</span><span>x</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>abs_y</span><span> </span><span>=</span><span> </span><span>@abs</span><span>(</span><span>y</span><span>);</span>
+
+<span>    </span><span>// Keep argument in [0, 1] for better polynomial accuracy</span>
+<span>    </span><span>const</span><span> </span><span>max_xy</span><span> </span><span>=</span><span> </span><span>@max</span><span>(</span><span>abs_x</span><span>,</span><span> </span><span>abs_y</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>min_xy</span><span> </span><span>=</span><span> </span><span>@min</span><span>(</span><span>abs_x</span><span>,</span><span> </span><span>abs_y</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>t</span><span> </span><span>=</span><span> </span><span>min_xy</span><span> </span><span>/</span><span> </span><span>@max</span><span>(</span><span>max_xy</span><span>,</span><span> </span><span>@as</span><span>(</span><span>Vec4</span><span>,</span><span> </span><span>@splat</span><span>(</span><span>1.0e-30</span><span>)));</span>
+<span>    </span><span>const</span><span> </span><span>t2</span><span> </span><span>=</span><span> </span><span>t</span><span> </span><span>*</span><span> </span><span>t</span><span>;</span>
+
+<span>    </span><span>const</span><span> </span><span>c1</span><span>:</span><span> </span><span>Vec4</span><span> </span><span>=</span><span> </span><span>@splat</span><span>(</span><span>1.0</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>c3</span><span>:</span><span> </span><span>Vec4</span><span> </span><span>=</span><span> </span><span>@splat</span><span>(</span><span>-</span><span>0.3333314528</span><span>);</span>
+<span>    </span><span>const</span><span> </span><span>c5</span><span>:</span><span> </span><span>Vec4</span><span> </span><span>=</span><span> </span><span>@splat</span><span>(</span><span>0.1999355085</span><span>);</span>
+<span>    </span><span>// ... more coefficients</span>
+
+<span>    </span><span>var</span><span> </span><span>atan_t</span><span> </span><span>=</span><span> </span><span>c17</span><span>;</span>
+<span>    </span><span>atan_t</span><span> </span><span>=</span><span> </span><span>atan_t</span><span> </span><span>*</span><span> </span><span>t2</span><span> </span><span>+</span><span> </span><span>c15</span><span>;</span>
+<span>    </span><span>atan_t</span><span> </span><span>=</span><span> </span><span>atan_t</span><span> </span><span>*</span><span> </span><span>t2</span><span> </span><span>+</span><span> </span><span>c13</span><span>;</span>
+<span>    </span><span>// ... Horner&#39;s method continues</span>
+<span>    </span><span>atan_t</span><span> </span><span>=</span><span> </span><span>atan_t</span><span> </span><span>*</span><span> </span><span>t</span><span>;</span>
+
+<span>    </span><span>// Quadrant correction using branchless selects</span>
+<span>    </span><span>const</span><span> </span><span>swap_mask</span><span> </span><span>=</span><span> </span><span>abs_y</span><span> </span><span>&gt;</span><span> </span><span>abs_x</span><span>;</span>
+<span>    </span><span>atan_t</span><span> </span><span>=</span><span> </span><span>@select</span><span>(</span><span>f64</span><span>,</span><span> </span><span>swap_mask</span><span>,</span><span> </span><span>halfPiVec</span><span> </span><span>-</span><span> </span><span>atan_t</span><span>,</span><span> </span><span>atan_t</span><span>);</span>
+
+<span>    </span><span>// ... more quadrant handling with @select</span>
+<span>    </span><span>return</span><span> </span><span>result</span><span>;</span>
+<span>}</span>
+</pre></div>
+<p>This polynomial approximation is accurate to ~1e-7 radians, which translates to about <strong>10mm position error</strong> at LEO distances. That&#39;s well within SGP4&#39;s inherent accuracy limits. The algorithm itself has kilometers of uncertainty over multi-day propagations built into it.</p>
+<p>To be honest, this math was tricky for me to wrap my head around. I had to ask AI to help me here because I was really struggling with it.</p>
+<h2 id="struct-of-arrays-for-multi-satellite-processing">&#34;Struct of Arrays&#34; for Multi Satellite Processing</h2><p>For processing multiple satellites, I use a &#34;struct of arrays&#34; layout:</p>
+<div><pre><span></span><span>pub</span><span> </span><span>const</span><span> </span><span>ElementsV4</span><span> </span><span>=</span><span> </span><span>struct</span><span> </span><span>{</span>
+<span>    </span><span>grav</span><span>:</span><span> </span><span>constants</span><span>.</span><span>Sgp4GravityModel</span><span>,</span>
+
+<span>    </span><span>// Each field is a Vec4 holding values for 4 satellites</span>
+<span>    </span><span>ecco</span><span>:</span><span> </span><span>Vec4</span><span>,</span>
+<span>    </span><span>inclo</span><span>:</span><span> </span><span>Vec4</span><span>,</span>
+<span>    </span><span>nodeo</span><span>:</span><span> </span><span>Vec4</span><span>,</span>
+<span>    </span><span>argpo</span><span>:</span><span> </span><span>Vec4</span><span>,</span>
+<span>    </span><span>mo</span><span>:</span><span> </span><span>Vec4</span><span>,</span>
+<span>    </span><span>// ...</span>
+
+<span>    </span><span>// Pre-splatted constants (computed once at init)</span>
+<span>    </span><span>xke</span><span>:</span><span> </span><span>Vec4</span><span>,</span>
+<span>    </span><span>j2</span><span>:</span><span> </span><span>Vec4</span><span>,</span>
+<span>    </span><span>one</span><span>:</span><span> </span><span>Vec4</span><span>,</span>
+<span>    </span><span>half</span><span>:</span><span> </span><span>Vec4</span><span>,</span>
+<span>    </span><span>// ...</span>
+<span>};</span>
+</pre></div>
+<p>&#34;Pre-splatting&#34; constants eliminates repeated <code>@splat</code> calls in the hot path. It&#39;s a small optimization, but in code running millions of times per second, everything counts, and its an easy win.</p>
+<h2 id="the-benchmark-results">The Benchmark Results</h2><h3 id="native-implementation-comparison-zig-vs-rust">Native Implementation Comparison (Zig vs Rust)</h3><p>First, let&#39;s compare apples to apples. Native compiled implementations:</p>
+<table>
+<thead>
+<tr>
+  <th>Scenario</th>
+  <th>astroz (Zig)</th>
+  <th>Rust sgp4</th>
+  <th>Speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>1 day (minute)</td>
+  <td>0.27 ms</td>
+  <td>0.31 ms</td>
+  <td><strong>1.16x</strong></td>
+</tr>
+<tr>
+  <td>1 week (minute)</td>
+  <td>1.99 ms</td>
+  <td>2.04 ms</td>
+  <td><strong>1.03x</strong></td>
+</tr>
+<tr>
+  <td>2 weeks (minute)</td>
+  <td>3.87 ms</td>
+  <td>4.03 ms</td>
+  <td><strong>1.04x</strong></td>
+</tr>
+<tr>
+  <td>2 weeks (second)</td>
+  <td>222 ms</td>
+  <td>234 ms</td>
+  <td><strong>1.05x</strong></td>
+</tr>
+<tr>
+  <td>1 month (minute)</td>
+  <td>8.37 ms</td>
+  <td>8.94 ms</td>
+  <td><strong>1.07x</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Both implementations achieve around <strong>5M propagations/sec</strong> for scalar (single-satellite) processing. The Zig implementation edges out Rust slightly. This is most likely hot path optimizations and <code>comptime</code> being quite aggressive with its pre compute.</p>
+<h3 id="native-simd-throughput-comparison">Native SIMD Throughput Comparison</h3><p><img src="https://quickchart.io/chart?c=%7B%22type%22%3A%22bar%22%2C%22data%22%3A%7B%22labels%22%3A%5B%22astroz%20Zig%20%28SIMD%29%22%2C%22astroz%20Zig%20%28scalar%29%22%2C%22Rust%20sgp4%22%5D%2C%22datasets%22%3A%5B%7B%22label%22%3A%22Propagations%20per%20Second%20%28Millions%29%22%2C%22data%22%3A%5B12%2C5.2%2C5.1%5D%2C%22backgroundColor%22%3A%5B%22%23f7a41d%22%2C%22%23f7a41d99%22%2C%22%23dea584%22%5D%7D%5D%7D%2C%22options%22%3A%7B%22title%22%3A%7B%22display%22%3Atrue%2C%22text%22%3A%22Native%20SGP4%20Throughput%20%28Single%20Satellite%29%22%7D%2C%22scales%22%3A%7B%22yAxes%22%3A%5B%7B%22ticks%22%3A%7B%22min%22%3A0%7D%2C%22scaleLabel%22%3A%7B%22display%22%3Atrue%2C%22labelString%22%3A%22Million%20props%2Fsec%22%7D%7D%5D%7D%7D%7D&amp;w=600&amp;h=400&amp;bkg=white" alt="Native Throughput"/></p>
+<p>The real gains come from SIMD. When processing multiple satellites or time points in parallel using <code>@Vector(4, f64)</code>, throughput jumps to <strong>11-13M propagations/sec</strong>, more than <strong>2x faster</strong> than scalar implementations.</p>
+<h3 id="python-bindings-performance">Python Bindings Performance</h3><p>For Python users, here&#39;s how astroz compares to python-sgp4:</p>
+<table>
+<thead>
+<tr>
+  <th>Scenario</th>
+  <th>astroz</th>
+  <th>python-sgp4</th>
+  <th>Speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>2 weeks (second)</td>
+  <td>160 ms</td>
+  <td>464 ms</td>
+  <td><strong>2.9x</strong></td>
+</tr>
+<tr>
+  <td>1 month (minute)</td>
+  <td>5.9 ms</td>
+  <td>16.1 ms</td>
+  <td><strong>2.7x</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="python-bindings-throughput">Python Bindings Throughput</h3><p><img src="https://quickchart.io/chart?c=%7B%22type%22%3A%22horizontalBar%22%2C%22data%22%3A%7B%22labels%22%3A%5B%22astroz%20Python%22%2C%22satkit%20%28Rust%29%22%2C%22python-sgp4%22%5D%2C%22datasets%22%3A%5B%7B%22label%22%3A%22Million%20Propagations%2Fsec%22%2C%22data%22%3A%5B7.0%2C3.7%2C2.2%5D%2C%22backgroundColor%22%3A%5B%22%233572A5%22%2C%22%23dea584%22%2C%22%236e7781%22%5D%7D%5D%7D%2C%22options%22%3A%7B%22title%22%3A%7B%22display%22%3Atrue%2C%22text%22%3A%22Python%20SGP4%20Throughput%22%7D%2C%22scales%22%3A%7B%22xAxes%22%3A%5B%7B%22ticks%22%3A%7B%22min%22%3A0%7D%2C%22scaleLabel%22%3A%7B%22display%22%3Atrue%2C%22labelString%22%3A%22Million%20props%2Fsec%22%7D%7D%5D%7D%7D%7D&amp;w=600&amp;h=300&amp;bkg=white" alt="Python Bindings Throughput"/></p>
+<h3 id="a-note-on-heyokapy">A Note on heyoka.py</h3><p>As mentioned in the intro, <a href="https://bluescarni.github.io/heyoka.py/notebooks/sgp4_propagator.html">heyoka.py</a> deserves attention. Here are the single-threaded benchmarks:</p>
+<table>
+<thead>
+<tr>
+  <th>Test</th>
+  <th>heyoka.py</th>
+  <th>astroz</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>8 sats × 1440 times</td>
+  <td>16.2M/s</td>
+  <td>7.5M/s</td>
+</tr>
+<tr>
+  <td>1 sat × 1440 times</td>
+  <td>3.8M/s</td>
+  <td><strong>8.5M/s</strong></td>
+</tr>
+<tr>
+  <td>100 sats × 100 times</td>
+  <td>15.5M/s</td>
+  <td>8.4M/s</td>
+</tr>
+</tbody>
+</table>
+<p>heyoka.py wins on multi satellite batches; astroz wins on time batched workloads. Which one you pick depends on your use case:</p>
+<ul>
+<li><strong>How many satellites at once?</strong> If you&#39;re propagating hundreds of satellites at the same time point (collision screening snapshots), heyoka.py wins this easily.</li>
+<li><strong>How many time points per satellite?</strong> If you&#39;re generating ephemerides, predicting passes, or doing trajectory analysis for individual satellites across many time steps, astroz is 2x faster.</li>
+<li><strong>Do you need easy deployment?</strong> astroz is <code>pip install astroz</code> with just NumPy. heyoka.py requires LLVM and a C++ stack that conda-forge recommends over pip.</li>
+</ul>
+<h2 id="seeing-it-at-scale">Seeing It at Scale</h2><p>Speed numbers are abstract until you see what they enable. When propagation is this fast, you stop thinking about batching and scheduling, you just compute what you need, when you need it.</p>
+<h3 id="the-live-demo">The Live Demo</h3><p>To show what this looks like, I built an <a href="https://attron.github.io/astroz-demo/">interactive Cesium visualization</a> that propagates the entire active catalog from CelesTrak (~13,000 satellites) across 1440 time points (a full day at minute resolution). That&#39;s ~19 million propagations completing in about 2.7 seconds. Add ~0.6 seconds for TEME→ECEF coordinate conversion, and you get a full day of orbital data for every tracked satellite in about 3.3 seconds. <em>(This demo runs through Python bindings at ~7M/sec; native Zig hits 11-13M/sec.)</em></p>
+<h2 id="looking-forward">Looking Forward</h2><p>Next up: <strong>SDP4</strong> for deep space objects (the current implementation only handles near-earth satellites with periods under 225 minutes), and <strong>multithreading</strong> to scale across cores. The SIMD work here was single threaded, there&#39;s another multiplier waiting.</p>
+<h2 id="try-it-yourself">Try It Yourself</h2><p>astroz is available on PyPI:</p>
+
+<p>Or add it to your Zig project:</p>
+<div><pre><span></span>zig<span> </span>fetch<span> </span>--save<span> </span>git+https://github.com/ATTron/astroz/#HEAD
+</pre></div>
+<p>The code is <a href="https://github.com/ATTron/astroz">open source on GitHub</a>. Stars, issues, and contributions welcome.</p>
+<hr/>
+<p><em>Browse the <a href="https://github.com/ATTron/astroz/tree/main/examples">examples</a> to integrate astroz into your own projects, or try the <a href="https://attron.github.io/astroz-demo/">live demo</a> to see it in action.</em></p>
+<hr/>
+<p><strong>Who Am I?</strong></p>
+<p>Anthony Templeton is a software engineer passionate about high-performance computing and aerospace applications. You can connect with me on <a href="https://www.linkedin.com/in/anthony-f-templeton/">LinkedIn</a> or check out more of my work on <a href="https://github.com/ATTron">GitHub</a>.</p>
+
+
+    
+
+    
+        
+
+        
+            
+
+
+        
+
+        
+            
+        
+    
+
+
+  </div></div>
+  </body>
+</html>
