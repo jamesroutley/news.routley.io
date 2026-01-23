@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://pgdog.dev/blog/replace-protobuf-with-rust">Original</a>
+    <h1>Replacing Protobuf with Rust to go 5 times faster</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+    <div>
+        
+        <p><strong>Jan 22nd, 2026</strong></p>
+       <p>PgDog is a proxy for scaling PostgreSQL. Under the hood, we use <a href="https://github.com/pganalyze/libpg_query/"><code>libpg_query</code></a> to parse and understand SQL queries. Since PgDog is written in Rust, we use its <a href="https://github.com/pganalyze/pg_query.rs/">Rust bindings</a> to interface with the core C library. 
+Those bindings use Protobuf (de)serialization to work uniformly across different programming languages, e.g., the popular Ruby <em>pg_query</em> gem.</p>
+
+<p>Protobuf is fast, but not using Protobuf is faster. We forked <em>pg_query.rs</em> and replaced Protobuf with direct C-to-Rust (and back to C) bindings, using bindgen and Claude-generated wrappers. This resulted in a 5x improvement in parsing queries, and a 10x improvement in deparsing (Postgres AST to SQL string conversion).</p>
+
+<h5 id="results">Results</h5>
+
+<p>You can reproduce these by cloning <a href="https://github.com/pgdogdev/pg_query.rs">our fork</a> and running the benchmark <a href="https://github.com/pgdogdev/pg_query.rs/blob/f5a92bf9ed87ebe60c444f64ccb7a40397a31bcc/tests/raw_parse_tests.rs">tests</a>:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Function</th>
+      <th>Queries per second</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>pg_query::parse</code> (Protobuf)</td>
+      <td>613</td>
+    </tr>
+    <tr>
+      <td><code>pg_query::parse_raw</code> (Direct C to Rust)</td>
+      <td>3357 (5.45x faster)</td>
+    </tr>
+    <tr>
+      <td><code>pg_query::deparse</code> (Protobuf)</td>
+      <td>759</td>
+    </tr>
+    <tr>
+      <td><code>pg_query::deparse_raw</code> (Direct Rust to C)</td>
+      <td>7319 (9.64x faster)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3 id="the-process">The process</h3>
+
+<p>The first step is always profiling. We use <a href="https://github.com/mstange/samply">samply</a>, which integrates nicely with the Firefox profiler. Samply is a sampling profiler: it measures how much time code spends running CPU instructions in each function. It works by inspecting the application call stack thousands of times per second. The more time is spent inside a particular function (or span, as they are typically called), the slower that code is. This is how we discovered <code>pg_query_parse_protobuf</code>:</p>
+
+<center>
+    <img src="https://pgdog.dev/assets/images/pg_query_parse_protobuf.png" width="95%" height="auto" alt="Parameters everywhere"/>
+</center>
+
+<p>This is the entrypoint to the <code>libpg_query</code> C library, used by all <em>pg_query</em> bindings. The function that wraps the actual Postgres parser, <code>pg_query_raw_parse</code>, barely registered on the flame graph. Parsing queries isn’t free, but the Postgres parser itself is very quick and has been optimized for a long time. With the hot spot identified, our first instinct was to do nothing and just add a cache.</p>
+
+<h4 id="caching-mostly-works">Caching mostly works</h4>
+
+<p>Caching is a trade-off between memory and CPU utilization, and memory is relatively cheap (latest DRAM crunch notwithstanding). The cache is mutex-protected, uses the LRU algorithm and is backed by a hashmap<sup id="fnref:1"><a href="#fn:1" rel="footnote" role="doc-noteref">1</a></sup>. The query text is the key and the Abstract Syntax Tree is the value, which expects most apps to use prepared statements. The query text contains placeholders instead of actual values and is therefore reusable, for example:</p>
+
+<div><div><pre><code><span>SELECT</span> <span>*</span> <span>FROM</span> <span>users</span> <span>WHERE</span> <span>id</span> <span>=</span> <span>$</span><span>1</span><span>;</span>
+</code></pre></div></div>
+
+<p>While the <code>id</code> parameter can change between invocations, the prepared statement does not, so we could cache its static AST in memory.</p>
+
+<p>This works pretty well, but eventually we ran into a couple of issues:</p>
+
+<ol>
+  <li>Some ORMs can have bugs that generate thousands of unique statements, e.g., <code>value IN ($1, $2, $3)</code> instead of <code>value = ANY($1)</code>, which causes a lot of cache misses</li>
+  <li>Applications use old PostgreSQL client drivers which don’t support prepared statements, e.g., Python’s <code>psycopg2</code> package</li>
+</ol>
+
+<p>The clock on Protobuf was ticking and we needed to act. So, like a lot of engineers these days, we asked an LLM to just do it for us.</p>
+
+<h4 id="tight-constraints">Tight constraints</h4>
+
+<p>I’m going to preface this section by saying that the vast majority of PgDog’s source code is written by a human. AI is not in a position to one-shot a connection pooler, load balancer and database sharder. However, when scoped to a very specific, well-defined and most importantly <em>machine-verifiable</em> task, it can work really well.</p>
+
+<p>The prompt we started with was pretty straightforward:</p>
+
+<blockquote>
+  <p><em>libpg_query is a library that wraps the PostgreSQL parser in an API. pg_query.rs is a Rust wrapper around libpg_query which uses Protobuf for (de)serialization. Replace Protobuf with bindgen-generated Rust structs that map directly to the Postgres AST.</em></p>
+</blockquote>
+
+<p>And after two days of back and forth between us and the machine, it worked. We ended up with 6,000 lines of recursive Rust that manually mapped C types and structs to Rust structs, and vice versa. We made the switch for <a href="https://docs.rs/pg_query/latest/pg_query/fn.parse.html"><code>parse</code></a>, <a href="https://docs.rs/pg_query/latest/pg_query/fn.deparse.html"><code>deparse</code></a> (used in our new query rewrite engine, which we’ll talk about in another post), <a href="https://docs.rs/pg_query/latest/pg_query/fn.fingerprint.html"><code>fingerprint</code></a> and <a href="https://docs.rs/pg_query/latest/pg_query/fn.scan.html"><code>scan</code></a>. These four methods are heavily used in PgDog to make sharding work, and we immediately saw a 25% improvement in <em>pgbench</em> benchmarks<sup id="fnref:2"><a href="#fn:2" rel="footnote" role="doc-noteref">2</a></sup>.</p>
+
+<p>Just to be clear: we had a lot of things going for us already that made this possible. First, <em>pg_query</em> has a Protobuf spec for <em>protoc</em> (and Prost, the Protobuf Rust implementation) to generate bindings, so Claude was able to get a comprehensive list of structs it needed to extract from C, along with the expected data types.</p>
+
+<p>Second, <em>pg_query.rs</em> was already using bindgen, so we had to just copy/paste some invocations around to get the AST structs included in bindgen’s output.</p>
+
+<p>And last, and definitely not least, <em>pg_query.rs</em> already had a working <code>parse</code> and <code>deparse</code> implementation, so we could test our AI-generated code against its output. This was entirely automated and verifiable: for each test case that used <code>parse</code>, we included a call to <code>parse_raw</code>, compared their results and if they differed by even one byte, Claude Code had to go back and try again.</p>
+
+<h4 id="the-implementation">The implementation</h4>
+
+<p>The translation code between Rust and C uses <code>unsafe</code> Rust functions that wrap Rust structs to C structs. The C structs are then passed to the Postgres/<em>libpg_query</em> C API which does the actual work of building the AST.</p>
+
+<p>The result is converted back to Rust using a recursive algorithm: each node in the AST has its own converter function which accepts an <code>unsafe</code> C pointer and returns a safe Rust struct. Much like the name suggests, the AST is a tree, which is stored in an array:</p>
+
+<div><div><pre><code><span>unsafe</span> <span>fn</span> <span>convert_list_to_raw_stmts</span><span>(</span>
+    <span>list</span><span>:</span> <span>*</span><span>mut</span> <span>bindings_raw</span><span>::</span><span>List</span>
+<span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>protobuf</span><span>::</span><span>RawStmt</span><span>&gt;</span> <span>{</span>
+    <span>// C-to-Rust conversion.</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>For each node in the list, the implementation calls <code>convert_node</code>, which then handles each one of the 100s of tokens available in the SQL grammar:</p>
+
+<div><div><pre><code><span>unsafe</span> <span>fn</span> <span>convert_node</span><span>(</span>
+    <span>node_ptr</span><span>:</span> <span>*</span><span>mut</span> <span>bindings_raw</span><span>::</span><span>Node</span>
+<span>)</span> <span>-&gt;</span> <span>Option</span><span>&lt;</span><span>protobuf</span><span>::</span><span>Node</span><span>&gt;</span> <span>{</span>
+    <span>// This is basically C in Rust, so we better check for nulls!</span>
+    <span>if</span> <span>node_ptr</span><span>.is_null</span><span>()</span> <span>{</span>
+        <span>return</span> <span>None</span><span>;</span>
+    <span>}</span>
+
+    <span>match</span> <span>(</span><span>*</span><span>node_ptr</span><span>)</span><span>.type_</span> <span>{</span>
+        <span>// SELECT statement root node.</span>
+        <span>bindings_raw</span><span>::</span><span>NodeTag_T_SelectStmt</span> <span>=&gt;</span> <span>{</span>
+            <span>let</span> <span>stmt</span> <span>=</span> <span>node_ptr</span> <span>as</span> <span>*</span><span>mut</span> <span>bindings_raw</span><span>::</span><span>SelectStmt</span><span>;</span>
+            <span>Some</span><span>(</span><span>protobuf</span><span>::</span><span>node</span><span>::</span><span>Node</span><span>::</span><span>SelectStmt</span><span>(</span><span>Box</span><span>::</span><span>new</span><span>(</span><span>convert_select_stmt</span><span>(</span><span>&amp;*</span><span>stmt</span><span>))))</span>
+        <span>}</span>
+        
+        <span>// INSERT statement root node.</span>
+        <span>bindings_raw</span><span>::</span><span>NodeTag_T_InsertStmt</span> <span>=&gt;</span> <span>{</span>
+            <span>let</span> <span>stmt</span> <span>=</span> <span>node_ptr</span> <span>as</span> <span>*</span><span>mut</span> <span>bindings_raw</span><span>::</span><span>InsertStmt</span><span>;</span>
+            <span>Some</span><span>(</span><span>protobuf</span><span>::</span><span>node</span><span>::</span><span>Node</span><span>::</span><span>InsertStmt</span><span>(</span><span>Box</span><span>::</span><span>new</span><span>(</span><span>convert_insert_stmt</span><span>(</span><span>&amp;*</span><span>stmt</span><span>))))</span>
+        <span>}</span>
+        
+        <span>// ... 100s more nodes.</span>
+    <span>}</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>For nodes that contain other nodes, we recurse on <code>convert_node</code> again until the algorithm reaches the leaves (nodes with no children) and terminates. For nodes that contain scalars, like a number (e.g., <code>5</code>) or text (e.g., <code>&#39;hello world&#39;</code>), the data type is copied into a Rust analog, e.g., <code>i32</code> or <code>String</code>.</p>
+
+<p>The end result is <a href="https://docs.rs/pg_query/latest/pg_query/protobuf/struct.ParseResult.html"><code>protobuf::ParseResult</code></a>, a Rust struct generated by Prost from the <em>pg_query</em> API Protobuf specification, but populated by native Rust code instead of Prost’s deserializer. Reusing existing structs reduces the chance of errors considerably: we can compare <code>parse</code> and <code>parse_raw</code> outputs, using the derived <code>PartialEq</code> trait, and ensure that both are identical, in testing.</p>
+
+<p>While recursive algorithms have a questionable reputation in the industry because bad ones can cause stack overflows, they are very fast. Recursion requires no additional memory allocation because all of its working space, the stack, is created on program startup. It also has excellent CPU cache locality because the instructions for the next invocation of the same function are already in the CPU L1/L2/L3 cache. Finally and arguably more importantly, they are just easier to read and understand than iterative implementations, which helps us, the humans, with debugging.</p>
+
+<p>Just for good measure, we tried generating an iterative algorithm, but it ended up being slower than Prost. The main cause (we think) was unnecessary memory allocations, hashmap lookups of previously converted nodes, and too much overhead from walking the tree several times. Meanwhile, recursion processes each AST node exactly once and uses the stack pointer to track its position in the tree. If you have any ideas on how to make an iterative algorithm work better, <a href="https://discord.gg/CcBZkjSJdd">let us know</a>!</p>
+
+<h3 id="closing-thoughts">Closing thoughts</h3>
+
+<p>Reducing the overhead from using the Postgres parser in PgDog makes a huge difference for us. As a network proxy, our budget for latency, memory utilization, and CPU cycles is low. After all, we aren’t a real database…yet! This change improves performance from two angles: we use less CPU and we do less work, so PgDog is faster and cheaper to run.</p>
+
+<p>If stuff like this is interesting to you, <a href="https://pgdog.dev/cdn-cgi/l/email-protection#68000128180f0c070f460c0d1e">reach out</a>. We are looking for a Founding Software Engineer to help us grow and build the next iteration of horizontal scaling for PostgreSQL.</p>
+
+
+
+    </div>
+</div></div>
+  </body>
+</html>
