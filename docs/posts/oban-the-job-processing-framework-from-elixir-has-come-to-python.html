@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.dimamik.com/posts/oban_py/">Original</a>
+    <h1>Oban, the job processing framework from Elixir, has come to Python</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+
+<article>
+     
+    <div><h2 id="setting-the-stage">Setting the Stage</h2>
+<p>I’ve used <a href="https://github.com/oban-bg/oban">Oban in Elixir</a> for almost as long as I’ve been writing software in Elixir, and it has always been an essential tool for processing jobs. I always knew Oban was cool, but I never dug deeper. This article is a collection of my notes and observations on how the Python implementation of Oban works and what I’ve learned while exploring its codebase. I’ll also try to compare it with the Elixir version and talk about concurrency in general.</p>
+<h2 id="surface-level">Surface Level</h2>
+<p><a href="https://oban.pro/docs/py/index.html">Oban</a> allows you to <strong>insert and process jobs using only your database</strong>. You can insert the job to send a confirmation email in the same database transaction where you create the user. If one thing fails, everything is rolled back.</p>
+<p>Additionally, like most job processing frameworks, Oban has <a href="https://oban.pro/docs/py/0.5.0/defining_queues.html">queues</a> with local and global queue limits. But unlike others, it <strong>stores your completed jobs</strong> and can <a href="https://oban.pro/docs/py/0.5.0/writing_jobs.html#recording-results">even keep their results if needed</a>. It has built-in <a href="https://oban.pro/docs/py/0.5.0/periodic_jobs.html#periodic-jobs">cron scheduling</a> and <a href="https://oban.pro/docs/py/0.5.0/managing_queues.html">many more features</a> to control how your jobs are processed.</p>
+<p>Oban comes in two versions - <a href="https://oban.pro/docs/py/index.html">Open Source Oban-py</a> and <a href="https://oban.pro/docs/py_pro/adoption.html">commercial Oban-py-pro</a>.</p>
+<p>OSS Oban has a few limitations, which are automatically lifted in the Pro version:</p>
+<ul>
+<li><strong>Single-threaded asyncio execution</strong> - concurrent but not truly parallel, so CPU-bound jobs block the event loop.</li>
+<li><strong>No bulk inserts</strong> - each job is inserted individually.</li>
+<li><strong>No bulk acknowledgements</strong> - each job completion is persisted individually.</li>
+<li><strong>Inaccurate rescues</strong> - jobs that are long-running might get rescued even if the producer is still alive. Pro version uses smarter heartbeats to track producer liveness.</li>
+</ul>
+<p>In addition, Oban-py-pro comes with a few extra features you’d configure separately, like <a href="https://oban.pro/docs/py_pro/0.5.0/workflow.html">workflows</a>, <a href="https://oban.pro/docs/py_pro/0.5.0/relay.html">relay</a>, <a href="https://oban.pro/docs/py_pro/0.5.0/unique_jobs.html">unique jobs</a>, and <a href="https://oban.pro/docs/py_pro/0.5.0/smart_concurrency.html">smart concurrency</a>.</p>
+<p>OSS Oban-py is a great start for your hobby project, or if you’d want to evaluate Oban philosophy itself, but for any bigger scale - I’d go with <a href="https://oban.pro/docs/py_pro/index.html">Oban Pro</a>. The pricing seems very compelling, considering the amount of work put into making the above features work.</p>
+<p>I obviously can’t walk you through the Pro version features, but let’s start with the basics. How Oban Py works under the hood, from the job insertion until the job execution. Stay tuned.</p>
+<h2 id="going-deeper---job-processing-path">Going Deeper - Job Processing Path</h2>
+<p>Let’s get straight to it. You insert your job:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span>from</span> oban <span>import</span> job
+</span></span><span><span>
+</span></span><span><span><span>@job</span>(queue<span>=</span><span>&#34;default&#34;</span>)
+</span></span><span><span><span>async</span> <span>def</span> <span>send_email</span>(to: str, subject: str, body: str):
+</span></span><span><span>    <span># Simple and clean, but no access to job context</span>
+</span></span><span><span>    <span>await</span> smtp<span>.</span>send(to, subject, body)
+</span></span><span><span>
+</span></span><span><span><span>await</span> send_email<span>.</span>enqueue(<span>&#34;<a href="https://www.dimamik.com/cdn-cgi/l/email-protection" data-cfemail="c7b2b4a2b587a2bfa6aab7aba2e9a4a8aa">[email protected]</a>&#34;</span>, <span>&#34;Hello&#34;</span>, <span>&#34;World&#34;</span>)
+</span></span></code></pre></div><p>After the insertion, the job lands in the <code>oban_jobs</code> database table with <code>state = &#39;available&#39;</code>. Oban fires off a PostgreSQL <code>NOTIFY</code> on the <code>insert</code> channel:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># oban.py:414-419</span>
+</span></span><span><span><span># Single inserts go through bulk insert path</span>
+</span></span><span><span>result <span>=</span> <span>await</span> self<span>.</span>_query<span>.</span>insert_jobs(jobs)
+</span></span><span><span>queues <span>=</span> {job<span>.</span>queue <span>for</span> job <span>in</span> result <span>if</span> job<span>.</span>state <span>==</span> <span>&#34;available&#34;</span>}
+</span></span><span><span><span>await</span> self<span>.</span>_notifier<span>.</span>notify(<span>&#34;insert&#34;</span>, [{<span>&#34;queue&#34;</span>: queue} <span>for</span> queue <span>in</span> queues])
+</span></span></code></pre></div><p>Every Oban node listening on that channel receives the notification. <strong>The Stager</strong> on each node gets woken up, but each <strong>Stager</strong> only cares about queues it’s actually running. Be aware that each node decides which queues it runs, so if the current node runs this queue, the producer is notified:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _stager.py:95-99</span>
+</span></span><span><span><span>async</span> <span>def</span> <span>_on_notification</span>(self, channel: str, payload: dict) <span>-&gt;</span> <span>None</span>:
+</span></span><span><span>    queue <span>=</span> payload[<span>&#34;queue&#34;</span>]
+</span></span><span><span>
+</span></span><span><span>    <span>if</span> queue <span>in</span> self<span>.</span>_producers:
+</span></span><span><span>        self<span>.</span>_producers[queue]<span>.</span>notify()
+</span></span></code></pre></div><p>That <code>notify()</code> call sets an <code>asyncio.Event</code>, breaking <strong>the Producer</strong> out of its wait loop, so it can dispatch the jobs to the workers:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _producer.py:244-262</span>
+</span></span><span><span><span>async</span> <span>def</span> <span>_loop</span>(self) <span>-&gt;</span> <span>None</span>:
+</span></span><span><span>    <span>while</span> <span>True</span>:
+</span></span><span><span>        <span>try</span>:
+</span></span><span><span>            <span># &lt;--- This is where the event is received ---&gt;</span>
+</span></span><span><span>            <span>await</span> asyncio<span>.</span>wait_for(self<span>.</span>_notified<span>.</span>wait(), timeout<span>=</span><span>1.0</span>)
+</span></span><span><span>        <span>except</span> asyncio<span>.</span>TimeoutError:
+</span></span><span><span>            <span>continue</span>
+</span></span><span><span>        <span>except</span> asyncio<span>.</span>CancelledError:
+</span></span><span><span>            <span>break</span>
+</span></span><span><span>
+</span></span><span><span>        <span># &lt;--- Reset the event so it can be triggered for the next batch ---&gt;</span>
+</span></span><span><span>        self<span>.</span>_notified<span>.</span>clear()
+</span></span><span><span>
+</span></span><span><span>        <span>try</span>:
+</span></span><span><span>            <span># &lt;--- A little debounce to potentially process multiple jobs at once ---&gt;</span>
+</span></span><span><span>            <span>await</span> self<span>.</span>_debounce()
+</span></span><span><span>            <span># &lt;--- Dispatch (Produce) the jobs from the database to the workers ---&gt;</span>
+</span></span><span><span>            <span>await</span> self<span>.</span>_produce()
+</span></span><span><span>        <span>except</span> asyncio<span>.</span>CancelledError:
+</span></span><span><span>            <span>break</span>
+</span></span><span><span>        <span>except</span> <span>Exception</span>:
+</span></span><span><span>            logger<span>.</span>exception(<span>&#34;Error in producer for queue </span><span>%s</span><span>&#34;</span>, self<span>.</span>_queue)
+</span></span></code></pre></div><p>Before fetching the jobs, <strong>the producer</strong> persists all pre-existing job completions (acks) to the database to make sure queue limits are respected. Next, it fetches new jobs, transitioning their state to executing at the same time. A slightly more complex version of this SQL is used:</p>
+<div><pre tabindex="0"><code data-lang="sql"><span><span><span>-- fetch_jobs.sql (simplified)
+</span></span></span><span><span><span></span><span>WITH</span> locked_jobs <span>AS</span> (
+</span></span><span><span>  <span>SELECT</span> priority, scheduled_at, id
+</span></span><span><span>  <span>FROM</span>
+</span></span><span><span>  oban_jobs
+</span></span><span><span>  <span>WHERE</span> <span>state</span> <span>=</span> <span>&#39;available&#39;</span> <span>AND</span> queue <span>=</span> <span>%</span>(queue)s
+</span></span><span><span>  <span>ORDER</span> <span>BY</span> priority <span>ASC</span>, scheduled_at <span>ASC</span>, id <span>ASC</span>
+</span></span><span><span>  <span>LIMIT</span> <span>%</span>(demand)s
+</span></span><span><span>  <span>FOR</span> <span>UPDATE</span> SKIP LOCKED
+</span></span><span><span>)
+</span></span><span><span><span>UPDATE</span> oban_jobs oj
+</span></span><span><span><span>SET</span>
+</span></span><span><span>  attempt <span>=</span> oj.attempt <span>+</span> <span>1</span>,
+</span></span><span><span>  attempted_at <span>=</span> timezone(<span>&#39;UTC&#39;</span>, now()),
+</span></span><span><span>  attempted_by <span>=</span> <span>%</span>(attempted_by)s,
+</span></span><span><span>  <span>state</span> <span>=</span> <span>&#39;executing&#39;</span>
+</span></span><span><span><span>FROM</span> locked_jobs
+</span></span><span><span><span>WHERE</span> oj.id <span>=</span> locked_jobs.id
+</span></span></code></pre></div><p>And this is <strong>the first really cool part</strong>.</p>
+<p><strong>Segue to <em>FOR UPDATE SKIP LOCKED</em>.</strong></p>
+<ul>
+<li>
+<p><code>FOR UPDATE</code> - Locks the selected rows so no other transaction can modify them until this transaction completes. This prevents two producers from grabbing the same job.</p>
+</li>
+<li>
+<p><code>SKIP LOCKED</code> - If a row is already locked by another transaction, skip it instead of waiting. This is crucial for concurrency.</p>
+</li>
+</ul>
+<p>Why this matters for job queues:
+Imagine two producer instances (A and B) trying to fetch jobs simultaneously:</p>
+<table>
+  <thead>
+      <tr>
+          <th>Without SKIP LOCKED</th>
+          <th>With SKIP LOCKED</th>
+      </tr>
+  </thead>
+  <tbody>
+      <tr>
+          <td>A locks job #1</td>
+          <td>A locks job #1</td>
+      </tr>
+      <tr>
+          <td>B <strong>waits</strong> for job #1 to unlock</td>
+          <td>B <strong>skips</strong> job #1, takes job #2</td>
+      </tr>
+      <tr>
+          <td>Slow, sequential processing</td>
+          <td>Fast, parallel processing</td>
+      </tr>
+  </tbody>
+</table>
+<p>Back in Python, we know that the jobs we just fetched should be processed immediately. When we fetched the job, we already transitioned its state and respected the queue demand.</p>
+<p>Each job gets dispatched as an <strong>async task</strong>:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span>jobs <span>=</span> <span>await</span> self<span>.</span>_get_jobs()
+</span></span><span><span><span>for</span> job <span>in</span> jobs:
+</span></span><span><span>    task <span>=</span> self<span>.</span>_dispatcher<span>.</span>dispatch(self, job)
+</span></span><span><span>    task<span>.</span>add_done_callback(
+</span></span><span><span>        <span>lambda</span> _, job_id<span>=</span>job<span>.</span>id: self<span>.</span>_on_job_complete(job_id)
+</span></span><span><span>    )
+</span></span><span><span>
+</span></span><span><span>    self<span>.</span>_running_jobs[job<span>.</span>id] <span>=</span> (job, task)
+</span></span></code></pre></div><p><code>add_done_callback</code> ensures that independent of success or failure, we can attach a callback to handle job completion.</p>
+<p><strong>The dispatcher</strong> controls how exactly the job is run. For the non-pro Oban version, it just uses <code>asyncio.create_task</code> to run the job in the event loop:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _producer.py:69-71</span>
+</span></span><span><span><span>class</span> <span>LocalDispatcher</span>:
+</span></span><span><span>    <span>def</span> <span>dispatch</span>(self, producer: Producer, job: Job) <span>-&gt;</span> asyncio<span>.</span>Task:
+</span></span><span><span>        <span>return</span> asyncio<span>.</span>create_task(producer<span>.</span>_execute(job))
+</span></span></code></pre></div><p><a href="https://oban.pro/releases/py_pro">For pro version</a>, local asyncio dispatcher is automatically replaced with a pool of processes, so you don’t need to do anything to have true parallelism across multiple cores.</p>
+<p>After the job is dispatched, <strong>the Executor</strong> takes over. It resolves your worker class from the string name, runs it, and pattern-matches the result:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _executor.py:73-83</span>
+</span></span><span><span><span>async</span> <span>def</span> <span>_process</span>(self) <span>-&gt;</span> <span>None</span>:
+</span></span><span><span>  self<span>.</span>worker <span>=</span> resolve_worker(self<span>.</span>job<span>.</span>worker)()
+</span></span><span><span>  self<span>.</span>result <span>=</span> <span>await</span> self<span>.</span>worker<span>.</span>process(self<span>.</span>job)
+</span></span></code></pre></div><div><pre tabindex="0"><code data-lang="python"><span><span><span># _executor.py:95-133</span>
+</span></span><span><span><span>match</span> result:
+</span></span><span><span>    <span>case</span> <span>Exception</span>() <span>as</span> error:
+</span></span><span><span>        <span># Retry or discard based on attempt count</span>
+</span></span><span><span>    <span>case</span> Cancel(reason<span>=</span>reason):
+</span></span><span><span>        <span># Mark cancelled</span>
+</span></span><span><span>    <span>case</span> Snooze(seconds<span>=</span>seconds):
+</span></span><span><span>        <span># Reschedule with decremented attempt</span>
+</span></span><span><span>    <span>case</span> _:
+</span></span><span><span>        <span># Completed successfully</span>
+</span></span></code></pre></div><p>And that’s <strong>the second cool part</strong>! You see how similar it is to <a href="https://hexdocs.pm/elixir/pattern-matching.html">Elixir’s pattern matching</a>? I love how it’s implemented!</p>
+<p>When execution finishes, the result gets queued for acknowledgement:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _producer.py:315</span>
+</span></span><span><span>self<span>.</span>_pending_acks<span>.</span>append(executor<span>.</span>action)
+</span></span></code></pre></div><p>The completion callback notifies <strong>the Producer</strong> to wake up again-fetch more jobs, and batch-ack the finished ones in a single query.</p>
+<p>That’s the hot path: <code>Insert → Notify → Fetch (with locking) → Execute → Ack.</code> Five hops from your code to completion. What about the background processes? What about errors and retries? What about periodic jobs, cron, and all these other pieces? Stay tuned.</p>
+<h2 id="the-undercurrents---background-processes">The Undercurrents - Background Processes</h2>
+<p>Oban runs several background loops that keep the system healthy.</p>
+<h3 id="leader-election">Leader Election</h3>
+<p>In a cluster, you don’t want every node pruning jobs or rescuing orphans. Oban elects a single leader:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _leader.py:107-113</span>
+</span></span><span><span><span>async</span> <span>def</span> <span>_election</span>(self) <span>-&gt;</span> <span>None</span>:
+</span></span><span><span>    self<span>.</span>_is_leader <span>=</span> <span>await</span> self<span>.</span>_query<span>.</span>attempt_leadership(
+</span></span><span><span>        self<span>.</span>_name, self<span>.</span>_node, int(self<span>.</span>_interval), self<span>.</span>_is_leader
+</span></span><span><span>    )
+</span></span></code></pre></div><div><pre tabindex="0"><code data-lang="sql"><span><span><span>-- Cleanup expired leaders first
+</span></span></span><span><span><span></span><span>DELETE</span> <span>FROM</span>
+</span></span><span><span>  oban_leaders
+</span></span><span><span><span>WHERE</span>
+</span></span><span><span>  expires_at <span>&lt;</span> timezone(<span>&#39;UTC&#39;</span>, now())
+</span></span></code></pre></div><div><pre tabindex="0"><code data-lang="sql"><span><span><span>-- If current node is a leader, it re-elects itself
+</span></span></span><span><span><span></span><span>INSERT</span> <span>INTO</span> oban_leaders (name, node, elected_at, expires_at)
+</span></span><span><span><span>VALUES</span> (
+</span></span><span><span>  <span>%</span>(name)s,
+</span></span><span><span>  <span>%</span>(node)s,
+</span></span><span><span>  timezone(<span>&#39;UTC&#39;</span>, now()),
+</span></span><span><span>  timezone(<span>&#39;UTC&#39;</span>, now()) <span>+</span> interval <span>&#39;%(ttl)s seconds&#39;</span>
+</span></span><span><span>)
+</span></span><span><span><span>ON</span> CONFLICT (name) <span>DO</span> <span>UPDATE</span> <span>SET</span>
+</span></span><span><span>  <span>-- Only update if we&#39;re the same node (i.e. current leader re-electing itself).
+</span></span></span><span><span><span></span>  <span>-- Other nodes can&#39;t overwrite an active leader&#39;s lease.
+</span></span></span><span><span><span></span>  expires_at <span>=</span> EXCLUDED.expires_at
+</span></span><span><span><span>WHERE</span>
+</span></span><span><span>  oban_leaders.node <span>=</span> EXCLUDED.node
+</span></span><span><span>RETURNING node
+</span></span></code></pre></div><div><pre tabindex="0"><code data-lang="sql"><span><span><span>-- Try to insert as a new leader if no leader exists
+</span></span></span><span><span><span></span><span>INSERT</span> <span>INTO</span> oban_leaders (
+</span></span><span><span>  name, node, elected_at, expires_at
+</span></span><span><span>) <span>VALUES</span> (
+</span></span><span><span>  <span>%</span>(name)s,
+</span></span><span><span>  <span>%</span>(node)s,
+</span></span><span><span>  timezone(<span>&#39;UTC&#39;</span>, now()),
+</span></span><span><span>  timezone(<span>&#39;UTC&#39;</span>, now()) <span>+</span> interval <span>&#39;%(ttl)s seconds&#39;</span>
+</span></span><span><span>)
+</span></span><span><span><span>ON</span> CONFLICT (name) <span>DO</span> <span>NOTHING</span>
+</span></span><span><span>RETURNING node
+</span></span></code></pre></div><p>The leader refreshes twice as often to hold onto the role:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _leader.py:101-105</span>
+</span></span><span><span><span># Sleep for half interval if leader (to boost their refresh interval and allow them to</span>
+</span></span><span><span><span># retain leadership), full interval otherwise</span>
+</span></span><span><span>sleep_duration <span>=</span> self<span>.</span>_interval <span>/</span> <span>2</span> <span>if</span> self<span>.</span>_is_leader <span>else</span> self<span>.</span>_interval
+</span></span></code></pre></div><p>When a node shuts down cleanly, it resigns and notifies the cluster:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _leader.py:83-87</span>
+</span></span><span><span><span>if</span> self<span>.</span>_is_leader:
+</span></span><span><span>    payload <span>=</span> {<span>&#34;action&#34;</span>: <span>&#34;resign&#34;</span>, <span>&#34;node&#34;</span>: self<span>.</span>_node, <span>&#34;name&#34;</span>: self<span>.</span>_name}
+</span></span><span><span>
+</span></span><span><span>    <span>await</span> self<span>.</span>_notifier<span>.</span>notify(<span>&#34;leader&#34;</span>, payload)
+</span></span><span><span>    <span>await</span> self<span>.</span>_query<span>.</span>resign_leader(self<span>.</span>_name, self<span>.</span>_node)
+</span></span></code></pre></div><p>And that’s <strong>the third cool part</strong>! Leader election is delegated entirely to PostgreSQL. Oban uses <code>INSERT ... ON CONFLICT</code> with a TTL-based lease - no Raft, no consensus protocol, no external coordination service. If the leader dies, its lease expires and the next node to run the election query takes over. Simple, effective, and zero additional infrastructure.</p>
+<h3 id="lifeline-rescuing-orphaned-jobs">Lifeline: Rescuing Orphaned Jobs</h3>
+<p>Workers crash. Containers get killed. When that happens, jobs can get stuck executing indefinitely. <strong>The Lifeline</strong> process (leader-only) rescues them:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _lifeline.py:73-77</span>
+</span></span><span><span><span>async</span> <span>def</span> <span>_rescue</span>(self) <span>-&gt;</span> <span>None</span>:
+</span></span><span><span>    <span>if</span> <span>not</span> self<span>.</span>_leader<span>.</span>is_leader:
+</span></span><span><span>        <span>return</span>
+</span></span><span><span>
+</span></span><span><span>    <span>await</span> use_ext(<span>&#34;lifeline.rescue&#34;</span>, _rescue, self<span>.</span>_query, self<span>.</span>_rescue_after)
+</span></span></code></pre></div><p>Oban-py rescue mechanics are purely time-based - any job in <code>executing</code> state longer than <code>rescue_after</code> (default: 5 minutes) gets moved back. Unlike the Oban Pro version, it doesn’t check whether the producer that owns the job is still alive. This means legitimately long-running jobs could be rescued and executed a second time.</p>
+<p>The takeaway is that you should set <code>rescue_after</code> higher than your longest expected job duration, and design workers to be idempotent.</p>
+<p>The SQL itself is straightforward - jobs stuck executing get moved back to available or discarded if they’ve exhausted retries:</p>
+<div><pre tabindex="0"><code data-lang="sql"><span><span><span>-- rescue_jobs.sql (simplified)
+</span></span></span><span><span><span></span><span>UPDATE</span> oban_jobs
+</span></span><span><span><span>SET</span>
+</span></span><span><span>  <span>state</span> <span>=</span> <span>CASE</span>
+</span></span><span><span>    <span>WHEN</span> attempt <span>&gt;=</span> max_attempts <span>THEN</span> <span>&#39;discarded&#39;</span>
+</span></span><span><span>    <span>ELSE</span> <span>&#39;available&#39;</span>
+</span></span><span><span>  <span>END</span>,
+</span></span><span><span>  meta <span>=</span> <span>CASE</span>
+</span></span><span><span>    <span>WHEN</span> attempt <span>&gt;=</span> max_attempts <span>THEN</span> meta
+</span></span><span><span>    <span>ELSE</span> meta <span>||</span> jsonb_build_object(<span>&#39;rescued&#39;</span>, coalesce((meta<span>-&gt;&gt;</span><span>&#39;rescued&#39;</span>)::int, <span>0</span>) <span>+</span> <span>1</span>)
+</span></span><span><span>  <span>END</span>
+</span></span><span><span><span>WHERE</span>
+</span></span><span><span>  <span>state</span> <span>=</span> <span>&#39;executing&#39;</span>
+</span></span><span><span>  <span>AND</span> attempted_at <span>&lt;</span> timezone(<span>&#39;UTC&#39;</span>, now()) <span>-</span> make_interval(secs <span>=&gt;</span> <span>%</span>(rescue_after)s)
+</span></span></code></pre></div><p>The rescued counter in meta lets you track how often jobs needed saving.</p>
+<h3 id="pruner-cleaning-up-old-jobs">Pruner: Cleaning Up Old Jobs</h3>
+<p>Without pruning, your oban_jobs table grows forever. <strong>The Pruner</strong> (also leader-only) deletes terminal jobs older than max_age (default: 1 day):</p>
+<div><pre tabindex="0"><code data-lang="sql"><span><span><span>-- prune_jobs.sql
+</span></span></span><span><span><span></span><span>WITH</span> jobs_to_delete <span>AS</span> (
+</span></span><span><span><span>SELECT</span> id <span>FROM</span> oban_jobs
+</span></span><span><span><span>WHERE</span>
+</span></span><span><span>(<span>state</span> <span>=</span> <span>&#39;completed&#39;</span> <span>AND</span> completed_at <span>&lt;=</span> timezone(<span>&#39;UTC&#39;</span>, now()) <span>-</span> make_interval(secs <span>=&gt;</span> <span>%</span>(max_age)s)) <span>OR</span>
+</span></span><span><span>(<span>state</span> <span>=</span> <span>&#39;cancelled&#39;</span> <span>AND</span> cancelled_at <span>&lt;=</span> timezone(<span>&#39;UTC&#39;</span>, now()) <span>-</span> make_interval(secs <span>=&gt;</span> <span>%</span>(max_age)s)) <span>OR</span>
+</span></span><span><span>(<span>state</span> <span>=</span> <span>&#39;discarded&#39;</span> <span>AND</span> discarded_at <span>&lt;=</span> timezone(<span>&#39;UTC&#39;</span>, now()) <span>-</span> make_interval(secs <span>=&gt;</span> <span>%</span>(max_age)s))
+</span></span><span><span><span>ORDER</span> <span>BY</span> id <span>ASC</span>
+</span></span><span><span><span>LIMIT</span> <span>%</span>(<span>limit</span>)s
+</span></span><span><span>)
+</span></span><span><span><span>DELETE</span> <span>FROM</span> oban_jobs <span>WHERE</span> id <span>IN</span> (<span>SELECT</span> id <span>FROM</span> jobs_to_delete)
+</span></span></code></pre></div><p>The LIMIT prevents long-running deletes from blocking other operations.</p>
+<h3 id="retry--backoff-mechanics">Retry &amp; Backoff Mechanics</h3>
+<p>When a job raises an exception, <strong>the Executor</strong> decides its fate:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _executor.py:96-109</span>
+</span></span><span><span><span>match</span> result:
+</span></span><span><span>    <span>case</span> <span>Exception</span>() <span>as</span> error:
+</span></span><span><span>        <span>if</span> self<span>.</span>job<span>.</span>attempt <span>&gt;=</span> self<span>.</span>job<span>.</span>max_attempts:
+</span></span><span><span>            self<span>.</span>action <span>=</span> AckAction(
+</span></span><span><span>                job<span>=</span>self<span>.</span>job,
+</span></span><span><span>                state<span>=</span><span>&#34;discarded&#34;</span>,
+</span></span><span><span>                error<span>=</span>self<span>.</span>_format_error(error),
+</span></span><span><span>            )
+</span></span><span><span>        <span>else</span>:
+</span></span><span><span>            self<span>.</span>action <span>=</span> AckAction(
+</span></span><span><span>                job<span>=</span>self<span>.</span>job,
+</span></span><span><span>                state<span>=</span><span>&#34;retryable&#34;</span>,
+</span></span><span><span>                error<span>=</span>self<span>.</span>_format_error(error),
+</span></span><span><span>                schedule_in<span>=</span>self<span>.</span>_retry_backoff(),
+</span></span><span><span>            )
+</span></span></code></pre></div><p>Simple rule: under <code>max_attempts</code> - retry, otherwise - discard.</p>
+<p>The default backoff uses jittery-clamped exponential growth with randomness to prevent thundering herds:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span># _backoff.py:66-87</span>
+</span></span><span><span><span>def</span> <span>jittery_clamped</span>(attempt: int, max_attempts: int, <span>*</span>, clamped_max: int <span>=</span> <span>20</span>) <span>-&gt;</span> int:
+</span></span><span><span>    <span>if</span> max_attempts <span>&lt;=</span> clamped_max:
+</span></span><span><span>        clamped_attempt <span>=</span> attempt
+</span></span><span><span>    <span>else</span>:
+</span></span><span><span>        clamped_attempt <span>=</span> round(attempt <span>/</span> max_attempts <span>*</span> clamped_max)
+</span></span><span><span>
+</span></span><span><span>    time <span>=</span> exponential(clamped_attempt, mult<span>=</span><span>1</span>, max_pow<span>=</span><span>100</span>, min_pad<span>=</span><span>15</span>)
+</span></span><span><span>
+</span></span><span><span>    <span>return</span> jitter(time, mode<span>=</span><span>&#34;inc&#34;</span>)
+</span></span></code></pre></div><p>And that’s <strong>the fourth cool thing</strong>! Backoff includes jitter to prevent <a href="https://en.wikipedia.org/wiki/Thundering_herd_problem">thundering herds</a> - without it, all failed jobs from the same batch would retry at the exact same moment, spiking load all over again.</p>
+<p>The formula: 15 + 2^attempt seconds, with up to 10% added jitter. Attempt 1 waits ~17s. Attempt 5 waits ~47s. Attempt 10 waits ~1039s (~17 minutes).</p>
+<p>The clamping handles jobs with high <code>max_attempts</code> - if you set <code>max_attempts=100</code>, it scales the attempt number down proportionally so you don’t wait years between retries.</p>
+<p>Workers can override this with custom backoff:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span>@worker</span>(queue<span>=</span><span>&#34;default&#34;</span>)
+</span></span><span><span><span>class</span> <span>MyWorker</span>:
+</span></span><span><span>    <span>async</span> <span>def</span> <span>process</span>(self, job: Job):
+</span></span><span><span>        <span>...</span>
+</span></span><span><span>
+</span></span><span><span>    <span>def</span> <span>backoff</span>(self, job: Job) <span>-&gt;</span> int:
+</span></span><span><span>        <span># Linear backoff: 60s, 120s, 180s...</span>
+</span></span><span><span>        <span>return</span> job<span>.</span>attempt <span>*</span> <span>60</span>
+</span></span></code></pre></div><h2 id="surfacing---takeaways">Surfacing - Takeaways</h2>
+<ul>
+<li><strong>PostgreSQL does the heavy lifting.</strong> <code>FOR UPDATE SKIP LOCKED</code> for concurrent job fetching, <code>LISTEN/NOTIFY</code> for real-time signaling, <code>ON CONFLICT</code> for leader election - the database isn’t just storage, it’s the coordination layer. There’s no Redis, no ZooKeeper, no external broker. One less thing to operate.</li>
+<li><strong>Oban-py is concurrent, but not parallel</strong>. Async IO allows multiple jobs to be in-flight, but the event loop is single-threaded. For I/O-bound workloads, this is fine. For CPU-bound tasks, consider using the Pro version with a process pool.</li>
+<li><strong>Leader election is simple and effective.</strong> No consensus protocol, no Raft - just an <code>INSERT ... ON CONFLICT</code> with a TTL. The leader refreshes at 2x the normal rate to hold the lease. If it dies, the lease expires and another node takes over. Good enough for pruning and rescuing.</li>
+<li><strong>The codebase is a pleasure to read.</strong> Clear naming, consistent patterns, and well-separated concerns - exploring it felt more like reading a well-written book than understanding a library.</li>
+<li><strong>OSS gets you far, Pro fills the gaps.</strong> Bulk operations, smarter rescues, and true parallelism are all Pro-only - but for what you get, Pro license feels like a great deal.</li>
+</ul>
+<p>Overall, <a href="https://oban.pro/docs/py/index.html">Oban.py</a> is a clean and well-structured port. If you’re coming from Elixir and miss Oban, or if you’re in Python and want a database-backed job queue that doesn’t require external infrastructure beyond PostgreSQL - it’s worth looking at.</p>
+
+
+    </div>
+
+    
+</article>
+            </div></div>
+  </body>
+</html>
