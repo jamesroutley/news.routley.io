@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://minidump.net/writing-a-net-gc-in-c-part-6/">Original</a>
+    <h1>Writing a .NET Garbage Collector in C# – Part 6: Mark and Sweep</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+            <div>
+              
+
+<a href="https://amzn.to/42tg58c" target="_blank" rel="noopener noreferrer">
+  <p><span>
+      If you enjoy this article, make sure to check the 2nd edition of <strong><u>Pro .NET Memory Management</u></strong> for more insights on the .NET Garbage Collector internals!
+    </span>
+    <img src="https://minidump.net/images/progc.png" alt="Pro .NET Memory Management"/>
+  </p>
+</a>
+
+<p>After a long (way too long) break, it’s time to resume our journey towards building a .NET garbage collector in C#. In the previous parts, we saw how to implement the minimal set of GC APIs to allow a simple application to run, and how to lay out the objects in memory to make the heap walkable. We then learned how to find the references of a given managed object. If you need a refresher, don’t hesitate to jump back to those past articles:</p>
+<ul>
+<li><a href="https://minidump.net/2025-28-01-writing-a-net-gc-in-c-part-1/">Part 1:</a> Introduction and setting up the project</li>
+<li><a href="https://minidump.net/writing-a-net-gc-in-c-part-2/">Part 2:</a> Implementing a minimal GC</li>
+<li><a href="https://minidump.net/writing-a-net-gc-in-c-part-3/">Part 3:</a> Using the DAC to inspect the managed objects</li>
+<li><a href="https://minidump.net/writing-a-net-gc-in-c-part-4/">Part 4:</a> Walking the managed heap</li>
+<li><a href="https://minidump.net/writing-a-net-gc-in-c-part-5/">Part 5:</a> Decoding the GCDesc to find the references of a managed object</li>
+</ul>
+<p>If you don’t have time to read everything, I would recommend focusing on part 4 which explains the layout of the heap.</p>
+<p>Now we have all the pieces of the puzzle to start implementing the mark phase of our garbage collection. The goal of the mark phase is to find all the objects that are currently reachable by user code, to deduce which ones aren’t reachable anymore and can be freed.</p>
+
+<p>Marking starts from the roots. That is: references that the GC treats as unconditionally live at the beginning of a collection. The roots can be sorted into three buckets:  the local variables and thread-static storage, the GC handles, and the finalization queue. You might also think of static fields, however in practice the static variables are kept alive by GC handles.</p>
+<p>While the GC is responsible for the last two buckets, the first one is handled directly by the runtime. The <code>IGCToCLR</code> interface exposes a <code>GcScanRoots</code> method that takes a callback, which will be called for every local variable. In addition to the callback, the <code>GcScanRoots</code> method takes 3 arguments: <code>condemned</code> and <code>max_gen</code> which are only used for some corner cases with server GC, and so are largely inconsequential for us, and a <code>ScanContext</code>:</p>
+<div><pre tabindex="0"><code data-lang="csharp"><span><span><span>[StructLayout(LayoutKind.Sequential)]</span>
+</span></span><span><span><span>public</span> <span>struct</span> <span>ScanContext</span>
+</span></span><span><span>{
+</span></span><span><span>    <span>public</span> IntPtr thread_under_crawl;
+</span></span><span><span>    <span>public</span> <span>int</span> thread_number;
+</span></span><span><span>    <span>public</span> <span>int</span> thread_count;
+</span></span><span><span>    <span>public</span> IntPtr stack_limit; <span>// Lowest point on the thread stack that the scanning logic is permitted to read</span>
+</span></span><span><span>    <span>public</span> <span>bool</span> promotion; <span>//TRUE: Promotion, FALSE: Relocation.</span>
+</span></span><span><span>    <span>public</span> <span>bool</span> concurrent; <span>//TRUE: concurrent scanning</span>
+</span></span><span><span>    <span>public</span> IntPtr _unused1;
+</span></span><span><span>    <span>public</span> IntPtr pMD;
+</span></span><span><span>    <span>public</span> <span>int</span> _unused3;
+</span></span><span><span>}
+</span></span></code></pre></div><p>Likewise, most of the fields in <code>ScanContext</code> are only useful for server GC (where threads are affinitized to a given heap). We’re going to use only two of them:</p>
+<ul>
+<li><code>promotion</code> tells the execution engine whether we’re scanning for the promotion (where we’re going to mark objects that are going to be promoted to an upper generation) or for the relocation (where we’re going to update pointers after moving objects in memory). As far as I can tell, it mostly impacts what roots are reported when <em>conservative mode</em> is enabled, so it shouldn’t affect us for now. Still, we’re going to set it to <code>true</code>.</li>
+<li><code>_unused1</code> is a pointer-sized field that the GC can fill to its own discretion. We’re going to use it to store a pointer to our instance of <code>GCHeap</code>. We need it because the callback given to <code>GcScanRoots</code> must be decorated with <code>UnmanagedCallersOnly</code> because it will be called from native code, and methods decorated with this attribute must be static.</li>
+</ul>
+<div><pre tabindex="0"><code data-lang="csharp"><span><span><span>private</span> <span>void</span> MarkPhase()
+</span></span><span><span>{
+</span></span><span><span>   ScanContext scanContext = <span>new</span>();
+</span></span><span><span>   scanContext.promotion = <span>true</span>;
+</span></span><span><span>   scanContext._unused1 = GCHandle.ToIntPtr(_handle);
+</span></span><span><span>
+</span></span><span><span>   <span>var</span> scanRootsCallback = (<span>delegate</span>* unmanaged&lt;GCObject**, ScanContext*, <span>uint</span>, <span>void</span>&gt;)&amp;ScanRootsCallback;
+</span></span><span><span>   _gcToClr.GcScanRoots((IntPtr)scanRootsCallback, <span>2</span>, <span>2</span>, &amp;scanContext);
+</span></span><span><span>}
+</span></span><span><span><span>
+</span></span></span><span><span><span>[UnmanagedCallersOnly]</span>
+</span></span><span><span><span>private</span> <span>static</span> <span>void</span> ScanRootsCallback(GCObject** obj, ScanContext* context, <span>uint</span> flags)
+</span></span><span><span>{
+</span></span><span><span>   <span>var</span> handle = GCHandle.FromIntPtr(context-&gt;_unused1);
+</span></span><span><span>   <span>var</span> gcHeap = (GCHeap)handle.Target!;
+</span></span><span><span>   gcHeap.ScanRoots(*obj, context, (GcCallFlags)flags);
+</span></span><span><span>}
+</span></span><span><span>
+</span></span><span><span><span>private</span> <span>void</span> ScanRoots(GCObject* obj, ScanContext* context, GcCallFlags flags)
+</span></span><span><span>{
+</span></span><span><span>   <span>// TODO: actual implementation of the callback</span>
+</span></span><span><span>}
+</span></span></code></pre></div><p>Don’t worry, I wasn’t planning on dropping the term ‘conservative mode’ without explaining it. Conservative mode is enabled by setting <code>DOTNET_gcConservative=1</code>. It switches the execution engine from “precise” root tracking (where .NET knows exactly what is a root and what isn’t) to “conservative” root tracking. In conservative root tracking, the execution engine scans the whole stack and reports any value that points to the range of memory managed by the GC. It greatly complicates the work of the GC because any reported root could be a false positive. As I understand, it’s mostly meant for new environments where the CLR isn’t fully implemented and doesn’t support precise root tracking yet. It can also be used to test some new features. At this point, I have no plan to implement support for conservative mode in our custom GC.</p>
+<p>Inside of our <code>ScanRoots</code> callback, we need to discover all the outgoing references from the given object, then browse the reference tree and mark all the objects that we discover. We’ve already seen <a href="https://minidump.net/writing-a-net-gc-in-c-part-5/">in part 5</a> how to get the references from the given object, and we implemented it into an <code>EnumerateObjectReferences</code> method. To mark the objects, we need to store somewhere the information that we found a given object. There are a few ways to do that. For instance, on x64 the object header includes 4 bytes of padding to keep the alignment, and we could theoretically repurpose that space. However, I plan to use those bytes later to implement different kind of optimizations for other issues that the GC is going to face. Instead, we’re going to do the same thing as the actual .NET GC.</p>
+<p>As a reminder, the layout of an object in memory is this:</p>
+<div><pre tabindex="0"><code data-lang="b"><span><span><span>                      Object         
+</span></span></span><span><span><span>                </span>+-----------------+<span>  
+</span></span></span><span><span><span>                | Object header   |  
+</span></span></span><span><span><span>                </span>+-----------------+<span>  
+</span></span></span><span><span><span>Object ref </span>---&gt;<span> | MethodTable*    | 
+</span></span></span><span><span><span>                </span>+-----------------+<span> 
+</span></span></span><span><span><span>                |  Field1         | 
+</span></span></span><span><span><span>                </span>+-----------------+<span> 
+</span></span></span><span><span><span>                |  Field2         | 
+</span></span></span><span><span><span>                </span>+-----------------+<span> 
+</span></span></span><span><span><span>                |  Field3         |
+</span></span></span><span><span><span>                </span>+-----------------<span>|
+</span></span></span><span><span><span>                |  Field4         |
+</span></span></span><span><span><span>                </span>+-----------------+<span>
+</span></span></span></code></pre></div><p>The trick is to take advantage of the fact that the method-table is aligned on a pointer boundary. It means that the two least-significant bits of the method-table pointer on a 32-bit runtime (three on a 64-bit runtime) are always going to be 0. Whenever it marks an object, the GC just sets the least-significant bit of the method-table pointer to 1. Of course, it must make sure to restore the original pointer at the end of the garbage collection, before resuming the runtime.</p>
+<p>Accordingly, we add the <code>Mark</code> and <code>Unmark</code> methods on our implementation of <code>GCObject</code>, which will flip the value of the least-significant bit of the method-table pointer. <code>IsMarked</code> checks the current value of that bit. Last but not least, we introduce a <code>MethodTable</code> property which applies a bit mask to the method-table pointer so that we don’t have to worry about whether the object is marked or not whenever we just want to access the method-table (ideally we should only do so in code paths where an object <em>might</em> be marked, but we don’t really care about that level of performance at this point).</p>
+<div><pre tabindex="0"><code data-lang="csharp"><span><span><span>[StructLayout(LayoutKind.Sequential)]</span>
+</span></span><span><span><span>public</span> <span>unsafe</span> <span>struct</span> <span>GCObject</span>
+</span></span><span><span>{
+</span></span><span><span>    <span>public</span> MethodTable* RawMethodTable;
+</span></span><span><span>    <span>public</span> <span>uint</span> Length;
+</span></span><span><span>
+</span></span><span><span>    <span>public</span> <span>readonly</span> MethodTable* MethodTable =&gt; (MethodTable*)((nint)RawMethodTable &amp; ~<span>1</span>);
+</span></span><span><span>
+</span></span><span><span>    <span>public</span> <span>bool</span> IsMarked() =&gt; ((nint)RawMethodTable &amp; <span>1</span>) != <span>0</span>;
+</span></span><span><span>
+</span></span><span><span>    <span>public</span> <span>void</span> Mark() =&gt; RawMethodTable = (MethodTable*)((nint)MethodTable | <span>1</span>);
+</span></span><span><span>
+</span></span><span><span>    <span>public</span> <span>void</span> Unmark() =&gt; RawMethodTable = (MethodTable*)((nint)MethodTable &amp; ~<span>1</span>);
+</span></span><span><span>
+</span></span><span><span>    <span>// ...</span>
+</span></span><span><span>}
+</span></span></code></pre></div><p>Great, now we can implement our actual traversal of the reference tree! We use a DFS (depth-first search) instead of a BFS (breadth-first search) under the assumption that we are more likely to sequentially scan objects that are related to each other, which could improve cache locality. We must be careful to not use recursion, as the object graph can get really big.</p>
+<div><pre tabindex="0"><code data-lang="csharp"><span><span><span>private</span> Stack&lt;IntPtr&gt; _markStack = <span>new</span>();
+</span></span><span><span>
+</span></span><span><span><span>private</span> <span>void</span> ScanRoots(GCObject* obj, ScanContext* context, GcCallFlags flags)
+</span></span><span><span>{
+</span></span><span><span>    <span>if</span> ((IntPtr)obj == <span>0</span>)
+</span></span><span><span>    {
+</span></span><span><span>        <span>return</span>;
+</span></span><span><span>    }
+</span></span><span><span>
+</span></span><span><span>    <span>if</span> (flags.HasFlag(GcCallFlags.GC_CALL_INTERIOR))
+</span></span><span><span>    {
+</span></span><span><span>        <span>// TODO</span>
+</span></span><span><span>        <span>return</span>;
+</span></span><span><span>    }
+</span></span><span><span>
+</span></span><span><span>    _markStack.Push((IntPtr)obj);
+</span></span><span><span>
+</span></span><span><span>    <span>while</span> (_markStack.Count &gt; <span>0</span>)
+</span></span><span><span>    {
+</span></span><span><span>        <span>var</span> ptr = _markStack.Pop();
+</span></span><span><span>        <span>var</span> o = (GCObject*)ptr;
+</span></span><span><span>
+</span></span><span><span>        <span>if</span> (o-&gt;IsMarked())
+</span></span><span><span>        {
+</span></span><span><span>            <span>continue</span>;
+</span></span><span><span>        }
+</span></span><span><span>
+</span></span><span><span>        o-&gt;EnumerateObjectReferences(_markStack.Push);
+</span></span><span><span>        o-&gt;Mark();
+</span></span><span><span>    }
+</span></span><span><span>}
+</span></span></code></pre></div><p>Notice that for now we ignore roots that are marked with the <code>GC_CALL_INTERIOR</code> flag. Those are <em>interior pointers</em>. Consider for instance the following code:</p>
+<div><pre tabindex="0"><code data-lang="csharp"><span><span><span>private</span> <span>static</span> <span>ref</span> <span>int</span> GetInteriorPointer()
+</span></span><span><span>{
+</span></span><span><span>    <span>var</span> array = <span>new</span> <span>int</span>[<span>10</span>];
+</span></span><span><span>    <span>return</span> <span>ref</span> array[<span>5</span>];
+</span></span><span><span>}
+</span></span></code></pre></div><p><code>GetInteriorPointer</code> returns a reference to an int, but that int is stored inside of an array. If the array is ever collected while some code holds that reference, bad things will happen. Therefore, by some mechanism, that <code>ref int</code> (called interior pointer) must keep the whole array alive. This is challenging for the GC because we are handed a pointer to an arbitrary part of an object, and we must somehow find the beginning of that object to mark it. For now, we’re just going to pretend that this problem doesn’t exist, and ignore interior pointers entirely.</p>
+
+<p>After we marked the objects that are referenced, directly or indirectly, by the roots, we need to do a full scan of the heap. Whenever we find an object that isn’t marked, we know that this object isn’t reachable anymore and we can clear it. For now, our GC doesn’t reuse memory so we’re just going to clear the memory to make sure that user applications will crash if we accidentally collect an object that is still reachable. To keep the heap in a walkable state, we replace the old object with a free object (free objects are explained <a href="https://minidump.net/writing-a-net-gc-in-c-part-4/">in part 4</a>). Also, when we find a marked object, we make sure to unmark it to restore its method-table pointer back to its original state.</p>
+<p>The <code>WalkHeapObjects</code> method has the same logic <a href="https://minidump.net/writing-a-net-gc-in-c-part-4/">as the <code>TraverseHeap</code> method of part 4</a>, but cleaned up and rewritten into an enumerator to be easily reusable.</p>
+<div><pre tabindex="0"><code data-lang="csharp"><span><span><span>private</span> <span>void</span> Sweep()
+</span></span><span><span>{
+</span></span><span><span>    <span>foreach</span> (IntPtr ptr <span>in</span> WalkHeapObjects())
+</span></span><span><span>    {
+</span></span><span><span>        <span>var</span> obj = (GCObject*)ptr;
+</span></span><span><span>
+</span></span><span><span>        <span>bool</span> marked = obj-&gt;IsMarked();
+</span></span><span><span>        obj-&gt;Unmark();
+</span></span><span><span>
+</span></span><span><span>        <span>bool</span> isFreeObject = obj-&gt;MethodTable == _freeObjectMethodTable;
+</span></span><span><span>
+</span></span><span><span>        <span>if</span> (!marked &amp;&amp; !isFreeObject)
+</span></span><span><span>        {
+</span></span><span><span>            <span>var</span> startPtr = ptr - IntPtr.Size; <span>// Include the header</span>
+</span></span><span><span>            <span>var</span> endPtr = Align(startPtr + (nint)obj-&gt;ComputeSize());
+</span></span><span><span>
+</span></span><span><span>            <span>// Clear the memory</span>
+</span></span><span><span>            <span>new</span> Span&lt;<span>byte</span>&gt;((<span>void</span>*)startPtr, (<span>int</span>)(endPtr - startPtr)).Clear();
+</span></span><span><span>
+</span></span><span><span>            <span>// Allocate a free object to keep the heap walkable</span>
+</span></span><span><span>            AllocateFreeObject(ptr, (<span>uint</span>)(endPtr - startPtr - SizeOfObject));
+</span></span><span><span>        }
+</span></span><span><span>    }
+</span></span><span><span>}
+</span></span><span><span>
+</span></span><span><span><span>private</span> IEnumerable&lt;IntPtr&gt; WalkHeapObjects()
+</span></span><span><span>{
+</span></span><span><span>    <span>foreach</span> (<span>var</span> segment <span>in</span> _segments)
+</span></span><span><span>    {
+</span></span><span><span>        <span>foreach</span> (<span>var</span> obj <span>in</span> WalkHeapObjects(segment.Start, segment.Current))
+</span></span><span><span>        {
+</span></span><span><span>            <span>yield</span> <span>return</span> obj;
+</span></span><span><span>        }
+</span></span><span><span>    }
+</span></span><span><span>}
+</span></span><span><span>
+</span></span><span><span><span>private</span> IEnumerable&lt;IntPtr&gt; WalkHeapObjects(nint start, nint end)
+</span></span><span><span>{
+</span></span><span><span>    <span>var</span> ptr = start + IntPtr.Size;
+</span></span><span><span>
+</span></span><span><span>    <span>while</span> (ptr &lt; end)
+</span></span><span><span>    {
+</span></span><span><span>        <span>yield</span> <span>return</span> ptr;
+</span></span><span><span>        ptr = FindNextObject(ptr);
+</span></span><span><span>    }
+</span></span><span><span>
+</span></span><span><span>    <span>static</span> <span>unsafe</span> nint FindNextObject(nint current)
+</span></span><span><span>    {
+</span></span><span><span>        <span>var</span> obj = (GCObject*)current;
+</span></span><span><span>        <span>return</span> Align(current + (nint)obj-&gt;ComputeSize());
+</span></span><span><span>    }
+</span></span><span><span>}
+</span></span></code></pre></div><p>And that’s it! Of course, if you try to run an application with the GC at this stage, it will quickly crash: we have yet to implement support for interior pointers, and we have completely skipped the other two types of roots: GC handles and the finalization queue. This will be the subject of our next articles.</p>
+<p>As usual, the full code is available on <a href="https://github.com/kevingosse/ManagedDotnetGC/">GitHub</a>.</p>
+
+
+<a href="https://amzn.to/42tg58c" target="_blank" rel="noopener noreferrer">
+  <p><span>
+      Liked this article? Don&#39;t hesitate to check the 2nd edition of <strong><u>Pro .NET Memory Management</u></strong> for more insights on the .NET Garbage Collector internals!
+    </span>
+    <img src="https://minidump.net/images/progc.png" alt="Pro .NET Memory Management"/>
+  </p>
+</a>
+
+
+              
+
+
+            </div>
+          </div></div>
+  </body>
+</html>
