@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://neutree.ai/blog/nano-vllm-part-1">Original</a>
+    <h1>Nano-vLLM: How a vLLM-style inference engine works</h1>
+    
+    <div id="readability-page-1" class="page"><div data-astro-cid-7jjqptxk=""> <h2 id="architecture-scheduling-and-the-path-from-prompt-to-token">Architecture, Scheduling, and the Path from Prompt to Token</h2>
+<p>When deploying large language models in production, the inference engine becomes a critical piece of infrastructure. Every LLM API you use — OpenAI, Claude, DeepSeek — is sitting on top of an inference engine like this. While most developers interact with LLMs through high-level APIs, understanding what happens beneath the surface—how prompts are processed, how requests are batched, and how GPU resources are managed—can significantly impact system design decisions.</p>
+<p>This two-part series explores these internals through <a href="https://github.com/GeeeekExplorer/nano-vllm">Nano-vLLM</a>, a minimal (~1,200 lines of Python) yet production-grade implementation that distills the core ideas behind <a href="https://github.com/vllm-project/vllm">vLLM</a>, one of the most widely adopted open-source inference engines.</p>
+<p>Nano-vLLM was created by a contributor to DeepSeek, whose name appears on the technical reports of models like DeepSeek-V3 and R1. Despite its minimal codebase, it implements the essential features that make vLLM production-ready: prefix caching, tensor parallelism, CUDA graph compilation, and torch compilation optimizations. Benchmarks show it achieving throughput comparable to—or even slightly exceeding—the full vLLM implementation. This makes it an ideal lens for understanding inference engine design without getting lost in the complexity of supporting dozens of model architectures and hardware backends.</p>
+<p>In Part 1, we focus on the engineering architecture: how the system is organized, how requests flow through the pipeline, and how scheduling decisions are made. We will treat the actual model computation as a black box for now—Part 2 will open that box to explore attention mechanisms, KV cache internals, and tensor parallelism at the computation level.</p>
+<h2 id="the-main-flow-from-prompt-to-output">The Main Flow: From Prompt to Output</h2>
+<p>The entry point to Nano-vLLM is straightforward: an <code>LLM</code> class with a <code>generate</code> method. You pass in an array of prompts and sampling parameters, and get back the generated text. But behind this simple interface lies a carefully designed pipeline that transforms text into tokens, schedules computation efficiently, and manages GPU resources.</p>
+<p><img src="https://neutree.ai/images/blog/nano-vllm-01-01.png" alt="01"/></p>
+<h3 id="from-prompts-to-sequences">From Prompts to Sequences</h3>
+<p>When <code>generate</code> is called, each prompt string goes through a tokenizer—a model-specific component that splits natural language into tokens, the fundamental units that LLMs process. Different model families (Qwen, LLaMA, DeepSeek) use different tokenizers, which is why a prompt of the same length may produce different token counts across models. The tokenizer converts each prompt into a <strong>sequence</strong>: an internal data structure representing a variable-length array of token IDs. This sequence becomes the core unit of work flowing through the rest of the system.</p>
+<h3 id="the-producer-consumer-pattern">The Producer-Consumer Pattern</h3>
+<p>Here’s where the architecture gets interesting. Rather than processing each sequence immediately, the system adopts a producer-consumer pattern with the Scheduler at its center. The <code>add_request</code> method acts as the producer: it converts prompts to sequences and places them into the Scheduler’s queue. Meanwhile, a separate <strong>step loop</strong> acts as the consumer, pulling batches of sequences from the Scheduler for processing. This decoupling is key—it allows the system to accumulate multiple sequences and process them together, which is where the performance gains come from.</p>
+<h3 id="batching-and-the-throughput-latency-trade-off">Batching and the Throughput-Latency Trade-off</h3>
+<p>Why does batching matter? GPU computation has significant fixed overhead—initializing CUDA kernels, transferring data between CPU and GPU memory, and synchronizing results. If you process one sequence at a time, you pay this overhead for every single request. By batching multiple sequences together, you amortize this overhead across many requests, dramatically improving overall throughput.</p>
+<p>However, batching comes with a trade-off. When three prompts are batched together, each must wait for the others to complete before any results are returned. The total time for the batch is determined by the slowest sequence. This means: larger batches yield higher throughput but potentially higher latency for individual requests; smaller batches yield lower latency but reduced throughput. This is a fundamental tension in inference engine design, and the batch size parameters you configure directly control this trade-off.</p>
+<h3 id="prefill-vs-decode-two-phases-of-generation">Prefill vs. Decode: Two Phases of Generation</h3>
+<p>Before diving into the Scheduler, we need to understand a crucial distinction. LLM inference happens in two phases:</p>
+<ul>
+<li><strong>Prefill</strong>: Processing the input prompt. All input tokens are processed together to build up the model’s internal state. During this phase, the user sees nothing.</li>
+<li><strong>Decode</strong>: Generating output tokens. The model produces one token at a time, each depending on all previous tokens. This is when you see text streaming out.</li>
+</ul>
+<p>For a single sequence, there is exactly one prefill phase followed by many decode steps. The Scheduler needs to distinguish between these phases because they have very different computational characteristics—prefill processes many tokens at once, while decode processes just one token per step.</p>
+<h2 id="inside-the-scheduler">Inside the Scheduler</h2>
+<p>The Scheduler is responsible for deciding which sequences to process and in what order. It maintains two queues:</p>
+<p><img src="https://neutree.ai/images/blog/nano-vllm-01-02.png" alt="02"/></p>
+<h3 id="waiting-and-running-queues">Waiting and Running Queues</h3>
+<ul>
+<li><strong>Waiting Queue</strong>: Sequences that have been submitted but not yet started. New sequences from <code>add_request</code> always enter here first.</li>
+<li><strong>Running Queue</strong>: Sequences that are actively being processed—either in prefill or decode phase.</li>
+</ul>
+<p>When a sequence enters the Waiting queue, the Scheduler checks with another component called the Block Manager to allocate resources for it. Once allocated, the sequence moves to the Running queue. The Scheduler then selects sequences from the Running queue for the next computation step, grouping them into a batch along with an action indicator (prefill or decode).</p>
+<h3 id="handling-resource-exhaustion">Handling Resource Exhaustion</h3>
+<p>What happens when GPU memory fills up? The KV cache (which stores intermediate computation results) has limited capacity. If a sequence in the Running queue cannot continue because there’s no room to store its next token’s cache, the Scheduler <strong>preempts</strong> it—moving it back to the front of the Waiting queue. This ensures the sequence will resume as soon as resources free up, while allowing other sequences to make progress.</p>
+<p>When a sequence completes (reaches an end-of-sequence token or maximum length), the Scheduler removes it from the Running queue and deallocates its resources, freeing space for waiting sequences.</p>
+<h2 id="the-block-manager-kv-cache-control-plane">The Block Manager: KV Cache Control Plane</h2>
+<p>The Block Manager is where vLLM’s memory management innovation lives. To understand it, we first need to introduce a new resource unit: the <strong>block</strong>.</p>
+<p><img src="https://neutree.ai/images/blog/nano-vllm-01-03.png" alt="03"/></p>
+<h3 id="from-sequences-to-blocks">From Sequences to Blocks</h3>
+<p>A sequence is a variable-length array of tokens—it can be 10 tokens or 10,000. But variable-length allocations are inefficient for GPU memory management. The Block Manager solves this by dividing sequences into fixed-size <strong>blocks</strong> (default: 256 tokens each).</p>
+<p>A 700-token sequence would occupy three blocks: two full blocks (256 tokens each) and one partial block (188 tokens, with 68 slots unused). Importantly, tokens from different sequences never share a block—but a long sequence will span multiple blocks.</p>
+<h3 id="prefix-caching-via-hashing">Prefix Caching via Hashing</h3>
+<p>Here’s where it gets clever. Each block’s content is hashed, and the Block Manager maintains a hash-to-block-id mapping. When a new sequence arrives, the system computes hashes for its blocks and checks if any already exist in the cache.</p>
+<p>If a block with the same hash exists, the system reuses it by incrementing a reference count—no redundant computation or storage needed. This is particularly powerful for scenarios where many requests share common prefixes (like system prompts in chat applications). The prefix only needs to be computed once; subsequent requests can reuse the cached results.</p>
+<h3 id="control-plane-vs-data-plane">Control Plane vs. Data Plane</h3>
+<p>A subtle but important point: the Block Manager lives in CPU memory and only tracks <em>metadata</em>—which blocks are allocated, their reference counts, and hash mappings. The actual KV cache data lives on the GPU. The Block Manager is the <strong>control plane</strong>; the GPU memory is the <strong>data plane</strong>. This separation allows fast allocation decisions without touching GPU memory until actual computation happens.</p>
+<p>When blocks are deallocated, the Block Manager marks them as free immediately, but the GPU memory isn’t zeroed—it’s simply overwritten when the block is reused. This avoids unnecessary memory operations.</p>
+<h2 id="the-model-runner-execution-and-parallelism">The Model Runner: Execution and Parallelism</h2>
+<p>The Model Runner is responsible for actually executing the model on GPU(s). When the step loop retrieves a batch of sequences from the Scheduler, it passes them to the Model Runner along with the action (prefill or decode).</p>
+<p><img src="https://neutree.ai/images/blog/nano-vllm-01-04.png" alt="04"/></p>
+<h3 id="tensor-parallel-communication">Tensor Parallel Communication</h3>
+<p>When a model is too large for a single GPU, Nano-vLLM supports <strong>tensor parallelism</strong> (TP)—splitting the model across multiple GPUs. With TP=8, for example, eight GPUs work together to run a single model.</p>
+<p><img src="https://neutree.ai/images/blog/nano-vllm-01-05.png" alt="05"/></p>
+<p>The communication architecture uses a leader-worker pattern:</p>
+<ul>
+<li><strong>Rank 0 (Leader)</strong>: Receives commands from the step loop, executes its portion, and coordinates with workers.</li>
+<li><strong>Ranks 1 to N-1 (Workers)</strong>: Continuously poll a shared memory buffer for commands from the leader.</li>
+</ul>
+<p>When the leader receives a <code>run</code> command, it writes the method name and arguments to shared memory. Workers detect this, read the parameters, and execute the same operation on their respective GPUs. Each worker knows its rank, so it can compute its designated portion of the work. This shared-memory approach is efficient for single-machine multi-GPU setups, avoiding network overhead.</p>
+<h3 id="preparing-for-computation">Preparing for Computation</h3>
+<p>Before invoking the model, the Model Runner prepares the input based on the action:</p>
+<ul>
+<li><strong>Prepare Prefill</strong>: Batches multiple sequences with variable lengths, computing cumulative sequence lengths for efficient attention computation.</li>
+<li><strong>Prepare Decode</strong>: Batches single tokens (one per sequence) with their positions and slot mappings for KV cache access.</li>
+</ul>
+<p>This preparation also involves converting CPU-side token data into GPU tensors—the point where data crosses from CPU memory to GPU memory.</p>
+<h3 id="cuda-graphs-reducing-kernel-launch-overhead">CUDA Graphs: Reducing Kernel Launch Overhead</h3>
+<p>For decode steps (which process just one token per sequence), kernel launch overhead can become significant relative to actual computation. CUDA Graphs address this by recording a sequence of GPU operations once, then replaying them with different inputs. Nano-vLLM pre-captures CUDA graphs for common batch sizes (1, 2, 4, 8, 16, up to 512), allowing decode steps to execute with minimal launch overhead.</p>
+<h3 id="sampling-from-logits-to-tokens">Sampling: From Logits to Tokens</h3>
+<p>The model doesn’t output a single token—it outputs <strong>logits</strong>, a probability distribution over the entire vocabulary. The final step is <strong>sampling</strong>: selecting one token from this distribution.</p>
+<p><img src="https://neutree.ai/images/blog/nano-vllm-01-06.png" alt="06"/></p>
+<p>The <code>temperature</code> parameter controls this selection. Mathematically, it adjusts the shape of the probability distribution:</p>
+<ul>
+<li><strong>Low temperature</strong> (approaching 0): The distribution becomes sharply peaked. The highest-probability token is almost always selected, making outputs more deterministic and focused.</li>
+<li><strong>High temperature</strong>: The distribution flattens. Lower-probability tokens have a better chance of being selected, making outputs more diverse and creative.</li>
+</ul>
+<p>This is where the “randomness” in LLM outputs comes from—and why the same prompt can produce different responses. The sampling step selects from a valid range of candidates, introducing controlled variability.</p>
+<h2 id="whats-next">What’s Next</h2>
+<p>In Part 2, we’ll open the black box of model. We’ll explore:</p>
+<ul>
+<li>How the model transforms tokens into hidden states and back</li>
+<li>The attention mechanism and why multi-head attention matters</li>
+<li>How KV cache is physically laid out on GPU memory</li>
+<li>Dense vs. MoE (Mixture of Experts) architectures</li>
+<li>How tensor parallelism works at the computation level</li>
+</ul>
+<p>Understanding these internals will complete the picture—from prompt string to generated text, with nothing left hidden.</p> </div></div>
+  </body>
+</html>
