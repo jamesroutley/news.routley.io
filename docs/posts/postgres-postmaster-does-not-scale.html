@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.recall.ai/blog/postgres-postmaster-does-not-scale">Original</a>
+    <h1>Postgres Postmaster does not scale</h1>
+    
+    <div id="readability-page-1" class="page"><div><div><!-- Postgres Postmaster does not scale -->
+<p>At <a href="https://recall.ai">Recall.ai</a> we run an unusual workload. We record millions of meetings every week. 
+We send meeting bots to calls so our customers can automate everything from meeting notes, to keeping the CRM up-to-date, to handling incidents, to providing live-feedback on the call and more.</p>
+<p>Processing TB/s of real-time media streams is the thing we get asked most about.
+However an often-overlooked feature of meetings is their unusual synchronization. 
+Most meetings start on the hour, some on the half, but most on the full. 
+It sounds obvious to say it aloud, but the implication of this has rippled through our entire media processing infrastructure.</p>
+<p><img alt="spiky" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a5366_4ccc059e.jpeg"/></p>
+<p>This is a picture of our load pattern. The y-axis is the number of EC2 instances in our fleet.
+Those large spikes are the bursts of meetings that we need to capture. 
+And when the meeting starts, the compute capacity must be ready to process the incoming data, or it will be lost forever.</p>
+<p>The extreme gradient of these spikes has resulted in us running into bottlenecks at almost every layer of the stack, from ARP to AWS.
+This is the story of a stubbornly mysterious issue, that led us to deeply examine postgres internals (<a href="https://www.recall.ai/blog/postgres-listen-notify-does-not-scale">again</a>) and uncover an often overlooked postgres bottleneck that only rears its head at extremely high scale.</p>
+<h3 id="tldr">TL;DR</h3>
+<p>Every postgres server starts and ends with the <em>postmaster</em> process. It is responsible for spawning and reaping children to handle connections and parallel workers, amongst other things.
+The postmaster runs a single-threaded main loop. With high worker churn, this loop can consume an entire CPU core, slowing down connection establishment, parallel queries, signal handling and more.
+This caused a rare, hard-to-debug issue where some of our EC2 instances would get delayed by 10-15s, waiting on the postmaster to fork a new backend to handle the connection.</p>
+<h3 id="slow-connections-to-postgres">Slow connections to postgres</h3>
+<p>Months ago we got alerted to large spike of delayed EC2 instances. We immediately investigated only to find that all of them were actually ready and waiting.
+We initially suspected a slow query caused the delay but we ruled this out. Eventually we uncovered that the delay originated from additional time connecting to postgres.</p>
+<p>Postgres has its own binary wire protocol. The client sends a startup message, to which the server responds with an auth request.</p>
+<p><img alt="pg" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a5369_e073edfb.jpeg"/></p>
+<p>What we observed was truly bizarre, the client would successfully establish a TCP connection to postgres, however the startup message only receive a response after 10s.
+Here is a example what we saw:</p>
+<p><img alt="pg-ws" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a536c_91c61889.jpeg"/></p>
+<ol>
+<li>The initial TCP SYN packet is sent from the client</li>
+<li>Less than one millisecond later the server responds with a SYN,ACK and the client ACK&#39;s to establish the connection</li>
+<li>The client send the startup message to the postgres server and the server ACK&#39;s the message</li>
+<li>10s later the server responds with an auth request and the connection continue nominally from there</li>
+</ol>
+<p>We ruled out obvious resource bottlenecks such as CPU, memory, disk I/O, network I/O and so forth.
+With all of these metrics looking nominal we turned to a deeper inspection of postgres internals.</p>
+<h3 id="a-reproduction-environment">A reproduction environment</h3>
+<p>We observed that the delay only occurred during the largest spikes, when many thousands of EC2 instances were booting. 
+Notably, it seemed to occur sporadically, maybe only once or twice a week.
+We host our database on RDS Postgres, which complicated the matter as low-level telemetry is limited.
+So we resorted to creating a production-like reproduction environment that we could use to continue our investigation.</p>
+<p><img alt="simulcrum" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a5375_79f1d95a.jpeg"/></p>
+<p>In this setup we used redis pub/sub to trigger a highly synchronized connection to postgres from a fleet of 3000+ EC2 instances.
+As we installed postgres on its own EC2 instance, we were able to instrument it while reproducing the delay.</p>
+<h3 id="a-deep-dive-into-the-postmaster">A deep dive into the postmaster</h3>
+<p>The next step was to form a hypothesis which we could validate. To do this we inspected the postgres source code.</p>
+<p>Every postgres has a supervisor process that is responsible for spawing and reaping new backends and workers. 
+This process is called the <em>postmaster</em> (I love this name).
+The postmaster is designed as a single-threaded server loop that processes its events synchronously.</p>
+<ul>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/postmaster.c#L1663">ServerLoop</a><ul>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/postmaster.c#L1703">ChildReaper</a>: Reap exited child processes (workers, backends, etc).</li>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/postmaster.c#L1712C16-L1713C4">AcceptConnection</a>: Launch a new backend to handle a connection.<ul>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/postmaster.c#L3555">BackendStartup</a><ul>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/launch_backend.c#L206">postmaster_child_launch</a><ul>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/launch_backend.c#L223">fork_process</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/postmaster.c#L3304">LaunchBackgroudWorkers</a>: Launch background workers for a parallel queries.<ul>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/postmaster.c#L3304">maybe_start_bgworker</a><ul>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/postmaster.c#L4142">StartBackgroundWorker</a><ul>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/launch_backend.c#L206">postmaster_child_launch</a><ul>
+<li><a href="https://github.com/postgres/postgres/blob/a9afa021e95f2b0ffaaf26f3a27e685f634f4ac9/src/backend/postmaster/launch_backend.c#L223">fork_process</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p>Our hypothesis was that the burst of new connections would temporarily overwhelm the postmaster loop, causing it to lag behind the queue of incoming connections.</p>
+<h3 id="profiling-the-postmaster">Profiling the postmaster</h3>
+<p>To do this we profiled the postmaster process under these periods of connection spikes in our simulated environment.
+It was surprisingly easy to pin the postmaster process. </p>
+<p><img alt="postmaster-cpu-graph" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a5378_8e1bb882.jpeg"/></p>
+<p>We ran the postgres on a <code>r8g.8xlarge</code> instance.
+At about ~1400 connections/sec we saturated the postmaster main loop and start to observe noticable delays.</p>
+<p><img alt="postmaster-pin" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a537e_3b82d36d.jpeg"/></p>
+<p>Use <code>perf</code> we took sampling profile of the postmaster while it was under duress.</p>
+<p><img alt="postmaster-perf-1" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a537b_6db5d321.jpeg"/></p>
+<p>As expected the overwhelming majority of the time is spent spawning and reaping backends. It turns out <code>fork</code> can be expensive! </p>
+<h3 id="huge-pages">Huge pages</h3>
+<p>A quick aside on how <code>fork</code> on linux works. When you call <code>fork</code>, it spawns a new &#34;child&#34; process, an exact duplicate of the parent continuing from the same instruction as the parent.
+However, copying the parent&#39;s memory pages would be prohibitively expensive for how <code>fork</code> is typically used. So linux employs a trick here, the pages are <a href="https://en.wikipedia.org/wiki/Copy-on-write">Copy-on-Write</a>. This optimization means the copy only happens when the child process tries to modify a parent&#39;s memory page.</p>
+<p>There is a catch however, linux still needs to copy the parent&#39;s <a href="https://docs.kernel.org/mm/page_tables.html">page table entries (PTEs)</a>.
+Reducing the number of PTEs decreases the overhead of forking the process.
+On Linux this is easy to do. You can enable huge pages in the kernel using <code>sudo echo $NUM_PAGES &gt; /proc/sys/vm/nr_hugepages</code> and <a href="https://www.postgresql.org/docs/18/kernel-resources.html#LINUX-HUGE-PAGES">configuring postgres</a> to use them.</p>
+<p>Enabling huge pages results in a large reduction in the postmaster PTE size. 
+Empirically we found a 20% throughput increase in connection rate with <code>huge_pages = on</code>.</p>
+<p><img alt="huge_pages" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a5381_e434cd57.jpeg"/></p>
+<h3 id="background-workers">Background workers</h3>
+<p>To further complicate the matter, the postmaster is also responsible for launching background workers for parallel queries.
+A high rate of parallel queries further increases increase the stress on postmaster main loop.</p>
+<pre><code>CREATE OR REPLACE FUNCTION bg_worker_churn(iterations integer)
+RETURNS void
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+  i int;
+BEGIN
+  PERFORM set_config(&#39;force_parallel_mode&#39;,&#39;on&#39;, true);
+  PERFORM set_config(&#39;parallel_setup_cost&#39;,&#39;0&#39;, true);
+  PERFORM set_config(&#39;parallel_tuple_cost&#39;,&#39;0&#39;, true);
+  PERFORM set_config(&#39;min_parallel_table_scan_size&#39;,&#39;0&#39;, true);
+  PERFORM set_config(&#39;min_parallel_index_scan_size&#39;,&#39;0&#39;, true);
+  PERFORM set_config(&#39;enable_indexscan&#39;,&#39;off&#39;, true);
+  PERFORM set_config(&#39;enable_bitmapscan&#39;,&#39;off&#39;, true);
+  PERFORM set_config(&#39;parallel_leader_participation&#39;,&#39;off&#39;, true);
+  PERFORM set_config(&#39;max_parallel_workers&#39;,&#39;512&#39;, true);
+  PERFORM set_config(&#39;max_parallel_workers_per_gather&#39;,&#39;128&#39;, true);
+
+  CREATE TABLE data (id BIGINT);
+  INSERT INTO data SELECT generate_series(0, 100000);
+  ANALYZE data;
+  FOR i IN 1..iterations LOOP
+    PERFORM sum(id) FROM data;
+  END LOOP;
+  DROP TABLE data;
+END;
+$function$;
+</code></pre>
+<p>A high background worker churn rate also puts pressure on the postmaster main loop.</p>
+<p><img alt="perf-bg" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a5384_7482e693.jpeg"/></p>
+<h3 id="unravelling-the-mystery">Unravelling the mystery</h3>
+<p>In production we only observed the connection delays sporadically. We determinated that was due to a confounding factor of increased background worker churn.</p>
+<p>The smoking gun was in our database monitoring the whole time, which showed the spike in <a href="https://github.com/postgres/postgres/blob/0c9f46c4280e31a4f49200f5d2cde37727651869/src/backend/postmaster/bgworker.c#L1279">background worker shutdown load</a> at the time of the delay.</p>
+<p><img alt="bg-shutdown" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a5387_4c6168d7.jpeg"/></p>
+<p>We were able to simulate a high background worker churn in parallel with the connection flood and observed a large decrease connection throughput from the postmaster.</p>
+<p><img alt="bg-and-connections" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a536f_d43b1a5f.jpeg"/></p>
+<p>We correlated this query with one our endpoints using a query that triggered a parllel execution plan, that would occasionally coincide with our hourly peaks, resulting in the delayed connections.</p>
+<h3 id="fixing-the-issue">Fixing the issue</h3>
+<p>Now that we deeply understand the failure mode we can mechnically reason about a solution.</p>
+<ol>
+<li>Implementing jitter in our fleet of EC2 instances reduced the peak connection rate</li>
+<li>Eliminating bursts of parallel queries from our API servers </li>
+</ol>
+<p>Both of these significantly reduce the pressure on the postmaster.</p>
+<h3 id="conclusion">Conclusion</h3>
+<p>Many pieces of wisdom in the engineering zeitgeist are well preached but poorly understood. Postgres connection pooling falls neatly into this category.
+In this expedition we found one of the underlying reasons that connection pooling is so widely deployed on postgres systems running at scale.</p>
+<p>Most online resources chalk this up to connection churn, citing fork rates and the pid-per-backend yada, yada. 
+This is all true but in my opinion misses the forest from the trees.
+The real bottleneck is the single-threaded main loop in the postmaster. Every operation requiring postmaster involvement is pulling from a fixed pool, the size of a single CPU core. 
+A rudimentary experiment shows that we can linearly increase connection throughput by adding additional postmasters on the same host. </p>
+<p><img alt="multi-postmaster" src="https://cdn.prod.website-files.com/633275e23914a500db413038/6981373a301d7520af6a5372_0f4c5386.jpeg"/></p>
+<p>This is one of my favourite kinds of discoveries: an artificial constraint that has warped the shape of the developer ecosystem (<a href="https://aws.amazon.com/rds/proxy/">RDS Proxy</a>, <a href="https://www.pgbouncer.org/">pgbouncer</a>, <a href="https://github.com/postgresml/pgcat">pgcat</a>, etc) around it. Hopefully to be lifted one day!</p>
+<p><em>Aside:</em> it&#39;s mildly absurd that none of the DBaaS or monitoring tools provide observability into postmaster contention. What&#39;s going on here?</p></div></div></div>
+  </body>
+</html>
