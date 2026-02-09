@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://blog.hofstede.it/running-your-own-as-bgp-on-freebsd-with-frr-gre-tunnels-and-policy-routing/">Original</a>
+    <h1>Running Your Own As: BGP on FreeBSD with FRR, GRE Tunnels, and Policy Routing</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      <hr/>
+<p><img alt="Logo" src="https://blog.hofstede.it/images/2026-02-08-running-your-own-as-bgp-freebsd.png" title="Running Your Own AS: Header image"/></p>
+<p>Running your own Autonomous System on the public internet sounds like something reserved for ISPs and large enterprises. It’s not. With sponsoring LIRs making <span>AS</span> numbers and IPv6 prefixes accessible to individuals, and FreeBSD providing the routing tools to make it work, you can announce your own address space to the Default-Free Zone from a single virtual machine.</p>
+<p>This article walks through the complete setup: obtaining resources from <span>RIPE</span> via a sponsoring <span>LIR</span>, configuring a FreeBSD <span>BGP</span> router with <span>FRR</span>, building <span>GRE</span>/<span>GIF</span> tunnels to distribute prefixes to remote servers, and solving the routing challenge that arises when a server needs to speak from two different IPv6 address spaces simultaneously.</p>
+<blockquote>
+<p><strong>Note on addresses:</strong> All provider-assigned <span>IP</span> addresses, hostnames, and management IPs in this article have been replaced with <a href="https://www.rfc-editor.org/rfc/rfc5737"><span>RFC</span> 5737</a> / <a href="https://www.rfc-editor.org/rfc/rfc3849"><span>RFC</span> 3849</a> documentation ranges. My own <span>AS</span> number (<span>AS201379</span>) and prefix (2a06:9801:1c::/48) are public <span>BGP</span> resources and shown as-is. The upstream <span>AS</span> numbers (<span>AS34927</span>, <span>AS209735</span>) are equally visible in public routing tables.</p>
+</blockquote>
+<h2>Why Run Your Own <span>AS</span>?</h2>
+<p>Provider-assigned IPv6 addresses are tied to that provider. Move to a different hoster and your addresses change - along with <span>DNS</span> records, firewall rules, reputation, and every system that references them. With your own <span>AS</span> and prefix, your addresses follow you. Migrate a server, update a tunnel endpoint, and traffic flows again without touching a single service configuration.</p>
+<p>There are also less practical reasons. Understanding <span>BGP</span> transforms how you think about internet routing. Watching your prefix propagate through the <span>DFZ</span> and appear on looking glasses worldwide is genuinely satisfying. And if you run services across multiple providers, having provider-independent addressing simplifies the architecture considerably.</p>
+<h2>Obtaining Resources</h2>
+<p>To announce prefixes on the internet, you need two things from a Regional Internet Registry (in Europe, that’s <span>RIPE</span> <span>NCC</span>):</p>
+<ol>
+<li><strong>An <span>AS</span> number</strong> - your identity in <span>BGP</span>. Mine is <span>AS201379</span>.</li>
+<li><strong>An IPv6 prefix</strong> - the address space you’ll announce. I received 2a06:9801:1c::/48.</li>
+</ol>
+<p>As an individual, you don’t need to become a <span>RIPE</span> member (which involves fees and bureaucracy). Instead, you work with a <strong>sponsoring <span>LIR</span></strong> - an existing <span>RIPE</span> member who sponsors your resource registration. Several LIRs cater to hobbyists and small operators. The process typically involves:</p>
+<ul>
+<li>Filling out a request form with your intended use case</li>
+<li>Creating the appropriate <span>RIPE</span> database objects (aut-num, inet6num, route6)</li>
+<li>Setting up <span>RPKI</span> ROAs (Route Origin Authorizations) to cryptographically bind your prefix to your <span>AS</span></li>
+</ul>
+<p>Once the paperwork is done, you need upstream connectivity - someone willing to carry your <span>BGP</span> sessions and announce your routes to the rest of the internet.</p>
+<h2>Architecture Overview</h2>
+<p>The setup involves two tiers: a <span>BGP</span> router that peers with upstream providers, and downstream servers that receive tunneled subnets from the router’s /48.</p>
+<div><pre><span></span><code>                    ┌──────────────────────────────┐
+                    │     Default-Free Zone         │
+                    └──────┬──────────────┬─────────┘
+                           │              │
+                    AS34927 (iFog)   AS209735 (Lagrange)
+                           │              │
+                      GRE tunnel     Direct peering
+                           │              │
+                    ┌──────┴──────────────┴─────────┐
+                    │    router01 (BGP Router)       │
+                    │     FreeBSD + FRR              │
+                    │     AS201379                   │
+                    │     2a06:9801:1c::/48          │
+                    └──────┬──────────────┬─────────┘
+                           │              │
+                      GIF tunnel     GIF tunnel
+                      (proto 41)     (proto 41)
+                           │              │
+                    ┌──────┴───┐   ┌──────┴──────────┐
+                    │  vps01   │   │  dcgw01          │
+                    │  VPS     │   │  DC OPNsense     │
+                    │  :1000:: │   │  :2000::/62      │
+                    │  /64     │   │                   │
+                    └──────────┘   └──────────────────┘
+</code></pre></div>
+
+<p>The <span>BGP</span> router (<code>router01</code>) announces 2a06:9801:1c::/48 to two upstream providers and maintains a blackhole route for the aggregate. Individual /64s (and a /62 for my Colocation datacenter) are tunneled to downstream servers via <span>GIF</span> tunnels (IPv6-in-IPv4 encapsulation). Each server receives real, globally routable addresses from my prefix while keeping its existing provider-assigned IPv6 fully operational.</p>
+<h2>The <span>BGP</span> Router</h2>
+<p>The router runs on a FreeBSD <span>VM</span> at a colocation facility with direct connectivity to two upstream networks. Let’s walk through each layer.</p>
+<h3>Network Configuration</h3>
+<p>The router’s <code>/etc/rc.conf</code> sets up the physical interface, tunnel interfaces, and static routes:</p>
+<div><pre><span></span><code><span>hostname</span><span>=</span><span>&#34;router01&#34;</span>
+
+<span># Security</span>
+<span>kern_securelevel_enable</span><span>=</span><span>&#34;YES&#34;</span>
+<span>kern_securelevel</span><span>=</span><span>&#34;2&#34;</span>
+
+<span># Physical interface</span>
+<span>ifconfig_vtnet0</span><span>=</span><span>&#34;inet 198.51.100.10/24 -rxcsum -txcsum -rxcsum6 -txcsum6 -lro -tso&#34;</span>
+<span>ifconfig_vtnet0_ipv6</span><span>=</span><span>&#34;inet6 2001:db8:100::96/64&#34;</span>
+
+<span>defaultrouter</span><span>=</span><span>&#34;198.51.100.1&#34;</span>
+<span>ipv6_defaultrouter</span><span>=</span><span>&#34;2001:db8:100::1&#34;</span>
+
+<span># Loopback alias for originated prefix</span>
+<span>ifconfig_lo0_alias0</span><span>=</span><span>&#34;inet6 2a06:9801:1c::1 prefixlen 64&#34;</span>
+
+<span># Tunnel interfaces</span>
+<span>cloned_interfaces</span><span>=</span><span>&#34;gif0 gif1 gre0&#34;</span>
+<span>kld_list</span><span>=</span><span>&#34;if_gif if_gre&#34;</span>
+
+<span># GRE Tunnel to transit provider (iFog)</span>
+<span>ifconfig_gre0</span><span>=</span><span>&#34;tunnel 198.51.100.10 198.51.100.44&#34;</span>
+<span>ifconfig_gre0_ipv6</span><span>=</span><span>&#34;inet6 2001:db8:300::2 2001:db8:300::1 prefixlen 128&#34;</span>
+<span>ifconfig_gre0_descr</span><span>=</span><span>&#34;Transit-iFog&#34;</span>
+
+<span># GIF Tunnel to VPS (vps01)</span>
+<span>ifconfig_gif0</span><span>=</span><span>&#34;tunnel 198.51.100.10 203.0.113.10&#34;</span>
+<span>ifconfig_gif0_ipv6</span><span>=</span><span>&#34;inet6 2a06:9801:1c:ffff::1 2a06:9801:1c:ffff::2 prefixlen 128&#34;</span>
+<span>ifconfig_gif0_descr</span><span>=</span><span>&#34;Tunnel-to-VPS&#34;</span>
+<span>ipv6_route_cloud</span><span>=</span><span>&#34;2a06:9801:1c:1000::/64 2a06:9801:1c:ffff::2&#34;</span>
+
+<span># GIF Tunnel to datacenter firewall (dcgw01)</span>
+<span>ifconfig_gif1</span><span>=</span><span>&#34;tunnel 198.51.100.10 192.0.2.50&#34;</span>
+<span>ifconfig_gif1_ipv6</span><span>=</span><span>&#34;inet6 2a06:9801:1c:ffff::3 2a06:9801:1c:ffff::4 prefixlen 128&#34;</span>
+<span>ifconfig_gif1_descr</span><span>=</span><span>&#34;Tunnel-to-Datacenter&#34;</span>
+<span>ipv6_route_dc</span><span>=</span><span>&#34;2a06:9801:1c:2000::/62 2a06:9801:1c:ffff::4&#34;</span>
+
+<span># Blackhole route for the aggregate + downstream routes</span>
+<span>ipv6_static_routes</span><span>=</span><span>&#34;myblock cloud dc&#34;</span>
+<span>ipv6_route_myblock</span><span>=</span><span>&#34;2a06:9801:1c::/48 -reject&#34;</span>
+<span>ipv6_gateway_enable</span><span>=</span><span>&#34;YES&#34;</span>
+
+<span># Services</span>
+<span>pf_enable</span><span>=</span><span>&#34;YES&#34;</span>
+<span>pflog_enable</span><span>=</span><span>&#34;YES&#34;</span>
+<span>frr_enable</span><span>=</span><span>&#34;YES&#34;</span>
+<span>zfs_enable</span><span>=</span><span>&#34;YES&#34;</span>
+<span>sshd_enable</span><span>=</span><span>&#34;YES&#34;</span>
+</code></pre></div>
+
+<p>A few things worth explaining:</p>
+<ul>
+<li><strong>The blackhole route</strong> (<code>-reject</code> for the /48) is essential. Without it, traffic for unassigned subnets within your prefix would follow the default route back to the upstream, creating a routing loop. The blackhole ensures unrouted traffic is dropped locally.</li>
+<li><strong>Point-to-point tunnel addresses</strong> use /128 prefixes on the <code>2a06:9801:1c:ffff::/64</code> link subnet. Each tunnel gets a pair of addresses from this range.</li>
+<li><strong>Downstream routes</strong> point specific subnets at the far end of each tunnel. The /64 for the <span>VPS</span> and /62 for the datacenter are routed to their respective tunnel endpoints.</li>
+<li><strong><span>GRE</span> vs <span>GIF</span></strong>: The iFog peering uses <span>GRE</span> because that’s what the provider requires. The downstream tunnels use <span>GIF</span> (protocol 41, IPv6-in-IPv4) which is simpler and has less overhead.</li>
+</ul>
+<h3><span>FRR</span> Configuration</h3>
+<p><span>FRR</span> (Free Range Routing) handles the <span>BGP</span> sessions. The configuration lives at <code>/usr/local/etc/frr/frr.conf</code>:</p>
+<div><pre><span></span><code>frr version 10.5.1
+frr defaults traditional
+hostname router01
+log syslog informational
+service integrated-vtysh-config
+!
+ipv6 prefix-list PL-MY-NET seq 5 permit 2a06:9801:1c::/48
+!
+ipv6 prefix-list PL-BOGONS seq 5 deny ::/0 le 7
+ipv6 prefix-list PL-BOGONS seq 10 deny ::/8
+ipv6 prefix-list PL-BOGONS seq 15 deny 100::/8
+ipv6 prefix-list PL-BOGONS seq 20 deny 200::/7
+ipv6 prefix-list PL-BOGONS seq 25 deny 400::/6
+ipv6 prefix-list PL-BOGONS seq 30 deny 800::/5
+ipv6 prefix-list PL-BOGONS seq 35 deny 1000::/4
+ipv6 prefix-list PL-BOGONS seq 40 deny 4000::/3
+ipv6 prefix-list PL-BOGONS seq 45 deny 6000::/3
+ipv6 prefix-list PL-BOGONS seq 50 deny 8000::/3
+ipv6 prefix-list PL-BOGONS seq 55 deny a000::/3
+ipv6 prefix-list PL-BOGONS seq 60 deny c000::/3
+ipv6 prefix-list PL-BOGONS seq 65 deny e000::/4
+ipv6 prefix-list PL-BOGONS seq 70 deny f000::/5
+ipv6 prefix-list PL-BOGONS seq 75 deny f800::/6
+ipv6 prefix-list PL-BOGONS seq 80 deny fc00::/7
+ipv6 prefix-list PL-BOGONS seq 85 deny fe80::/10
+ipv6 prefix-list PL-BOGONS seq 90 deny fec0::/10
+ipv6 prefix-list PL-BOGONS seq 95 deny ff00::/8
+ipv6 prefix-list PL-BOGONS seq 100 deny 2a06:9801:1c::/48
+ipv6 prefix-list PL-BOGONS seq 105 deny ::/0 ge 49
+ipv6 prefix-list PL-BOGONS seq 110 permit ::/0 le 48
+!
+route-map RM-IFOG-OUT permit 10
+ match ipv6 address prefix-list PL-MY-NET
+ set community 34927:9501 34927:9301 additive
+exit
+!
+route-map RM-LAGRANGE-OUT permit 10
+ match ipv6 address prefix-list PL-MY-NET
+ set as-path prepend 201379 201379
+exit
+!
+route-map RM-IFOG-IN permit 10
+ match ipv6 address prefix-list PL-BOGONS
+exit
+!
+route-map RM-LAGRANGE-IN permit 10
+ match ipv6 address prefix-list PL-BOGONS
+exit
+!
+ipv6 route 2a06:9801:1c::/48 blackhole
+!
+router bgp 201379
+ bgp router-id 198.51.100.10
+ no bgp default ipv4-unicast
+ neighbor 2001:db8:300::1 remote-as 34927
+ neighbor 2001:db8:300::1 description Upstream-iFog
+ neighbor 2001:db8:300::1 ttl-security hops 1
+ neighbor 2001:db8:300::1 update-source gre0
+ neighbor 2001:db8:100::ff remote-as 209735
+ neighbor 2001:db8:100::ff description Upstream-Lagrange
+ neighbor 2001:db8:100::ff ttl-security hops 1
+ neighbor 2001:db8:100::ff update-source 2001:db8:100::96
+ !
+ address-family ipv6 unicast
+  network 2a06:9801:1c::/48
+  neighbor 2001:db8:300::1 activate
+  neighbor 2001:db8:300::1 soft-reconfiguration inbound
+  neighbor 2001:db8:300::1 maximum-prefix 250000 90 restart 30
+  neighbor 2001:db8:300::1 route-map RM-IFOG-IN in
+  neighbor 2001:db8:300::1 route-map RM-IFOG-OUT out
+  neighbor 2001:db8:100::ff activate
+  neighbor 2001:db8:100::ff soft-reconfiguration inbound
+  neighbor 2001:db8:100::ff maximum-prefix 250000 90 restart 30
+  neighbor 2001:db8:100::ff route-map RM-LAGRANGE-IN in
+  neighbor 2001:db8:100::ff route-map RM-LAGRANGE-OUT out
+ exit-address-family
+exit
+</code></pre></div>
+
+<p>There’s a lot happening here. Let me break down the key design decisions.</p>
+<h4>Prefix Lists</h4>
+<p>Two prefix lists control what gets sent and received:</p>
+<ul>
+<li><strong><span>PL</span>-<span>MY</span>-<span>NET</span></strong>: Matches only our /48. Used in outbound route-maps to ensure we only ever announce our own prefix.</li>
+<li><strong><span>PL</span>-<span>BOGONS</span></strong>: A comprehensive bogon filter for inbound routes. This rejects non-routable address space (link-local, <span>ULA</span>, multicast, documentation ranges), our own prefix (to prevent loops), and anything more specific than a /48 or less specific than a /8. The final <code>permit ::/0 le 48</code> at the end accepts everything that survived the deny rules.</li>
+</ul>
+<p>The bogon filter deserves emphasis. Accepting bad routes from peers can cause anything from black-holed traffic to becoming an unwitting participant in route hijacks. Filter aggressively on inbound.</p>
+<h4>Route Maps</h4>
+<p>Each peer gets its own pair of inbound/outbound route maps:</p>
+<ul>
+<li><strong>Outbound to iFog</strong> (<code>RM-IFOG-OUT</code>): Announces our /48 with <span>BGP</span> communities <code>34927:9501</code> and <code>34927:9301</code>. These are iFog-specific communities that control route propagation - in this case, requesting announcement to specific peering partners.</li>
+<li><strong>Outbound to Lagrange</strong> (<code>RM-LAGRANGE-OUT</code>): Announces our /48 with <span>AS</span>-path prepending (adds our <span>ASN</span> twice). This makes the Lagrange path appear longer to the rest of the internet, steering inbound traffic to prefer the iFog path. Useful for traffic engineering when one upstream has better connectivity.</li>
+<li><strong>Inbound from both</strong>: Apply the bogon filter to reject garbage routes.</li>
+</ul>
+<h4><span>BGP</span> Session Details</h4>
+<ul>
+<li><strong><code>no bgp default ipv4-unicast</code></strong>: We’re IPv6-only. Don’t activate IPv4 address family by default.</li>
+<li><strong><code>ttl-security hops 1</code></strong>: <span>GTSM</span> (Generalized <span>TTL</span> Security Mechanism) - reject <span>BGP</span> packets with <span>TTL</span> less than 254. This prevents remote attacks on the <span>BGP</span> session since only directly connected peers can send packets with <span>TTL</span> 255.</li>
+<li><strong><code>soft-reconfiguration inbound</code></strong>: Store received routes before applying filters. This lets you change inbound policy without resetting the <span>BGP</span> session.</li>
+<li><strong><code>maximum-prefix 250000 90 restart 30</code></strong>: Safety valve. If a peer sends more than 250,000 prefixes (or 90% of that as a warning), tear down the session and retry after 30 minutes. Protects against route leaks from upstream.</li>
+</ul>
+<h3>Firewall on the Router</h3>
+<p>The <span>BGP</span> router’s <span>PF</span> configuration protects the control plane while allowing data plane forwarding:</p>
+<div><pre><span></span><code><span># --- Macros ---</span>
+<span>ext_if</span><span> </span><span>=</span><span> </span><span>&#34;vtnet0&#34;</span>
+<span>dc_tun</span><span> </span><span>=</span><span> </span><span>&#34;gif1&#34;</span>
+<span>vps_tun</span><span> </span><span>=</span><span> </span><span>&#34;gif0&#34;</span>
+
+<span>trusted_ipv4</span><span> </span><span>=</span><span> </span><span>&#34;{ 198.51.100.100, 198.51.100.101 }&#34;</span>
+<span>trusted_ipv6</span><span> </span><span>=</span><span> </span><span>&#34;{ 2001:db8:ffff:1::/64, 2001:db8:ffff:2::/64 }&#34;</span>
+
+<span>bgp_peers_v4</span><span> </span><span>=</span><span> </span><span>&#34;{ 198.51.100.20 }&#34;</span>
+<span>bgp_peers_v6</span><span> </span><span>=</span><span> </span><span>&#34;{ 2001:db8:100::ff }&#34;</span>
+<span>ifog_gre_endpoint</span><span> </span><span>=</span><span> </span><span>&#34;198.51.100.44&#34;</span>
+<span>ifog_bgp_peer</span><span>     </span><span>=</span><span> </span><span>&#34;2001:db8:300::1&#34;</span>
+
+<span>my_network_v6</span><span> </span><span>=</span><span> </span><span>&#34;2a06:9801:1c::/48&#34;</span>
+<span>vps_v4</span><span> </span><span>=</span><span> </span><span>&#34;203.0.113.10&#34;</span>
+
+<span># --- Tables ---</span>
+<span>table</span><span> </span><span>&lt;</span><span>bruteforce</span><span>&gt;</span><span> </span><span>persist</span>
+<span>table</span><span> </span><span>&lt;</span><span>trusted_v4</span><span>&gt;</span><span> </span><span>const</span><span> </span><span>{</span><span> </span><span>$</span><span>trusted_ipv4</span><span> </span><span>}</span>
+<span>table</span><span> </span><span>&lt;</span><span>trusted_v6</span><span>&gt;</span><span> </span><span>const</span><span> </span><span>{</span><span> </span><span>$</span><span>trusted_ipv6</span><span> </span><span>}</span>
+<span>table</span><span> </span><span>&lt;</span><span>bgp_peers_v4</span><span>&gt;</span><span> </span><span>const</span><span> </span><span>{</span><span> </span><span>$</span><span>bgp_peers_v4</span><span> </span><span>}</span>
+<span>table</span><span> </span><span>&lt;</span><span>bgp_peers_v6</span><span>&gt;</span><span> </span><span>const</span><span> </span><span>{</span><span> </span><span>$</span><span>bgp_peers_v6</span><span> </span><span>}</span>
+<span>table</span><span> </span><span>&lt;</span><span>bogons</span><span>&gt;</span><span> </span><span>const</span><span> </span><span>{</span><span> </span><span>0.0</span><span>.</span><span>0.0</span><span>/</span><span>8</span><span>,</span><span> </span><span>10.0</span><span>.</span><span>0.0</span><span>/</span><span>8</span><span>,</span><span> </span><span>172.16</span><span>.</span><span>0.0</span><span>/</span><span>12</span><span>,</span><span> </span>\
+<span>    </span><span>192.168</span><span>.</span><span>0.0</span><span>/</span><span>16</span><span>,</span><span> </span><span>169.254</span><span>.</span><span>0.0</span><span>/</span><span>16</span><span>,</span><span> </span><span>::</span><span>/</span><span>96</span><span>,</span><span> </span><span>fc00</span><span>::</span><span>/</span><span>7</span><span>,</span><span> </span>\
+<span>    </span><span>fec0</span><span>::</span><span>/</span><span>10</span><span>,</span><span> </span><span>ff00</span><span>::</span><span>/</span><span>8</span><span> </span><span>}</span>
+
+<span># --- Options ---</span>
+<span>set</span><span> </span><span>skip</span><span> </span><span>on</span><span> </span><span>lo0</span>
+<span>set</span><span> </span><span>block</span><span>-</span><span>policy</span><span> </span><span>drop</span>
+<span>set</span><span> </span><span>loginterface</span><span> </span><span>$</span><span>ext_if</span>
+
+<span># --- Scrub ---</span>
+<span>scrub</span><span> </span><span>in</span><span> </span><span>all</span><span> </span><span>fragment</span><span> </span><span>reassemble</span>
+<span>scrub</span><span> </span><span>on</span><span> </span><span>$</span><span>vps_tun</span><span> </span><span>max</span><span>-</span><span>mss</span><span> </span><span>1440</span>
+<span>scrub</span><span> </span><span>on</span><span> </span><span>$</span><span>dc_tun</span><span> </span><span>max</span><span>-</span><span>mss</span><span> </span><span>1140</span>
+<span>scrub</span><span> </span><span>on</span><span> </span><span>gre0</span><span> </span><span>max</span><span>-</span><span>mss</span><span> </span><span>1400</span>
+
+<span># --- Filtering ---</span>
+<span>block</span><span> </span><span>log</span><span> </span><span>all</span>
+<span>block</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>ext_if</span><span> </span><span>from</span><span> </span><span>{</span><span> </span><span>&lt;</span><span>bogons</span><span>&gt;</span><span>,</span><span> </span><span>$</span><span>my_network_v6</span><span> </span><span>}</span><span> </span><span>to</span><span> </span><span>any</span>
+<span>antispoof</span><span> </span><span>quick</span><span> </span><span>for</span><span> </span><span>{</span><span> </span><span>$</span><span>ext_if</span><span> </span><span>}</span>
+
+<span># --- Control Plane ---</span>
+
+<span># SSH from trusted sources only</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>ext_if</span><span> </span><span>proto</span><span> </span><span>tcp</span><span> </span><span>from</span><span> </span><span>&lt;</span><span>trusted_v4</span><span>&gt;</span><span> </span><span>to</span><span> </span><span>(</span><span>$</span><span>ext_if</span><span>)</span><span> </span><span>port</span><span> </span><span>22</span><span> </span>\
+<span>    </span><span>flags</span><span> </span><span>S</span><span>/</span><span>SA</span><span> </span><span>keep</span><span> </span><span>state</span><span> </span>\
+<span>    </span><span>(</span><span>max</span><span>-</span><span>src</span><span>-</span><span>conn</span><span> </span><span>5</span><span>,</span><span> </span><span>max</span><span>-</span><span>src</span><span>-</span><span>conn</span><span>-</span><span>rate</span><span> </span><span>3</span><span>/</span><span>30</span><span>,</span><span> </span>\
+<span>     </span><span>overload</span><span> </span><span>&lt;</span><span>bruteforce</span><span>&gt;</span><span> </span><span>flush</span><span> </span><span>global</span><span>)</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>ext_if</span><span> </span><span>proto</span><span> </span><span>tcp</span><span> </span><span>from</span><span> </span><span>&lt;</span><span>trusted_v6</span><span>&gt;</span><span> </span><span>to</span><span> </span><span>(</span><span>$</span><span>ext_if</span><span>)</span><span> </span><span>port</span><span> </span><span>22</span><span> </span>\
+<span>    </span><span>flags</span><span> </span><span>S</span><span>/</span><span>SA</span><span> </span><span>keep</span><span> </span><span>state</span><span> </span>\
+<span>    </span><span>(</span><span>max</span><span>-</span><span>src</span><span>-</span><span>conn</span><span> </span><span>5</span><span>,</span><span> </span><span>max</span><span>-</span><span>src</span><span>-</span><span>conn</span><span>-</span><span>rate</span><span> </span><span>3</span><span>/</span><span>30</span><span>,</span><span> </span>\
+<span>     </span><span>overload</span><span> </span><span>&lt;</span><span>bruteforce</span><span>&gt;</span><span> </span><span>flush</span><span> </span><span>global</span><span>)</span>
+
+<span># BGP (TCP 179) - strictly limited to known peers</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>ext_if</span><span> </span><span>proto</span><span> </span><span>tcp</span><span> </span><span>from</span><span> </span><span>&lt;</span><span>bgp_peers_v4</span><span>&gt;</span><span> </span><span>to</span><span> </span><span>(</span><span>$</span><span>ext_if</span><span>)</span><span> </span><span>port</span><span> </span><span>179</span><span> </span>\
+<span>    </span><span>flags</span><span> </span><span>S</span><span>/</span><span>SA</span><span> </span><span>keep</span><span> </span><span>state</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>ext_if</span><span> </span><span>proto</span><span> </span><span>tcp</span><span> </span><span>from</span><span> </span><span>&lt;</span><span>bgp_peers_v6</span><span>&gt;</span><span> </span><span>to</span><span> </span><span>(</span><span>$</span><span>ext_if</span><span>)</span><span> </span><span>port</span><span> </span><span>179</span><span> </span>\
+<span>    </span><span>flags</span><span> </span><span>S</span><span>/</span><span>SA</span><span> </span><span>keep</span><span> </span><span>state</span>
+
+<span># GRE tunnel from iFog</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>ext_if</span><span> </span><span>proto</span><span> </span><span>gre</span><span> </span><span>from</span><span> </span><span>$</span><span>ifog_gre_endpoint</span><span> </span><span>to</span><span> </span><span>(</span><span>$</span><span>ext_if</span><span>)</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>gre0</span><span> </span><span>proto</span><span> </span><span>tcp</span><span> </span><span>from</span><span> </span><span>$</span><span>ifog_bgp_peer</span><span> </span><span>to</span><span> </span><span>any</span><span> </span><span>port</span><span> </span><span>179</span>
+
+<span># ICMPv6: essential for NDP, PMTUD, and diagnostics</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>inet6</span><span> </span><span>proto</span><span> </span><span>ipv6</span><span>-</span><span>icmp</span><span> </span><span>icmp6</span><span>-</span><span>type</span><span> </span><span>{</span><span> </span>\
+<span>    </span><span>echoreq</span><span>,</span><span> </span><span>echorep</span><span>,</span><span> </span><span>neighbrsol</span><span>,</span><span> </span><span>neighbradv</span><span>,</span><span> </span>\
+<span>    </span><span>toobig</span><span>,</span><span> </span><span>timex</span><span>,</span><span> </span><span>paramprob</span><span>,</span><span> </span><span>routersol</span><span> </span><span>}</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>inet</span><span> </span><span>proto</span><span> </span><span>icmp</span><span> </span><span>icmp</span><span>-</span><span>type</span><span> </span><span>{</span><span> </span><span>echoreq</span><span>,</span><span> </span><span>unreach</span><span>,</span><span> </span><span>timex</span><span> </span><span>}</span>
+
+<span># --- Data Plane ---</span>
+
+<span># Inbound traffic destined for our prefix</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>ext_if</span><span> </span><span>inet6</span><span> </span><span>from</span><span> </span><span>any</span><span> </span><span>to</span><span> </span><span>$</span><span>my_network_v6</span><span> </span><span>keep</span><span> </span><span>state</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>gre0</span><span> </span><span>inet6</span><span> </span><span>from</span><span> </span><span>any</span><span> </span><span>to</span><span> </span><span>$</span><span>my_network_v6</span><span> </span><span>keep</span><span> </span><span>state</span>
+
+<span># Return traffic from downstream tunnels</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>vps_tun</span><span> </span><span>inet6</span><span> </span><span>from</span><span> </span><span>$</span><span>my_network_v6</span><span> </span><span>to</span><span> </span><span>any</span><span> </span><span>keep</span><span> </span><span>state</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>dc_tun</span><span> </span><span>inet6</span><span> </span><span>from</span><span> </span><span>$</span><span>my_network_v6</span><span> </span><span>to</span><span> </span><span>any</span><span> </span><span>keep</span><span> </span><span>state</span>
+
+<span># GIF tunnel encapsulation (proto 41) from downstream endpoints</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>ext_if</span><span> </span><span>proto</span><span> </span><span>41</span><span> </span><span>from</span><span> </span><span>$</span><span>vps_v4</span><span> </span><span>to</span><span> </span><span>(</span><span>$</span><span>ext_if</span><span>)</span>
+
+<span># Outbound</span>
+<span>pass</span><span> </span><span>out</span><span> </span><span>quick</span><span> </span><span>all</span><span> </span><span>keep</span><span> </span><span>state</span>
+</code></pre></div>
+
+<p>The firewall cleanly separates <strong>control plane</strong> (<span>SSH</span>, <span>BGP</span> sessions) from <strong>data plane</strong> (forwarded traffic). The control plane rules are strict: <span>BGP</span> is locked to known peer addresses, <span>SSH</span> to trusted management IPs. The data plane rules are simpler since the router just needs to forward packets between upstreams and downstream tunnels.</p>
+<p>The <code>block in quick on $ext_if from { &lt;bogons&gt;, $my_network_v6 }</code> rule is important - it drops packets claiming to come from our own prefix arriving on the external interface. If someone on the internet spoofs a source address from our range, this catches it before it enters the forwarding path.</p>
+<p>Note the per-tunnel <span>MSS</span> clamping in the scrub section. Each tunnel has different overhead (<span>GRE</span> adds more headers than <span>GIF</span>), so the <span>MSS</span> values differ. Getting this wrong causes mysterious connection stalls with large packets.</p>
+<h2>The Downstream Server: Dual-Stack with Policy Routing</h2>
+<p>This is where things get interesting. The <span>VPS</span> (<code>vps01</code>) already has provider-assigned IPv6 from its hoster. Jails on this server use addresses from both address spaces:</p>
+<ul>
+<li><strong>Provider IPv6</strong> (2001:db8:200:0:1000::/68) - the hoster’s addresses, NATed to the host</li>
+<li><strong><span>BGP</span> IPv6</strong> (2a06:9801:1c:1000::/64) - our own prefix, routed natively via the <span>GIF</span> tunnel</li>
+<li><strong>Private IPv4</strong> (10.254.254.0/24) - NATed to the host’s public IPv4</li>
+</ul>
+<p>The challenge: when a jail sends traffic from its <span>BGP</span> address (2a06:…), that traffic must exit through the <span>GIF</span> tunnel to the <span>BGP</span> router - not through the default route to the <span>VPS</span> provider, where it would be dropped as spoofed. But traffic from the provider address must continue using the normal default route.</p>
+<p>The solution is <strong>dual-<span>FIB</span> policy routing</strong> - FreeBSD’s implementation of multiple routing tables.</p>
+<h3>How Dual-<span>FIB</span> Works</h3>
+<p>FreeBSD supports multiple routing tables called FIBs (Forwarding Information Bases). Each <span>FIB</span> is an independent routing table with its own default route and entries. Interfaces and <span>PF</span> rules can assign traffic to a specific <span>FIB</span>, and the kernel consults the appropriate table when forwarding.</p>
+<div><pre><span></span><code>FIB 0 (default):
+  default --&gt; vtnet0 --&gt; VPS provider upstream
+  Used by: host traffic, provider-addressed jail traffic
+
+FIB 1:
+  default --&gt; gif0 --&gt; BGP router (router01)
+  Used by: BGP-addressed jail traffic (2a06:9801:1c::/48)
+</code></pre></div>
+
+<h3>Network Configuration</h3>
+<p>Here’s the relevant portion of the server’s <code>/etc/rc.conf</code>:</p>
+<div><pre><span></span><code><span>hostname</span><span>=</span><span>&#34;vps01.example.com&#34;</span>
+
+<span>kern_securelevel_enable</span><span>=</span><span>&#34;YES&#34;</span>
+<span>kern_securelevel</span><span>=</span><span>&#34;2&#34;</span>
+
+<span># Primary interface - provider IPv4 and IPv6</span>
+<span>ifconfig_vtnet0</span><span>=</span><span>&#34;inet 203.0.113.10 netmask 255.255.252.0 -lro -tso&#34;</span>
+<span>ifconfig_vtnet0_ipv6</span><span>=</span><span>&#34;inet6 2001:db8:200::2 prefixlen 68&#34;</span>
+<span>defaultrouter</span><span>=</span><span>&#34;203.0.113.1&#34;</span>
+<span>ipv6_defaultrouter</span><span>=</span><span>&#34;fe80::1%vtnet0&#34;</span>
+
+<span># Jail bridge - three address spaces</span>
+<span>cloned_interfaces</span><span>=</span><span>&#34;bridge0 gif0&#34;</span>
+<span>ifconfig_bridge0_name</span><span>=</span><span>&#34;bastille0&#34;</span>
+<span>ifconfig_bastille0</span><span>=</span><span>&#34;inet 10.254.254.1/24&#34;</span>
+<span>ifconfig_bastille0_ipv6</span><span>=</span><span>&#34;inet6 2001:db8:200:0:1000::1 prefixlen 68&#34;</span>
+<span>ifconfig_bastille0_alias0</span><span>=</span><span>&#34;inet6 2a06:9801:1c:1000::1 prefixlen 64&#34;</span>
+
+<span># GIF tunnel to BGP router - assigned to FIB 1</span>
+<span>ifconfig_gif0</span><span>=</span><span>&#34;fib 1 tunnel 203.0.113.10 198.51.100.10 tunnelfib 0&#34;</span>
+<span>ifconfig_gif0_ipv6</span><span>=</span><span>&#34;inet6 2a06:9801:1c:ffff::2 2a06:9801:1c:ffff::1 prefixlen 128&#34;</span>
+
+<span># Enable forwarding</span>
+<span>gateway_enable</span><span>=</span><span>&#34;YES&#34;</span>
+<span>ipv6_gateway_enable</span><span>=</span><span>&#34;YES&#34;</span>
+
+<span># FIB 1 routing table entries</span>
+<span>static_routes</span><span>=</span><span>&#34;fib1default jailleak bgplink&#34;</span>
+<span>route_fib1default</span><span>=</span><span>&#34;-6 default -interface gif0 -fib 1&#34;</span>
+<span>route_jailleak</span><span>=</span><span>&#34;-6 2001:db8:200:0:1000::/68 -interface bastille0 -fib 1&#34;</span>
+<span>route_bgplink</span><span>=</span><span>&#34;-6 2a06:9801:1c:1000::/64 -interface bastille0 -fib 1&#34;</span>
+</code></pre></div>
+
+<p>The <span>GIF</span> tunnel configuration deserves a closer look:</p>
+<div><pre><span></span><code><span>ifconfig_gif0</span><span>=</span><span>&#34;fib 1 tunnel 203.0.113.10 198.51.100.10 tunnelfib 0&#34;</span>
+</code></pre></div>
+
+<p>This single line contains two critical directives:</p>
+<ul>
+<li><strong><code>fib 1</code></strong>: The tunnel interface itself lives in <span>FIB</span> 1. Traffic arriving on gif0 and traffic routed out gif0 consults routing table 1.</li>
+<li><strong><code>tunnelfib 0</code></strong>: But the outer IPv4 encapsulation (the 203.0.113.10 —&gt; 198.51.100.10 wrapper) uses <span>FIB</span> 0. This is essential - the IPv4 path to the <span>BGP</span> router goes through the provider’s default route in <span>FIB</span> 0. Without <code>tunnelfib 0</code>, the encapsulated packets would try to use <span>FIB</span> 1’s default route (which points at gif0 itself), creating a recursive loop.</li>
+</ul>
+<p>The three static routes in <span>FIB</span> 1 complete the picture:</p>
+<ul>
+<li><strong><code>fib1default</code></strong>: Default route in <span>FIB</span> 1 exits through gif0 to the <span>BGP</span> router</li>
+<li><strong><code>jailleak</code></strong>: Tells <span>FIB</span> 1 that the provider’s jail subnet is reachable via bastille0 (without this, return traffic in <span>FIB</span> 1 for jails’ provider addresses would try to exit through gif0)</li>
+<li><strong><code>bgplink</code></strong>: Same for the <span>BGP</span> jail subnet - <span>FIB</span> 1 needs to know these addresses are local on bastille0</li>
+</ul>
+<h3><span>PF</span>: The Routing Glue</h3>
+<p><span>PF</span> is where the address-based routing decision happens. When a jail sends a packet from a <span>BGP</span> address, <span>PF</span> assigns it to <span>FIB</span> 1:</p>
+<div><pre><span></span><code><span>#</span><span> </span><span>BGP</span><span>-</span><span>addressed</span><span> </span><span>jail</span><span> </span><span>traffic</span><span> </span><span>--</span><span>&gt;</span><span> </span><span>force</span><span> </span><span>into</span><span> </span><span>routing</span><span> </span><span>table</span><span> </span><span>1</span><span> </span><span>(</span><span>exits</span><span> </span><span>via</span><span> </span><span>gif0</span><span>)</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>bastille0</span><span> </span><span>inet6</span><span> </span><span>from</span><span> </span><span>$</span><span>bgp_net</span><span> </span><span>to</span><span> </span><span>any</span><span> </span><span>rtable</span><span> </span><span>1</span><span> </span><span>keep</span><span> </span><span>state</span>
+</code></pre></div>
+
+<p>The <code>rtable 1</code> directive is the key. It tells <span>PF</span> to route matching packets using <span>FIB</span> 1 instead of the default <span>FIB</span> 0. Since <span>FIB</span> 1’s default route points out gif0 to the <span>BGP</span> router, these packets get encapsulated and sent to router01, which then forwards them to the internet with the correct source address.</p>
+<p>For traffic arriving on the tunnel destined for jails, <span>PF</span> uses <code>reply-to</code> to ensure return traffic takes the same path:</p>
+<div><pre><span></span><code><span>#</span><span> </span><span>Inbound</span><span> </span><span>BGP</span><span> </span><span>traffic</span><span> </span><span>-</span><span> </span><span>reply</span><span>-</span><span>to</span><span> </span><span>ensures</span><span> </span><span>responses</span><span> </span><span>exit</span><span> </span><span>via</span><span> </span><span>gif0</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>tun_if</span><span> </span><span>reply</span><span>-</span><span>to</span><span> </span><span>(</span><span>$</span><span>tun_if</span><span> </span><span>$</span><span>bgp_hub_ip</span><span>)</span><span> </span><span>inet6</span><span> </span>\
+<span>    </span><span>from</span><span> </span><span>any</span><span> </span><span>to</span><span> </span><span>$</span><span>bgp_net</span><span> </span><span>keep</span><span> </span><span>state</span>
+
+<span>#</span><span> </span><span>BGP</span><span> </span><span>ICMPv6</span><span> </span><span>-</span><span> </span><span>also</span><span> </span><span>needs</span><span> </span><span>reply</span><span>-</span><span>to</span><span> </span><span>for</span><span> </span><span>correct</span><span> </span><span>return</span><span> </span><span>path</span>
+<span>pass</span><span> </span><span>in</span><span> </span><span>quick</span><span> </span><span>on</span><span> </span><span>$</span><span>tun_if</span><span> </span><span>reply</span><span>-</span><span>to</span><span> </span><span>(</span><span>$</span><span>tun_if</span><span> </span><span>$</span><span>bgp_hub_ip</span><span>)</span><span> </span><span>inet6</span><span> </span><span>proto</span><span> </span><span>ipv6</span><span>-</span><span>icmp</span><span> </span>\
+<span>    </span><span>from</span><span> </span><span>any</span><span> </span><span>to</span><span> </span><span>$</span><span>bgp_net</span><span> </span>\
+<span>    </span><span>icmp6</span><span>-</span><span>type</span><span> </span><span>{</span><span> </span><span>echoreq</span><span>,</span><span> </span><span>echorep</span><span>,</span><span> </span><span>toobig</span><span>,</span><span> </span><span>timex</span><span>,</span><span> </span><span>paramprob</span><span> </span><span>}</span><span> </span>\
+<span>    </span><span>keep</span><span> </span><span>state</span>
+</code></pre></div>
+
+<p>Without <code>reply-to</code>, the kernel would consult <span>FIB</span> 0 for return traffic (since the jail itself isn’t in <span>FIB</span> 1), and replies to <span>BGP</span>-addressed connections would exit through vtnet0 with the wrong source routing - getting dropped as spoofed by the provider. The <code>reply-to</code> directive forces <span>PF</span> to send reply packets back out the interface they arrived on, to the specified next-hop.</p>
+<h3>The Complete Picture</h3>
+<p>Here’s how a request to a <span>BGP</span>-addressed jail service flows:</p>
+<div><pre><span></span><code> 1. Client sends packet to 2a06:9801:1c:1000::10 (web jail)
+ 2. Packet traverses the internet, reaching AS201379 via iFog or Lagrange
+ 3. router01 forwards it through gif0 tunnel to vps01
+ 4. vps01 receives proto 41 on vtnet0, decapsulates --&gt; gif0
+ 5. PF matches: reply-to ($tun_if $bgp_hub_ip), creates state
+ 6. Packet forwarded to bastille0 --&gt; jail
+ 7. Jail responds, packet exits on bastille0
+ 8. PF&#39;s state table triggers reply-to: send via gif0 to bgp_hub_ip
+ 9. gif0 encapsulates (proto 41) using FIB 0 to reach router01
+10. router01 receives, forwards to upstream --&gt; internet --&gt; client
+</code></pre></div>
+
+<p>And for outbound connections initiated by the jail using its <span>BGP</span> address:</p>
+<div><pre><span></span><code>1. Jail sends packet from 2a06:9801:1c:1000::10
+2. Packet arrives on bastille0
+3. PF matches: &#34;from $bgp_net --&gt; rtable 1&#34;
+4. Kernel routes via FIB 1 --&gt; default route --&gt; gif0
+5. gif0 encapsulates using FIB 0 --&gt; vtnet0 --&gt; router01
+6. router01 receives, forwards to internet (source: 2a06:9801:1c:1000::10)
+</code></pre></div>
+
+<p>Meanwhile, the exact same jail can communicate using its provider address through the normal default route in <span>FIB</span> 0, with <span>NAT</span> to the host’s address. Both address spaces coexist on the same interface, differentiated purely by <span>PF</span> rules and <span>FIB</span> selection.</p>
+<h2>Verification</h2>
+<p>Once everything is running, verification is straightforward. From inside a jail with both addresses:</p>
+<div><pre><span></span><code><span># Traffic from the provider address - NATed through the hoster</span>
+root@caddy:~<span> </span><span># curl --interface 2001:db8:200:0:1000::10 https://ifconfig.co</span>
+<span>2001</span>:db8:200::2
+
+<span># Traffic from the BGP address - routed natively through the tunnel</span>
+root@caddy:~<span> </span><span># curl --interface 2a06:9801:1c:1000::10 https://ifconfig.co</span>
+2a06:9801:1c:1000::10
+</code></pre></div>
+
+<p>The first request shows the host’s NATed provider address. The second shows the jail’s real <span>BGP</span> address - confirming the packet traversed the tunnel and reached the internet through <span>AS201379</span>.</p>
+<p>A traceroute from an external host confirms the <span>BGP</span> path is working:</p>
+<div><pre><span></span><code>$ mtr -rw 2a06:9801:1c:1000::10
+HOST:                              Loss%   Snt   Last   Avg  Best  Wrst StDev
+ 1.|-- [local-gateway]               0.0%    10    2.6   5.5   2.6  14.1   3.6
+    ...
+ 9.|-- [transit-provider-edge]       0.0%    10   33.8  46.2  33.8  81.2  19.0
+10.|-- [ifog-peering-fabric]         0.0%    10   33.5  46.7  33.5  87.0  18.6
+11.|-- 2001:db8:300::2               0.0%    10   44.3  59.1  41.9 136.7  33.2
+12.|-- 2a06:9801:1c:ffff::2         0.0%    10   72.7  98.9  68.8 198.8  42.4
+13.|-- 2a06:9801:1c:1000::10        0.0%    10  164.1  83.1  63.5 164.1  33.4
+</code></pre></div>
+
+<p>Traffic enters via the transit provider (hops 9-10), traverses the <span>GRE</span> tunnel to router01 (hop 11), then the <span>GIF</span> tunnel to vps01 (hop 12, the <code>2a06:9801:1c:ffff::2</code> link address), and finally reaches the jail (hop 13). The prefix also shows up correctly on bgp.tools as active and originated by <span>AS201379</span> with both upstreams visible.</p>
+<h2>Lessons Learned</h2>
+<p><strong><span>MSS</span> clamping is non-negotiable with tunnels.</strong> Every layer of encapsulation eats into the <span>MTU</span>. <span>GIF</span> adds 20 bytes (IPv4 header) to every packet. <span>GRE</span> adds more. If you don’t clamp the <span>TCP</span> <span>MSS</span>, large packets get fragmented or dropped, causing mysterious failures where small requests work but large transfers stall. Set <code>max-mss</code> in <span>PF</span>’s scrub rules for every tunnel interface, calculated as: <span>MTU</span> minus IPv6 header (40 bytes) minus <span>TCP</span> header (20 bytes).</p>
+<p><strong><span>FIB</span> separation is cleaner than source-based routing hacks.</strong> FreeBSD’s multi-<span>FIB</span> support is a first-class feature. Using <code>rtable</code> in <span>PF</span> and <code>fib</code>/<code>tunnelfib</code> on interfaces gives you full control over which routing table handles which traffic. It’s conceptually cleaner and more debuggable than alternatives like ip6tables <span>MARK</span> targets on Linux.</p>
+<p><strong>Bogon filtering matters even for small networks.</strong> The internet is full of misconfigurations and occasional malice. Filtering inbound routes prevents your router from accepting nonsense that could black-hole traffic or worse. The cost is a few lines of configuration; the protection is real.</p>
+<p><strong><code>reply-to</code> solves asymmetric routing.</strong> When traffic can arrive on multiple interfaces, the kernel’s default <span>FIB</span> selection for return traffic may choose the wrong path. <span>PF</span>’s <code>reply-to</code> directive forces replies back out the arrival interface, which is exactly what you need for tunnel overlay setups.</p>
+<p><strong>Start with two upstreams.</strong> A single upstream means zero redundancy and no ability to do traffic engineering. Two upstreams give you failover and the ability to prefer one path over the other using <span>AS</span>-path prepending or communities. The operational complexity increase is minimal.</p>
+<h2>Conclusion</h2>
+<p>Running your own <span>AS</span> on the internet is more accessible than most people assume. The barrier isn’t technical complexity - it’s knowing that the option exists. A FreeBSD <span>VM</span>, <span>FRR</span>, a couple of tunnels, and some careful <span>PF</span> rules give you provider-independent addressing, real <span>BGP</span> peering, and a deeper understanding of how the internet actually works.</p>
+<p>The dual-<span>FIB</span> approach on the downstream server is the piece I’m most satisfied with. It elegantly solves the “two address spaces, one server” problem without hacks: <span>BGP</span> traffic takes the tunnel, provider traffic takes the default route, and <span>PF</span>’s <code>rtable</code> directive makes the decision based purely on source address. Both paths coexist transparently, and the jails don’t need to know anything about the routing underneath.</p>
+<p>Is it overkill for a blog? Absolutely. But the same infrastructure carries every service I run, and having addresses that survive provider migrations has already paid for itself in operational simplicity. Besides, there’s something deeply satisfying about seeing your own <span>AS</span> number show up in a traceroute.</p>
+<hr/>
+<h2>References</h2>
+<ul>
+<li><a href="https://www.ripe.net/manage-ips-and-asns/resource-management/requesting-resources/"><span>RIPE</span> <span>NCC</span> - Requesting Resources</a></li>
+<li><a href="https://docs.frrouting.org/en/latest/"><span>FRR</span> Documentation</a></li>
+<li><a href="https://docs.freebsd.org/en/books/handbook/firewalls/">FreeBSD Handbook: Firewalls (<span>PF</span>)</a></li>
+<li><a href="https://man.freebsd.org/cgi/man.cgi?query=setfib">FreeBSD setfib(1)</a></li>
+<li><a href="https://bgp.tools/">bgp.tools</a> - <span>BGP</span> looking glass and analytics</li>
+<li><a href="https://www.ripe.net/manage-ips-and-asns/resource-management/rpki/"><span>RIPE</span> <span>RPKI</span> Documentation</a></li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc5082"><span>RFC</span> 5082 - <span>GTSM</span> (<span>TTL</span> Security)</a></li>
+</ul>
+<hr/>
+<p>The internet is a network of networks, and now you’re one of them. There’s a certain elegance in participating in the same routing protocol that glues together every network on the planet - from your single /48 all the way up to the Tier 1 carriers. <span>BGP</span> doesn’t care about your size. It just cares that your routes are valid, your filters are clean, and your packets know where to go.</p>
+    </div></div>
+  </body>
+</html>
