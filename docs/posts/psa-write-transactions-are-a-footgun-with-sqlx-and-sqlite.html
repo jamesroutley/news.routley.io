@@ -34,7 +34,8 @@
         </p>
     
 
-    <p>Write transactions can lead to lock starvation and serious performance degradation when using SQLite with <a href="https://crates.io/crates/sqlx">SQLx</a>, the popular async Rust SQL library. In retrospect, I feel like this should have been obvious, but it took a little more staring at suspiciously consistent &#34;slow statement&#34; logs than I&#39;d like to admit, so I&#39;m writing it up in case it helps others avoid this footgun.</p>
+    <p><strong>Update (Feb 18, 2026): After a productive discussion on <a href="https://www.reddit.com/r/rust/comments/1r7eh9v/psa_write_transactions_are_a_footgun_with_sqlx/">Reddit</a> and additional <a href="https://github.com/emschwartz/sqlx-sqlite-contention-repro">benchmarking</a>, I found that the solutions I originally proposed (batched writes or using a synchronous connection) don&#39;t actually help. The real issue is simpler and more fundamental than I described: SQLite is single-writer, so any amount of contention at the SQLite level will severely hurt write performance. The fix is to use a single writer connection with writes queued at the application level, and a separate connection pool for concurrent reads. The original blog post text is preserved below, with retractions and updates marked accordingly. My apologies to the SQLx maintainers for suggesting that this behavior was unique to SQLx.</strong></p>
+<p>Write transactions can lead to lock starvation and serious performance degradation when using SQLite with <a href="https://crates.io/crates/sqlx">SQLx</a>, the popular async Rust SQL library. In retrospect, I feel like this should have been obvious, but it took a little more staring at suspiciously consistent &#34;slow statement&#34; logs than I&#39;d like to admit, so I&#39;m writing it up in case it helps others avoid this footgun.</p>
 <h2 id="sqlite-locking-and-transactions">SQLite Locking and Transactions</h2><p>SQLite is single-writer. In WAL mode, it can support concurrent reads and writes (or, technically &#34;write&#34; singular), but no matter the mode there is only ever one writer at a time. Before writing, a process needs to obtain an <a href="https://sqlite.org/lockingv3.html">EXCLUSIVE lock</a> on the database.</p>
 <p>If you start a read transaction with a SELECT and then perform a write in the same transaction, the transaction will need to be upgraded to write transaction with an exclusive lock:</p>
 <blockquote>
@@ -58,7 +59,8 @@
 <span>tx</span><span>.</span><span>commit</span><span>().</span><span>await</span><span>?</span><span>;</span>
 </pre></div>
 <p>This type of transaction where you read and then write is completely fine. The transaction starts as a read transaction and then is upgraded to a write transaction for the <code>UPDATE</code>.</p>
-<h2 id="lock-starvation-with-multiple-writes">Lock Starvation with Multiple Writes</h2><p>The problem arises when you call <code>await</code> within a write transaction. For example, this could happen if you call multiple write statements within a transaction:</p>
+<h2 id="lock-delstarvationdel-contention-with-multiple-writes">Lock <del>Starvation</del> Contention with Multiple Writes</h2><p><strong>Update: This section incorrectly attributes the performance degradation to the interaction between async Rust and SQLite. The problem is actually that any contention for the EXCLUSIVE lock at the SQLite level, whether from single statements or batches, will hurt write performance.</strong></p>
+<p>The problem arises when you call <code>await</code> within a write transaction. For example, this could happen if you call multiple write statements within a transaction:</p>
 <div><pre><span></span><span>let</span><span> </span><span>mut</span><span> </span><span>tx</span><span> </span><span>=</span><span> </span><span>db_connection</span><span>.</span><span>begin</span><span>().</span><span>await</span><span>?</span><span>;</span>
 
 <span>for</span><span> </span><span>(</span><span>id</span><span>,</span><span> </span><span>value</span><span>)</span><span> </span><span>in</span><span> </span><span>values</span><span> </span><span>{</span>
@@ -75,7 +77,80 @@
 <p>When the program reaches the first <code>INSERT</code> statement, the transaction is upgraded to a write transaction with an exclusive lock. However, when you call <code>await</code>, the task yields control back to the async runtime. The runtime may schedule another task before returning to this one. The problem is that this task is now holding an exclusive lock on the database. All other writers must wait for this one to finish. If the newly scheduled task tries to write, it will simply wait until it hits the <a href="https://docs.rs/sqlx/latest/sqlx/sqlite/struct.SqliteConnectOptions.html#method.busy_timeout"><code>busy_timeout</code></a> and returns a busy timeout error. The original task <em>might</em> be able to make progress if no other concurrent writers are scheduled before it, but under higher load you might continuously have new tasks that block the original writer from progressing.</p>
 <p>Starting a transaction with <code>BEGIN IMMEDIATE</code> will also cause this problem, because you will immediately take the exclusive lock and then yield control with <code>await</code>.</p>
 <h2 id="identifying-this-problem-in-logs">Identifying this Problem in Logs</h2><p>In practice, you can spot this issue in your production logs if you see a lot of SQLx warnings that say <code>slow statement: execution time exceeded alert threshold</code> where the <code>elapsed</code> time is very close to your <a href="https://docs.rs/sqlx/latest/sqlx/sqlite/struct.SqliteConnectOptions.html#method.busy_timeout"><code>busy_timeout</code></a> (which is 5 seconds by default). This is the result of other tasks being scheduled by the runtime and then trying and failing to obtain the exclusive lock they need to write to the database while being blocked by a parked task.</p>
-<h2 id="partial-solution-batched-writes">Partial Solution: Batched Writes</h2><p>We could safely replace the example code above with this snippet that uses a bulk insert to avoid the lock starvation problem:</p>
+<h2 id="the-fix-single-writer-separate-reader-pool">The Fix: Single Writer, Separate Reader Pool</h2><p>SQLite&#39;s concurrency model (in WAL mode) is many concurrent readers with exactly one writer. Mirroring this architecture at the application level provides the best performance.</p>
+<p>Instead of a single connection pool, where connections may be upgraded to write at any time, use two separate pools:</p>
+<div><pre><span></span><span>let</span><span> </span><span>write_options</span><span> </span><span>=</span><span> </span><span>SqliteConnectOptions</span><span>::</span><span>new</span><span>()</span>
+<span>    </span><span>.</span><span>filename</span><span>(</span><span>&#34;my.db&#34;</span><span>)</span>
+<span>    </span><span>.</span><span>journal_mode</span><span>(</span><span>SqliteJournalMode</span><span>::</span><span>Wal</span><span>);</span>
+
+<span>let</span><span> </span><span>read_options</span><span> </span><span>=</span><span> </span><span>SqliteConnectOptions</span><span>::</span><span>new</span><span>()</span>
+<span>    </span><span>.</span><span>filename</span><span>(</span><span>&#34;my.db&#34;</span><span>)</span>
+<span>    </span><span>.</span><span>journal_mode</span><span>(</span><span>SqliteJournalMode</span><span>::</span><span>Wal</span><span>)</span>
+<span>    </span><span>.</span><span>read_only</span><span>(</span><span>true</span><span>);</span>
+
+<span>// Single writer connection — all writes queue here</span>
+<span>let</span><span> </span><span>writer</span><span> </span><span>=</span><span> </span><span>SqlitePoolOptions</span><span>::</span><span>new</span><span>()</span>
+<span>    </span><span>.</span><span>max_connections</span><span>(</span><span>1</span><span>)</span>
+<span>    </span><span>.</span><span>connect_with</span><span>(</span><span>write_options</span><span>)</span>
+<span>    </span><span>.</span><span>await</span><span>?</span><span>;</span>
+
+<span>// Multiple reader connections — reads run concurrently</span>
+<span>let</span><span> </span><span>reader</span><span> </span><span>=</span><span> </span><span>SqlitePoolOptions</span><span>::</span><span>new</span><span>()</span>
+<span>    </span><span>.</span><span>max_connections</span><span>(</span><span>num_cpus</span><span>::</span><span>get</span><span>()</span><span> </span><span>as</span><span> </span><span>u32</span><span>)</span>
+<span>    </span><span>.</span><span>connect_with</span><span>(</span><span>read_options</span><span>)</span>
+<span>    </span><span>.</span><span>await</span><span>?</span><span>;</span>
+</pre></div>
+<p>With this setup, write transactions serialize within the application. Tasks will queue waiting for the single writer connection, rather than all trying to obtain SQLite&#39;s EXCLUSIVE lock.</p>
+<p>In my <a href="https://github.com/emschwartz/sqlx-sqlite-contention-repro">benchmarks</a>, this approach was ~20x faster than using a single pool with multiple connections:</p>
+<table>
+<thead>
+<tr>
+  <th>Scenario</th>
+  <th>Total Time</th>
+  <th>Rows/sec</th>
+  <th>P50</th>
+  <th>P99</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>Single pool (50 connections)</td>
+  <td>1.93s</td>
+  <td>2,586</td>
+  <td>474ms</td>
+  <td>182s</td>
+</tr>
+<tr>
+  <td>Single writer connection</td>
+  <td>83ms</td>
+  <td>60,061</td>
+  <td>43ms</td>
+  <td>82ms</td>
+</tr>
+</tbody>
+</table>
+<p>An alternative to separate pools is wrapping writes in a <a href="https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html">Mutext</a>, which achieves similar performance (95ms in the benchmarks). However, separate pools make the intent clearer and, if the reader pool is configured as read-only, prevent accidentally issuing a write on a reader connection.</p>
+<h2 id="what-about-read-then-write-transactions">What About Read-Then-Write Transactions?</h2><p>Having separate pools works when reads and writes are independent, but sometimes you need to atomically read and then write based on it:</p>
+<div><pre><span></span><span>let</span><span> </span><span>mut</span><span> </span><span>tx</span><span> </span><span>=</span><span> </span><span>pool</span><span>.</span><span>begin</span><span>().</span><span>await</span><span>?</span><span>;</span>
+
+<span>let</span><span> </span><span>balance</span><span> </span><span>=</span><span> </span><span>sqlx</span><span>::</span><span>query_scalar</span><span>::</span><span>&lt;</span><span>_</span><span>,</span><span> </span><span>i64</span><span>&gt;</span><span>(</span>
+<span>    </span><span>&#34;SELECT balance FROM accounts WHERE id = ?&#34;</span>
+<span>)</span>
+<span>    </span><span>.</span><span>bind</span><span>(</span><span>account_id</span><span>)</span>
+<span>    </span><span>.</span><span>fetch_one</span><span>(</span><span>&amp;</span><span>mut</span><span> </span><span>*</span><span>tx</span><span>)</span>
+<span>    </span><span>.</span><span>await</span><span>?</span><span>;</span>
+
+<span>sqlx</span><span>::</span><span>query</span><span>(</span><span>&#34;UPDATE accounts SET balance = ? WHERE id = ?&#34;</span><span>)</span>
+<span>    </span><span>.</span><span>bind</span><span>(</span><span>balance</span><span> </span><span>-</span><span> </span><span>amount</span><span>)</span>
+<span>    </span><span>.</span><span>bind</span><span>(</span><span>account_id</span><span>)</span>
+<span>    </span><span>.</span><span>execute</span><span>(</span><span>&amp;</span><span>mut</span><span> </span><span>*</span><span>tx</span><span>)</span>
+<span>    </span><span>.</span><span>await</span><span>?</span><span>;</span>
+<span>    </span>
+<span>tx</span><span>.</span><span>commit</span><span>().</span><span>await</span><span>?</span><span>;</span>
+</pre></div>
+<p>Sending this transaction to the single write connection is fine if the read is extremely fast, such as a single lookup by primary key. However, if your application requires expensive reads that must precede writes in a single atomic transaction, the shared connection pool with moderate concurrency might outperform a single writer.</p>
+<h2 id="delpartial-solution-batched-writesdel"><del>Partial Solution: Batched Writes</del></h2><p><strong>Retraction: Benchmarking showed that batched writes perform no better than the naive loop under concurrency, because 50 connections still contend for the write lock regardless of whether each connection issues 100 small <code>INSERT</code>s or one large <code>INSERT</code>. QueryBuilder is still useful for reducing per-statement overhead, but it does not fix the contention problem.</strong></p>
+<p>We could safely replace the example code above with this snippet that uses a bulk insert to avoid the lock starvation problem:</p>
 <div><pre><span></span><span>let</span><span> </span><span>mut</span><span> </span><span>builder</span><span> </span><span>=</span><span> </span><span>sqlx</span><span>::</span><span>QueryBuilder</span><span>::</span><span>new</span><span>(</span>
 <span>	</span><span>&#34;INSERT INTO table (id, some_field)&#34;</span>
 <span>);</span>
@@ -90,7 +165,8 @@
 <span>	</span><span>.</span><span>await</span><span>?</span><span>;</span>
 </pre></div>
 <p>Note that if you do this with different numbers of values, you should call <code>.persistent(false)</code>. By default, SQLx caches prepared statements. However, each version of the query with a different number of arguments will be cached separately, which may thrash the cache.</p>
-<h2 id="raw-sql-for-atomic-writes-to-multiple-tables">Raw SQL for Atomic Writes to Multiple Tables</h2><p>Unfortunately, the fix for atomic writes to multiple tables is uglier and potentially very dangerous. To avoid holding an exclusive lock across an <code>await</code>, you need to use the <a href="https://docs.rs/sqlx/latest/sqlx/fn.raw_sql.html"><code>raw_sql</code></a> interface to execute a transaction in one shot:</p>
+<h2 id="delraw-sql-for-atomic-writes-to-multiple-tablesdel"><del>Raw SQL for Atomic Writes to Multiple Tables</del></h2><p><strong>Retraction: Benchmarking showed that this did not actually improve performance.</strong></p>
+<p>Unfortunately, the fix for atomic writes to multiple tables is uglier and potentially very dangerous. To avoid holding an exclusive lock across an <code>await</code>, you need to use the <a href="https://docs.rs/sqlx/latest/sqlx/fn.raw_sql.html"><code>raw_sql</code></a> interface to execute a transaction in one shot:</p>
 <div><pre><span></span><span>sqlx</span><span>::</span><span>raw_sql</span><span>(</span><span> </span><span>// this is implicitly wrapped in a transaction</span>
 <span>	</span><span>&#34;UPDATE table1 SET foo = &#39;bar&#39;;</span>
 <span>	UPDATE table2 SET baz = &#39;qux&#39;;&#34;</span>
@@ -103,7 +179,8 @@
 <p>The query string may only contain a single DML statement: SELECT, INSERT, UPDATE, DELETE and variants. The SQLite driver does not currently follow this restriction, but that behavior is deprecated.</p>
 </blockquote>
 <p>If you find yourself needing atomic writes to multiple tables with SQLite and Rust, you might be better off rethinking your schema to combine those tables or switching to a synchronous library like <a href="https://crates.io/crates/rusqlite"><code>rusqlite</code></a> with a single writer started with <a href="https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html"><code>spawn_blocking</code></a>.</p>
-<h2 id="could-rusts-type-system-save-us">Could Rust&#39;s Type System Save Us?</h2><p>Maybe, but it probably won&#39;t. If SQLx offered both a sync and async API (definitely out of scope) and differentiated between read and write statements, a write <a href="https://docs.rs/sqlx/latest/sqlx/struct.Transaction.html"><code>Transaction</code></a> could be <code>!Send</code> like <a href="https://doc.rust-lang.org/std/sync/struct.MutexGuard.html#impl-Send-for-MutexGuard%3C%27_,+T%3E"><code>std::sync::MutexGuard</code></a>, which would prevent it from being held across an <code>await</code> point.</p>
+<h2 id="could-rusts-type-system-save-us">Could Rust&#39;s Type System Save Us?</h2><p><strong>Update: the most useful change would actually be making a distinction between a <code>ReadPool</code> and a <code>WritePool</code>. Libraries like SQLx could enforce the distinction at compile time or runtime by inspecting the queries for the presence of write statements, or the <code>ReadPool</code> could be configured as read-only.</strong></p>
+<p>Maybe, but it probably won&#39;t. If SQLx offered both a sync and async API (definitely out of scope) and differentiated between read and write statements, a write <a href="https://docs.rs/sqlx/latest/sqlx/struct.Transaction.html"><code>Transaction</code></a> could be <code>!Send</code> like <a href="https://doc.rust-lang.org/std/sync/struct.MutexGuard.html#impl-Send-for-MutexGuard%3C%27_,+T%3E"><code>std::sync::MutexGuard</code></a>, which would prevent it from being held across an <code>await</code> point.</p>
 <p>However, SQLx is not an ORM and it probably isn&#39;t worth it for the library to have different methods for read versus write statements. Without that, there isn&#39;t a way to prevent write transaction locks from being held across <code>await</code>s while allowing safe read transactions to be used across <code>await</code>s.</p>
 <p>So, in lieu of type safety to prevent this footgun, I wrote up this blog post and <a href="https://github.com/launchbadge/sqlx/pull/4166">this pull request</a> to include a warning about this in the docs.</p>
 <hr/>
