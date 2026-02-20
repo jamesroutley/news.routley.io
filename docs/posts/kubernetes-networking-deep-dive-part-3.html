@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://techblog.hughtipping.com/p/kubernetes-networking-deep-dive-part-8e0">Original</a>
+    <h1>Kubernetes Networking Deep Dive, Part 3</h1>
+    
+    <div id="readability-page-1" class="page"><div><div dir="auto"><p><span>This is the third post in  my four-part series tracking packets as they flow through a Kubernetes cluster. In </span><a href="https://techblog.hughtipping.com/p/kubernetes-networking-deep-dive-part-f73" rel="">Part 2</a><span>, I went over pod-to-pod (east-west) traffic. Now let’s talk about traffic from an external user, through a LoadBalancer into the cluster, to a pod, and back again. Yep, all that.</span></p><p>Every packet destined for a Kubernetes Service has to pass through iptables rules that select a backend pod and modify packet headers. This is important for debugging connectivity problems, latency, and service configuration.</p><p>Let’s dig a bit into the Service resource type in Kubernetes.</p><p>Pods are “ephemeral,” meaning they are temporary. Every time a pod gets created or restarted, it gets a new IP address. Trying to connect to a pod’s IP address directly is brittle since the IP can change at a moment’s notice. Instead, use a Service to provide a more stable endpoint that will route your traffic to the pods it exposes.</p><p><strong>ClusterIP</strong><span> (default): This will allocate a virtual IP from the Service CIDR for the service itself. You can only get to this IP from inside the cluster. It appears only in iptables or IPVS rules, not on any kind of network interface.</span></p><p><strong>NodePort</strong><span>: This type of service opens a port (default range 30000-32767) directly on every node in the cluster. External traffic can reach the service via </span><code>&lt;node-ip&gt;:&lt;nodeport&gt;</code><span>.</span></p><p><strong>LoadBalancer</strong><span>: This provisions a load balancer outside of the cluster within whatever platform you’re using (cloud provider or MetalLB for physical services). The load balancer obtains an external IP address and forwards traffic to the NodePort.</span></p><pre><code><code># View services and their types
+kubectl get svc -o wide
+# Output:
+# NAME         TYPE           CLUSTER-IP    EXTERNAL-IP     PORT(S)        AGE
+# kubernetes   ClusterIP      10.96.0.1     &lt;none&gt;          443/TCP        30d
+# my-app       LoadBalancer   10.96.0.15    203.0.113.50    80:30080/TCP   5d
+# internal-api ClusterIP      10.96.0.42    &lt;none&gt;          8080/TCP       5d
+</code></code></pre><p><span>For the my-app service, the </span><code>80:30080/TCP</code><span> means: external port 80 coming into the LB maps to the NodePort listening on 30080.</span></p><p>For example, let’s say we trace traffic to a LoadBalancer service with three backend pods:</p><ul><li><p>External client: 198.51.100.5 (public internet)</p></li><li><p>Load balancer external IP: 203.0.113.50 (provided by the LoadBalancer provisioner)</p></li><li><p>NodePort: 30080</p></li><li><p>Service ClusterIP: 10.96.0.15</p></li><li><p>Backend pods:</p><ul><li><p>Pod 1: 10.244.0.5 on Node 1 (192.168.1.10)</p></li><li><p>Pod 2: 10.244.1.3 on Node 2 (192.168.1.11)</p></li><li><p>Pod 3: 10.244.2.2 on Node 3 (192.168.1.12)</p></li></ul></li></ul><p>The client’s browser connects to http://203.0.113.50 (the load balancer). The client’s TCP/IP stack creates a packet:</p><ul><li><p>Source IP: 198.51.100.5 (the client)</p></li><li><p>Destination IP: 203.0.113.50 (the load balancer)</p></li><li><p>Source port: 54321 (ephemeral)</p></li><li><p>Destination port: 80 (what the load balancer listens on)</p></li></ul><p>The external load balancer receives the packet on its external IP. Then, the load balancer:</p><ol><li><p><span>Accepts the TCP connection (</span><a href="https://en.wikipedia.org/wiki/Handshake_(computing)#TCP_three-way_handshake" rel="">three way handshake</a><span>)</span></p></li><li><p>It selects a healthy backend node from its pool (nodes with NodePort 30080)</p></li><li><p>Then it forwards the traffic to that node</p></li></ol><p>The load balancer performs checks against the NodePort to determine if the node is ready to accept traffic.</p><pre><code><code># Example health check with netcat (what the LB does internally)
+# TCP connect to each node on port 30080 to ensure it&#39;s responding.
+nc -zv 192.168.1.10 30080
+nc -zv 192.168.1.11 30080
+nc -zv 192.168.1.12 30080
+</code></code></pre><p>Depending on how the load balancer is configured:</p><ul><li><p><strong>SNAT mode</strong><span>: LB changes source IP to its own IP (this helps you restrict incoming traffic only from the LB. You could also place the source IP into a header X-Forwarded-For and have the client read that if the source IP is important)</span></p></li><li><p><strong>DSR/Transparent mode</strong><span>: LB preserves client source IP</span></p></li></ul><p>The load balancer forwards the packet to Node 1 (192.168.1.10):</p><ul><li><p>Source IP: 198.51.100.5 (client, preserved)</p></li><li><p>Destination IP: 192.168.1.10 (node)</p></li><li><p>Destination port: 30080 (NodePort port)</p></li></ul><p>The packet goes to the node’s physical interface (eth0).</p><p>The packet first passes through the PREROUTING chain in the iptables nat table. This is where Kubernetes service routing starts.</p><pre><code><code>sudo iptables -t nat -L PREROUTING -n --line-numbers
+# Output:
+# Chain PREROUTING (policy ACCEPT)
+# num  target     prot opt source               destination
+# 1    KUBE-SERVICES  all  --  0.0.0.0/0        0.0.0.0/0
+</code></code></pre><p>From the above, all traffic is sent to the KUBE-SERVICES chain.</p><p>The KUBE-SERVICES chain contains rules for all the Services in the cluster. It matches a rule by the destination IP:port combinations.</p><pre><code><code>sudo iptables -t nat -L KUBE-SERVICES -n | head -20
+# Output:
+# Chain KUBE-SERVICES (2 references)
+# target                     prot opt source       destination
+# KUBE-SVC-XXXX1             tcp  --  0.0.0.0/0    10.96.0.15    /* default/my-app cluster IP */ tcp dpt:80
+# KUBE-NODEPORTS             all  --  0.0.0.0/0    0.0.0.0/0     ADDRTYPE match dst-type LOCAL
+</code></code></pre><p><span>For NodePort traffic, the destination is a local node IP, </span><em>not the ClusterIP</em><span>. The rule </span><code>ADDRTYPE match dst-type LOCAL</code><span> catches this and then goes to the chain KUBE-NODEPORTS. (Dizzy yet?)</span></p><p>This chain matches the actual NodePort numbers:</p><pre><code><code>sudo iptables -t nat -L KUBE-NODEPORTS -n
+# Output:
+# Chain KUBE-NODEPORTS (1 references)
+# target                     prot opt source       destination
+# KUBE-EXT-XXXX1             tcp  --  0.0.0.0/0    0.0.0.0/0    /* default/my-app */ tcp dpt:30080
+</code></code></pre><p>Traffic to port 30080 then moves to the KUBE-EXT-XXXX1 chain for that particular node (external traffic handling for this service).</p><p>The KUBE-EXT chain handles external traffic policy and then jumps to the service chain:</p><pre><code><code>sudo iptables -t nat -L KUBE-EXT-XXXX1 -n
+# Output (externalTrafficPolicy: Cluster):
+# Chain KUBE-EXT-XXXX1 (1 references)
+# target                     prot opt source       destination
+# KUBE-MARK-MASQ             all  --  0.0.0.0/0    0.0.0.0/0
+# KUBE-SVC-XXXX1             all  --  0.0.0.0/0    0.0.0.0/0
+</code></code></pre><p>KUBE-MARK-MASQ marks the packet for source NAT (SNAT) later. This is necessary because the packet may be forwarded to a pod on a different node.</p><p>The KUBE-SVC chain does load balancing across endpoints within the cluster (the different available pods):</p><pre><code><code>sudo iptables -t nat -L KUBE-SVC-XXXX1 -n
+# Output:
+# Chain KUBE-SVC-XXXX1 (2 references)
+# target                     prot opt source       destination
+# KUBE-SEP-AAAA1             all  --  0.0.0.0/0    0.0.0.0/0    statistic mode random probability 0.33333333349
+# KUBE-SEP-BBBB2             all  --  0.0.0.0/0    0.0.0.0/0    statistic mode random probability 0.50000000000
+# KUBE-SEP-CCCC3             all  --  0.0.0.0/0    0.0.0.0/0
+</code></code></pre><p><span>Now, probability rules implement </span><em>random</em><span> load balancing for picking which pod:</span></p><ul><li><p>First rule: 33.3% chance (1/3)</p></li><li><p>Second rule: 50% of remaining (1/2 of 2/3 = 1/3)</p></li><li><p>Third rule: 100% of remaining (1/3)</p></li></ul><p><span>Each endpoint gets </span><em>equal</em><span> probability.</span></p><p>Assume the random selection chooses KUBE-SEP-BBBB2 (Pod 2 on Node 2):</p><pre><code><code>sudo iptables -t nat -L KUBE-SEP-BBBB2 -n
+# Output:
+# Chain KUBE-SEP-BBBB2 (1 references)
+# target                     prot opt source       destination
+# KUBE-MARK-MASQ             all  --  10.244.1.3   0.0.0.0/0
+# DNAT                       tcp  --  0.0.0.0/0    0.0.0.0/0    tcp to:10.244.1.3:8080
+</code></code></pre><p>The DNAT rule rewrites the destination:</p><ul><li><p>Before: dst 192.168.1.10:30080 (the NodePort)</p></li><li><p>After: dst 10.244.1.3:8080 (the Pod’s actual IP address! We’ve nearly there!)</p></li></ul><p>The packet now has:</p><ul><li><p>Source IP: 198.51.100.5 (client)</p></li><li><p>Destination IP: 10.244.1.3 (Pod 2)</p></li><li><p>Destination port: 8080</p></li></ul><p><span>After PREROUTING, the kernel does some routing magic. The destination 10.244.1.3 is on Node 2, </span><em>not local to this node</em><span>. The packet must be </span><em>forwarded</em><span>.</span></p><pre><code><code>ip route get 10.244.1.3
+# Output (VXLAN example):
+# 10.244.1.3 via 10.244.1.0 dev flannel.1 src 10.244.0.0
+</code></code></pre><p>The packet will head out the flannel.1 interface to get to Node 2.</p><p>The packet passes through the FORWARD chain in the filter table:</p><pre><code><code>sudo iptables -L FORWARD -n | head -10
+# Output:
+# Chain FORWARD (policy ACCEPT)
+# target     prot opt source               destination
+# KUBE-FORWARD  all  --  0.0.0.0/0        0.0.0.0/0
+# KUBE-SERVICES  all  --  0.0.0.0/0       0.0.0.0/0   ctstate NEW
+</code></code></pre><p>Before the packet leaves the node, it passes through POSTROUTING in the nat table (Don’t worry if it’s not all familiar to you):</p><pre><code><code>sudo iptables -t nat -L POSTROUTING -n
+# Output:
+# Chain POSTROUTING (policy ACCEPT)
+# target                     prot opt source       destination
+# KUBE-POSTROUTING           all  --  0.0.0.0/0    0.0.0.0/0
+</code></code></pre><pre><code><code>sudo iptables -t nat -L KUBE-POSTROUTING -n
+# Output:
+# Chain KUBE-POSTROUTING (1 references)
+# target     prot opt source               destination
+# RETURN     all  --  0.0.0.0/0            0.0.0.0/0    mark match ! 0x4000/0x4000
+# MARK       all  --  0.0.0.0/0            0.0.0.0/0    MARK xor 0x4000
+# MASQUERADE all  --  0.0.0.0/0            0.0.0.0/0
+</code></code></pre><p>The packet was marked by KUBE-MARK-MASQ earlier. MASQUERADE performs SNAT, changing the source IP to the node’s IP:</p><ul><li><p>Before: src 198.51.100.5</p></li><li><p>After: src 192.168.1.10</p></li></ul><p>The packet now has:</p><ul><li><p>Source IP: 192.168.1.10 (Node 1)</p></li><li><p>Destination IP: 10.244.1.3 (Pod 2)</p></li></ul><p><span>The packet is forwarded to Node 2 using the CNI’s </span><em>cross-node</em><span> mechanism (VXLAN, BGP, etc.) as described in </span><a href="https://techblog.hughtipping.com/p/kubernetes-networking-deep-dive-part-f73" rel="">Part 2</a><span>.</span></p><p>On Node 2, the packet is decapsulated (if overlay) and routed to Pod 2. The pod receives:</p><ul><li><p>Source IP: 192.168.1.10 (Node 1, because of SNAT)</p></li><li><p>Destination IP: 10.244.1.3 (Pod 2)</p></li><li><p>Destination port: 8080</p></li></ul><p><span>The application sees the request as coming from Node 1, </span><em>not the original client</em><span>. The client IP has been lost due to SNAT.</span></p><p>Once the app is done doing what it needs to do with the packet, Pod 2’s application sends a response:</p><ul><li><p>Source IP: 10.244.1.3</p></li><li><p>Destination IP: 192.168.1.10 (Node 1, from SNAT)</p></li><li><p>Source port: 8080</p></li><li><p><span>Destination port: 54321 (client’s original port, preserved in </span><a href="https://blog.cloudflare.com/conntrack-tales-one-thousand-and-one-flows/" rel="">conntrack</a><span>)</span></p></li></ul><p>The destination 192.168.1.10 is Node 1. The packet is forwarded via the CNI.</p><p><span>When the packet arrives at Node 1, the kernel’s connection tracking (conntrack) </span><em>recognizes it as a reply to an already established connection</em><span>:</span></p><pre><code><code>sudo conntrack -L | grep 10.244.1.3
+# Output:
+# tcp  6 117 TIME_WAIT src=198.51.100.5 dst=192.168.1.10 sport=54321 dport=30080 
+#      src=10.244.1.3 dst=192.168.1.10 sport=8080 dport=54321 [ASSURED] mark=0 use=1
+</code></code></pre><p><span>The conntrack entry shows the </span><em>original connection</em><span> (client to NodePort) and the reply direction (pod to node). The Linux kernel automatically reverses the NAT (kinda neat, eh?):</span></p><ul><li><p><strong>Un-SNAT</strong><span>: Source 10.244.1.3 becomes 192.168.1.10 (and then to the nodeport perspective)</span></p></li><li><p><strong>Un-DNAT</strong><span>: Source 192.168.1.10:30080 (from the client’s perspective)</span></p></li></ul><p>The packet is then sent back to the client:</p><ul><li><p>Source IP: 192.168.1.10 (Node 1)</p></li><li><p>Destination IP: 198.51.100.5 (client)</p></li><li><p>Source port: 30080</p></li></ul><p><span>The packet returns through the load balancer to the client. </span><em>The load balancer maintains its own connection state</em><span> and may perform additional translations to present the external IP (203.0.113.50) of the Load Balancer itself as the source (this hides your internal infrastructure).</span></p><p>The client receives the response from 203.0.113.50:80.</p><p>As if that wasn’t enough (and it was a lot), here is some additional information about the behavior of packet routing.</p><p><span>The default behavior (externalTrafficPolicy: Cluster) is to use SNAT, which </span><em>loses</em><span> the client IP. But there are other ways.</span></p><ul><li><p>Traffic can land on any node</p></li><li><p>If the selected pod is on a different node, traffic is forwarded</p></li><li><p>SNAT is applied to ensure return traffic comes back through the same node</p></li><li><p><em>Client IP is lost</em></p></li><li><p>Load is evenly distributed</p></li></ul><ul><li><p>Traffic only goes to pods on the node that received it</p></li><li><p>If there are no local pods, the node will actually fail the health checks and the load balancer will stop sending traffic to that node</p></li><li><p>No SNAT is needed because the traffic stays local to the node.</p></li><li><p>The Client IP is preserved</p></li><li><p>Load may not be evenly distributed in cases where nodes have MORE pods so are likely to get more traffic.</p></li></ul><pre><code><code>apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local  # Preserve client IP
+  selector:
+    app: my-app
+  ports:
+  - port: 80
+    targetPort: 8080
+</code></code></pre><p><span>With </span><code>externalTrafficPolicy: Local</code><span>, the iptables rules will also change:</span></p><pre><code><code>sudo iptables -t nat -L KUBE-EXT-XXXX1 -n
+# Output (externalTrafficPolicy: Local):
+# Chain KUBE-EXT-XXXX1 (1 references)
+# target                     prot opt source       destination
+# KUBE-SVC-XXXX1             all  --  0.0.0.0/0    0.0.0.0/0
+</code></code></pre><p><em>Notice: No KUBE-MARK-MASQ. No, MASQERADEing SNAT will be applied.</em></p><p>The KUBE-SVC chain only contains endpoints local to the node:</p><pre><code><code># On Node 1, which has Pod 1 (10.244.0.5)
+sudo iptables -t nat -L KUBE-SVC-XXXX1 -n
+# Output:
+# Chain KUBE-SVC-XXXX1 (1 references)
+# target                     prot opt source       destination
+# KUBE-SEP-AAAA1             all  --  0.0.0.0/0    0.0.0.0/0
+</code></code></pre><p>In this example, only one endpoint (the local pod) is listed. Nodes without local pods have this:</p><pre><code><code># On Node 3, which has no pods for this service
+sudo iptables -t nat -L KUBE-SVC-XXXX1 -n
+# Output:
+# Chain KUBE-SVC-XXXX1 (1 references)
+# target                     prot opt source       destination
+# KUBE-MARK-DROP             all  --  0.0.0.0/0    0.0.0.0/0
+</code></code></pre><p><span>The KUBE-MARK-DROP rule causes the packet to be </span><em>dropped</em><span>. This will cause the health check to fail since the packet is essentially thrown away. The load balancerwill see this and will stop sending traffic to this particular node.</span></p><p><span>Use </span><strong>Cluster</strong><span> when:</span></p><ul><li><p>Client IP is not needed (or you are putting the IP in an X-Forwarded-For header at the LB level)</p></li><li><p>Even load distribution is wanted</p></li><li><p>All nodes should be receiving traffic regardless of where the traffic is destined,</p></li></ul><p><span>Use </span><strong>Local</strong><span> when:</span></p><ul><li><p>Client IP must be preserved (logging, geolocation, rate limiting)</p></li><li><p>Application needs to see a real client IP address for whatever reason</p></li><li><p>It’s ok to have uneven load balancing</p></li></ul><p>I read up that when kube-proxy runs in IPVS mode, the flow is similar to that long path above, but it’s done in a different manner.</p><p><span>Instead of iptables chains, IPVS creates </span><em>virtual servers</em><span> that you can check on with the ipvsadm command.</span></p><pre><code><code>sudo ipvsadm -Ln
+# Output:
+# IP Virtual Server version 1.2.1 (size=4096)
+# Prot LocalAddress:Port Scheduler Flags
+#   -&gt; RemoteAddress:Port           Forward Weight ActiveConn InActConn
+# TCP  10.96.0.15:80 rr
+#   -&gt; 10.244.0.5:8080              Masq    1      2          0
+#   -&gt; 10.244.1.3:8080              Masq    1      1          0
+#   -&gt; 10.244.2.2:8080              Masq    1      3          0
+# TCP  192.168.1.10:30080 rr
+#   -&gt; 10.244.0.5:8080              Masq    1      2          0
+#   -&gt; 10.244.1.3:8080              Masq    1      1          0
+#   -&gt; 10.244.2.2:8080              Masq    1      3          0
+</code></code></pre><p>IPVS handles both ClusterIP (10.96.0.15:80) and NodePort (192.168.1.10:30080) Service types as virtual servers.</p><p><span>IPVS mode s</span><em>till uses iptables</em><span> under the hood for a few cases:</span></p><ul><li><p>Masquerading (SNAT)</p></li><li><p><a href="https://www.cisco.com/c/en/us/tech/quality-of-service-qos/qos-packet-marking/index.html" rel="">Packet marking</a></p></li><li><p><span>NodePort handling on </span><em>all node IPs</em></p></li></ul><p>For some more torture, here you go:</p><pre><code><code>sudo iptables -t nat -L KUBE-POSTROUTING -n
+# Output (IPVS mode):
+# Chain KUBE-POSTROUTING (1 references)
+# target     prot opt source               destination
+# MASQUERADE all  --  0.0.0.0/0            0.0.0.0/0    match-set KUBE-LOOP-BACK dst,dst,src
+</code></code></pre><p>IPVS supports multiple Load Balancing algorithms (e.g. rr = roundrobin)</p><pre><code><code># View current scheduler
+sudo ipvsadm -Ln | grep &#34;TCP  10.96&#34;
+# Output shows scheduler algorithms that are available: rr, lc, dh, sh, sed, nq
+
+# Let&#39;s see how it&#39;s configured in the kube-proxy config
+kubectl get configmap kube-proxy -n kube-system -o yaml | grep scheduler
+# Output: scheduler: &#34;rr&#34;
+</code></code></pre><p>Let’s move a little further out from the level of iptables and ipvs and examine the Ingress Controller. This resource adds another hop to the flow of traffic. Traffic flows:</p><p><span>Client → Load Balancer → NodePort → </span><strong>Ingress Controller Pod</strong><span> → Backend Pod</span></p><ol><li><p>An Ingress Controller (nginx, envoy, traefik, etc.) runs as pods in the cluster</p></li><li><p>Those pods are exposed via a LoadBalancer or NodePort service (so that it routes traffic to the Ingress)</p></li><li><p>Ingresses let you route based upon things like host or path to the backend services (so that a specific host name or URL will route to a difference running app).</p></li><li><p><span>The controller receives the traffic and </span><em>proxies this traffic</em><span> to backends based upon Ingress rules</span></p></li></ol><pre><code><code>kubectl get ingress
+# Output:
+# NAME      CLASS   HOSTS           ADDRESS         PORTS   AGE
+# my-app    nginx   app.example.com 203.0.113.50    80      5d
+</code></code></pre><ol><li><p>A client browser resolves, e.g., app.example.com to 203.0.113.50 (The Ingress Load Balander IP)</p></li><li><p>The traffic arrives at LoadBalancer</p></li><li><p><span>The load balancer forwards to the NodePort of the Ingress Controller </span><em>Service</em></p></li><li><p>iptables routes this traffic to an Ingress Controller pod (as we have already discussed)</p></li><li><p>The Ingress Controller examines the Host header and path</p></li><li><p>The Controller then opens new connection to the backend service (ClusterIP)</p></li><li><p>iptables routes to the backend pod as we’ve discussed before.</p></li><li><p>The response returns back through the controller to the client</p></li></ol><p>The Ingress Controller terminates the original connection and creates a new one, providing L7 routing capabilities.</p><pre><code><code># View Ingress Controller pods and their node placement
+kubectl get pods -n ingress-nginx -o wide
+# Output:
+# NAME                                        READY   STATUS    IP           NODE
+# ingress-nginx-controller-5c8d66c76d-abc12   1/1     Running   10.244.0.8   node-1
+# ingress-nginx-controller-5c8d66c76d-def34   1/1     Running   10.244.1.9   node-2
+</code></code></pre><pre><code><code># Watch packet counts through service chains
+sudo iptables -t nat -L KUBE-SVC-XXXX1 -n -v
+# Output:
+# Chain KUBE-SVC-XXXX1 (2 references)
+#  pkts bytes target     prot opt in     out     source               destination
+#   847  50K KUBE-SEP-AAAA1  all  --  *      *   0.0.0.0/0            0.0.0.0/0    statistic mode random probability 0.333
+#   823  49K KUBE-SEP-BBBB2  all  --  *      *   0.0.0.0/0            0.0.0.0/0    statistic mode random probability 0.500
+#   851  51K KUBE-SEP-CCCC3  all  --  *      *   0.0.0.0/0            0.0.0.0/0
+</code></code></pre><pre><code><code># Watch connection tracking for a specific service
+sudo conntrack -E -p tcp --dport 30080
+# Output (live events):
+# [NEW] tcp      6 120 SYN_SENT src=198.51.100.5 dst=192.168.1.10 sport=54321 dport=30080
+# [UPDATE] tcp   6 60 SYN_RECV src=198.51.100.5 dst=192.168.1.10 sport=54321 dport=30080
+# [UPDATE] tcp   6 432000 ESTABLISHED src=198.51.100.5 dst=192.168.1.10 sport=54321 dport=30080
+</code></code></pre><p>tcpdump is your friend here:</p><pre><code><code># At the node&#39;s physical interface (incoming)
+sudo tcpdump -i eth0 -nn port 30080
+
+# At the bridge (after DNAT, before forwarding)
+sudo tcpdump -i cni0 -nn port 8080
+
+# At the VXLAN interface (cross-node traffic)
+sudo tcpdump -i flannel.1 -nn port 8080
+
+# Inside the pod
+kubectl exec -it my-pod -- tcpdump -i eth0 -nn port 8080
+</code></code></pre><pre><code><code># Enable iptables tracing (verbose, use sparingly)
+sudo iptables -t raw -A PREROUTING -p tcp --dport 30080 -j TRACE
+sudo iptables -t raw -A OUTPUT -p tcp --sport 8080 -j TRACE
+
+# View trace in kernel log
+sudo dmesg -w | grep TRACE
+
+# Clean up when done
+sudo iptables -t raw -D PREROUTING -p tcp --dport 30080 -j TRACE
+sudo iptables -t raw -D OUTPUT -p tcp --sport 8080 -j TRACE
+</code></code></pre><ol><li><p>Verify that LoadBalancer does, in fact, have an external IP address:</p></li></ol><pre><code><code>kubectl get svc my-app
+# Check EXTERNAL-IP is not &lt;pending&gt;
+</code></code></pre><ol start="2"><li><p>Verify that the NodePort is open:</p></li></ol><pre><code><code># From a node
+ss -tlnp | grep 30080
+# Output should show kube-proxy listening
+</code></code></pre><ol start="3"><li><p>Check that the endpoints exist (you probably won’t have to do this much if ever):</p></li></ol><pre><code><code>kubectl get endpoints my-app
+# Output:
+# NAME     ENDPOINTS                                         AGE
+# my-app   10.244.0.5:8080,10.244.1.3:8080,10.244.2.2:8080   5d
+</code></code></pre><ol start="4"><li><p>Verify iptables rules:</p></li></ol><pre><code><code>sudo iptables -t nat -L KUBE-SERVICES -n | grep my-app
+</code></code></pre><ol><li><p>Check externalTrafficPolicy:</p></li></ol><pre><code><code>kubectl get svc my-app -o jsonpath=&#39;{.spec.externalTrafficPolicy}&#39;
+# Output: Cluster (means SNAT is applied)
+</code></code></pre><ol><li><p>Change to Local if client IP needed:</p></li></ol><pre><code><code>kubectl patch svc my-app -p &#39;{&#34;spec&#34;:{&#34;externalTrafficPolicy&#34;:&#34;Local&#34;}}&#39;
+</code></code></pre><ol><li><p>Verify pods are running on nodes receiving traffic:</p></li></ol><pre><code><code>kubectl get pods -o wide -l app=my-app
+</code></code></pre><ol><li><p>Check if SNAT is happening when it actually shouldn’t:</p></li></ol><pre><code><code>sudo conntrack -L -d &lt;pod-ip&gt; | head
+# Is the source IP the client&#39;s or the node&#39;s?
+</code></code></pre><ol start="2"><li><p>Verify that the CNI is forwarding cross-node traffic:</p></li></ol><pre><code><code># On source node
+sudo tcpdump -i flannel.1 -nn host &lt;pod-ip&gt;
+</code></code></pre><ol start="3"><li><p>Check that the pod is healthy:</p></li></ol><pre><code><code>kubectl describe pod &lt;pod-name&gt; | grep -A5 Conditions
+</code></code></pre><p>North-south traffic through a LoadBalancer service follows this path:</p><ol><li><p>Client connects to external load balancer IP address</p></li><li><p><span>Load balancer forwards to the NodePort on a </span><em>healthy</em><span> node</span></p></li><li><p>iptables PREROUTING/KUBE-SERVICES chains intercept the packet</p></li><li><p><span>KUBE-SVC chain </span><em>randomly</em><span> selects a backend pod (this is the load balancing decision)</span></p></li><li><p>KUBE-SEP chain performs DNAT to the pod IP</p></li><li><p>If the pod is on a different node, SNAT is applied (externalTrafficPolicy: Cluster)</p></li><li><p>Packet is forwarded to the pod via CNI</p></li><li><p><span>Return traffic uses conntrack to </span><em>reverse</em><span> the NAT translations</span></p></li></ol><p>Two choices for the configuration:</p><ul><li><p><strong>externalTrafficPolicy: Cluster</strong><span>: Even load distribution, loses client IP</span></p></li><li><p><strong>externalTrafficPolicy: Local</strong><span>: Preserves client IP, may have uneven distribution</span></p></li></ul><p>Part 4 will cover encryption in flight: where TLS terminates, CNI-level encryption options, and how to achieve end-to-end encryption without a service mesh.</p><ul><li><p>Service: https://kubernetes.io/docs/concepts/services-networking/service/</p></li><li><p>Service Types: https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types</p></li><li><p>External Traffic Policy: https://kubernetes.io/docs/tasks/access-application-cluster/create-external-load-balancer/#preserving-the-client-source-ip</p></li><li><p>Ingress: https://kubernetes.io/docs/concepts/services-networking/ingress/</p></li><li><p>Ingress Controllers: https://kubernetes.io/docs/concepts/services-networking/ingress-controllers/</p></li></ul><ul><li><p>kube-proxy Modes: https://kubernetes.io/docs/reference/command-line-tools-reference/kube-proxy/</p></li><li><p>IPVS Proxy Mode: https://kubernetes.io/docs/concepts/services-networking/service/#proxy-mode-ipvs</p></li><li><p>Virtual IPs and Service Proxies: https://kubernetes.io/docs/reference/networking/virtual-ips/</p></li></ul><ul><li><p>iptables: https://netfilter.org/documentation/</p></li><li><p>iptables-extensions (statistic module): https://man7.org/linux/man-pages/man8/iptables-extensions.8.html</p></li><li><p>conntrack: https://conntrack-tools.netfilter.org/</p></li><li><p>conntrack man page: https://man7.org/linux/man-pages/man8/conntrack.8.html</p></li><li><p>IPVS: http://www.linuxvirtualserver.org/software/ipvs.html</p></li><li><p>ipvsadm: https://man7.org/linux/man-pages/man8/ipvsadm.8.html</p></li></ul><ul><li><p>AWS ELB: https://docs.aws.amazon.com/elasticloadbalancing/</p></li><li><p>GCP Load Balancing: https://cloud.google.com/load-balancing/docs</p></li><li><p>Azure Load Balancer: https://docs.microsoft.com/en-us/azure/load-balancer/</p></li></ul><ul><li><p>MetalLB: https://metallb.universe.tf/</p></li></ul><ul><li><p>NGINX Ingress Controller: https://kubernetes.github.io/ingress-nginx/</p></li><li><p>Traefik: https://doc.traefik.io/traefik/providers/kubernetes-ingress/</p></li><li><p>Envoy/Contour: https://projectcontour.io/</p></li><li><p>HAProxy Ingress: https://haproxy-ingress.github.io/</p></li></ul></div></div></div>
+  </body>
+</html>
