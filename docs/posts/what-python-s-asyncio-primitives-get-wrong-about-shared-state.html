@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.inngest.com/blog/no-lost-updates-python-asyncio">Original</a>
+    <h1>What Python’s asyncio primitives get wrong about shared state</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>Coordinating concurrent tasks around shared state is one of the most common problems in Python&#39;s <code>asyncio</code>. The standard library gives you <code>asyncio.Event</code> and <code>asyncio.Condition</code>, but each has a gap that only shows up under real concurrency pressure. We hit this while building <a href="https://github.com/inngest/inngest-py">Inngest&#39;s Python SDK</a>, where multiple async handlers coordinate around WebSocket connection state.</p>
+<p>This post works through each primitive, shows exactly where it breaks, and iterates toward a solution that handles every case we threw at it.</p>
+<h2 id="the-scenario">The scenario</h2>
+<p>Imagine an async Python app managing a connection that moves through states:</p>
+<div><p><span>txt</span></p><pre><code><span>disconnected → connecting → connected → closing → closed</span>
+</code></pre></div>
+<p>One of your concurrent handlers needs to drain pending requests when the connection starts shutting down. It has to wait for the <code>closing</code> state:</p>
+<div><pre><code><span>state </span><span>=</span><span> </span><span>&#34;disconnected&#34;</span><span></span>
+<!-- -->
+<span></span><span>async</span><span> </span><span>def</span><span> </span><span>drain_requests</span><span>(</span><span>)</span><span>:</span><span></span>
+<span>    </span><span></span>
+<span>    </span><span>.</span><span>.</span><span>.</span><span></span>
+<span>    </span><span>print</span><span>(</span><span>&#34;draining pending requests&#34;</span><span>)</span>
+</code></pre></div>
+<p>Simple enough. Let&#39;s see how each stdlib tool handles it.</p>
+<h2 id="attempt-1-polling">Attempt 1: Polling</h2>
+<p>The most obvious approach: check the value in a loop.</p>
+<div><pre><code><span>async</span><span> </span><span>def</span><span> </span><span>drain_requests</span><span>(</span><span>)</span><span>:</span><span></span>
+<span>    </span><span>while</span><span> state </span><span>!=</span><span> </span><span>&#34;closing&#34;</span><span>:</span><span></span>
+<span>        </span><span>await</span><span> asyncio</span><span>.</span><span>sleep</span><span>(</span><span>0.1</span><span>)</span><span></span>
+<span>    </span><span>print</span><span>(</span><span>&#34;draining pending requests&#34;</span><span>)</span>
+</code></pre></div>
+<p>This works. But the tradeoffs are bad:</p>
+<ul>
+<li><strong>Latency vs. efficiency</strong>: A short sleep interval wastes CPU cycles. A long one adds latency. There&#39;s no good value.</li>
+<li><strong>Duplication</strong>: Every consumer reimplements the same polling loop with the same tradeoff.</li>
+<li><strong>No event-driven wake</strong>: The consumer runs whether or not anything changed.</li>
+</ul>
+<p>We can do better. What we actually want is to <em>sleep until the state changes</em>, not sleep for an arbitrary duration and check.</p>
+<h2 id="attempt-2-asyncioevent">Attempt 2: asyncio.Event</h2>
+<p><code>asyncio.Event</code> is the stdlib&#39;s answer to &#34;wake me up when something happens&#34;:</p>
+<div><pre><code><span>closing_event </span><span>=</span><span> asyncio</span><span>.</span><span>Event</span><span>(</span><span>)</span><span></span>
+<!-- -->
+<span></span><span>async</span><span> </span><span>def</span><span> </span><span>drain_requests</span><span>(</span><span>)</span><span>:</span><span></span>
+<span>    </span><span>await</span><span> closing_event</span><span>.</span><span>wait</span><span>(</span><span>)</span><span></span>
+<span>    </span><span>print</span><span>(</span><span>&#34;draining pending requests&#34;</span><span>)</span>
+</code></pre></div>
+<p>No polling, no wasted cycles. The handler blocks until the event fires. But <code>Event</code> is boolean: it&#39;s either set or unset. Our connection has five states, and <code>drain_requests</code> only cares about one of them. What happens when another handler needs to wait for <code>connected</code>? You need a second event. A third handler waiting for &#34;not disconnected&#34;? A third event with inverted logic. The setter has to know about all of them:</p>
+<div><pre><code><span>closing_event </span><span>=</span><span> asyncio</span><span>.</span><span>Event</span><span>(</span><span>)</span><span></span>
+<span>connected_event </span><span>=</span><span> asyncio</span><span>.</span><span>Event</span><span>(</span><span>)</span><span></span>
+<!-- -->
+<span></span><span>async</span><span> </span><span>def</span><span> </span><span>set_state</span><span>(</span><span>new_state</span><span>)</span><span>:</span><span></span>
+<span>    </span><span>global</span><span> state</span>
+<span>    state </span><span>=</span><span> new_state</span>
+<span>    </span><span>if</span><span> new_state </span><span>==</span><span> </span><span>&#34;closing&#34;</span><span>:</span><span></span>
+<span>        closing_event</span><span>.</span><span>set</span><span>(</span><span>)</span><span></span>
+<span>    </span><span>if</span><span> new_state </span><span>==</span><span> </span><span>&#34;connected&#34;</span><span>:</span><span></span>
+<span>        connected_event</span><span>.</span><span>set</span><span>(</span><span>)</span>
+</code></pre></div>
+<p>Every new condition requires another <code>Event</code> object. The coordination between events is where bugs live. Forget a <code>set()</code> or <code>clear()</code> call and a consumer blocks forever.</p>
+<h2 id="attempt-3-asynciocondition">Attempt 3: asyncio.Condition</h2>
+<p><code>asyncio.Condition</code> lets consumers wait on arbitrary predicates:</p>
+<div><pre><code><span>state </span><span>=</span><span> </span><span>&#34;disconnected&#34;</span><span></span>
+<span>condition </span><span>=</span><span> asyncio</span><span>.</span><span>Condition</span><span>(</span><span>)</span><span></span>
+<!-- -->
+<span></span><span>async</span><span> </span><span>def</span><span> </span><span>drain_requests</span><span>(</span><span>)</span><span>:</span><span></span>
+<span>    </span><span>async</span><span> </span><span>with</span><span> condition</span><span>:</span><span></span>
+<span>        </span><span>await</span><span> condition</span><span>.</span><span>wait_for</span><span>(</span><span>lambda</span><span>:</span><span> state </span><span>==</span><span> </span><span>&#34;closing&#34;</span><span>)</span><span></span>
+<span>    </span><span>print</span><span>(</span><span>&#34;draining pending requests&#34;</span><span>)</span>
+</code></pre></div>
+<p>One coordination point, arbitrary predicates, no proliferation of <code>Event</code> objects. This is much better.</p>
+<p>But it breaks under a common pattern.</p>
+<h3 id="the-lost-update">The lost update</h3>
+<p><code>Condition</code> is designed to check the <em>current</em> value when a consumer wakes up. That&#39;s fine when state only moves forward, but it falls apart when transitions are fast. When the setter changes state, it calls <code>notify_all()</code>, which schedules wakeups for every waiting consumer. But in a single-threaded event loop, no consumer actually runs until the current coroutine yields. If the value changes again before that happens, consumers wake up and re-evaluate their predicate against the <em>current</em> value, not the value that triggered the notification. The predicate fails and the consumer goes back to sleep, potentially forever.</p>
+<div><pre><code><span></span>
+<span></span><span>await</span><span> set_state</span><span>(</span><span>&#34;closing&#34;</span><span>)</span><span>  </span><span></span>
+<span></span><span>await</span><span> set_state</span><span>(</span><span>&#34;closed&#34;</span><span>)</span><span>   </span><span></span>
+<!-- -->
+<span></span><span></span>
+<span></span>
+</code></pre></div>
+<p>Here&#39;s a runnable reproduction:</p>
+<div><pre><code><span>import</span><span> asyncio</span>
+<!-- -->
+<span>state </span><span>=</span><span> </span><span>&#34;disconnected&#34;</span><span></span>
+<span>condition </span><span>=</span><span> asyncio</span><span>.</span><span>Condition</span><span>(</span><span>)</span><span></span>
+<!-- -->
+<span></span><span>async</span><span> </span><span>def</span><span> </span><span>set_state</span><span>(</span><span>new_state</span><span>)</span><span>:</span><span></span>
+<span>    </span><span>global</span><span> state</span>
+<span>    </span><span>async</span><span> </span><span>with</span><span> condition</span><span>:</span><span></span>
+<span>        state </span><span>=</span><span> new_state</span>
+<span>        condition</span><span>.</span><span>notify_all</span><span>(</span><span>)</span><span></span>
+<!-- -->
+<span></span><span>async</span><span> </span><span>def</span><span> </span><span>drain_requests</span><span>(</span><span>)</span><span>:</span><span></span>
+<span>    </span><span>async</span><span> </span><span>with</span><span> condition</span><span>:</span><span></span>
+<span>        </span><span>await</span><span> condition</span><span>.</span><span>wait_for</span><span>(</span><span>lambda</span><span>:</span><span> state </span><span>==</span><span> </span><span>&#34;closing&#34;</span><span>)</span><span></span>
+<span>    </span><span>print</span><span>(</span><span>&#34;draining pending requests&#34;</span><span>)</span><span></span>
+<!-- -->
+<span></span><span>async</span><span> </span><span>def</span><span> </span><span>main</span><span>(</span><span>)</span><span>:</span><span></span>
+<span>    task </span><span>=</span><span> asyncio</span><span>.</span><span>create_task</span><span>(</span><span>drain_requests</span><span>(</span><span>)</span><span>)</span><span></span>
+<span>    </span><span>await</span><span> asyncio</span><span>.</span><span>sleep</span><span>(</span><span>0</span><span>)</span><span>  </span><span></span>
+<!-- -->
+<span>    </span><span>await</span><span> set_state</span><span>(</span><span>&#34;closing&#34;</span><span>)</span><span>  </span><span></span>
+<span>    </span><span>await</span><span> set_state</span><span>(</span><span>&#34;closed&#34;</span><span>)</span><span>   </span><span></span>
+<!-- -->
+<span>    </span><span>await</span><span> asyncio</span><span>.</span><span>wait_for</span><span>(</span><span>task</span><span>,</span><span> timeout</span><span>=</span><span>1.0</span><span>)</span><span></span>
+<span>    </span><span></span>
+<!-- -->
+<span>asyncio</span><span>.</span><span>run</span><span>(</span><span>main</span><span>(</span><span>)</span><span>)</span>
+</code></pre></div>
+<p>The value <em>was</em> <code>&#34;closing&#34;</code>, but by the time <code>drain_requests</code> wakes and checks, it&#39;s already <code>&#34;closed&#34;</code>. The intermediate state is gone.</p>
+<p>This isn&#39;t a contrived edge case. In our SDK&#39;s connection manager, a close signal can arrive and the connection can shut down in the same event loop tick. <code>drain_requests</code> never runs, and any in-flight work just disappears.</p>
+<h2 id="the-fix-per-consumer-queues">The fix: per-consumer queues</h2>
+<p>Instead of waking consumers and asking &#34;is the current state what you want?&#34;, buffer every transition into a per-consumer queue. Each consumer drains its own queue and checks each transition individually. The consumer never misses a state.</p>
+<p>Each consumer registers its own <code>asyncio.Queue</code>. When the value changes, the setter pushes <code>(old, new)</code> into every registered queue. Here&#39;s a simplified version that illustrates the core idea:</p>
+<div><pre><code><span>class</span><span> </span><span>ValueWatcher</span><span>:</span><span></span>
+<span>    </span><span>def</span><span> </span><span>__init__</span><span>(</span><span>self</span><span>,</span><span> initial_value</span><span>)</span><span>:</span><span></span>
+<span>        self</span><span>.</span><span>_value </span><span>=</span><span> initial_value</span>
+<span>        self</span><span>.</span><span>_watch_queues</span><span>:</span><span> </span><span>list</span><span>[</span><span>asyncio</span><span>.</span><span>Queue</span><span>]</span><span> </span><span>=</span><span> </span><span>[</span><span>]</span><span></span>
+<!-- -->
+<span>    </span><span>@property</span><span></span>
+<span>    </span><span>def</span><span> </span><span>value</span><span>(</span><span>self</span><span>)</span><span>:</span><span></span>
+<span>        </span><span>return</span><span> self</span><span>.</span><span>_value</span>
+<!-- -->
+<span>    </span><span>@value</span><span>.</span><span>setter</span><span></span>
+<span>    </span><span>def</span><span> </span><span>value</span><span>(</span><span>self</span><span>,</span><span> new_value</span><span>)</span><span>:</span><span></span>
+<span>        </span><span>if</span><span> new_value </span><span>==</span><span> self</span><span>.</span><span>_value</span><span>:</span><span></span>
+<span>            </span><span>return</span><span></span>
+<!-- -->
+<span>        old_value </span><span>=</span><span> self</span><span>.</span><span>_value</span>
+<span>        self</span><span>.</span><span>_value </span><span>=</span><span> new_value</span>
+<!-- -->
+<span>        </span><span></span>
+<span>        </span><span>for</span><span> queue </span><span>in</span><span> self</span><span>.</span><span>_watch_queues</span><span>:</span><span></span>
+<span>            queue</span><span>.</span><span>put_nowait</span><span>(</span><span>(</span><span>old_value</span><span>,</span><span> new_value</span><span>)</span><span>)</span><span></span>
+<!-- -->
+<span>    </span><span>async</span><span> </span><span>def</span><span> </span><span>wait_for</span><span>(</span><span>self</span><span>,</span><span> target</span><span>)</span><span>:</span><span></span>
+<span>        queue </span><span>=</span><span> asyncio</span><span>.</span><span>Queue</span><span>(</span><span>)</span><span></span>
+<span>        self</span><span>.</span><span>_watch_queues</span><span>.</span><span>append</span><span>(</span><span>queue</span><span>)</span><span></span>
+<!-- -->
+<span>        </span><span>try</span><span>:</span><span></span>
+<span>            </span><span>if</span><span> self</span><span>.</span><span>_value </span><span>==</span><span> target</span><span>:</span><span></span>
+<span>                </span><span>return</span><span></span>
+<!-- -->
+<span>            </span><span>while</span><span> </span><span>True</span><span>:</span><span></span>
+<span>                old</span><span>,</span><span> new </span><span>=</span><span> </span><span>await</span><span> queue</span><span>.</span><span>get</span><span>(</span><span>)</span><span></span>
+<span>                </span><span>if</span><span> new </span><span>==</span><span> target</span><span>:</span><span></span>
+<span>                    </span><span>return</span><span></span>
+<span>        </span><span>finally</span><span>:</span><span></span>
+<span>            self</span><span>.</span><span>_watch_queues</span><span>.</span><span>remove</span><span>(</span><span>queue</span><span>)</span>
+</code></pre></div>
+<p><code>wait_for</code> registers a queue, checks the current value, then drains transitions until it finds a match. The <code>try/finally</code> ensures the queue gets deregistered even if the caller cancels.</p>
+<p>The queue buffers and delivers every intermediate transition in order, even if the value changes multiple times before a consumer runs.</p>
+<h2 id="making-it-production-ready">Making it production-ready</h2>
+<p>We still need a handful of features to make it production-ready. Our final implementation needs the following:</p>
+<ul>
+<li><strong>Thread safety</strong>: A <code>threading.Lock</code> protects the value and queue list. Each queue is paired with its event loop, and the setter uses <code>loop.call_soon_threadsafe</code> instead of <code>put_nowait</code> directly.</li>
+<li><strong>Atomic registration</strong>: <code>wait_for</code> checks the current value and registers the queue inside the same lock acquisition, closing the race where a transition could slip between registration and the initial check.</li>
+<li><strong>Full generic typing</strong>: <code>Generic[T]</code> end-to-end, so predicates, queues, and return values are all type-checked.</li>
+<li><strong>Predicate-based matching</strong>: <code>wait_for</code>, <code>wait_for_not</code>, and <code>wait_for_not_none</code> all route through a shared <code>_wait_for_condition(predicate)</code> core.</li>
+<li><strong>Timeouts</strong>: Every wait method accepts an optional <code>timeout</code>, backed by <code>asyncio.wait_for</code>.</li>
+<li><strong>Conditional set</strong>: <code>set_if</code> atomically sets the value only when the current value satisfies a predicate, useful for state machine transitions that should only happen from a specific state.</li>
+<li><strong>Change watching</strong>: <code>wait_for_change</code> waits for any transition regardless of value, handy for logging or reacting to state churn.</li>
+<li><strong>Callback API</strong>: <code>on_change</code> and <code>on_value</code> for synchronous consumers alongside the async wait API.</li>
+<li><strong>Resilient notifications</strong>: The setter catches <code>RuntimeError</code> (closed loop) and suppresses callback exceptions so one failure doesn&#39;t block other consumers.</li>
+</ul>
+<p>The full implementation is about 300 lines, most of which is docstrings and convenience methods built on the same core. Feel free to copy it into your codebase!</p>
+<details><summary><strong>Full <code>ValueWatcher</code> source</strong></summary><div><pre><code><span>from</span><span> __future__ </span><span>import</span><span> annotations</span>
+<!-- -->
+<span></span><span>import</span><span> asyncio</span>
+<span></span><span>import</span><span> threading</span>
+<span></span><span>import</span><span> typing</span>
+<!-- -->
+<span>T </span><span>=</span><span> typing</span><span>.</span><span>TypeVar</span><span>(</span><span>&#34;T&#34;</span><span>)</span><span></span>
+<!-- -->
+<span></span><span></span>
+<span>S </span><span>=</span><span> typing</span><span>.</span><span>TypeVar</span><span>(</span><span>&#34;S&#34;</span><span>)</span><span></span>
+<!-- -->
+<!-- -->
+<span></span><span>class</span><span> </span><span>ValueWatcher</span><span>(</span><span>typing</span><span>.</span><span>Generic</span><span>[</span><span>T</span><span>]</span><span>)</span><span>:</span><span></span>
+<span>    </span><span>&#34;&#34;&#34;</span>
+<span>    Thread-safe observable value with async watchers.</span>
+<!-- -->
+<span>    Watchers can await value changes via methods like `wait_for` and</span>
+<span>    `wait_for_change`. Alternatively, they can add callbacks via `on_change` and</span>
+<span>    `on_value`.</span>
+<!-- -->
+<span>    Any thread can set `.value`, and the watcher will react accordingly.</span>
+<span>    &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>    </span><span>def</span><span> </span><span>__init__</span><span>(</span><span></span>
+<span>        self</span><span>,</span><span></span>
+<span>        initial_value</span><span>:</span><span> T</span><span>,</span><span></span>
+<span>        </span><span>*</span><span>,</span><span></span>
+<span>        on_change</span><span>:</span><span> typing</span><span>.</span><span>Callable</span><span>[</span><span>[</span><span>T</span><span>,</span><span> T</span><span>]</span><span>,</span><span> </span><span>None</span><span>]</span><span> </span><span>|</span><span> </span><span>None</span><span> </span><span>=</span><span> </span><span>None</span><span>,</span><span></span>
+<span>    </span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> </span><span>None</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Args:</span>
+<span>            initial_value: The initial value.</span>
+<span>            on_change: Called when the value changes. Good for debug logging.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        self</span><span>.</span><span>_lock </span><span>=</span><span> threading</span><span>.</span><span>Lock</span><span>(</span><span>)</span><span></span>
+<span>        self</span><span>.</span><span>_on_changes</span><span>:</span><span> </span><span>list</span><span>[</span><span>typing</span><span>.</span><span>Callable</span><span>[</span><span>[</span><span>T</span><span>,</span><span> T</span><span>]</span><span>,</span><span> </span><span>None</span><span>]</span><span>]</span><span> </span><span>=</span><span> </span><span>[</span><span>]</span><span></span>
+<span>        </span><span>if</span><span> on_change</span><span>:</span><span></span>
+<span>            self</span><span>.</span><span>_on_changes</span><span>.</span><span>append</span><span>(</span><span>on_change</span><span>)</span><span></span>
+<!-- -->
+<span>        </span><span></span>
+<span>        </span><span></span>
+<span>        </span><span></span>
+<span>        self</span><span>.</span><span>_watch_queues</span><span>:</span><span> </span><span>list</span><span>[</span><span></span>
+<span>            </span><span>tuple</span><span>[</span><span>asyncio</span><span>.</span><span>AbstractEventLoop</span><span>,</span><span> asyncio</span><span>.</span><span>Queue</span><span>[</span><span>tuple</span><span>[</span><span>T</span><span>,</span><span> T</span><span>]</span><span>]</span><span>]</span><span></span>
+<span>        </span><span>]</span><span> </span><span>=</span><span> </span><span>[</span><span>]</span><span></span>
+<!-- -->
+<span>        </span><span></span>
+<span>        self</span><span>.</span><span>_background_tasks</span><span>:</span><span> </span><span>set</span><span>[</span><span>asyncio</span><span>.</span><span>Task</span><span>[</span><span>T</span><span>]</span><span>]</span><span> </span><span>=</span><span> </span><span>set</span><span>(</span><span>)</span><span></span>
+<!-- -->
+<span>        self</span><span>.</span><span>_value </span><span>=</span><span> initial_value</span>
+<!-- -->
+<span>    </span><span>@property</span><span></span>
+<span>    </span><span>def</span><span> </span><span>value</span><span>(</span><span>self</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> T</span><span>:</span><span></span>
+<span>        </span><span>with</span><span> self</span><span>.</span><span>_lock</span><span>:</span><span></span>
+<span>            </span><span>return</span><span> self</span><span>.</span><span>_value</span>
+<!-- -->
+<span>    </span><span>@value</span><span>.</span><span>setter</span><span></span>
+<span>    </span><span>def</span><span> </span><span>value</span><span>(</span><span>self</span><span>,</span><span> new_value</span><span>:</span><span> T</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> </span><span>None</span><span>:</span><span></span>
+<span>        </span><span>with</span><span> self</span><span>.</span><span>_lock</span><span>:</span><span></span>
+<span>            </span><span>if</span><span> new_value </span><span>==</span><span> self</span><span>.</span><span>_value</span><span>:</span><span></span>
+<span>                </span><span>return</span><span></span>
+<!-- -->
+<span>            old_value </span><span>=</span><span> self</span><span>.</span><span>_value</span>
+<span>            self</span><span>.</span><span>_value </span><span>=</span><span> new_value</span>
+<!-- -->
+<span>            </span><span></span>
+<span>            queues </span><span>=</span><span> </span><span>list</span><span>(</span><span>self</span><span>.</span><span>_watch_queues</span><span>)</span><span></span>
+<span>            callbacks </span><span>=</span><span> </span><span>list</span><span>(</span><span>self</span><span>.</span><span>_on_changes</span><span>)</span><span></span>
+<!-- -->
+<span>        </span><span></span>
+<span>        </span><span>for</span><span> loop</span><span>,</span><span> queue </span><span>in</span><span> queues</span><span>:</span><span></span>
+<span>            </span><span>try</span><span>:</span><span></span>
+<span>                </span><span></span>
+<span>                </span><span></span>
+<span>                </span><span></span>
+<span>                </span><span></span>
+<span>                </span><span></span>
+<span>                </span><span></span>
+<span>                </span><span></span>
+<span>                </span><span></span>
+<span>                loop</span><span>.</span><span>call_soon_threadsafe</span><span>(</span><span></span>
+<span>                    queue</span><span>.</span><span>put_nowait</span><span>,</span><span> </span><span>(</span><span>old_value</span><span>,</span><span> new_value</span><span>)</span><span></span>
+<span>                </span><span>)</span><span></span>
+<span>            </span><span>except</span><span> RuntimeError</span><span>:</span><span></span>
+<span>                </span><span></span>
+<span>                </span><span>pass</span><span></span>
+<!-- -->
+<span>        </span><span>for</span><span> on_change </span><span>in</span><span> callbacks</span><span>:</span><span></span>
+<span>            </span><span>try</span><span>:</span><span></span>
+<span>                on_change</span><span>(</span><span>old_value</span><span>,</span><span> new_value</span><span>)</span><span></span>
+<span>            </span><span>except</span><span> Exception</span><span>:</span><span></span>
+<span>                </span><span></span>
+<span>                </span><span></span>
+<span>                </span><span>pass</span><span></span>
+<!-- -->
+<span>    </span><span>def</span><span> </span><span>set_if</span><span>(</span><span></span>
+<span>        self</span><span>,</span><span></span>
+<span>        new_value</span><span>:</span><span> T</span><span>,</span><span></span>
+<span>        condition</span><span>:</span><span> typing</span><span>.</span><span>Callable</span><span>[</span><span>[</span><span>T</span><span>]</span><span>,</span><span> </span><span>bool</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> </span><span>bool</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Atomically set the value only if the current value satisfies the</span>
+<span>        condition. Returns True if the value was set.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        </span><span>with</span><span> self</span><span>.</span><span>_lock</span><span>:</span><span></span>
+<span>            </span><span>if</span><span> </span><span>not</span><span> condition</span><span>(</span><span>self</span><span>.</span><span>_value</span><span>)</span><span>:</span><span></span>
+<span>                </span><span>return</span><span> </span><span>False</span><span></span>
+<!-- -->
+<span>            </span><span>if</span><span> new_value </span><span>==</span><span> self</span><span>.</span><span>_value</span><span>:</span><span></span>
+<span>                </span><span>return</span><span> </span><span>True</span><span></span>
+<!-- -->
+<span>            old_value </span><span>=</span><span> self</span><span>.</span><span>_value</span>
+<span>            self</span><span>.</span><span>_value </span><span>=</span><span> new_value</span>
+<!-- -->
+<span>            queues </span><span>=</span><span> </span><span>list</span><span>(</span><span>self</span><span>.</span><span>_watch_queues</span><span>)</span><span></span>
+<span>            callbacks </span><span>=</span><span> </span><span>list</span><span>(</span><span>self</span><span>.</span><span>_on_changes</span><span>)</span><span></span>
+<!-- -->
+<span>        </span><span>for</span><span> loop</span><span>,</span><span> queue </span><span>in</span><span> queues</span><span>:</span><span></span>
+<span>            </span><span>try</span><span>:</span><span></span>
+<span>                loop</span><span>.</span><span>call_soon_threadsafe</span><span>(</span><span></span>
+<span>                    queue</span><span>.</span><span>put_nowait</span><span>,</span><span> </span><span>(</span><span>old_value</span><span>,</span><span> new_value</span><span>)</span><span></span>
+<span>                </span><span>)</span><span></span>
+<span>            </span><span>except</span><span> RuntimeError</span><span>:</span><span></span>
+<span>                </span><span>pass</span><span></span>
+<!-- -->
+<span>        </span><span>for</span><span> on_change </span><span>in</span><span> callbacks</span><span>:</span><span></span>
+<span>            </span><span>try</span><span>:</span><span></span>
+<span>                on_change</span><span>(</span><span>old_value</span><span>,</span><span> new_value</span><span>)</span><span></span>
+<span>            </span><span>except</span><span> Exception</span><span>:</span><span></span>
+<span>                </span><span>pass</span><span></span>
+<!-- -->
+<span>        </span><span>return</span><span> </span><span>True</span><span></span>
+<!-- -->
+<span>    </span><span>def</span><span> </span><span>on_change</span><span>(</span><span>self</span><span>,</span><span> callback</span><span>:</span><span> typing</span><span>.</span><span>Callable</span><span>[</span><span>[</span><span>T</span><span>,</span><span> T</span><span>]</span><span>,</span><span> </span><span>None</span><span>]</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> </span><span>None</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Add a callback that&#39;s called when the value changes.</span>
+<!-- -->
+<span>        Args:</span>
+<span>            callback: Called with (old_value, new_value) on each change.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        </span><span>with</span><span> self</span><span>.</span><span>_lock</span><span>:</span><span></span>
+<span>            self</span><span>.</span><span>_on_changes</span><span>.</span><span>append</span><span>(</span><span>callback</span><span>)</span><span></span>
+<!-- -->
+<span>    </span><span>def</span><span> </span><span>on_value</span><span>(</span><span>self</span><span>,</span><span> value</span><span>:</span><span> T</span><span>,</span><span> callback</span><span>:</span><span> typing</span><span>.</span><span>Callable</span><span>[</span><span>[</span><span>]</span><span>,</span><span> </span><span>None</span><span>]</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> </span><span>None</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        One-shot callback for when the value equals `value`. Requires a</span>
+<span>        running event loop (internally spawns a background task).</span>
+<!-- -->
+<span>        Args:</span>
+<span>            value: The value to wait for.</span>
+<span>            callback: Called when the internal value equals `value`.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        task </span><span>=</span><span> asyncio</span><span>.</span><span>create_task</span><span>(</span><span>self</span><span>.</span><span>wait_for</span><span>(</span><span>value</span><span>)</span><span>)</span><span></span>
+<span>        self</span><span>.</span><span>_background_tasks</span><span>.</span><span>add</span><span>(</span><span>task</span><span>)</span><span></span>
+<!-- -->
+<span>        </span><span>def</span><span> </span><span>_done</span><span>(</span><span>t</span><span>:</span><span> asyncio</span><span>.</span><span>Task</span><span>[</span><span>T</span><span>]</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> </span><span>None</span><span>:</span><span></span>
+<span>            self</span><span>.</span><span>_background_tasks</span><span>.</span><span>discard</span><span>(</span><span>t</span><span>)</span><span></span>
+<span>            </span><span>if</span><span> </span><span>not</span><span> t</span><span>.</span><span>cancelled</span><span>(</span><span>)</span><span> </span><span>and</span><span> t</span><span>.</span><span>exception</span><span>(</span><span>)</span><span> </span><span>is</span><span> </span><span>None</span><span>:</span><span></span>
+<span>                callback</span><span>(</span><span>)</span><span></span>
+<!-- -->
+<span>        task</span><span>.</span><span>add_done_callback</span><span>(</span><span>_done</span><span>)</span><span></span>
+<!-- -->
+<span>    </span><span>async</span><span> </span><span>def</span><span> </span><span>wait_for</span><span>(</span><span></span>
+<span>        self</span><span>,</span><span></span>
+<span>        value</span><span>:</span><span> T</span><span>,</span><span></span>
+<span>        </span><span>*</span><span>,</span><span></span>
+<span>        immediate</span><span>:</span><span> </span><span>bool</span><span> </span><span>=</span><span> </span><span>True</span><span>,</span><span></span>
+<span>        timeout</span><span>:</span><span> </span><span>float</span><span> </span><span>|</span><span> </span><span>None</span><span> </span><span>=</span><span> </span><span>None</span><span>,</span><span></span>
+<span>    </span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> T</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Wait for the internal value to equal the given value.</span>
+<!-- -->
+<span>        Args:</span>
+<span>            value: Return when the internal value is equal to this.</span>
+<span>            immediate: If True and the internal value is already equal to the given value, return immediately. Defaults to True.</span>
+<span>            timeout: Seconds to wait before raising `asyncio.TimeoutError`. None means wait forever.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        </span><span>return</span><span> </span><span>await</span><span> self</span><span>.</span><span>_wait_for_condition</span><span>(</span><span></span>
+<span>            </span><span>lambda</span><span> v</span><span>:</span><span> v </span><span>==</span><span> value</span><span>,</span><span></span>
+<span>            immediate</span><span>=</span><span>immediate</span><span>,</span><span></span>
+<span>            timeout</span><span>=</span><span>timeout</span><span>,</span><span></span>
+<span>        </span><span>)</span><span></span>
+<!-- -->
+<span>    </span><span>async</span><span> </span><span>def</span><span> </span><span>wait_for_not</span><span>(</span><span></span>
+<span>        self</span><span>,</span><span></span>
+<span>        value</span><span>:</span><span> T</span><span>,</span><span></span>
+<span>        </span><span>*</span><span>,</span><span></span>
+<span>        immediate</span><span>:</span><span> </span><span>bool</span><span> </span><span>=</span><span> </span><span>True</span><span>,</span><span></span>
+<span>        timeout</span><span>:</span><span> </span><span>float</span><span> </span><span>|</span><span> </span><span>None</span><span> </span><span>=</span><span> </span><span>None</span><span>,</span><span></span>
+<span>    </span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> T</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Wait for the internal value to not equal the given value.</span>
+<!-- -->
+<span>        Args:</span>
+<span>            value: Return when the internal value is not equal to this.</span>
+<span>            immediate: If True and the internal value is already not equal to the given value, return immediately. Defaults to True.</span>
+<span>            timeout: Seconds to wait before raising `asyncio.TimeoutError`. None means wait forever.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        </span><span>return</span><span> </span><span>await</span><span> self</span><span>.</span><span>_wait_for_condition</span><span>(</span><span></span>
+<span>            </span><span>lambda</span><span> v</span><span>:</span><span> v </span><span>!=</span><span> value</span><span>,</span><span></span>
+<span>            immediate</span><span>=</span><span>immediate</span><span>,</span><span></span>
+<span>            timeout</span><span>=</span><span>timeout</span><span>,</span><span></span>
+<span>        </span><span>)</span><span></span>
+<!-- -->
+<span>    </span><span>async</span><span> </span><span>def</span><span> </span><span>wait_for_not_none</span><span>(</span><span></span>
+<span>        self</span><span>:</span><span> ValueWatcher</span><span>[</span><span>S </span><span>|</span><span> </span><span>None</span><span>]</span><span>,</span><span></span>
+<span>        </span><span>*</span><span>,</span><span></span>
+<span>        immediate</span><span>:</span><span> </span><span>bool</span><span> </span><span>=</span><span> </span><span>True</span><span>,</span><span></span>
+<span>        timeout</span><span>:</span><span> </span><span>float</span><span> </span><span>|</span><span> </span><span>None</span><span> </span><span>=</span><span> </span><span>None</span><span>,</span><span></span>
+<span>    </span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> S</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Wait for the internal value to be not None.</span>
+<!-- -->
+<span>        Args:</span>
+<span>            immediate: If True and the internal value is already not None, return immediately. Defaults to True.</span>
+<span>            timeout: Seconds to wait before raising `asyncio.TimeoutError`. None means wait forever.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        result </span><span>=</span><span> </span><span>await</span><span> self</span><span>.</span><span>_wait_for_condition</span><span>(</span><span></span>
+<span>            </span><span>lambda</span><span> v</span><span>:</span><span> v </span><span>is</span><span> </span><span>not</span><span> </span><span>None</span><span>,</span><span></span>
+<span>            immediate</span><span>=</span><span>immediate</span><span>,</span><span></span>
+<span>            timeout</span><span>=</span><span>timeout</span><span>,</span><span></span>
+<span>        </span><span>)</span><span></span>
+<span>        </span><span>if</span><span> result </span><span>is</span><span> </span><span>None</span><span>:</span><span></span>
+<span>            </span><span>raise</span><span> AssertionError</span><span>(</span><span>&#34;unreachable&#34;</span><span>)</span><span></span>
+<span>        </span><span>return</span><span> result</span>
+<!-- -->
+<span>    </span><span>async</span><span> </span><span>def</span><span> </span><span>_wait_for_condition</span><span>(</span><span></span>
+<span>        self</span><span>,</span><span></span>
+<span>        condition</span><span>:</span><span> typing</span><span>.</span><span>Callable</span><span>[</span><span>[</span><span>T</span><span>]</span><span>,</span><span> </span><span>bool</span><span>]</span><span>,</span><span></span>
+<span>        </span><span>*</span><span>,</span><span></span>
+<span>        immediate</span><span>:</span><span> </span><span>bool</span><span> </span><span>=</span><span> </span><span>True</span><span>,</span><span></span>
+<span>        timeout</span><span>:</span><span> </span><span>float</span><span> </span><span>|</span><span> </span><span>None</span><span> </span><span>=</span><span> </span><span>None</span><span>,</span><span></span>
+<span>    </span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> T</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Wait until `condition(current_value)` is true, then return the</span>
+<span>        matching value. Handles the TOCTOU gap between checking the current</span>
+<span>        value and subscribing to the change queue.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        </span><span></span>
+<span>        </span><span>if</span><span> immediate</span><span>:</span><span></span>
+<span>            </span><span></span>
+<span>            current </span><span>=</span><span> self</span><span>.</span><span>value</span>
+<span>            </span><span>if</span><span> condition</span><span>(</span><span>current</span><span>)</span><span>:</span><span></span>
+<span>                </span><span>return</span><span> current</span>
+<!-- -->
+<span>        </span><span>async</span><span> </span><span>def</span><span> </span><span>_wait</span><span>(</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> T</span><span>:</span><span></span>
+<span>            </span><span>with</span><span> self</span><span>.</span><span>_watch</span><span>(</span><span>)</span><span> </span><span>as</span><span> queue</span><span>:</span><span></span>
+<span>                </span><span></span>
+<span>                </span><span></span>
+<span>                </span><span>if</span><span> immediate</span><span>:</span><span></span>
+<span>                    </span><span></span>
+<span>                    current </span><span>=</span><span> self</span><span>.</span><span>value</span>
+<span>                    </span><span>if</span><span> condition</span><span>(</span><span>current</span><span>)</span><span>:</span><span></span>
+<span>                        </span><span>return</span><span> current</span>
+<!-- -->
+<span>                </span><span>while</span><span> </span><span>True</span><span>:</span><span></span>
+<span>                    _</span><span>,</span><span> new </span><span>=</span><span> </span><span>await</span><span> queue</span><span>.</span><span>get</span><span>(</span><span>)</span><span></span>
+<span>                    </span><span>if</span><span> condition</span><span>(</span><span>new</span><span>)</span><span>:</span><span></span>
+<span>                        </span><span>return</span><span> new</span>
+<!-- -->
+<span>        </span><span>return</span><span> </span><span>await</span><span> asyncio</span><span>.</span><span>wait_for</span><span>(</span><span>_wait</span><span>(</span><span>)</span><span>,</span><span> timeout</span><span>=</span><span>timeout</span><span>)</span><span></span>
+<!-- -->
+<span>    </span><span>async</span><span> </span><span>def</span><span> </span><span>wait_for_change</span><span>(</span><span></span>
+<span>        self</span><span>,</span><span></span>
+<span>        </span><span>*</span><span>,</span><span></span>
+<span>        timeout</span><span>:</span><span> </span><span>float</span><span> </span><span>|</span><span> </span><span>None</span><span> </span><span>=</span><span> </span><span>None</span><span>,</span><span></span>
+<span>    </span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> T</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Wait for the internal value to change.</span>
+<!-- -->
+<span>        Args:</span>
+<span>            timeout: Seconds to wait before raising `asyncio.TimeoutError`. None means wait forever.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        </span><span>async</span><span> </span><span>def</span><span> </span><span>_wait</span><span>(</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> T</span><span>:</span><span></span>
+<span>            </span><span>with</span><span> self</span><span>.</span><span>_watch</span><span>(</span><span>)</span><span> </span><span>as</span><span> queue</span><span>:</span><span></span>
+<span>                _</span><span>,</span><span> new </span><span>=</span><span> </span><span>await</span><span> queue</span><span>.</span><span>get</span><span>(</span><span>)</span><span></span>
+<span>                </span><span>return</span><span> new</span>
+<!-- -->
+<span>        </span><span>return</span><span> </span><span>await</span><span> asyncio</span><span>.</span><span>wait_for</span><span>(</span><span>_wait</span><span>(</span><span>)</span><span>,</span><span> timeout</span><span>=</span><span>timeout</span><span>)</span><span></span>
+<!-- -->
+<span>    </span><span>def</span><span> </span><span>_watch</span><span>(</span><span>self</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> _WatchContextManager</span><span>[</span><span>T</span><span>]</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Watch for all changes to the value. This method returns a context</span>
+<span>        manager so it must be used in a `with` statement.</span>
+<!-- -->
+<span>        Its return value is a queue that yields tuples of the old and new</span>
+<span>        values.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        loop </span><span>=</span><span> asyncio</span><span>.</span><span>get_running_loop</span><span>(</span><span>)</span><span></span>
+<span>        queue </span><span>=</span><span> asyncio</span><span>.</span><span>Queue</span><span>[</span><span>tuple</span><span>[</span><span>T</span><span>,</span><span> T</span><span>]</span><span>]</span><span>(</span><span>)</span><span></span>
+<span>        </span><span>with</span><span> self</span><span>.</span><span>_lock</span><span>:</span><span></span>
+<span>            self</span><span>.</span><span>_watch_queues</span><span>.</span><span>append</span><span>(</span><span>(</span><span>loop</span><span>,</span><span> queue</span><span>)</span><span>)</span><span></span>
+<!-- -->
+<span>        </span><span>return</span><span> _WatchContextManager</span><span>(</span><span></span>
+<span>            on_exit</span><span>=</span><span>lambda</span><span>:</span><span> self</span><span>.</span><span>_remove_queue</span><span>(</span><span>queue</span><span>)</span><span>,</span><span></span>
+<span>            queue</span><span>=</span><span>queue</span><span>,</span><span></span>
+<span>        </span><span>)</span><span></span>
+<!-- -->
+<span>    </span><span>def</span><span> </span><span>_remove_queue</span><span>(</span><span>self</span><span>,</span><span> queue</span><span>:</span><span> asyncio</span><span>.</span><span>Queue</span><span>[</span><span>tuple</span><span>[</span><span>T</span><span>,</span><span> T</span><span>]</span><span>]</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> </span><span>None</span><span>:</span><span></span>
+<span>        </span><span>&#34;&#34;&#34;</span>
+<span>        Remove a queue from the watch list in a thread-safe manner.</span>
+<span>        &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>        </span><span>with</span><span> self</span><span>.</span><span>_lock</span><span>:</span><span></span>
+<span>            self</span><span>.</span><span>_watch_queues </span><span>=</span><span> </span><span>[</span><span></span>
+<span>                entry </span><span>for</span><span> entry </span><span>in</span><span> self</span><span>.</span><span>_watch_queues </span><span>if</span><span> entry</span><span>[</span><span>1</span><span>]</span><span> </span><span>is</span><span> </span><span>not</span><span> queue</span>
+<span>            </span><span>]</span><span></span>
+<!-- -->
+<!-- -->
+<span></span><span>class</span><span> </span><span>_WatchContextManager</span><span>(</span><span>typing</span><span>.</span><span>Generic</span><span>[</span><span>T</span><span>]</span><span>)</span><span>:</span><span></span>
+<span>    </span><span>&#34;&#34;&#34;</span>
+<span>    Context manager that&#39;s used to automatically delete a queue when it&#39;s no</span>
+<span>    longer being watched.</span>
+<!-- -->
+<span>    Returns a queue that yields tuples of the old and new values.</span>
+<span>    &#34;&#34;&#34;</span><span></span>
+<!-- -->
+<span>    </span><span>def</span><span> </span><span>__init__</span><span>(</span><span></span>
+<span>        self</span><span>,</span><span></span>
+<span>        on_exit</span><span>:</span><span> typing</span><span>.</span><span>Callable</span><span>[</span><span>[</span><span>]</span><span>,</span><span> </span><span>None</span><span>]</span><span>,</span><span></span>
+<span>        queue</span><span>:</span><span> asyncio</span><span>.</span><span>Queue</span><span>[</span><span>tuple</span><span>[</span><span>T</span><span>,</span><span> T</span><span>]</span><span>]</span><span>,</span><span></span>
+<span>    </span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> </span><span>None</span><span>:</span><span></span>
+<span>        self</span><span>.</span><span>_on_exit </span><span>=</span><span> on_exit</span>
+<span>        self</span><span>.</span><span>_queue </span><span>=</span><span> queue</span>
+<!-- -->
+<span>    </span><span>def</span><span> </span><span>__enter__</span><span>(</span><span>self</span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> asyncio</span><span>.</span><span>Queue</span><span>[</span><span>tuple</span><span>[</span><span>T</span><span>,</span><span> T</span><span>]</span><span>]</span><span>:</span><span></span>
+<span>        </span><span></span>
+<span>        </span><span></span>
+<span>        </span><span>return</span><span> self</span><span>.</span><span>_queue</span>
+<!-- -->
+<span>    </span><span>def</span><span> </span><span>__exit__</span><span>(</span><span></span>
+<span>        self</span><span>,</span><span></span>
+<span>        exc_type</span><span>:</span><span> </span><span>type</span><span>[</span><span>BaseException</span><span>]</span><span> </span><span>|</span><span> </span><span>None</span><span>,</span><span></span>
+<span>        exc_value</span><span>:</span><span> BaseException </span><span>|</span><span> </span><span>None</span><span>,</span><span></span>
+<span>        traceback</span><span>:</span><span> </span><span>object</span><span>,</span><span></span>
+<span>    </span><span>)</span><span> </span><span>-</span><span>&gt;</span><span> </span><span>None</span><span>:</span><span></span>
+<span>        self</span><span>.</span><span>_on_exit</span><span>(</span><span>)</span>
+</code></pre></div></details>
+<p><code>wait_for_not_none</code> is particularly useful since we love type safety:</p>
+<div><pre><code><span></span>
+<span></span><span>await</span><span> state</span><span>.</span><span>wait_for_not</span><span>(</span><span>&#34;disconnected&#34;</span><span>)</span><span></span>
+<!-- -->
+<span></span><span></span>
+<span>ws_watcher </span><span>=</span><span> ValueWatcher</span><span>[</span><span>Connection </span><span>|</span><span> </span><span>None</span><span>]</span><span>(</span><span>None</span><span>)</span><span></span>
+<span>ws</span><span>:</span><span> Connection </span><span>=</span><span> </span><span>await</span><span> ws_watcher</span><span>.</span><span>wait_for_not_none</span><span>(</span><span>)</span>
+</code></pre></div>
+<h2 id="one-caveat">One caveat</h2>
+<p>The setter deduplicates by equality: if the new value <code>==</code> the current value, no notification fires. This works well for enums, strings, and ints, but mutating a mutable object in place and reassigning the same reference won&#39;t trigger consumers (because <code>obj == obj</code> is trivially <code>True</code>). Stick to immutable values and this isn&#39;t a concern.</p>
+<h2 id="wrapping-up">Wrapping up</h2>
+<p>The core insight is simple: <code>asyncio.Condition</code> asks consumers &#34;is the <em>current</em> state what you want?&#34; when it should ask &#34;did the state <em>ever become</em> what you want?&#34; Per-consumer queues make that possible by buffering every transition instead of just notifying about the latest one.</p>
+<p>We use <code>ValueWatcher</code> throughout <a href="https://github.com/inngest/inngest-py">Inngest&#39;s Python SDK</a> to coordinate WebSocket connection state, worker lifecycle, and graceful shutdown. If you&#39;re managing shared mutable state in asyncio, give it a try.</p></div></div>
+  </body>
+</html>
