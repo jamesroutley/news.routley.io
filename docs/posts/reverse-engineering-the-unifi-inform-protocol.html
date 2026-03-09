@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://tamarack.cloud/blog/reverse-engineering-unifi-inform-protocol">Original</a>
+    <h1>Reverse-engineering the UniFi inform protocol</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>A few years ago I ran a small UniFi hosting service. Managed cloud controllers for MSPs and IT shops who didn&#39;t want to run their own. Every customer got their own VPS running a dedicated controller.</p>
+<p>The product worked. People wanted hosted controllers, mostly so they didn&#39;t have to deal with hardware, port forwarding, backups. The problem was the economics.</p>
+<p>Each customer needed their own VPS. DigitalOcean droplets ran $4-6/month. I was charging $7-8. That&#39;s $1-2 of margin per customer, and any support request at all wiped it out. I was essentially volunteering.</p>
+<p>The obvious fix is multi-tenancy: put multiple controllers on shared infrastructure instead of giving every customer their own VM. But UniFi controllers aren&#39;t multi-tenant. Each one is its own isolated instance with its own database and port bindings. You need a routing layer, something in front that can look at incoming traffic and figure out which customer it belongs to.</p>
+<p>For the web UI on port 8443, that&#39;s easy. Subdomain per customer behind a reverse proxy, nothing special. But the inform protocol on port 8080 is where things get interesting.</p>
+<h2>What inform does</h2>
+<p>Every UniFi device (access points, switches, gateways) phones home to its controller. An HTTP POST to port 8080 every 10 seconds. This is how the controller keeps track of everything: device stats, config sync, firmware versions, client counts.</p>
+<p>The payload is AES-128-CBC encrypted. So I assumed you&#39;d need per-device encryption keys to do anything useful with the traffic, which would mean you&#39;d need the controller&#39;s database, which would mean you&#39;re back to one instance per customer.</p>
+<p>Then I looked at the raw bytes.</p>
+<h2>The packet</h2>
+<p>The first 40 bytes of every inform packet are unencrypted:</p>
+<pre><code>Offset  Size   Field
+──────  ─────  ──────────────────────────
+0       4B     Magic: &#34;TNBU&#34; (0x544E4255)
+4       4B     Packet version (currently 0)
+8       6B     Device MAC address
+14      2B     Flags (encrypted, compressed, etc.)
+16      2B     AES IV length
+18      16B    AES IV
+34      4B     Data version
+38      4B     Payload length
+42+     var    Encrypted payload (AES-128-CBC)
+</code></pre>
+<p>Byte offset 8 is the device&#39;s MAC address, completely unencrypted.</p>
+<p>On the wire it looks like this:</p>
+<pre><code>54 4E 42 55    # Magic: &#34;TNBU&#34;
+00 00 00 00    # Version: 0
+FC EC DA A1    # MAC: fc:ec:da:a1:b2:c3
+B2 C3
+01 00          # Flags
+...
+</code></pre>
+<p>&#34;TNBU&#34; is just &#34;UBNT&#34; backwards, Ubiquiti&#39;s ticker symbol and the default SSH credentials on their devices.</p>
+<p>The MAC is in the header because the controller needs to identify the device <em>before</em> decrypting. Encryption keys are per-device, assigned during adoption, so the controller has to know which device is talking before it can look up the right key. Not a security oversight, just a practical requirement. But it means you can route inform traffic without touching the encryption at all.</p>
+<h2>Reading the MAC</h2>
+<p>Extracting it is almost nothing:</p>
+<figure data-rehype-pretty-code-figure=""><pre tabindex="0" data-language="go" data-theme="github-light github-dark"><code data-language="go" data-theme="github-light github-dark"><span data-line=""><span>header </span><span>:=</span><span> make</span><span>([]</span><span>byte</span><span>, </span><span>40</span><span>)</span></span>
+<span data-line=""><span>if</span><span> _, err </span><span>:=</span><span> io.</span><span>ReadFull</span><span>(conn, header); err </span><span>!=</span><span> nil</span><span> {</span></span>
+<span data-line=""><span>    return</span><span> err</span></span>
+<span data-line=""><span>}</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>if</span><span> string</span><span>(header[</span><span>0</span><span>:</span><span>4</span><span>]) </span><span>!=</span><span> &#34;TNBU&#34;</span><span> {</span></span>
+<span data-line=""><span>    return</span><span> fmt.</span><span>Errorf</span><span>(</span><span>&#34;not an inform packet&#34;</span><span>)</span></span>
+<span data-line=""><span>}</span></span>
+<span data-line=""> </span>
+<span data-line=""><span>mac </span><span>:=</span><span> fmt.</span><span>Sprintf</span><span>(</span><span>&#34;</span><span>%02x</span><span>:</span><span>%02x</span><span>:</span><span>%02x</span><span>:</span><span>%02x</span><span>:</span><span>%02x</span><span>:</span><span>%02x</span><span>&#34;</span><span>,</span></span>
+<span data-line=""><span>    header[</span><span>8</span><span>], header[</span><span>9</span><span>], header[</span><span>10</span><span>],</span></span>
+<span data-line=""><span>    header[</span><span>11</span><span>], header[</span><span>12</span><span>], header[</span><span>13</span><span>])</span></span></code></pre></figure>
+<p>Read 14 bytes and you know which device is talking. No decryption needed.</p>
+<h2>Building the proxy</h2>
+<p>With the MAC in hand, routing is simple. Keep a table of which MAC belongs to which tenant, forward the whole packet (header and encrypted payload, untouched) to the right backend.</p>
+<pre><code>Device (MAC: aa:bb:cc:dd:ee:ff)
+      |
+      v
++-----------------------------------+
+|                                   |
+|  Inform Proxy                     |
+|                                   |
+|  Read MAC from bytes 8-13         |
+|                                   |
+|  Lookup:                          |
+|    aa:bb:cc:... -&gt; tenant-7       |
+|    11:22:33:... -&gt; tenant-3       |
+|    fe:dc:ba:... -&gt; tenant-12      |
+|                                   |
+|  Forward to correct backend       |
+|                                   |
++-----------------------------------+
+      |           |           |
+      v           v           v
+   Tenant 7   Tenant 3   Tenant 12
+</code></pre>
+<p>The whole proxy is maybe 200 lines of Go with an in-memory MAC-to-tenant lookup table.</p>
+<p>In practice, the proxy is mostly a fallback. Once a device is adopted, you point it at its tenant&#39;s subdomain (<code>set-inform http://acme.tamarack.cloud:8080/inform</code>) and after that, standard Host header routing handles it through normal ingress. The MAC-based routing catches edge cases like devices that haven&#39;t been reconfigured yet, or factory-reset devices re-adopting.</p>
+<h2>The other ports</h2>
+<p>Inform is the hard one. The rest of the controller&#39;s ports are more straightforward:</p>
+<table><thead><tr><th>Port</th><th>Protocol</th><th>Purpose</th></tr></thead><tbody><tr><td>8080</td><td>TCP/HTTP</td><td>Inform (device phone-home)</td></tr><tr><td>8443</td><td>TCP/HTTPS</td><td>Web UI and API</td></tr><tr><td>3478</td><td>UDP</td><td>STUN</td></tr><tr><td>6789</td><td>TCP</td><td>Speed test (internal)</td></tr><tr><td>27117</td><td>TCP</td><td>MongoDB (internal)</td></tr><tr><td>10001</td><td>UDP</td><td>L2 discovery (local only)</td></tr></tbody></table>
+<p>Once I figured out inform, the rest was almost anticlimactic. 8443 is the web UI, so that&#39;s just subdomain-per-tenant with standard HTTPS ingress. 3478 (STUN) is stateless so a single shared coturn instance covers every tenant. The rest are either internal to the container or L2-only, so they never leave the host.</p>
+<h2>Inside the encrypted payload</h2>
+<p>For the curious: the payload after byte 42 is AES-128-CBC. Freshly adopted devices use a default key (<code>ba86f2bbe107c7c57eb5f2690775c712</code>) which is publicly documented by Ubiquiti and ships in the controller source code. After adoption, the controller assigns a unique per-device key.</p>
+<p>The decrypted payload contains device stats and configuration data. Interesting if you&#39;re building controller software, but irrelevant for routing.</p>
+<h2>So what does this get you</h2>
+<p>Every tenant still gets their own dedicated controller, but you&#39;re not paying for a whole VM per customer anymore. What was a volunteering operation at $1-2 margin becomes something you can actually make money on.</p>
+<p>None of it works if the MAC is inside the encrypted payload. You&#39;d need per-device keys at the proxy layer, which means you&#39;d need access to every controller&#39;s database, which puts you right back at one instance per customer. Six plaintext bytes in a packet header make the whole thing possible.</p>
+<p>I don&#39;t think Ubiquiti designed it this way for third parties to build on. The MAC is there because the controller genuinely needs it before decryption. But the happy side effect is that the inform protocol is routable by anyone who can read 14 bytes off a TCP connection.</p>
+<p><em>If you&#39;ve poked at the inform protocol yourself, I&#39;d like to hear about it. <a href="https://tamarack.cloud/cdn-cgi/l/email-protection#771613161a3703161a160516141c59141b180213"><span data-cfemail="e8898c8985a89c8985899a898b83c68b84879d8c">[email protected]</span></a></em></p></div></div>
+  </body>
+</html>
