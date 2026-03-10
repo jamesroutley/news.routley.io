@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.paradedb.com/blog/optimizing-top-k">Original</a>
+    <h1>Optimizing Top K in Postgres</h1>
+    
+    <div id="readability-page-1" class="page"><div><div><div><div><article>
+<div><div><p><img alt="Ming Ying headshot" loading="lazy" width="28" height="28" decoding="async" data-nimg="1" srcset="/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fming_headshot.8828872d.jpeg&amp;w=32&amp;q=75&amp;dpl=dpl_H4Hxg8LUdaBmZTf3sddbfWxW2TFw 1x, /_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fming_headshot.8828872d.jpeg&amp;w=64&amp;q=75&amp;dpl=dpl_H4Hxg8LUdaBmZTf3sddbfWxW2TFw 2x" src="https://www.paradedb.com/_next/image?url=%2F_next%2Fstatic%2Fmedia%2Fming_headshot.8828872d.jpeg&amp;w=64&amp;q=75&amp;dpl=dpl_H4Hxg8LUdaBmZTf3sddbfWxW2TFw"/></p></div><p><span>By <!-- -->Ming Ying<!-- --> on<!-- --> <!-- -->February 13, 2026</span></p></div>
+<img alt="How We Optimized Top K in Postgres" loading="lazy" width="1200" height="630" decoding="async" data-nimg="1" src="https://www.paradedb.com/_next/static/media/hero.5fe2c18a.svg?dpl=dpl_H4Hxg8LUdaBmZTf3sddbfWxW2TFw"/>
+<p>In databases, <em>Top K</em> means “give me the <em>K</em> best rows, ordered by some column or value.” Commonly that means “the most recent rows,” “the highest scores,” or “the largest values.”</p>
+<p>It feels like a basic problem that Postgres should solve. After all, can’t we just create an index? Yet in many production Postgres deployments, Top K is deceptively hard. This post examines where Postgres’ Top K optimizations shine, where they falter, and why search libraries like Lucene/Tantivy or databases like ParadeDB that specialize in Top K take a fundamentally different approach.</p>
+<h2 id="postgres-solution-a-sorted-b-tree">Postgres&#39; Solution: A Sorted B-Tree</h2>
+<p>Let’s begin with a single table containing 100M rows.</p>
+<pre><code><span>CREATE TABLE</span> benchmark_logs (
+    id SERIAL <span>PRIMARY KEY</span>,
+    message TEXT,
+    country <span>VARCHAR</span>(<span>255</span>),
+    severity <span>INTEGER</span>,
+    <span>timestamp</span> <span>TIMESTAMP</span>,
+    metadata JSONB
+);
+</code></pre>
+<p>We want to return the top 10 most recent rows by <code>timestamp</code>:</p>
+<pre><code><span>SELECT</span> <span>*</span>
+<span>FROM</span> benchmark_logs
+<span>ORDER</span> <span>BY</span> <span>timestamp</span> <span>DESC</span>
+LIMIT <span>10</span>;
+</code></pre>
+<p>Without an index, this query takes 15 seconds. To accelerate it, we can create a B-Tree index on <code>timestamp</code>.</p>
+<pre><code><span>CREATE</span> INDEX <span>ON</span> benchmark_logs (<span>timestamp</span>);
+</code></pre>
+<p>B-Trees are ideal for Top K queries because they are sorted structures, so the retrieval of Top K results is trivially O(K). Easy and done, right? Our query drops to an impressive 5ms.</p>
+<div data-slot="callout-root" data-variant="note" role="note" aria-label="note callout"><div data-slot="callout-content"><p>Under the hood, a B-tree is a hierarchy of Postgres pages (think of pages as
+nodes). Upper pages guide navigation, while the actual indexed values live in
+the leaf pages at the bottom in sorted order. To answer “give me the top K
+largest rows,” Postgres jumps from the root down to the leaf with the largest
+value and then walks backward through the linked leaves, reading entries until
+it has collected K rows. Because a B-tree is a balanced tree, the path from
+the root to any leaf is short and predictable.</p></div></div>
+<h2 id="but-wait-we-need-filters-too">But Wait, We Need Filters Too</h2>
+<p>There’s a constraint hiding in the example above: it only works when the index fully matches the query shape. The moment you add filters that aren’t part of the index, things get complicated.</p>
+<p>Consider a more realistic query with the filter <code>WHERE severity &lt; 3</code>:</p>
+<pre><code><span>SELECT</span> <span>*</span>
+<span>FROM</span> benchmark_logs
+<span>WHERE</span> severity <span>&lt;</span> <span>3</span>
+<span>ORDER</span> <span>BY</span> <span>timestamp</span> <span>DESC</span>
+LIMIT <span>10</span>;
+</code></pre>
+<p>Now Postgres faces a dilemma. It can use the B-tree index on <code>timestamp</code> to get rows in the right <code>timestamp</code> order, but it has no way to skip directly to “US” rows. It must walk the index one entry at a time, checking the country for each row and discarding most of them. In the worst case, this means walking the entire index. Or it can scan rows that match <code>severity &lt; 3</code> first, but then it loses the ordering and must sort the results afterward.</p>
+<p>Either way, Postgres ends up scanning far more rows than K, doing extra work to filter or sort, and suddenly we’re back to queries taking up to 15 seconds in the worst case.</p>
+<h2 id="sorting-and-filtering--combinatorial-explosion">Sorting and Filtering = Combinatorial Explosion</h2>
+<p>A natural response is to add a composite B-tree index on both <code>severity</code> and <code>timestamp</code>.</p>
+<pre><code><span>CREATE</span> INDEX <span>ON</span> benchmark_logs (severity, <span>timestamp</span>);
+</code></pre>
+<p>A composite B-tree is still a sorted tree, but now entries are ordered first by <code>severity</code>, and then by <code>timestamp</code> within each <code>severity</code> value. This works great for this query shape: Postgres can jump directly to the portion of the tree matching <code>severity &lt; 3</code> and then walk the timestamps in descending order to get the top K rows.</p>
+<p>The problem is that this solution doesn’t generalize. For instance, imagine we now also want to filter by <code>country</code>:</p>
+<pre><code><span>SELECT</span> <span>*</span>
+<span>FROM</span> benchmark_logs
+<span>WHERE</span> country <span>=</span> <span>&#39;United States&#39;</span>
+<span>AND</span> severity <span>&lt;</span> <span>3</span>
+<span>ORDER</span> <span>BY</span> <span>timestamp</span> <span>DESC</span>
+LIMIT <span>10</span>;
+</code></pre>
+<p>Or, if we change the sort columns:</p>
+<pre><code><span>SELECT</span> <span>*</span>
+<span>FROM</span> benchmark_logs
+<span>WHERE</span> country <span>=</span> <span>&#39;United States&#39;</span>
+<span>ORDER</span> <span>BY</span> severity <span>ASC</span>, <span>timestamp</span> <span>DESC</span>
+LIMIT <span>10</span>;
+</code></pre>
+<p>Supporting every realistic combination of filters and sort orders requires a growing set of indexes. These indexes cause storage bloat, slower writes, and query plans that are hard to reason about.</p>
+<h2 id="postgres-top-k-falls-apart-with-search">Postgres’ Top K Falls Apart with Search</h2>
+<p>Everything so far assumed that filters are simple predicates that can be expressed as equality or range conditions inside a B-tree. Full text search breaks that assumption.</p>
+<p>Consider a query that combines Postgres’ native text search (which performs token matching instead of full string matching) with a range filter, and then
+returns results sorted by relevance (i.e. a <a href="https://en.wikipedia.org/wiki/Tf%E2%80%93idf">TF-IDF</a>-like score):</p>
+<pre><code><span>SELECT</span> <span>*</span>,
+       ts_rank(to_tsvector(<span>&#39;english&#39;</span>, message), q) <span>AS</span> rank
+<span>FROM</span> benchmark_logs,
+     plainto_tsquery(<span>&#39;english&#39;</span>, <span>&#39;research team&#39;</span>) <span>AS</span> q
+<span>WHERE</span> to_tsvector(<span>&#39;english&#39;</span>, message) @@ q
+  <span>AND</span> severity <span>&lt;</span> <span>3</span>
+<span>ORDER</span> <span>BY</span> rank <span>DESC</span>
+LIMIT <span>10</span>;
+</code></pre>
+<p>This query may look similar to the earlier examples: filter rows, then return the top 10 by score. But internally, Postgres has no single structure that can satisfy all of these constraints at once.</p>
+<p>Postgres can use a GIN (generalized inverted) index for the <code>tsvector</code> text search predicate and a B-tree for ordering or numeric filters. But because GIN does not preserve ordering and Postgres cannot combine ordering guarantees across different indexes, the planner must decompose the query into phases:</p>
+<ol>
+<li>Use the GIN index to produce a (potentially large) set of matching row IDs</li>
+<li>Fetch those rows from the “heap” (i.e. the underlying table storage)</li>
+<li>Apply additional filters like <code>severity &lt; 3</code></li>
+<li>Sort the surviving rows</li>
+<li>Return the top 10 results</li>
+</ol>
+<p>If the result set produced by GIN is large, the repeated heap fetches in Step 2 become very expensive. To demonstrate,
+let&#39;s see how well this query can perform if we optimize it as much as possible. First, we&#39;ll precompute the
+<code>to_tsvector</code> expression, which avoids some query-time overhead and helps the Postgres planner collect better statistics:</p>
+<pre><code><span>ALTER TABLE</span> benchmark_logs
+<span>ADD</span> <span>COLUMN</span> message_fts tsvector
+GENERATED ALWAYS <span>AS</span> (to_tsvector(<span>&#39;english&#39;</span>, <span>coalesce</span>(message,<span>&#39;&#39;</span>))) STORED;
+</code></pre>
+<p>Next, we&#39;ll create a GIN index on the generated column:</p>
+<pre><code><span>CREATE</span> INDEX <span>ON</span> benchmark_logs <span>USING</span> gin (message_fts);
+</code></pre>
+<p>Finally, we&#39;ll replace the <code>to_tsvector</code> expressions in our query with the generated column:</p>
+<pre><code><span>SELECT</span> <span>*</span>,
+       ts_rank(message_fts, q) <span>AS</span> rank
+<span>FROM</span> benchmark_logs,
+     plainto_tsquery(<span>&#39;english&#39;</span>, <span>&#39;research team&#39;</span>) <span>AS</span> q
+<span>WHERE</span> message_fts @@ q
+  <span>AND</span> severity <span>&lt;</span> <span>3</span>
+<span>ORDER</span> <span>BY</span> rank <span>DESC</span>
+LIMIT <span>10</span>;
+</code></pre>
+<p>With our GIN index in place, this query still takes 37 seconds to execute, largely because the query <code>research team</code>
+returns millions of matches that must be checked against the filter and sorted.</p>
+<p>As an additional optimization, we can create a partial GIN index on the predicate <code>severity &lt; 3</code>.</p>
+<pre><code><span>CREATE</span> INDEX <span>ON</span> benchmark_logs <span>USING</span> gin (message_fts) <span>WHERE</span> severity <span>&lt;</span> <span>3</span>;
+</code></pre>
+<p>Unfortunately, the query still takes roughly the same amount of time (33 seconds) because a large candidate set is still being returned
+even with the <code>severity &lt; 3</code> predicate<sup>1</sup>. Achieving further improvements would require altering the query itself to make it more selective
+— which may or may not be feasible in real-world scenarios.</p>
+<h2 id="search-databases-think-about-top-k-differently">Search Databases Think About Top K Differently</h2>
+<p>These examples highlight two problems with Top K in Postgres:</p>
+<ol>
+<li>B-trees force you to pre-commit to a query shape, which is at odds with the idea of ad-hoc Top K queries.</li>
+<li>B-trees don&#39;t play well with text search queries/GIN indexes, especially when the Top K candidate sets are large.</li>
+</ol>
+<p>Search databases like ParadeDB take a fundamentally different approach. Rather than requiring many tailored indexes, we use a single compound index that contains all fields required for Top K filtering and sorting.
+Unlike a B-tree, this index is not necessarily sorted. This means that the goal isn&#39;t to beat a B-tree optimized for one specific query — it&#39;s to make all
+shapes of Top K queries, including those with text search and scoring, reasonably fast with low variance across different shapes<sup>2</sup>.</p>
+<p>Additionally, because the sort keys are not known up front, we must accept that large candidate sets are inevitable. The optimization target becomes making the actual work of scanning and filtering extremely cheap, and to prune aggressively when selecting the Top K to avoid extra work.</p>
+<h2 id="the-basic-data-structures-inverted-index-and-columnar-arrays">The Basic Data Structures: Inverted Index and Columnar Arrays</h2>
+<p>ParadeDB&#39;s index, like most search indexes, is built on two core structures. The first is an inverted index, which maps each term (i.e. “research”) to a “posting list” — a sorted list of document IDs that contain that term.</p>
+<pre><code>Documents                     Inverted Index
+<span>[1]</span>: &#34;us research&#34;            research → <span>[1, 2]</span>
+<span>[2]</span>: &#34;ca research&#34;            us       → <span>[1, 3]</span>
+<span>[3]</span>: &#34;us database&#34;            ca       → <span>[2]</span>
+                              database → <span>[3]</span>
+</code></pre>
+<p>The second is a columnar layout, which stores a single field in a contiguous, compact array. Columnar arrays are well known for accelerating analytical queries, but they are also a natural fit for Top K queries because they allow for cheap, cache-friendly lookups.</p>
+<pre><code>Row Store
++------------------------------+
+|  id | country | severity     |
+| <span>[1]</span> | <span>[US]</span>    | <span>[2]</span>          |
+| <span>[2]</span> | <span>[CA]</span>    | <span>[9]</span>          |
+| <span>[3]</span> | <span>[US]</span>    | <span>[1]</span>          |
++------------------------------+
+
+Column Store
++------------------------------+
+| id:       <span>[1]</span><span>[2]</span><span>[3]</span>          |
+| country:  <span>[US]</span><span>[CA]</span><span>[US]</span>       |
+| severity: <span>[2]</span><span>[9]</span><span>[1]</span>          |
++------------------------------+
+</code></pre>
+<p>In ParadeDB, these structures are provided by <a href="https://github.com/quickwit-oss/tantivy">Tantivy</a>, the Rust-based search library inspired by Lucene.</p>
+<h2 id="a-compound-index-eliminates-expensive-row-lookups">A Compound Index Eliminates Expensive Row Lookups</h2>
+<p>In Postgres, every indexed row contains a pointer to where the row lives in the table. If a Top K filter cannot be fully answered by the index, Postgres must follow that pointer and materialize the entire row from the underlying table storage. This operation is expensive and prone to cache misses when performed for millions of candidates.</p>
+<p>ParadeDB solves this by storing all searchable, filterable, and sortable fields inside a single index. Every indexed row is assigned a compact internal <code>u32</code> identifier called a document ID, and every data structure in the index refers to that same ID.</p>
+<p>This document ID design is very efficient for boolean queries (i.e. multiple <code>WHERE</code> clauses). For example, consider the boolean <code>WHERE country = &#39;United States&#39; AND severity &lt; 3</code>. The text condition produces a stream of document IDs from the inverted index, while the range filter becomes a direct lookup into a columnar array at that same ID. Evaluating the <code>AND</code> condition reduces to intersecting <code>u32</code> streams without materializing any intermediate rows.</p>
+<h2 id="columnar-arrays-make-filters-cheap">Columnar Arrays Make Filters Cheap</h2>
+<p>Because candidates produced by the text search index may not be in contiguous order, columnar arrays must have true O(1) random access. In Tantivy’s columnar format, this is achieved by setting the row ID of a columnar value to its ordinal (i.e. its position in the array). So accessing a value from a column to evaluate a filter is simply:</p>
+<pre><code>value = column[row_id]
+</code></pre>
+<p>Additionally, columns are annotated with minimum and maximum value metadata. This allows range filters like <code>severity &lt; 3</code> to skip entire columns that cannot satisfy the filter. For columns that do overlap the range, values are processed in batches instead of individually. By applying comparisons to vectors of values instead of scalars, the engine can use SIMD instructions to evaluate many values in a single CPU operation.</p>
+<h2 id="block-wand-enables-early-pruning">Block WAND Enables Early Pruning</h2>
+<pre><code>Current score threshold: 8.5
+
++-------------------+   <span>max_score</span>=<span>12</span> → Evaluate
+| Block A           |
+| docs: <span>[1 2 3 4]</span>   |
++-------------------+
+
++-------------------+   <span>max_score</span>=<span>7</span> → Skip
+| Block B           |
+| docs: <span>[5 6 7 8]</span>   |
++-------------------+
+</code></pre>
+<p>For queries that are ordered by a relevance score (i.e. a BM25 score), Tantivy goes one step further with an optimization called Block WAND. Conceptually, this means skipping the evaluation of entire chunks of documents unless they have a mathematical possibility of entering the Top K.</p>
+<p>Block WAND works by maintaining an upper bound on how much score any document within a block of document IDs could possibly achieve. As the engine fills its Top K heap, it establishes a threshold: the lowest score currently in the heap. Before evaluating a block, the engine checks the block’s maximum score. If that maximum is below the threshold, the entire block is skipped without scoring individual documents.</p>
+<p>In ParadeDB, the analogous query to the relevance-sorted query above would be:</p>
+<pre><code><span>SELECT</span> <span>*</span>, pdb.score(id) <span>FROM</span> benchmark_logs
+<span>WHERE</span> severity <span>&lt;</span> <span>3</span> <span>AND</span> message <span>||</span><span>|</span> <span>&#39;research team&#39;</span>
+<span>ORDER</span> <span>BY</span> pdb.score(id) <span>DESC</span>
+LIMIT <span>10</span>;
+</code></pre>
+<div data-slot="callout-root" data-variant="note" role="note" aria-label="note callout"><div data-slot="callout-content"><div data-slot="callout-content-body"><p><code>|||</code> is ParadeDB&#39;s <a href="https://docs.paradedb.com/documentation/full-text/match">match
+disjunction</a>
+operator.</p></div></div></div>
+<p>This query now drops to a very reasonable 300ms<sup>4</sup>.</p>
+<div><h3>Top K Text Search Query Time: ParadeDB vs Postgres GIN</h3></div>
+<h2 id="a-recent-improvement-to-paradedbs-top-k-performance">A Recent Improvement to ParadeDB&#39;s Top K Performance</h2>
+<p>In <code>0.21.0</code> Top K performance improved by up to 30% for certain benchmarked Top K queries. For instance, the following Top K query dropped from 90ms to 70ms over a 100M row dataset:</p>
+<pre><code><span>SELECT</span> <span>*</span> <span>FROM</span> benchmark_logs
+<span>WHERE</span> message <span>=</span><span>=</span><span>=</span> <span>&#39;research&#39;</span> <span>AND</span> country <span>=</span><span>=</span><span>=</span> <span>&#39;Canada&#39;</span>
+<span>ORDER</span> <span>BY</span> severity, <span>timestamp</span> LIMIT <span>10</span>;
+</code></pre>
+<div data-slot="callout-root" data-variant="note" role="note" aria-label="note callout"><div data-slot="callout-content"><div data-slot="callout-content-body"><p><code>===</code> is ParadeDB&#39;s <a href="https://docs.paradedb.com/documentation/full-text/term">term
+search</a> operator.</p></div></div></div>
+<p>This improvement was thanks to an upstream change in <a href="https://github.com/quickwit-oss/tantivy">Tantivy</a>, which changes how doc ID iterators are advanced when executing a boolean query.</p>
+<p>Previously, in order to determine if a doc ID was present in all clauses of a boolean <code>AND</code>, Tantivy had to advance all iterators to the <em>next</em> matching document using <code>seek</code> . For instance, consider two doc ID iterators:</p>
+<pre><code>Iterator A (<span>country</span> = <span>&#39;United States&#39;</span>): [<span>100</span>, <span>101</span>, <span>102</span>, <span>103</span>, ...]
+Iterator B (<span>country</span> = <span>&#39;Canada&#39;</span>): [<span>50</span>, <span>10000</span>, ...]
+</code></pre>
+<p>Let’s assume iterator <code>B</code> is currently positioned on <code>50</code>, and iterator <code>A</code> is positioned on <code>100</code>. In order to determine if <code>100</code> is in <code>B</code>, we have to advance <code>B</code> to <code>10000</code> . This can be an expensive operation because advancing to the next match may require scanning several blocks containing values between <code>50</code> and <code>10000</code>.</p>
+<p>With this change, Tantivy can instead perform a cheaper membership check for a specific doc ID without actually advancing the iterator.</p>
+<h2 id="wrapping-up">Wrapping Up</h2>
+<p>Postgres&#39; Top K approach is a bit like all or nothing — the happy path is nearly instant, but the worst case can take seconds or even minutes.
+ParadeDB, on the other hand, is designed to make any Top K query reasonably fast as long as all filters and sort keys are present in the index.</p>
+<p>Moving forward, we still see meaningful headroom to optimize our Top K performance by pruning work earlier in the execution pipeline. One direction is index partitioning and segment-level ordering, where data is physically grouped or sorted by commonly queried dimensions (such as time ranges or coarse score buckets). With this layout, entire segments whose maximum possible score or ordering value cannot beat the current Top K threshold can be skipped.</p>
+<p>We&#39;re also currently working on optimizing Top K joins — i.e. &#34;search and filter over multiple tables, join the results, and return the Top K.&#34;
+If this kind of work excites you, <a href="https://paradedb.notion.site/?pvs=143">we’re hiring</a> for engineers who enjoy solving these kinds of database internals problems.</p>
+<p>And please don’t hesitate to <a href="https://github.com/paradedb/paradedb">give our open-source project</a> a star!</p>
+<hr/>
+<ol>
+<li>The <code>EXPLAIN ANALYZE</code> output of the Top K text search query with GIN:</li>
+</ol>
+<pre><code>                                                                               QUERY PLAN
+
+ Limit  (cost<span>=</span><span>22944.38</span>.<span>.22944</span><span>.41</span> <span>rows</span><span>=</span><span>10</span> width<span>=</span><span>289</span>) (actual <span>time</span><span>=</span><span>33747.662</span>.<span>.33747</span><span>.667</span> <span>rows</span><span>=</span><span>10.00</span> loops<span>=</span><span>1</span>)
+   Buffers: shared hit<span>=</span><span>11851</span> read<span>=</span><span>5890349</span>
+   <span>-</span><span>&gt;</span>  Sort  (cost<span>=</span><span>22944.38</span>.<span>.22946</span><span>.87</span> <span>rows</span><span>=</span><span>995</span> width<span>=</span><span>289</span>) (actual <span>time</span><span>=</span><span>33747.660</span>.<span>.33747</span><span>.664</span> <span>rows</span><span>=</span><span>10.00</span> loops<span>=</span><span>1</span>)
+         Sort Key: (ts_rank(benchmark_logs.message_fts, <span>&#39;&#39;&#39;research&#39;&#39; &amp; &#39;&#39;team&#39;&#39;&#39;</span>::tsquery)) <span>DESC</span>
+         Sort <span>Method</span>: top<span>-</span>N heapsort  Memory: <span>35</span>kB
+         Buffers: shared hit<span>=</span><span>11851</span> read<span>=</span><span>5890349</span>
+         <span>-</span><span>&gt;</span>  Bitmap Heap Scan <span>on</span> benchmark_logs  (cost<span>=</span><span>18964.29</span>.<span>.22922</span><span>.88</span> <span>rows</span><span>=</span><span>995</span> width<span>=</span><span>289</span>) (actual <span>time</span><span>=</span><span>4791.339</span>.<span>.25655</span><span>.017</span> <span>rows</span><span>=</span><span>10000000.00</span> loops<span>=</span><span>1</span>)
+               Recheck Cond: ((message_fts @@ <span>&#39;&#39;&#39;research&#39;&#39; &amp; &#39;&#39;team&#39;&#39;&#39;</span>::tsquery) <span>AND</span> (severity <span>&lt;</span> <span>3</span>))
+               Heap Blocks: exact<span>=</span><span>5882353</span>
+               Buffers: shared hit<span>=</span><span>11851</span> read<span>=</span><span>5890349</span>
+               <span>-</span><span>&gt;</span>  Bitmap Index Scan <span>on</span> benchmark_logs_message_fts_idx  (cost<span>=</span><span>0.00</span>.<span>.18964</span><span>.04</span> <span>rows</span><span>=</span><span>995</span> width<span>=</span><span>0</span>) (actual <span>time</span><span>=</span><span>3669.878</span>.<span>.3669</span><span>.881</span> <span>rows</span><span>=</span><span>10000000.00</span> loops<span>=</span><span>1</span>)
+                     Index Cond: (message_fts @@ <span>&#39;&#39;&#39;research&#39;&#39; &amp; &#39;&#39;team&#39;&#39;&#39;</span>::tsquery)
+                     Index Searches: <span>1</span>
+                     Buffers: shared hit<span>=</span><span>11851</span> read<span>=</span><span>7996</span>
+ Planning:
+   Buffers: shared read<span>=</span><span>2</span>
+ Planning <span>Time</span>: <span>1.342</span> ms
+ Execution <span>Time</span>: <span>33813.810</span> ms
+(<span>18</span> <span>rows</span>)
+</code></pre>
+<ol start="2">
+<li>See our <a href="https://github.com/paradedb/paradedb/tree/main/benchmarks">benchmarks</a> of 100M rows, published <a href="https://paradedb.github.io/paradedb/benchmarks/">on our public benchmarks</a>. See the <code>logs (100M rows)</code> results.</li>
+<li>ParadeDB uses BM25 instead of TF-IDF for relevance scoring. BM25 is generally considered to be a more accurate relevance score.</li>
+<li>The <code>EXPLAIN ANALYZE</code> output of the Top K text search query with ParadeDB:</li>
+</ol>
+<pre><code>    QUERY PLAN
+
+ Limit  (cost<span>=</span><span>1010.12</span>.<span>.1011</span><span>.35</span> <span>rows</span><span>=</span><span>10</span> width<span>=</span><span>257</span>) (actual <span>time</span><span>=</span><span>297.430</span>.<span>.298</span><span>.912</span> <span>rows</span><span>=</span><span>10.00</span> loops<span>=</span><span>1</span>)
+   Buffers: shared hit<span>=</span><span>20920</span> read<span>=</span><span>13732</span>
+   <span>-</span><span>&gt;</span>  Gather <span>Merge</span>  (cost<span>=</span><span>1010.12</span>.<span>.4877326</span><span>.97</span> <span>rows</span><span>=</span><span>39806668</span> width<span>=</span><span>257</span>) (actual <span>time</span><span>=</span><span>297.428</span>.<span>.298</span><span>.910</span> <span>rows</span><span>=</span><span>10.00</span> loops<span>=</span><span>1</span>)
+         Workers Planned: <span>7</span>
+         Workers Launched: <span>7</span>
+         Buffers: shared hit<span>=</span><span>20920</span> read<span>=</span><span>13732</span>
+         <span>-</span><span>&gt;</span>  Parallel Custom Scan (ParadeDB Scan) <span>on</span> benchmark_logs  (cost<span>=</span><span>10.00</span>.<span>.10</span><span>.02</span> <span>rows</span><span>=</span><span>1</span> width<span>=</span><span>257</span>) (actual <span>time</span><span>=</span><span>249.554</span>.<span>.249</span><span>.605</span> <span>rows</span><span>=</span><span>10.00</span> loops<span>=</span><span>8</span>)
+               <span>Table</span>: benchmark_logs
+               Index: benchmark_logs_idx
+               Segment Count: <span>8</span>
+               Heap Fetches: <span>10</span>
+               <span>Exec</span> <span>Method</span>: TopNScanExecState
+               Scores: <span>true</span>
+                  TopN <span>Order</span> <span>By</span>: pdb.score() <span>desc</span>
+                  TopN Limit: <span>10</span>
+                  Queries: <span>8</span>
+               Tantivy Query: {&#34;boolean&#34;:{&#34;must&#34;:[{&#34;range&#34;:{&#34;field&#34;:&#34;severity&#34;,&#34;lower_bound&#34;:<span>null</span>,&#34;upper_bound&#34;:{&#34;excluded&#34;:<span>3</span>},&#34;is_datetime&#34;:<span>false</span>}},{&#34;with_index&#34;:{&#34;query&#34;:{&#34;match&#34;:{&#34;field&#34;:&#34;message&#34;,&#34;value&#34;:&#34;research team&#34;,&#34;tokenizer&#34;:<span>null</span>,&#34;distance&#34;:<span>null</span>,&#34;transposition_cost_one&#34;:<span>null</span>,&#34;prefix&#34;:<span>null</span>,&#34;conjunction_mode&#34;:<span>false</span>}}}}]}}
+               Buffers: shared hit<span>=</span><span>20856</span> read<span>=</span><span>13732</span>
+ Planning:
+   Buffers: shared hit<span>=</span><span>576</span> read<span>=</span><span>7</span>
+ Planning <span>Time</span>: <span>5.927</span> ms
+ Execution <span>Time</span>: <span>299.393</span> ms
+(<span>22</span> <span>rows</span>)
+</code></pre></article></div><!--$--><!--/$--></div></div></div></div>
+  </body>
+</html>
