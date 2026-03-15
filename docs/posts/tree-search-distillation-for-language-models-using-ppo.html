@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://ayushtambde.com/blog/tree-search-distillation-for-language-models-using-ppo/">Original</a>
+    <h1>Tree Search Distillation for Language Models Using PPO</h1>
+    
+    <div id="readability-page-1" class="page"><article>
+    
+    <p>03-01-2026 · Updated 03-03-2026</p>
+    <p>Game-playing neural networks like AlphaZero achieve superhuman performance in board games by augmenting the raw policy with a test-time search harness and distilling the stronger, augmented policy back into the network. Why aren’t similar techniques used in language modelling today? The DeepSeek-R1 authors mention they found <a href="https://arc.net/l/quote/caevdneg">limited success with MCTS</a>; Finbarr Timbers has an <a href="https://finbarr.ca/request-for-research-puct/">excellent post</a> on why they may have faced this problem, namely their choice of UCT instead of pUCT.</p>
+
+    <p>The purpose of this post is to explore two questions:</p>
+    <ul>
+      <li>Is it possible that search distillation actually improves language model reasoning?</li>
+      <li>How does it perform relative to standard language RL methods, e.g. GRPO?</li>
+    </ul>
+
+    <p>To explore this, I applied MCTS across reasoning steps to Qwen-2.5-1.5B-Instruct, to search for stronger trajectories and distill these back into the model via an online PPO loop. On the task of <a href="https://en.wikipedia.org/wiki/Countdown_(game_show)">Countdown</a>, a combinatorial arithmetic game, the distilled model (evaluated without a search harness) achieves an asymptotic mean@16 eval score of 11.3%, compared to 8.4% for CISPO and 7.7% for best-of-N. Relative to the pre-RL instruct model (3.1%), this is an 8.2 percentage point improvement.</p>
+
+    <p>The low absolute scores reflect the fact that these are small-scale experiments on a 1.5B model. I want to use this post as the first in a series, and hope to see these scores increase in subsequent blog posts as I use larger models and compute budgets.</p>
+
+    <h2>Countdown</h2>
+
+    <p>I initially tried using GSM8K as the environment to test this method, but found minimal differences between GRPO and MCTS to make a strong claim either way. Instead, I decided to go with the game of Countdown as our environment. The premise is simple: given a set of N positive integers, use standard operations (+, -, /, *) to compute a particular target. Why Countdown? The hypothesis is that combinatorial problems benefit more from the sort of parallel adaptive reasoning tree search enables, as opposed to, say, GSM8K where sequential reasoning also leads to effective outcomes. We train on a dataset of 20,000 samples, and evaluate on a test set of 820 samples. Each sample consists of four input integers, between 1 and 13.</p>
+
+    <p>I found that using a sparse reward (0/1 for correctness) during training results in unstable training. Switching to a dense reward function:</p>
+    <p>$1.0 - 2 \cdot \min\left(\frac{|t - p|}{t}, 1.0\right)$ if formatting is correct, else $-1.0$</p>
+    <p>Here, $t$ is the true target and $p$ is the predicted target.</p>
+
+    <p>However, evaluation still uses the sparse reward function, since we’d like to be able to intuit the scores (e.g. % pass rate).</p>
+
+    <h2>Monte Carlo Tree Search</h2>
+
+    <p>The MCTS algorithm has been covered in-depth by others, so I’m going to skip a detailed description: for the purposes of this post I’d like to focus on the delta between classical MCTS and the method I tried. Briefly speaking, MCTS iteratively builds a search tree to intelligently explore the action space, guided by a value function.</p>
+    <p>Board games have a relatively meaningful action space, i.e. each move in chess tends to have a substantial effect on whether the player wins or not. Contrast that to language modelling, where many tokens in a reasoning trace act as fillers or syntactic sugar, and branching from the top-k logits (or conditioning on an entropy threshold) doesn’t always result in search diversity. Imagine a state where the next probable tokens are “but”, “however”, “yet” etc; we would end up spending computational resources to build prohibitively large search trees with marginal benefit on a per-token basis.</p>
+
+    <p>I prefer the approach introduced by <a href="https://arxiv.org/abs/2305.10601">Tree-of-Thoughts (Yao et al., 2023)</a> to search over possible next reasoning steps. In this formulation each node-state is a sequence of contiguous tokens:</p>
+    <ul>
+      <li>The root node corresponds to the input prompt</li>
+      <li> Intermediate nodes correspond to reasoning steps: <code>&lt;step&gt;...&lt;/step&gt;</code></li>
+      <li> Terminal nodes correspond to answers: <code>&lt;answer&gt;...&lt;/answer&gt;</code></li>
+    </ul>
+
+    <p>In the spirit of investigating more scaling “knobs”, my implementation uses parallel MCTS, where N agents share the same per-sample search tree and use virtual losses to encourage search diversity.</p>
+
+    <p>Starting from each leaf node, we produce K completions until the stop tag <code>&lt;/step&gt;</code> is encountered. These K sequences form our action space for that particular node.</p>
+
+    <p>Since pUCT requires action-level priors, we compute sequence-level summed logprobs and apply the softmax function to get relative priors. These play nice since raw cumulative sequence probabilities become vanishingly tiny and numerically unstable.</p>
+
+    <p>MCTS also generally uses a value head $V(s_t)$ that improves over training and helps guide the search process to better trajectories. This is implemented as an MLP followed by a tanh function applied to the final hidden state of the transformer.</p>
+    <p>This approach shares similarities with <a href="https://arxiv.org/html/2309.17179v2">TS-LLM (Feng et al., 2023)</a>, which also combines AlphaZero-style tree search with a learned value function over sentence-level actions.</p>
+    <p>The key differences are:</p>
+    <ol>
+      <li>Using online RL (CISPO/PPO) rather than SFT for distillation</li>
+      <li>Parallel MCTS with virtual losses as an additional scaling axis</li>
+    </ol>
+
+    <h3>Trajectory Selection</h3>
+
+    <p>Normally with board game MCTS, the training signal comes from minimising KL divergence between the search policy at the root node and the raw policy the model predicts. However, since there is a mismatch in the granularity of our action space relative to the raw model action space (reasoning steps vs. tokens), we need to do something else. The approach I use is that after all workers complete M iterations of the algorithm for a particular sample, they perform a greedy selection process:</p>
+
+    <ul>
+      <li>Starting from the root, select a trajectory by maximum visit count</li>
+      <li>Submit this trajectory to a shared buffer to be used for PPO training</li>
+    </ul>
+
+    <h2>Training</h2>
+
+    <p>Workers designated as “trainers” asynchronously pull samples from the shared buffer. They use the AdamW optimiser and perform a single PPO inner step for each batch of B samples, with CISPO as our loss type.</p>
+
+    <p>The training objective is to minimise the total loss $L_{total}$:</p>
+    <p>$L_{total} = c_{ppo} L_{ppo} + c_{value} L_{value} + c_{KL}\, \mathbb{D}_{KL}(\pi_\theta \mid\mid \pi_{ref})$</p>
+
+    <p>$L_{cispo} = -\mathbb{E}\left[sg(\min(\frac{\pi_\theta(a_t \mid s_t)}{\pi_{old}(a_t \mid s_t)}), \epsilon) \cdot A_t \cdot \log \pi_\theta(a_t \mid s_t) \right]$</p>
+
+    <p>where $A_t = r_{terminal} - sg\!\left(V_{old}(s_t)\right)$ is a token level advantage (we assign the same terminal reward to each token). I didn’t use GAE because reasoning traces can extend to thousands of tokens, and with a terminal reward, early tokens get exponentially discounted to negligibly small values.</p>
+
+    <p>$L_{value} = \mathbb{E} \left[(V(s_t) - r)^2\right]$</p>
+
+    <p>$\mathbb{D}_{KL}(\pi_\theta \mid\mid \pi_{ref}) = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{ref}(a_t \mid s_t)} - \log \frac{\pi_\theta(a_t \mid s_t)}{\pi _{ref}(a_t \mid s_t)} - 1$ (from the DeepSeek-R1 paper)</p>
+
+    <p>We run the training process until the eval score plateaus.</p>
+
+    <h3>Infrastructure</h3>
+
+    <p>All experiments were performed on a 8xH100 node from Andromeda. For MCTS, six of the GPUs are designated as generators, while two are trainers. A Rust worker samples questions from the dataset and submits inference requests to a generator pool exposed via gRPC. They write the selected trajectories to a Redis stream; trainers iteratively pull samples from here. Weights are synced between generators and trainers every 8 gradient steps using Redis pub/sub.</p>
+
+    <h2>Baselines</h2>
+
+    <p>I ran a CISPO baseline with a global batch size of 128 samples and a group size of 16, resulting in an effective batch size of 2048. Logits were computed in float32 as per ScaleRL. Again, training ran until the eval score plateaued. All eight GPUs were used to train CISPO and there was no trainer/generator split.</p>
+
+    <p>To isolate the value-add of the tree structure, I ran experiments where the trajectories submitted to our training buffer were selected via “best-of-N” (N=64) instead of tree search.</p>
+
+    <h2>Results</h2>
+
+    <p>We use mean@16 to evaluate the model. This means running 16 generations for each eval prompt, grading them with a sparse 0/1 reward, and averaging the results. During evaluation the MCTS-distilled policy with no search harness achieves an asymptotic mean@16 score of 11.3%, while the CISPO model asymptotes at 8.4%, and Best-of-N performs the worst, plateauing at 7.7%.</p>
+    <p><img src="https://ayushtambde.com/blog-countdown-results.png" alt="Countdown mean@16 evaluation curves for MCTS-distilled policy, CISPO, and best-of-N"/></p>
+
+    <p>Surprisingly, I also found that despite the training reward being significantly higher, “best-of-N” distillation underperforms both CISPO and MCTS on the eval suite. While it’s not entirely clear why, we can theorise: if our model has a 98% chance of making at least one reasoning error during its thinking trace, there’s still a $1 - 0.98^{64} \approx 72.6 \%$ chance of selecting at least one correct trajectory. But if there’s no incentive to produce robust reasoning every time, it’s unlikely the model will learn to develop strategies that improve its single-shot score. In secondary school I used a number of techniques to keep track of intermediate steps when solving maths problems. This significantly reduced the probability of making “dumb mistakes” in exams. If I had the option to take the exam multiple times I would never have adopted those techniques!</p>
+
+    <h2>Code</h2>
+
+    <p>All code is open source and can be found <a href="https://github.com/at2005/llm-mcts">here</a>.</p>
+
+    <h2>Future Directions</h2>
+
+    <p>So what does this mean? The part that excites me here is the additional reasoning knobs we can tune, like the number of parallel workers per tree, or the number of MCTS iterations. I haven&#39;t tuned these properly, but initial experiments showed increasing both these values led to significant performance gains. So I want to explore this direction further! There&#39;s plenty of work to be done scaling this method and charting empirical trends to evaluate its potential for larger models and compute budgets. <a href="mailto:tambdeayush@gmail.com">Reach out</a> if you would like to collaborate!</p>
+
+    <p>Now for the caveats: it’s possible this is a “small model phenomenon”, and the method doesn’t scale as well as GRPO for larger models etc. Is it possible to tune the GRPO (CISPO) baseline to match MCTS? Perhaps, but ScaleRL found that most hyperparameters for GRPO adjust compute efficiency, not the final reward ceiling.</p>
+    <p>One might note that MCTS uses more inference compute on a per-sample basis than GRPO: of course it performs better! However, the goal here is not to make an apples-to-apples compute comparison; yes, MCTS does use more inference-time compute, but it also gives us additional levers for applying/scaling that compute and raising the reward ceiling. Whereas it&#39;s not obvious to me that throwing 100x more compute at GRPO would have turned the plateau into a hockey stick.</p>
+
+    <h2>Acknowledgements</h2>
+
+    <p>I’d like to thank the <a href="https://andromeda.ai/">Andromeda team</a> and <a href="https://www.molly.info/">Molly Mielke McCarthy</a> for sponsoring compute for this project, as well as Tom McCarthy and Joe Melkonian for reading over early drafts of this post and offering valuable feedback. I’d also like to thank Finbarr Timbers for the blog post that acted as the impetus for this work.</p>
+
+    <h2>Table of Values</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Parameter</th>
+          <th>Value</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Base Model</td><td>Qwen-2.5-1.5B-Instruct</td><td>Foundation model used for experiments</td></tr>
+        <tr><td>Training Dataset Size</td><td>20,000 samples</td><td>Number of Countdown problems for training</td></tr>
+        <tr><td>Evaluation Set Size</td><td>820 samples</td><td>Number of problems in eval set</td></tr>
+        <tr><td>N (integers per problem)</td><td>4</td><td>Number of integers in each Countdown problem</td></tr>
+        <tr><td>Input Bounds</td><td>[1, 13]</td><td>Range for input integers</td></tr>
+        <tr><td>MCTS Workers (N agents)</td><td>16</td><td>Number of parallel agents sharing one search tree</td></tr>
+        <tr><td>Completions per Node (K)</td><td>4</td><td>Number of candidate sequences generated at each leaf</td></tr>
+        <tr><td>MCTS Iterations (M)</td><td>100</td><td>Number of iterations per sample</td></tr>
+        <tr><td>Virtual Loss</td><td>1</td><td>Value added to visit counts to discourage parallel branch collisions</td></tr>
+        <tr><td>MCTS/BoN Global Batch Size</td><td>32</td><td>Total batch size for MCTS/Best-of-N training</td></tr>
+        <tr><td>CISPO Global Batch Size</td><td>128</td><td>Total batch size for baseline training</td></tr>
+        <tr><td>CISPO Group Size</td><td>16</td><td>Number of trajectories per group</td></tr>
+        <tr><td>CISPO epsilon_high</td><td>5.0</td><td>Clipping parameter for CISPO</td></tr>
+        <tr><td>Best-of-N Sample Size</td><td>64</td><td>N, or the number of generations per sample for best-of-N baseline</td></tr>
+        <tr><td>Weight Sync Frequency</td><td>Every 8 gradient steps</td><td>How often weights sync between generators and trainers</td></tr>
+        <tr><td>c<sub>puct</sub></td><td>0.5</td><td>pUCT coefficient</td></tr>
+        <tr><td>c<sub>KL</sub></td><td>0.05</td><td>KL divergence weight</td></tr>
+        <tr><td>c<sub>ppo</sub></td><td>1.0</td><td>PPO objective weight</td></tr>
+        <tr><td>c<sub>value</sub></td><td>1.0</td><td>Value objective weight</td></tr>
+        <tr><td>N<sub>t</sub></td><td>2</td><td>Number of trainer processes</td></tr>
+        <tr><td>N<sub>g</sub></td><td>6</td><td>Number of generator processes</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Appendix: Experimental Curves</h2>
+    <p>Note that we use a different logging cadence for each run, which is partially why the x-axis limits differ. We train the models until the eval score plateaus.</p>
+
+    <h3>Evaluation</h3>
+    <figure>
+      <img src="https://ayushtambde.com/plots-mcts/mcts-eval.png" alt="MCTS mean@16 evaluation by step"/>
+      <figcaption>MCTS mean@16 evaluation curve.</figcaption>
+    </figure>
+    <figure>
+      <img src="https://ayushtambde.com/plots-mcts/grpo-eval.png" alt="GRPO mean@16 evaluation by step"/>
+      <figcaption>GRPO/CISPO mean@16 evaluation curve.</figcaption>
+    </figure>
+    <figure>
+      <img src="https://ayushtambde.com/plots-mcts/bon-eval.png" alt="Best-of-N mean@16 evaluation by step"/>
+      <figcaption>Best-of-N mean@16 evaluation curve.</figcaption>
+    </figure>
+
+    <h3>Training</h3>
+    <figure>
+      <img src="https://ayushtambde.com/plots-mcts/mcts-reward-train.png" alt="MCTS reward by iteration"/>
+      <figcaption>MCTS reward-training curve.</figcaption>
+    </figure>
+    <figure>
+      <img src="https://ayushtambde.com/plots-mcts/grpo-train-reward.png" alt="GRPO reward by iteration"/>
+      <figcaption>GRPO/CISPO reward-training curve.</figcaption>
+    </figure>
+    <figure>
+      <img src="https://ayushtambde.com/plots-mcts/bon-reward-train.png" alt="Best-of-N reward by iteration"/>
+      <figcaption>Best-of-N reward-training curve.</figcaption>
+    </figure>
+    </article></div>
+  </body>
+</html>
