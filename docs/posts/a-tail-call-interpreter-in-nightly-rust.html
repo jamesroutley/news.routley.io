@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.mattkeeter.com/blog/2026-04-05-tailcall/">Original</a>
+    <h1>A tail-call interpreter in (nightly) Rust</h1>
+    
+    <div id="readability-page-1" class="page"><div id="content">
+<!-- End header -->
+
+
+
+
+
+<meta property="og:title" content="A tail-call interpreter in (nightly) Rust"/>
+<meta property="og:type" content="article"/>
+<meta property="og:description" content="Exploring tail-call-style interpreter implementation with an optimized Uxn emulator, on ARM, x86, and WebAssembly"/>
+<meta property="og:url" content="https://mattkeeter.com/blog/2026-04-05-tailcall/index.html"/>
+<meta property="og:image" content="https://mattkeeter.com/blog/2026-04-05-tailcall/hero.png"/>
+<meta name="twitter:card" content="summary_large_image"/>
+
+<p>Last week, I wrote a tail-call interpreter using the <code>become</code>
+keyword, which was
+<a href="https://github.com/rust-lang/rust/pull/144232">recently added to nightly Rust</a>
+(seven months ago is recent, right?).</p>
+<p>It was a surprisingly pleasant experience, and the resulting VM outperforms both
+my previous Rust implementation <em>and</em> my hand-coded ARM64 assembly.
+Tailcall-based techniques have been all the rage recently (see
+<a href="https://blog.reverberate.org/2025/02/10/tail-call-updates.html">this overview</a>);
+consider this my trip report implementing a simple but non-trivial system.</p>
+<hr/>
+<p>For those keeping track at home, this is the latest in my exploration of
+high-performance emulation of the <a href="https://wiki.xxiivv.com/site/uxntal_reference.html">Uxn CPU</a>,
+which runs <a href="https://wiki.xxiivv.com/site/roms.html">a bunch of applications</a>
+in the <a href="https://100r.co/site/home.html">Hundred Rabbits</a> ecosystem.</p>
+<p>If you want to read the whole saga, here&#39;s the list:</p>
+<ul>
+<li><a href="https://www.mattkeeter.com/projects/raven">Project writeup for Raven</a>, my original Rust implementation</li>
+<li><a href="https://www.mattkeeter.com/blog/2024-07-12-interpreter/">Beating the compiler</a>, in which I write an
+ARM64 assembly implementation which outperforms my Rust code</li>
+<li><a href="https://www.mattkeeter.com/blog/2025-01-20-guided/">Guided by the beauty of our test suite</a>, in which I
+revisit the code a year later and improve its testing and CI</li>
+<li><a href="https://www.mattkeeter.com/blog/2026-03-15-uxn/">An x86-64 backend for <code>raven-uxn</code></a>, in which I port
+the assembly implementation from ARM64 to x86 (with the help of Claude Code)</li>
+</ul>
+<p>Experimenting with LLMs
+<a href="https://news.ycombinator.com/item?id=47387431">proved controversial</a>,
+which wasn&#39;t a surprise; I&#39;m
+pleased to declare that all of the tail-call code is human-written, and the new
+backend can be used as a substitute for the x86 assembly backend at a minor
+performance penalty.</p>
+<p>(This blog post is also entirely human-written, per my
+<a href="https://www.mattkeeter.com/about#gen-ai">personal standards</a>)</p>
+<p>The next few sections summarize previous work, so feel free to skim them if
+you&#39;ve done the reading and jump straight to <a href="#tailcalls">tailcalls in Rust</a>.</p>
+<hr/>
+<h3>Basics of Uxn emulation</h3>
+<p>Uxn is a simple stack machine with 256 instructions.
+The whole CPU has just over 64K of space, split between a few memories:</p>
+<ul>
+<li>Two 256-byte stacks, each with an index byte</li>
+<li>65536 bytes of RAM, which is used for both data and program text</li>
+<li>A 2-byte program counter</li>
+<li>256 bytes of &#34;device memory&#34;, used for peripherals</li>
+</ul>
+
+<p>The simplest emulator reads a byte from RAM at the program counter, then calls
+into an instruction (which may update the program counter):</p>
+<pre><code>fn run(core: &amp;mut Uxn, dev: &amp;mut Device, mut pc: u16) -&gt; u16 {
+    loop {
+        let op = core.next(&amp;mut pc);
+        let Some(next) = core.op(op, dev, pc) else {
+            break pc;
+        };
+        pc = next;
+    }
+}
+
+impl Uxn {
+    fn op(
+        &amp;mut self, op: u8, dev: &amp;mut Device, pc: u16
+    ) -&gt; Option&lt;u16&gt; {
+        match op {
+            op::BRK =&gt; self.brk(pc),
+            op::INC =&gt; self.inc::&lt;0b000&gt;(pc),
+            op::POP =&gt; self.pop::&lt;0b000&gt;(pc),
+            op::NIP =&gt; self.nip::&lt;0b000&gt;(pc),
+            op::SWP =&gt; self.swp::&lt;0b000&gt;(pc),
+            // ... etc
+            op::ORA2kr =&gt; self.ora::&lt;0b111&gt;(pc),
+            op::EOR2kr =&gt; self.eor::&lt;0b111&gt;(pc),
+            op::SFT2kr =&gt; self.sft::&lt;0b111&gt;(pc),
+        }
+    }
+}
+</code></pre>
+<p>There are 256 instructions, many of which are parameterized with flags.  Here&#39;s
+the <code>INC</code> instruction, which increments the top byte on the stack:</p>
+<pre><code>impl Uxn {
+    pub fn inc&lt;const FLAGS: u8&gt;(&amp;mut self, pc: u16) -&gt; Option&lt;u16&gt; {
+        let mut s = self.stack_view::&lt;FLAGS&gt;();
+        let v = s.pop();
+        s.push(v.wrapping_add(1));
+        Some(pc)
+    }
+}
+</code></pre>
+<p>All of the opcode implementations are inlined into the main <code>op</code> function, but
+there&#39;s <a href="https://www.mattkeeter.com/blog/2024-07-12-interpreter/">room for improvement</a>:
+some values are stored in memory rather than registers, and the main <code>op</code>
+selection branch is unpredictable.</p>
+<h3>Threaded code in assembly</h3>
+<p>In our assembly implementation, we can instead use threaded code (specifically
+<a href="https://en.wikipedia.org/wiki/Threaded_code#Token_threading">token threading</a>).
+We store all of the CPU state in registers, then end each instruction with a
+jump to the subsequent instruction:</p>
+<pre><code>; x0 | stack pointer
+; x1 | stack index
+; x4 | ram pointer
+; x5 | program counter
+; x8 | opcode table
+_INC:
+    ldrb w9, [x0, x1]           ; read the byte from the top of the stack
+    add w9, w9, #1              ; increment it
+    strb w9, [x0, x1]           ; write it back
+    ldrb w9, [x4, x5]           ; load the next opcode from RAM
+    add x5, x5, #1              ; increment the program counter
+    and x5, x5, #0xffff         ; wrap the program counter
+    ldr x10, [x8, x9, lsl #3]   ; load the opcode implementation address
+    br x10                      ; jump to the opcode&#39;s implementation
+</code></pre>
+<p>This distributes the dispatch operation across every opcode, making it easier
+for the branch predictor to learn sequences of opcodes in the program.  Overall
+speedups were significant: 40-50% faster on ARM64, and about 2× faster on
+x86-64.</p>
+<p>Unfortunately, it requires maintaining about
+<a href="https://github.com/mkeeter/raven/blob/main/raven-uxn/src/native/aarch64/impl.s">2000 lines of code</a>, and is
+<strong>incredibly unsafe</strong>. In my x86 port, I introduced an out-of-bounds write,
+which stomped on a few bytes outside of device RAM; the only symptom was that
+the fuzzer would segfault when exiting after running a very particular program.</p>
+<p>So, what&#39;s to be done?</p>
+<h3>Tail calls in Rust</h3>
+<p>We&#39;d like to get the same behavior as our assembly implementation – VM state
+stored in registers, dispatch at the end of each opcode – without hand-writing
+every instruction in assembly.  Fortunately, there is hope!</p>
+<p>The core idea has almost certainly been reinvented a bunch of times, but
+I first encountered the idea of tail-call interpreters in the
+<a href="https://github.com/wasm3/wasm3/blob/main/docs/Interpreter.md#m3-massey-meta-machine">Massey Meta Machine writeup</a>,
+which was a mind-expanding read.</p>
+<p>There are two pieces:</p>
+<ul>
+<li>Store program state in function arguments, which are mapped to registers
+based on your system&#39;s calling convention</li>
+<li>End each function by calling the next function</li>
+</ul>
+<p>We could write this <strong>today</strong> in Rust; here&#39;s our <code>inc</code> function:</p>
+<pre><code>const TABLE: FunctionTable = FunctionTable([
+    brk,
+    inc::&lt;0b000&gt;,
+    pop::&lt;0b000&gt;,
+    nip::&lt;0b000&gt;,
+    swp::&lt;0b000&gt;,
+    rot::&lt;0b000&gt;,
+    dup::&lt;0b000&gt;,
+    // ...etc
+]);
+
+fn inc&lt;&#39;a, const FLAGS: u8&gt;(
+    stack_data: &amp;&#39;a mut [u8; 256],
+    stack_index: u8,
+    rstack_data: &amp;&#39;a mut [u8; 256],
+    rstack_index: u8,
+    dev: &amp;&#39;a mut [u8; 256],
+    ram: &amp;&#39;a mut [u8; 65536],
+    mut pc: u16,
+    vdev: &amp;mut dyn Device,
+) -&gt; (Uxn&lt;&#39;a&gt;, u16) {
+    let mut core = Uxn {
+        stack: Stack {
+            data: stack_data,
+            index: stack_index,
+        },
+        ret: Stack {
+            data: rstack_data,
+            index: rstack_index,
+        },
+        dev,
+        ram,
+    };
+    match core.inc::&lt;FLAGS&gt;(pc) {
+        Some(pc) =&gt; {
+            let op = core.next(&amp;mut pc);
+            TABLE.0[op as usize](
+                core.stack.data,
+                core.stack.index,
+                core.ret.data,
+                core.ret.index,
+                core.dev,
+                core.ram,
+                pc,
+                vdev,
+            )
+        }
+        None =&gt; (core, pc)
+    }
+}
+</code></pre>
+<p>We want to reuse our existing <code>Uxn</code> opcode implementations, so we reconstruct
+the <code>core: Uxn</code> object at the beginning of the function, call its <code>inc</code>
+function, then deconstruct it again when calling the next operation. There&#39;s a
+lot of boilerplate, and it&#39;s tempting to just pass a <code>&amp;mut Uxn</code> argument, but
+that removes the &#34;state is stored in registers&#34; benefit; we&#39;ll remove
+boilerplate with a macro later on.</p>
+<p>Unfortunately, there&#39;s a problem with this implementation:</p>
+<pre><code>thread &#39;snapshots::tailcall::mandelbrot&#39; (67889685) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+error: test failed, to rerun pass `-p raven-varvara --test snapshots`
+</code></pre>
+<p>Even in a release build, the compiler has not optimized out the stack.  As we
+execute more and more operations, the stack gets deeper and deeper until it
+inevitably overflows.</p>
+<p>We need tell the compiler to generate a <code>br</code> (branch to register) instead of a
+<code>bl</code> (branch-and-link) instruction, and – more importantly – not to allocate any
+persistent space on the stack.  In other words, we need a
+<a href="https://en.wikipedia.org/wiki/Tail_call">tail call</a>.</p>
+<p>In nightly Rust, this is a one-word fix:</p>
+<pre><code>     match core.inc::&lt;FLAGS&gt;(pc) {
+         Some(pc) =&gt; {
+             let op = core.next(&amp;mut pc);
+-            TABLE.0[op as usize](
++            become TABLE.0[op as usize](
+                 core.stack.data,
+                 core.stack.index,
+                 core.ret.data,
+                 core.ret.index,
+                 core.dev,
+                 core.ram,
+                 pc,
+                 vdev,
+             )
+</code></pre>
+<p>With this change in place, the Rust compiler makes <a href="https://doc.rust-lang.org/std/keyword.become.html">a guarantee</a>:</p>
+<blockquote>
+<p>When tail calling a function, instead of its stack frame being added to the
+stack, the stack frame of the caller is directly replaced with the callee’s.</p>
+</blockquote>
+<p>That&#39;s it, everything works!  End of writeup!</p>
+<h3>Implementation details</h3>
+<p>Okay, okay, I&#39;ve got a little more to say.</p>
+<p>First, I promised a macro to eliminate the boilerplate.  As always, it&#39;s
+a horrifying thing to behold:</p>
+<pre><code>macro_rules! tail_fn {
+    ($name:ident $(::&lt;$flags:ident&gt;)?) =&gt; {
+        tail_fn!($name $(::&lt;$flags&gt;)?[][vdev: &amp;mut dyn Device]);
+    };
+    ($name:ident $(::&lt;$flags:ident&gt;)?($($arg:ident: $ty:ty),*)) =&gt; {
+        tail_fn!($name $(::&lt;$flags&gt;)?[$($arg: $ty),*][]);
+    };
+    ($name:ident $(::&lt;$flags:ident&gt;)?[$($arg0:ident: $ty0:ty),*][$($arg1:ident: $ty1:ty),*]) =&gt; {
+        extern &#34;rust-preserve-none&#34; fn $name&lt;&#39;a, $(const $flags: u8)?&gt;(
+            stack_data: &amp;&#39;a mut [u8; 256],
+            stack_index: u8,
+            rstack_data: &amp;&#39;a mut [u8; 256],
+            rstack_index: u8,
+            dev: &amp;&#39;a mut [u8; 256],
+            ram: &amp;&#39;a mut [u8; 65536],
+            pc: u16,
+            $($arg0: $ty0),*
+            $($arg1: $ty1),*
+        ) -&gt; (UxnCore&lt;&#39;a&gt;, u16) {
+            let mut core = UxnCore {
+                stack: Stack {
+                    data: stack_data,
+                    index: stack_index,
+                },
+                ret: Stack {
+                    data: rstack_data,
+                    index: rstack_index,
+                },
+                dev,
+                ram,
+            };
+            match core.$name::&lt;$($flags)?&gt;(pc, $($arg0),*) {
+                Some(mut pc) =&gt; {
+                    let op = core.next(&amp;mut pc);
+                    become TABLE.0[op as usize](
+                        core.stack.data,
+                        core.stack.index,
+                        core.ret.data,
+                        core.ret.index,
+                        core.dev,
+                        core.ram,
+                        pc,
+                        $($arg0),*
+                        $($arg1),*
+                    )
+                }
+                None =&gt; (core, pc),
+            }
+        }
+    };
+}
+</code></pre>
+<p>(This is now from the actual implementation, so some types are slightly
+different than the simplified code earlier in this writeup)</p>
+<p>The macro is very awkward, but it lets us declare all three kinds of functions:</p>
+<ul>
+<li>Fabled ones</li>
+<li>Innumerable ones</li>
+<li>Those drawn with a very fine camel hair brush</li>
+</ul>
+<p>Wait, no, wrong list; the three kinds of functions are</p>
+<ul>
+<li>Bare functions</li>
+<li>Functions with <code>FLAGS</code></li>
+<li>Functions with <code>FLAGS</code> and additional arguments</li>
+</ul>
+<p>Here&#39;s what all three look like:</p>
+<pre><code>tail_fn!(brk); // bare function
+tail_fn!(inc::&lt;FLAGS&gt;); // function with flags
+tail_fn!(dei::&lt;FLAGS&gt;(dev: &amp;mut dyn Device)); // flags and arguments
+</code></pre>
+<p>You don&#39;t need to spend much time puzzling over the macro; we&#39;re firmly in &#34;if
+it compiles, it works&#34; territory here.  It&#39;s also worth noting that this is
+still <em>100% safe</em> Rust: our <code>#![forbid(unsafe_code)]</code> attribute remains
+untriggered.</p>
+<h3>Codegen notes</h3>
+<p>The compiler does a good job of inlining and stripping functions down to their
+essential operations; the boilerplate of constructing and deconstructing the
+<code>UxnCore</code> is fully optimized out.</p>
+<pre><code>0000000100039c50 &lt;raven_uxn::tailcall::inc::&lt;0&gt;&gt;:
+    and     x8, x0, #0xff           ; mask stack pointer
+    ldrb    w9, [x21, x8]           ; read byte
+    add     w9, w9, #1              ; increment value
+    strb    w9, [x21, x8]           ; write back value
+    and     x8, x2, #0xffff         ; mask pc
+    ldrb    w8, [x24, x8]           ; look up next opcode
+    adrp    x9, 0x100279000         ; load table base
+    add     x9, x9, #3776           ; offset??
+    ldr     x3, [x9, x8, lsl  #3]   ; get jump target
+    add     w2, w2, #1              ; increment program counter
+    br      x3                      ; jump!
+</code></pre>
+<p>I see two main differences from our hand-written implementation:</p>
+<ul>
+<li>It does register masking before use, instead of after modification. For
+example, the program counter (in <code>x2</code>) is masked when used for a lookup, but
+<em>not</em> masked after it is incremented</li>
+<li>The table base is loaded from an offset, instead of stored in a register</li>
+</ul>
+<p>We could fix the latter by also threading the table through the argument list,
+which improves performance on x86 (but doesn&#39;t seem to matter on ARM64).</p>
+<h3>Performance results</h3>
+<p>Speaking of performance, how does it do?</p>
+<p>I&#39;ve got two main benchmarks:</p>
+<ul>
+<li>A microbenchmark program which naively computes a Fibonacci number</li>
+<li>A larger program which <a href="https://www.mattkeeter.com/projects/raven/demo/#mandelbrot">renders a Mandlebrot fractal</a></li>
+</ul>
+<p>On my laptop (M1 Macbook), I&#39;m pleased to report that I&#39;m no longer beating the
+compiler: the tail-call interpreter handily beats my hand-written
+assembly on both benchmarks.</p>
+<table>
+    <tbody><tr><th></th><th>Fibonacci</th><th>Mandelbrot
+    </th></tr><tr><td>VM
+        </td><td>2.41
+        </td><td>125
+    </td></tr><tr><td>Assembly
+        </td><td>1.32
+        </td><td>87
+    </td></tr><tr><td>Tailcall
+        </td><td>1.19
+        </td><td>76
+</td></tr></tbody></table>
+<p>(all times in milliseconds, smaller is faster)</p>
+<p>Now, let&#39;s take a big sip of
+<a href="https://www.harney.com/products/williamsburg-ginger-cake-tin-of-20-sachets">seasonally-inappropriate tea</a>
+and test on x86—</p>
+<table>
+    <tbody><tr><th></th><th>Fibonacci</th><th>Mandelbrot
+    </th></tr><tr><td>VM
+        </td><td>4.70
+        </td><td>264
+    </td></tr><tr><td>Assembly
+        </td><td>1.84
+        </td><td>168
+    </td></tr><tr><td>Tailcall
+        </td><td>3.23
+        </td><td>175
+</td></tr></tbody></table>
+<p>—<em>oh no</em>.  It&#39;s outperforming the VM, but is still losing to the assembly
+backend by a noticeable amount (especially in the Fibonacci microbenchmark).
+What&#39;s going on here?</p>
+<p>Let&#39;s start by looking at the generated code for <code>INC</code>, our simplest opcode:</p>
+<pre><code>_RINvNtCs7kxjQDHw3ed_9raven_uxn8tailcall3incKh0_EB4_:
+    movzx  eax,dil                  ; mask stack index
+    inc    BYTE PTR [r13+rax]       ; increment byte on stack
+    movzx  eax,cx                   ; mask pc register
+    movzx  eax,BYTE PTR [rdx+rax]   ; read next opcode from RAM
+    inc    ecx                      ; increment pc reigster
+    mov    rax,QWORD PTR [r8+rax*8] ; read jump target from table
+    jmp    rax                      ; jump to target
+    ; followed by `int3` operations to pad to 32-byte alignment
+</code></pre>
+<p>This implementation looks broadly fine: it&#39;s doing the minimal number of reads
+and writes, and is basically what I&#39;d expect.  Indeed, incrementing the byte by
+address may be more efficient than my assembly, which loads and stores that
+byte.</p>
+<p>(Also, I didn&#39;t harp on this before, but declaring these functions as <code>extern &#34;rust-preserve-none&#34;</code> is very important for the x86 implementation.  The default
+calling convention doesn&#39;t use enough registers for all of our arguments, which
+adds tremendous amounts of overhead)</p>
+<p>So, <code>INC</code> is inoffensive.  Let&#39;s now look at <code>ADD2</code>, which adds the top two
+16-bit values on the stack.  I&#39;ll start by showing you the hand-tuned
+implementation from the assembly backend:</p>
+<pre><code>_ADD2:
+    movzx  eax,BYTE PTR [rbx+r12*1]     ; read byte from data stack
+    dec    r12b                         ; decrement data pointer
+    movzx  ecx,BYTE PTR [rbx+r12*1]     ; read byte from data stack
+    dec    r12b                         ; decrement data pointer
+    shl    ecx,0x8                      ; build 16-bit value
+    or     eax,ecx
+    movzx  ecx,BYTE PTR [rbx+r12*1]     ; read byte from data stack
+    lea    r11,[r12-0x1]                ; get next byte address
+    and    r11,0xff                     ; mask index byte
+    movzx  edx,BYTE PTR [rbx+r11*1]     ; read byte from data stack
+    shl    edx,0x8                      ; build 16-bit value
+    or     ecx,edx
+    add    ecx,eax                      ; do addition
+    mov    BYTE PTR [rbx+r12*1],cl      ; write byte to data stack
+    shr    ecx,0x8                      ; shift 16-bit value
+    mov    BYTE PTR [rbx+r11*1],cl      ; write byte to data stack
+    movzx  eax,BYTE PTR [r15+rbp*1]     ; read next opcode
+    inc    bp                           ; increment pc
+    lea    rcx,[rip+0x22e5c7]           ; read jump address
+    jmp    QWORD PTR [rcx+rax*8]        ; jump
+</code></pre>
+<p>This implementation is 79 bytes, and does the bare minimum number of reads and
+writes: 4 byte reads + 2 byte writes to the data stack, one byte read from RAM
+(to get the next opcode), and one <code>qword</code> read from the jump table (to get the
+jump target).</p>
+<p>In contrast, here&#39;s the compiled tailcall implementation:</p>
+<pre><code>_RINvNtCs7kxjQDHw3ed_9raven_uxn8tailcall3addKh1_EB4_:
+    push   rbp                      ; spill rbp to the stack
+    mov    QWORD PTR [rsp-0x8],r11  ; spill r11 to the stack too?
+    mov    r11,r9                   ; do the Register Shuffle (??)
+    mov    r9,r8
+    mov    r8d,ecx
+    mov    rax,r13
+    movzx  r10d,dil                 ; get index as byte
+    movzx  edi,BYTE PTR [r13+r10]   ; read byte from stack
+    lea    ebx,[r10-0x1]            ; get next index
+    movzx  ebx,bl                   ; mask index to byte
+    lea    r13d,[r10-0x2]           ; precompute another index
+    movzx  ebp,BYTE PTR [rax+rbx*1] ; read byte from stack
+    shl    ebp,0x8                  ; build 16-bit value
+    or     ebp,edi
+    movzx  edi,r13b                 ; mask index byte
+    movzx  r13d,BYTE PTR [rax+rdi]  ; read byte from stack
+    add    r10b,0xfd                ; compute another address
+    movzx  ecx,r10b                 ; mask index byte
+    movzx  ebx,BYTE PTR [rax+rcx]   ; read byte from stack
+    shl    ebx,0x8                  ; build 16-bit value
+    or     ebx,r13d
+    add    ebx,ebp                  ; do addition
+    mov    BYTE PTR [rax+rcx*1],bh  ; write byte to stack
+    mov    BYTE PTR [rax+rdi*1],bl  ; write byte to stack
+    movzx  ecx,r8w                  ; mask pc word
+    movzx  ecx,BYTE PTR [rdx+rcx*1] ; read opcode
+    inc    r8d                      ; increment pc
+    mov    r10,QWORD PTR [r9+rcx*8] ; get next jump address
+    mov    r13,rax                  ; do the Reverse Register Shuffle (??)
+    mov    ecx,r8d
+    mov    r8,r9
+    mov    r9,r11
+    mov    r11,QWORD PTR [rsp-0x8]  ; restore spilled r11
+    mov    rax,r10
+    pop    rbp                      ; restore pushed rbp
+    jmp    rax                      ; jump
+    ; followed by `int3` padding to a 32-byte boundary
+</code></pre>
+<p>This is 121 bytes, and – more concerningly – spills and restores two full
+64-bit registers to the stack.  This looks like (to use a technical term) <em>real
+bad codegen</em>.  On one hand, this is an unfinished nightly feature in <code>rustc</code>, so
+it&#39;s understandable; on the other hand, I&#39;m surprised this isn&#39;t well optimized
+by the LLVM backend, even if the <code>rustc</code> side is immature.</p>
+<p>This blog post is getting unwieldy, so I won&#39;t speculate too much further,
+but I will make a few observations:</p>
+<ul>
+<li><a href="https://godbolt.org/z/5ExWMnvnh">Plain C code is compiled to something more optimal</a>
+by Clang</li>
+<li><a href="https://godbolt.org/z/fKabjvn98">Similarly plain Rust code</a> isn&#39;t quite as
+bad as what I was seeing, but still spills <code>rbp</code> to the stack unnecessarily.</li>
+</ul>
+<h3>One more thing</h3>
+<p>WebAssembly also <a href="https://web.dev/blog/wasmgc-wasm-tail-call-optimizations-baseline">supports tail calls</a>,
+and Raven supports compilation to WebAssembly!  I wonder how the tail-call
+interpreter will fare, compared to both native performance and the simple VM
+interpreter?</p>
+<p>I can only benchmark the Mandelbrot example; the Fibonacci program is too fast
+(given limitations on web timer resolution).  Here are the numbers:</p>
+<table>
+    <tbody><tr><th>Engine</th><th>Backend</th><th>Time (ms)
+    </th></tr><tr><td rowspan="2">Native
+        </td><td>VM
+        </td><td>125
+    </td></tr><tr><td>Tailcall
+        </td><td>76
+    </td></tr><tr><td rowspan="2">Firefox
+        </td><td>VM
+        </td><td>264
+    </td></tr><tr><td>Tailcall
+        </td><td>311
+    </td></tr><tr><td rowspan="2">Chrome
+        </td><td>VM
+        </td><td>244
+    </td></tr><tr><td>Tailcall
+        </td><td>905
+    </td></tr><tr><td rowspan="2"><code>wasmtime</code>
+        </td><td>VM
+        </td><td>128
+    </td></tr><tr><td>Tailcall
+        </td><td>595
+</td></tr></tbody></table>
+<p>Surprise, it&#39;s <strong>terrible</strong>: 1.2× slower on Firefox, 3.7× slower on Chrome, and
+4.6× slower in <code>wasmtime</code>. I guess patterns which generate good assembly don&#39;t
+map well to the WASM stack machine, and the JITs aren&#39;t smart enough to lower it
+to optimal machine code.</p>
+<p><code>wasmtime</code> did manage impressive performance on the traditional VM
+implementation though — within a few percentage points of the native Rust build!</p>
+<p>(All of these tests were on my M1 Max laptop;
+<code>wasmtime</code> was built from <a href="https://github.com/bytecodealliance/wasmtime/commit/e9e1665c5"><code>e9e1665c5</code></a>,
+Firefox 149.0, and Chrome 146.0.7680.178)</p>
+<h3>Conclusion</h3>
+<p>The <a href="https://github.com/mkeeter/raven/pull/48">tailcall interpreter PR is merged</a>,
+and has been deployed in the <code>0.3.0</code> release.  When enabled, it&#39;s the default on
+ARM64 systems, and the second choice on x86-64 systems (if the <code>native</code> feature
+is not enabled).</p>
+<p>I&#39;d be very curious to get tips on improving x86 and WASM performance;</p>
+
+<!-- Begin footer -->
+</div></div>
+  </body>
+</html>
