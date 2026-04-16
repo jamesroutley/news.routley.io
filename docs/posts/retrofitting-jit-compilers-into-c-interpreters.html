@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://tratt.net/laurie/blog/2026/retrofitting_jit_compilers_into_c_interpreters.html">Original</a>
+    <h1>Retrofitting JIT Compilers into C Interpreters</h1>
+    
+    <div id="readability-page-1" class="page"><div id="article-body">
+
+
+
+
+
+<p>C interpreters are a common language implementation technique and the basis for
+the reference implementations of languages such as Lua, Ruby, and
+Python. Unfortunately, C interpreters are slow, especially compared to
+language implementations powered by JIT compilers. In this post I’m going to show
+that it is possible to take C interpreters and, by changing a tiny proportion
+of code, automatically turn them into JIT compiling VMs (Virtual Machines). This offers a point in the language performance design space
+that was previously out of reach: better performance while retaining
+full compatibility with reference implementations.</p>
+<p>The system that lets us do this is <a href="https://github.com/ykjit/yk/"><em>yk</em></a>,
+something we’ve have been working on for some time. I want to
+set expectations appropriately. yk is alpha-stage software: it’s not production ready,
+though it’s some way beyond a hacky research prototype in breadth and
+quality. You can quite easily hit <code>TODO</code>s that halt the program, or encounter
+missing parts where execution continues suboptimally; we only have a subset
+of the optimisations we’d like; only an x64 is currently implemented; and we don’t yet have the breadth of
+languages and benchmarks that one would need to draw strong conclusions about
+performance.</p>
+<p>That said, you can already see some interesting results. <em>Seeing</em> programming
+language performance is quite hard, but this video might give you an idea.
+First, we run a Mandelbrot program through the reference <a href="https://lua.org/download.html">PUC Lua
+VM</a> and then through
+<a href="https://github.com/ykjit/yklua">yklua</a>, our fork of PUC Lua with
+an automatically derived JIT compiler:</p>
+<p><video controls=""><source src="/laurie/blog/extra/2026/retrofitting_jit_compilers/mandelbrot_lua.mp4" type="video/mp4"/><a href="https://hamy.xyz/laurie/blog/extra/2026/retrofitting_jit_compilers/mandelbrot_lua.mp4">[Video]</a></video></p>
+<p>I must confess that I have cherry picked an example
+where we get better-than-average performance. Rather than the ~4x improvement
+in the video above, on <a href="https://github.com/ykjit/yk-benchmarks">our Lua benchmark suite</a> so far a more
+realistic geometric mean is a little under 2x. Small benchmarks inevitably flatter the sorts of techniques
+I’ll be talking about, so “real” programs will on average see less than that.</p>
+<p>What might surprise you is that we only added about 400LoC to PUC Lua, and changed
+under 50LoC. This hopefully makes the trade-off yk offers clear: yklua does
+not reach the performance peaks of the wonderful, carefully hand-written,
+LuaJIT; but LuaJIT is stuck in the 13 year old past of Lua 5.1,
+whereas yklua trivially tracks updates to PUC Lua. The point of this post isn’t
+to tell you that one side or the other of this trade-off is best. Rather, it’s
+to show that the trade-off exists, and that yk fills in a part of the design
+space that was largely out of bounds before.</p>
+<p>There’s also nothing inherently Lua specific about yk. Alongside various smaller
+implementations, recently we’ve put a few days effort into adjusting
+<a href="https://micropython.org/">MicroPython</a> leading to – you might spot a naming
+pattern here – <a href="https://github.com/ykjit/ykmicropython/">ykmicropython</a>. The
+MicroPython interpreter uses some idioms that we have yet to support, and any
+benchmark which encounters one of those currently has terrible performance. But
+if you have a program which doesn’t hit many of those parts you can
+already see a meaningful performance improvement. The Mandelbrot
+benchmark isn’t where ykmicropython performs best, but it’s still good enough
+to see a difference (“normal” MicroPython top, ykmicropython bottom):</p>
+<p><video controls=""><source src="/laurie/blog/extra/2026/retrofitting_jit_compilers/mandelbrot_micropython.mp4" type="video/mp4"/><a href="https://hamy.xyz/laurie/blog/extra/2026/retrofitting_jit_compilers/mandelbrot_micropython.mp4">[Video]</a></video></p>
+<p>Eventually, my hope is that if you have a C interpreter, big or small, yk will
+allow you to add a JIT to it for little effort, gaining additional performance
+for free.</p>
+<p>In this post I’ll explain why we created yk, why it works
+the way it does, and some of the technical challenges involved. Despite
+the length of this post, I won’t come close to covering everything I
+arguably should, and I’ll inevitably simplify much of what I do cover. Future posts will
+hopefully fill in more details, add nuance, and track yk’s evolution.</p>
+<p>I want to thank Shopify and the Royal Academy of Engineering, who together generously
+funded the underlying research. I am immensely grateful to both, though of course
+I speak for neither organisation! The work I’m presenting in this post is a
+joint effort with <a href="https://www.eddbarrett.co.uk/">Edd Barrett</a>, <a href="https://diekmann.uk/">Lukas
+Diekmann</a>, and <a href="https://p3ld3v.dev/">Pavel Durov</a>. I want to dedicate this work
+to the late Chris Seaton, who was an early champion of yk when it was no
+more than a tiny demo: he is much missed by those of us who considered him a
+friend.</p>
+<h2><a name="why_are_jit_compilers_hard"></a>Why are JIT compilers hard?</h2>
+<p>Many programming languages are implemented as
+<a href="https://hamy.xyz/laurie/blog/2023/distinguishing_an_interpreter_from_a_compiler.html">interpreters</a>.
+This is the most common approach for dynamically typed languages, but is also
+true of a surprising number of other languages, from CPU simulators to domain
+specific languages. Interpreters are simple to write, but do not have great
+performance.</p>
+<p>It is therefore common to add a Just-In-Time (JIT) compiler to interpreters. The
+fundamental thesis of JIT compilation is that the way a program executed in
+the near past is indicative of how it will execute in the future. JIT compilers
+thus <em>speculatively optimise</em> a program; whilst the speculations hold, performance
+is good; if the speculations fail to hold, performance will (possibly temporarily) decrease.</p>
+<p>JIT compilers therefore observe a running program, identify the <em>hot</em> (i.e.
+most frequently executed) parts and some surrounding context (e.g. the types of
+objects used), extract and optimise those, and compile them to machine code
+(henceforth “JITed code”). The JIT-compiled code can then be run in place of
+the interpreter.</p>
+<p>JIT compilers are difficult and expensive to create. Most obviously, they have
+<em>lots</em> of delicate, moving parts, and JIT compiler authors need to be expert in
+multiple domains. Minor mistakes can lead to days of frustrating debugging;
+architectural mistakes can take years to undo. Over a decade ago, someone who
+knew more than me estimated that
+<a href="https://en.wikipedia.org/wiki/HotSpot">HotSpot</a> (aka “the JVM” i.e. the
+standard Java VM) had already consumed well over 1,000 person years of effort.
+V8, the JavaScript JIT compiling VM in Chrome, has had a large team working on
+it for many years.</p>
+<p>Less obviously, because of their complexity, JIT compilers can be difficult to evolve.
+Even if one creates a fully compatible JIT compiler for a given version of a
+language, the blighters in control of the language specification are bound to
+extend or alter the language. It’s quite easy for changes in the language to
+break assumptions embedded deep within a JIT compiler, causing the latter to lag
+behind the language specification. Eventually, “lag” has
+a tendency to turn into “will never catch up”, which tends to be the beginning
+of irrelevance.</p>
+<p>JIT compilers also make achieving full – and I mean “full”! –
+compatibility difficult. Often it is necessary to create a new VM in order to
+create the best possible JIT compiler. However, doing so almost inevitably
+means foregoing full compatibility. The new VM might not be able to interface
+with existing extension modules; it might run finalisers at slightly different
+points in time; not implement every last function in the standard library; and
+so on. If a user tries a new VM and their software doesn’t work out of the box,
+not only will they not experiment further, but they will often resolve never to
+waste time on that VM again.</p>
+<p>Perhaps the best evidence for how hard JIT compilers are to create is simply to
+enumerate the publicly known JIT compilers for Python include Cinder, IronPython, Jython,
+Nuitka, Psyco, Pyjion, PyPy, Pyston, S6, Shed Skin, Skybison, Starkiller, TrufflePython,
+Unladen Swallow, WPython, and Zippy. Few of these are still active, despite
+the skilled people involved, and the desires and hopes of many users.</p>
+<h2><a name="automatic_jit_compilers"></a>Automatic JIT compilers</h2>
+<p>We could bypass most of the problems I’ve noted above if we could somehow
+automatically create JIT compilers. There are two main approaches to automatically creating JIT
+compilers from interpreters, with those two approaches exemplified by two
+systems: meta-tracing in <a href="https://rpython.readthedocs.io/en/latest/">RPython</a>
+(which is part of the PyPy project); and (a form of) partial evaluation in
+<a href="https://www.graalvm.org/latest/graalvm-as-a-platform/language-implementation-framework/">Truffle</a>.</p>
+<p>RPython and Truffle are brilliant technical achievements: I remain in awe
+of both projects. They can, in different ways and with different trade-offs,
+create astonishingly high-performance JIT compilers from interpreters.</p>
+<p>There is, however, a catch: both systems require you to create a <em>new</em>
+interpreter. They thus run into the almost-but-not-quite-compatible challenge I
+mentioned earlier. Perhaps because of this, neither system has seen the
+widespread use that their excellent performance would suggest they should.</p>
+<h2><a name="deriving_a_jit_compiler_from_c_interpreters"></a>Deriving a JIT compiler from C interpreters</h2>
+<p>While most of the languages we’re interested in optimising
+have an English specification, users tend to take what the reference interpreter
+does as the specification. From the perspective of a language lawyer, users are clearly wrong to
+do so, but few users know that language lawyers even exist — they mostly care about
+completing the task at hand!</p>
+<p>What this means is so obvious that I did not fully internalise it for many
+years: for many languages, the C interpreter <em>is</em> the source of truth for the language.
+Rightly or wrongly, any
+implementation which deviates from that source of truth, even in minor ways, will
+be unacceptable to most users.</p>
+<p>This means that RPython and Truffle, wonderful though they are, leave an
+important gap in the design space. When I eventually woke up to that
+reality, the question we needed to answer became obvious: is it
+possible to automatically derive a JIT compiler from a C interpreter? If we
+could do so, we could avoid the compatibility issues that prevent many users
+from using faster language implementations.</p>
+<p>Other people have had, at least to some degree, similar thoughts and
+there is a small body of work sharing the same aim, notably <a href="https://ieeexplore.ieee.org/document/1342540">this often forgotten
+paper</a> and the later
+<a href="https://en.wikipedia.org/wiki/Copy-and-patch">copy-and-patch</a>. Putting
+aside the (sometimes large) amount of manual work these approaches require,
+their basic aim is to JIT compile an interpreter’s core
+interpreter loop. This is a worthwhile thing to do, but many programs spend
+much of their time outside of that loop. For example, basic functionality
+like “is object o1 <code>==</code> o2?” is often deferred to functions outside of the core
+loop. In my opinion, if you want to get good performance, you have to be able
+to inline code far beyond the core interpreter loop.</p>
+<p>Ultimately, at least in my pea brain, there is then only one technique that can
+realistically achieve the aim we want: meta-tracing. And,
+indeed, that’s exactly what yk does: it meta-traces C interpreters. That’s why
+we could take in the normal C Lua VM, add a few lines of code, and have it
+become a JIT compiler.</p>
+<p>However “meta-tracing for C” is a far harder thing than that simple phrase
+suggests. Put bluntly, it’s very close to trying to ram a square peg into a
+round hole, which is why more than one person I’ve met has suggested, mostly
+politely, that it’s never going to work. Indeed, we’ve had to solve all sorts
+of problems, big and small, to make this a practical reality.</p>
+<h2><a name="tracing_and_metatracing"></a>Tracing and meta-tracing</h2>
+<p>Meta-tracing is a surprisingly challenging technique to explain, but
+I’ll do my best. First let’s reuse terminology that I think came from
+Truffle: a <em>host</em> language is the one we write interpreters in (e.g. C); a <em>guest</em>
+language is the language being implemented (e.g. Lua, Ruby, your favourite CPU
+simulator, etc).</p>
+<h3><a name="tracing"></a>Tracing</h3>
+<p>Let’s start briefly by looking at (non-meta) tracing JIT compilation. Such a
+system looks for <em>hot loops</em> (e.g. <code>for</code> or <code>while</code> loops) in a guest program.
+When it encounters one, it then <em>traces</em> (i.e. records) the execution of the
+next iteration of the loop, optimises it, and compiles it into machine code.
+When the interpreter next comes to execute that loop, it hands execution over to
+the JIT-compiled code.</p>
+<p>For example, imagine I have this guest language program:</p>
+<pre><span>for</span><span> x </span><span>in </span><span>... </span><span>do
+</span><span>  </span><span>if</span><span> x &gt; </span><span>0 </span><span>then
+</span><span>    y = y + </span><span>3
+</span><span>  </span><span>end
+</span><span>end
+</span></pre>
+<p>and the <code>for</code> loop has become hot enough to trace. Let’s assume that in the
+particular iteration that was traced <code>x</code> had a concrete value greater than 0.
+The resulting trace might look roughly as follows:</p>
+<pre><span>OP_LOOKUP(&#34;x&#34;)
+</span><span>guard true, pop() &gt; 0
+</span><span>OP_LOOKUP(&#34;y&#34;)
+</span><span>OP_INT(3)
+</span><span>OP_ADD
+</span><span>OP_SET(&#34;y&#34;)
+</span></pre>
+<p>The trace is, mostly, a record of the guest language operations (“opcodes” or
+“bytecodes”) that were executed. We can then JIT compile the trace above into machine
+code and use it in place of the interpreter.</p>
+<p>There is, however, one obvious oddity in the trace. When we executed the <code>for</code>
+loop, <code>x &gt; 0</code> evaluated to true, and we thus executed the true branch of the
+<code>if</code> statement. You can clearly see <code>y = y + 3</code> in the above fragment but the
+<code>if</code> has become a <code>guard</code>. Formally speaking, we say a trace linearises control
+flow. In plain English, a trace records only one an <code>if</code> statement’s <code>true</code> or
+<code>false</code> branches, not both.</p>
+<p>What that means is that a trace only records a subset of a program’s behaviour:
+at some point, an execution of the trace might need to move beyond that
+subset. Guards record the points when this can happen: if a guard fails, the
+rest of the trace is invalid. When that happens, the JIT-compiled code must
+<em>deoptimise</em> back to the interpreter.</p>
+<p>We can thus immediately see a fundamental difference between tracing JIT compilers
+and the more common “method-based” JIT compilers. In the latter, one is looking
+for functions that execute frequently. When such a function is found, it is
+compiled (at run-time!) in much the same way that a traditional ahead-of-time
+compiler like gcc/clang would compile a function. In other words, method-based
+JIT compilers produce code which captures far more of a program’s behaviour than a trace-based compiler.</p>
+<p>Some readers with long memories will remember that the first JavaScript JIT
+compiler in Firefox was TraceMonkey. As its name suggest, it was a tracing JIT
+compiler for JavaScript, but its performance track
+record was uneven, and after 2 or 3 years it was replaced by a method-based
+JIT compiler. This experience has led a number of people over the years to declare that
+tracing JIT compilers are inferior in all ways.</p>
+<p>My view is more nuanced. If you’ve got enough time, enough
+money, and a green field, method-based JIT compilers are almost certainly going
+to be superior in the general case. If you lack any of those three factors, the
+right technical choice might be different. yk is explicitly aimed at the case
+where you lack a green field.</p>
+<h3><a name="metatracing"></a>Meta-tracing</h3>
+<p>How does meta-tracing differ from tracing? A tracing JIT compiler is
+specialised to a particular guest language, and contains a hand-written trace
+recorder, a hand-written optimiser, and a hand-written code generator. A
+meta-tracing system says “hand me an interpreter for your favourite guest
+language and I will do the rest for you”. It does that by recording what the
+host language interpreter is doing while executing the guest language.</p>
+<p>For example if I have a C interpreter along these lines:</p>
+<pre><span>Instruction *code = ...;
+</span><span>int</span><span> pc = </span><span>0</span><span>;
+</span><span>Value **stack = ...;
+</span><span>while </span><span>(</span><span>true</span><span>) {
+</span><span>  Instruction i = code[pc];
+</span><span>  </span><span>switch </span><span>(</span><span>GET_OPCODE</span><span>(i)) {
+</span><span>    </span><span>case</span><span> OP_LOOKUP: </span><span>push</span><span>(</span><span>lookup</span><span>(</span><span>GET_OPVAL</span><span>())); pc++; </span><span>break</span><span>;
+</span><span>    </span><span>case</span><span> OP_ADD: </span><span>push</span><span>(</span><span>pop</span><span>() + </span><span>pop</span><span>()); pc++; </span><span>break</span><span>;
+</span><span>    </span><span>case</span><span> OP_JGT:
+</span><span>      </span><span>if </span><span>(</span><span>pop</span><span>() &gt; </span><span>0</span><span>) pc++; </span><span>else</span><span> pc += </span><span>GET_OPVAL</span><span>(i);
+</span><span>      </span><span>break</span><span>;
+</span><span>    </span><span>case </span><span>...: ...
+</span><span>  }
+</span><span>}
+</span></pre>
+<p>then my guest language fragment from earlier will lead to a trace along the
+following lines:</p>
+<pre><span>push(lookup(&#34;x&#34;)); pc++;
+</span><span>guard true, pop() &gt; 0; pc++;
+</span><span>push(lookup(&#34;y&#34;)); pc++;
+</span><span>push(3); pc++;
+</span><span>push(pop() + pop()); pc++;
+</span><span>set(&#34;y&#34;, pop()); pc++;
+</span></pre>
+<p>As this might suggest, we have recorded the code the host-language interpreter
+executed while it was itself running the guest program. The (meta-)trace we see
+here is thus a trace of the C interpreter’s actions. That trace was
+automatically constructed by the meta-tracer; it can then be passed to the
+meta-tracing systems optimiser and code generator. In other words, meta-tracing
+automates what must be hand-written in a (non-meta) tracing JIT compiler.</p>
+<p>There’s one additional factor that’s worth highlighting about meta-tracing: it
+naturally, and aggressively, inlines into function calls. In other words rather
+than recording <code>push(...)</code> the trace will record the contents of <code>push</code> so the
+trace will look more like:</p>
+<pre><span>guard true, *used &lt; *capacity;
+</span><span>storage[*used] = elem;
+</span><span>*used += 1;
+</span></pre>
+<p>This ability to inline is a fundamental part of meta-tracing’s strengths, and why
+yk is different than previous approaches to speeding up C interpreters.</p>
+<h2><a name="from_a_c_interpreter_to_a_metatracing_interpreter"></a>From a C interpreter to a meta-tracing interpreter</h2>
+<p>Now we’ve seen the high-level idea of meta-tracing, the next question is: how
+does yk convert a C interpreter into a meta-tracing-compatible interpreter? The
+first key part is that we use a fork of LLVM called – wait for it –
+<a href="https://github.com/ykjit/ykllvm">ykllvm</a> which must be used to compile the
+interpreter. At a basic level this just requires changing <code>cc</code> and <code>ld</code> in the
+interpreter’s <code>Makefile</code> to:</p>
+<pre><span>‘yk-config release --cc‘ -o vm.o vm.c
+</span><span>‘yk-config release --ldflags‘ -o vm vm.o
+</span></pre>
+<p>At a deeper level, ykllvm is doing three main things: adding the ability to
+record a trace; serialising IR so that the interpreter can be reconstructed
+after trace recording; and making deoptimisation possible. We’ll look at
+the last of these later: let’s start with the first two.</p>
+<p>When we’ve detected a hot loop at the guest language level, we need a way to
+record what actions the interpreter takes. There are various ways one could
+do this, but the one we use now is to insert calls to a
+function <code>__yk_trace_basicblock(id)</code> in every <em>basic block</em>: roughly speaking,
+this can be thought of as “at every point there’s an <code>if</code> or equivalent”. We
+give every basic block a unique ID.</p>
+<p>After an interpreter has run through ykllvm it is compiled in a way that is
+roughly equivalent to the following:</p>
+<pre><span>Instruction *code = ...;
+</span><span>int</span><span> pc = </span><span>0</span><span>;
+</span><span>Value **stack = ...;
+</span><span>while </span><span>(</span><span>true</span><span>) {
+</span><span>  </span><span>__yk_tracebasicblock</span><span>(</span><span>0</span><span>);
+</span><span>  Instruction i = code[pc];
+</span><span>  </span><span>switch </span><span>(</span><span>GET_OPCODE</span><span>(i)) {
+</span><span>    </span><span>case</span><span> OP_LOOKUP:
+</span><span>      </span><span>__yk_tracebasicblock</span><span>(</span><span>1</span><span>);
+</span><span>      </span><span>push</span><span>(</span><span>lookup</span><span>(</span><span>GET_OPVAL</span><span>()));
+</span><span>      pc++; </span><span>break</span><span>;
+</span><span>    </span><span>case</span><span> OP_ADD:
+</span><span>      </span><span>__yk_tracebasicblock</span><span>(</span><span>2</span><span>);
+</span><span>      </span><span>push</span><span>(</span><span>pop</span><span>() + </span><span>pop</span><span>());
+</span><span>      pc++; </span><span>break</span><span>;
+</span><span>    </span><span>case</span><span> OP_JGT:
+</span><span>      </span><span>__yk_tracebasicblock</span><span>(</span><span>2</span><span>);
+</span><span>      </span><span>if </span><span>(</span><span>pop</span><span>() &gt; </span><span>0</span><span>) {
+</span><span>        </span><span>__yk_tracebasicblock</span><span>(</span><span>3</span><span>);
+</span><span>        pc++; 
+</span><span>      } </span><span>else </span><span>{
+</span><span>        </span><span>__yk_tracebasicblock</span><span>(</span><span>4</span><span>);
+</span><span>        pc += </span><span>GET_OPVAL</span><span>(i);
+</span><span>      }
+</span><span>      </span><span>break</span><span>;
+</span><span>    </span><span>case </span><span>...: ...
+</span><span>  }
+</span><span>}
+</span></pre>
+<p>When a trace is recorded we’ll end up with a sequence along the lines of <code>[0, 1, 0, 1, 0, 2, ...]</code> as a representation of the guest program executing
+<code>OP_LOOKUP; OP_LOOKUP; OP_ADD</code>.</p>
+<p>When we’ve got that sequence of basic block IDs we then need to reconstruct
+ykllvm’s view of the interpreter’s IR (Intermediate Representation). Roughly
+speaking, this can be thought of as a tree / graph representation of the
+interpreter that ykllvm built up whilst compiling it. If we take a chunk of
+LLVM’s “normal” IR for yklua and represent it textually we get:</p>
+<pre><span>359:                                              ; preds = %341
+</span><span>  %360 = load ptr, ptr %355, align 8, !tbaa !11
+</span><span>  %361 = load ptr, ptr %352, align 8, !tbaa !11
+</span><span>  %362 = call ptr @luaH_getshortstr(ptr noundef %361, ptr noundef %360) #18
+</span><span>  %363 = getelementptr inbounds nuw i8, ptr %362, i64
+</span><span>  %364 = load i8, ptr %363, align 8, !tbaa !9
+</span><span>  %365 = and i8 %364, 15
+</span><span>  %366 = icmp eq i8 %365, 0
+</span><span>  br i1 %366, label %371, label %367
+</span><span>367:                                              ; preds = %359
+</span><span>  %368 = load i64, ptr %362, align 8, !tbaa !11
+</span><span>  store i64 %368, ptr %345, align 8, !tbaa !11
+</span><span>  %369 = load i8, ptr %363, align 8, !tbaa !9
+</span><span>  %370 = getelementptr inbounds nuw i8, ptr %345, i64 8
+</span><span>  store i8 %369, ptr %370, align 8, !tbaa !9
+</span><span>  br label %3329
+</span><span>371:                                              ; preds = %341, %359
+</span><span>  %372 = phi ptr [ %362, %359 ], [ null, %341 ]
+</span><span>  store ptr %203, ptr %171, align 8, !tbaa !11
+</span><span>  %373 = load ptr, ptr %172, align 8, !tbaa !11
+</span><span>  store ptr %373, ptr %13, align 8, !tbaa !11
+</span><span>  call void @luaV_finishget(ptr noundef nonnull %0, ptr noundef nonnull %352, ptr noundef %355, ptr noundef %345, ptr noundef %372)
+</span><span>  %374 = load volatile i32, ptr %173, align 8, !tbaa !11
+</span><span>  br label %3329
+</span></pre>
+<p>ykllvm converts that to a slightly different IR: we tweak a few things (e.g.
+the fearsomely complicated <code>getelementptr</code> instruction is split into
+easier-to-handle variants) and add <code>safepoint</code>s (we’ll come back to those
+later):</p>
+<pre><span>bb47:
+</span><span>  %47_0: ptr = ptr_add %46_2, 8
+</span><span>  %47_1: i8 = load %47_0
+</span><span>  %47_2: i8 = and %47_1, 15i8
+</span><span>  %47_3: i1 = eq %47_2, 0i8
+</span><span>  condbr %47_3, bb49, bb48 [safepoint: 396i64, (%0_0, %0_2, %0_5, %0_6, ...
+</span><span>bb48:
+</span><span>  %48_0: i64 = load %46_2
+</span><span>  *%45_3 = %48_0
+</span><span>  %48_2: i8 = load %47_0
+</span><span>  %48_3: ptr = ptr_add %45_3, 8
+</span><span>  *%48_3 = %48_2
+</span><span>  br bb812
+</span><span>bb49:
+</span><span>  %49_0: ptr = phi bb47 -&gt; %46_2, bb45 -&gt; 0x0
+</span><span>  *%6_10 = %29_0
+</span><span>  %49_2: ptr = load %11_5
+</span><span>  *%0_21 = %49_2
+</span><span>  call luaV_finishget(%0_0, %45_10, %45_13, %45_3, %49_0) [safepoint: 397i64, ...
+</span><span>  br bb50
+</span></pre>
+<p>This “ykllvm IR” is then serialised (i.e. converted into a moderately efficient
+sequence of bytes) and placed in a special section in the binary alongside the
+“normally compiled” C code. When a trace is recorded, we can then map basic
+block IDs (e.g. <code>47</code>) to a fragment in ykllvm IR, stitch all those fragments
+together, optimise, and compile them. As this might suggest, although I’ve
+framed this post in terms of “meta-tracing C interpreters”, arguably what we’re
+really doing is better described as meta-tracing (a view of) LLVM IR.</p>
+<h2><a name="optimising_a_trace"></a>Optimising a trace</h2>
+<p>Just stitching together a trace of recorded basic blocks and compiling them
+into machine code gives at best moderate performance gains. Indeed, in yk the
+situation would be worse than in previous approaches because of things like
+<code>__yk_trace_basicblock</code>, which frustrate some static optimisations in LLVM!</p>
+<p>What we need to do is optimise the
+traces. yk has several traditional compiler optimisations built in.
+For example constant folding allows us to take a trace like this:</p>
+<pre><span>%7: i8 = 8
+</span><span>%8: i8 = 7
+</span><span>%9: i8 = add %7, %8
+</span><span>call print(%9)
+</span></pre>
+<p>and optimise it to:</p>
+<pre><span>%9: i8 = 15
+</span><span>call print(%9)
+</span></pre>
+<p>Dead load / store analysis allows us to take a trace such as:</p>
+<pre><span>%8: ptr = ...
+</span><span>%9: i8 = ...
+</span><span>store %9, %8 ; store the value of %9 to the pointer in %8
+</span><span>%11: i8 = load %8
+</span><span>call print(%11)
+</span></pre>
+<p>and optimise it to:</p>
+<pre><span>%8: ptr = ...
+</span><span>%9: i8 = ...
+</span><span>store %9, %8
+</span><span>call print(%9)
+</span></pre>
+<p>and so on.</p>
+<h3><a name="helping_the_optimiser"></a>Helping the optimiser</h3>
+<p>The optimisations above are effective and fast to run — but on a normal
+interpreter, they only have a moderate effect. The fundamental reason for
+that is that a C interpreter is an arbitrary program and yk’s optimiser
+often either can’t soundly optimise parts of it, or isn’t sure that doing so will be
+worth it.</p>
+<p>Fortunately, interpreter authors have additional knowledge that can hugely help
+the optimiser. Sometimes that knowledge is more about the guest language (e.g.
+a function’s opcodes are immutable) and sometimes it is more about the
+interpreter (e.g. that a seemingly unbounded loop will in fact only run a small
+number of times).</p>
+<p>Crucially, none of this knowledge is directly expressed in the C code. What we
+need is a way for the interpreter author to pass this extra knowledge to yk so
+that its optimiser can take advantage of it. Fortunately, RPython has done a
+lot of the intellectual heavy lifting in this regard, and we can reuse many of
+its concepts. Surprisingly, adding or tweaking just a few lines of C code
+can lead to significant performance improvements in JIT-compiled code. In order
+to understand why, I’ll dive into detail about two of the major optimisation
+features that yk offers interpreter authors.</p>
+<h4><a name="promotion"></a>Promotion</h4>
+<p>Let’s start with one of the core features, <em>promotion</em>, which takes a run-time value
+and “burns it into” a trace as a constant, and an associated
+guard (to ensure that if the value changes on subsequent execution,
+deoptimisation occurs, and execution is still correct).</p>
+<p>yk exposes promotion as a C function <code>yk_promote</code>. In normal use, this is
+just the identity function, but when a trace is being recorded, <code>yk_promote</code>
+copies the value passed to it into a buffer: in the compiled trace, the call to
+<code>yk_promote</code> will be replaced with the associated constant.</p>
+<p>For example, in our C interpreter from earlier we might implement <code>OP_INT(x)</code>
+which pushes a constant integer (sometimes called an “immediate”) onto the
+stack as follows:</p>
+<pre><span>...
+</span><span>case</span><span> OP_INT: </span><span>push</span><span>(</span><span>yk_promote</span><span>(constant_pool[</span><span>GET_OPVAL</span><span>(i)])); pc++; </span><span>break</span><span>;
+</span></pre>
+<p>Without the <code>yk_promote</code> the trace for <code>OP_ADD(3)</code> might look roughly as follows:</p>
+<pre><span>tmp = constant_pool[i &amp; 8]
+</span><span>push(tmp)
+</span></pre>
+<p>With <code>yk_promote</code> it will become:</p>
+<pre><span>tmp = constant_pool[i &amp; 8]
+</span><span>guard true, tmp == 3
+</span><span>push(3)
+</span></pre>
+<p>The bad news is that we’ve had to insert a <code>guard</code> (in case the speculation
+turns out not to hold) but the good news is that after that guard we know for
+sure that <code>tmp</code> is the constant 3, rather than some unknown value. That means – if
+I hand-wave a bit, because if I went into full detail we’d be here for hours –
+that when we see a sequence such as:</p>
+<pre><span>tmp = constant_pool[i &amp; 8]
+</span><span>guard true, tmp == 3
+</span><span>push(3)
+</span><span>pc += 1
+</span><span>i = code[pc]
+</span><span>tmp = constant_pool[i &amp; 8]
+</span><span>guard true, tmp == 4
+</span><span>push(4)
+</span><span>push(pop() + pop())
+</span></pre>
+<p>we can optimise that last instruction into <code>push(7)</code> without even looking at
+the stack (though we will have to ensure that the <code>used</code> portion of the stack
+is adjusted appropriately). Doing so not only removes some instructions (<code>pop</code>
+must do a <code>load</code> at the very least) but makes it possible for us to generate
+better machine code.</p>
+<h4><a name="idempotent_functions"></a>Idempotent functions</h4>
+<p>As you might have guessed from the example above, <code>yk_promote</code> isn’t
+enough on its own to make a big dent in performance. Happily, though, we can
+combine it with another feature to make what is perhaps the single biggest
+individual optimisation for a yk interpreter: exposing that opcodes
+are immutable.</p>
+<p>The additional tool we need is a way of expressing <em>idempotent</em> functions: that
+is, functions that always return the same output given the same input. yk
+allows this to be expressed with the <code>yk_idempotent</code> function annotation.
+Cast your mind back to the C interpreter from earlier and this line:</p>
+<pre><span>Instruction i = code[pc];
+</span></pre>
+<p>Let’s assume that for a given <code>pc</code>, we always return the same <code>Instruction</code>
+(e.g. “at pc 4 you will always see OP_ADD”). We then change this line to
+be a function call:</p>
+<pre><span>Instruction i = </span><span>load_inst</span><span>(</span><span>yk_promote</span><span>(code + pc));
+</span></pre>
+<p>and then add the function <code>load_inst</code> with the appropriate <code>yk_idempotent</code> annotation:</p>
+<pre><span>__attribute__</span><span>((yk_idempotent))
+</span><span>Instruction </span><span>load_inst</span><span>(Instruction *</span><span>pc</span><span>) {
+</span><span>  </span><span>return </span><span>*pc;
+</span><span>}
+</span></pre>
+<p>During recording trace, yk will record the value that <code>load_inst</code> returned. If the trace
+optimiser can prove that <code>load_inst</code> was called with a constant value (e.g.
+because of <code>yk_promote</code>), it will then remove the call to <code>load_inst</code> and
+replace it with that return value. In other words if <code>load_inst(0x1234)</code>
+returns <code>0b01110111</code> then in a trace we will simply see that latter constant.</p>
+<p>The obvious advantage of this is that we have removed the load of the
+opcode entirely, but what we’ve really done is open the floodgates for
+yk’s optimiser to do its thing on instruction decoding. For example if
+<code>GET_OPVAL</code> is:</p>
+<pre><span>#define </span><span>GET_OPVAL</span><span>(</span><span>i</span><span>) ((i &amp; 0b11110000) &gt;&gt; </span><span>4</span><span>)
+</span></pre>
+<p>then yk, knowing that <code>i</code> is <code>0b01110111</code>, will then optimise <code>GET_OPVAL(i)</code> to
+<code>0b0111</code>. As this suggests, optimisations tend to accumulate, particularly in
+the context of tracing interpreter loops: proving that something is constant
+often allows other things further down the trace to be optimised too.</p>
+<p>The good news doesn’t stop there. Since we had to promote <code>pc</code>, calculations
+like <code>pc += GET_OPVAL(i)</code> optimise to a constant address; and that allows us to
+remove most guards based on them (which we can now trivially prove are true).</p>
+<p>In other words, by simply breaking out <code>load_inst</code> and declaring it idempotent
+– a diff of less than 10 lines in yklua – we are able to remove nearly all
+instructions relating to instruction decoding, as well as several knock-on
+operations. Individually each operation that’s optimised away is small, and
+very fast to run, but when enough of them are optimised away there’s a big
+effect. In yklua, removing the <code>yk_idempotent</code> annotation slows things down by
+around 4x!</p>
+<h3><a name="other_optimisations"></a>Other optimisations</h3>
+<p>yk provides other optimisations. For example, by default yk
+does not inline host-language functions which contain loops into a trace: annotating
+functions with <code>yk_unroll</code> tells yk to inline these functions, unrolling the
+loops they contain. This is always semantically correct, but generally
+dangerous for performance (how often does a loop go around?) — except in
+cases where you know that the loop will go around a small, constant or
+near-constant number of times. A classic example of this is a function
+in an interpreter which unpacks function arguments: guest language functions
+tend to have a fixed number of parameters. The argument unpacking function
+tends to be a good candidate for <code>yk_unroll</code>.</p>
+<p>However, rather than going through all the possible optimisations, what I hope you’re starting to
+realise from my description is that there is quite a lot of low-hanging fruit
+in many C interpreters that can help yk. Indeed, nearly all the performance
+gains I showed at the start of this post result from basic tweaks to the
+interpreter (a few <code>yk_promote</code>s, a couple of <code>yk_idempotent</code>s, and several
+<code>yk_unroll</code>s and so on).</p>
+<p>An open question is how much more benefit can one get? My intuition is: quite a
+lot, but it will be highly dependent on how invasive the changes you’re willing
+to make are.</p>
+<p>At the trivial end of things are simple refactorings that make the interpreter
+more yk friendly. For example, sometimes a very large, important, function has
+a single (unbounded) loop in it: moving that loop into its own function makes
+the larger function inlineable. More difficult – though heavily dependent on
+the interpreter – would be to add <a href="https://bibliography.selflanguage.org/_static/implementation.pdf">Self-style
+maps</a>, which
+would open up a lot of opportunities for yk’s optimiser.</p>
+<h2><a name="backwards_code_generation"></a>Backwards code generation</h2>
+<p>yk is big enough, complex enough, and with enough novelty that, wherever
+possible, we’ve tried to filch good ideas from elsewhere. One idea we’ve
+recently made use of comes from LuaJIT: yk generates machine code by traversing
+the trace in reverse. This turns out to allow us to generate better code, more
+quickly, and to do so with less implementation complexity. Since, as far as I
+know, yk is only the second system to do this, it’s worth giving an overview of
+what the advantages of doing so are.</p>
+<p>For example, given a trace such as:</p>
+<pre><span>%5: i8 = load %4
+</span><span>%6: i8 = load %4
+</span><span>%7: i8 = add %5, %6
+</span></pre>
+<p>yk generates the (say) x64 code for <code>add</code> first, and only then for the two
+<code>load</code>s. There are two main reasons for doing this: simple register allocation;
+and implicit dead code elimination.</p>
+<p>Register allocation sounds like it should be a simple thing for a compiler, and
+in some ways it is. We have variables (e.g. the <code>%x</code> variables in traces) and
+we assign them to registers in the CPU (e.g. <code>rax</code>). When we run out of
+registers (of which there are typically few, commonly 16 on modern CPUs), we
+put variables on the stack (which is near-infinite in size). Unfortunately,
+done naively, too many variables end up on the stack and performance tanks.</p>
+<p>As that might suggest, good register allocation isn’t simple. Indeed, so
+challenging are the trade-offs between “generate code that runs fast enough”
+and “don’t make an unusably slow compiler” that register allocation has been an
+active research topic for decades. Summarising the reasons for that succinctly
+is hard, but the basic problem is that you need to look arbitrarily far
+backwards and forwards in a program to do good register allocation, and that’s
+difficult and expensive for programs with complex control flow.</p>
+<p>Fortunately, in tracing compilers, LuaJIT shows that we can do something
+completely different: backwards code generation. In normal forwards code
+generation, one assigns a fairly arbitrary register to a variable
+and hopes that will prove to be a good choice for later parts of the trace. In
+backwards code generation, one assigns a register to a variable knowing that
+it’s a good choice now, and leaves it up to “earlier” code to adjust as
+necessary. Those two choices might sound equivalent, but they’re not.</p>
+<p>For quite a while, yk did forwards code generation. The register allocator was
+fiddly and fragile, and in order to make it generate even vaguely good code, we had to
+have an initial backwards pass that calculated the lifetime of variables and also,
+where appropriate, “this variable will definitely need to
+end up in <code>rdi</code> later” and so on.</p>
+<p>That we had to have an initial backwards pass was, eventually, the clue for me
+to consider adopting LuaJIT’s approach. I must admit that at first I found
+backwards code generation made my head hurt: forwards code generation is far
+more intuitive. But, once I’d got used to the idea, the eventual
+<a href="https://github.com/ykjit/yk/blob/master/ykrt/src/compile/j2/regalloc.rs">register
+allocator</a>
+became relatively simple to work with. Crucially, it’s easy to use, faster to run, and generates far better code than forwards code
+generation.</p>
+<p>I also mentioned above that backwards code generation implicitly does dead code
+elimination. When a platform backend asks what register variable <code>%7</code> should be
+in, it is implicitly saying “<code>%7</code> will be used later in the trace”. We record
+that using a single bit. That means that we no longer need to work out <code>%7</code>s
+lifetime: we find it implicitly upon our first encounter (which, given this is
+backwards code generation, is its last use). Then, when we come to process <code>%7</code>
+we say “is this variable constructed using side effects?” (if so we must
+generate code for it) or “if it doesn’t have side effects, is it used later in
+the trace?”. That latter condition <em>is</em> dead code elimination. All in all, dead
+code elimination is fewer than 10LoC.</p>
+<p>The reason I’m highlighting this is because traces end up with quite a lot of
+dead code, whether due to trace optimisation or platform specific code generation tricks.
+For example, consider this trace:</p>
+<pre><span>%2: ptr = ...
+</span><span>%3: ptradd %2, 8
+</span><span>%4: load %3
+</span></pre>
+<p>On x64 yk this will generate the following x64 code:</p>
+<pre><span>; %2: ptr = ...
+</span><span>mov rax, ...
+</span><span>; %3: ptradd %2, 8
+</span><span>; %4: load %3
+</span><span>load rdi, [rax+8]
+</span></pre>
+<p>Note that we didn’t generate any code for the <code>ptradd</code> instruction because
+<code>load</code> was able to incorporate it indirectly. This might seem trivial, but it
+means we’ve avoided using a register for <code>%3</code>: you don’t have to do this very
+often to have a big, positive, impact on register allocation!</p>
+<h2><a name="locations"></a>Locations</h2>
+<p>Astute readers will have noticed that I haven’t made clear how an interpreter
+tells yk where guest language loops are. As you might expect, yk has absolutely
+no idea where a Lua or Ruby or Python loop might start or end: indeed, it
+doesn’t even know whether such languages have <code>while</code> loops or some other
+construct entirely.</p>
+<p>To tell where yk where loops are, interpreters have to use a <em>location</em>, which
+we pass to a <em>control point</em>. Locations are simple: they’re markers that tell
+yk something about part of the guest program (typically about a specific
+opcode in the user’s program). Control points are
+more subtle: they’re the point in the interpreter where control is handed over
+to yk alongside a location. A control point call might do nothing, might start
+tracing, or might start executing a compiled trace.</p>
+<p>For our purposes, we can consider locations to come in two
+flavours:</p>
+<ul>
+<li><em>null</em>: this guest-level <code>pc</code> is not the start of a loop.</li>
+<li><em>loop</em>: this guest-level <code>pc</code> is the start of a loop.</li>
+</ul>
+<p>One constructs these with <code>yk_location_null</code> or <code>yk_location_new</code>
+respectively, with those two functions returning an opaque <code>YkLocation</code> type.
+Strictly speaking, one doesn’t need null locations, but they often make it easier
+to get an interpreter up and running with yk.</p>
+<p><code>YkLocation</code>s are quite deliberately, a machine word wide, so that you can
+store them efficiently (e.g. alongside relevant opcodes). That said, the
+easiest thing to do is to create an array with one <code>YkLocation</code> per opcode in
+the user’s program. For example, if we have a language that represents <code>while</code>
+loops with a backwards jump opcode <code>OP_JMP</code> we might create the array of
+<code>YkLocation</code>s as follows:</p>
+<pre><span>Instruction *code = ...;
+</span><span>YkLocation *yklocs = </span><span>calloc</span><span>(sizeof(YkLocation), prog_len);
+</span><span>for </span><span>(</span><span>int</span><span> pc = </span><span>0</span><span>; pc &lt; prog_len; pc++) {
+</span><span>  Instruction i = code[pc];
+</span><span>  </span><span>if </span><span>(prog[pc] == OP_JMP &amp;&amp; </span><span>GET_OPVAL</span><span>(i) &lt; </span><span>0</span><span>)
+</span><span>    yklocs[pc] = </span><span>yk_location_new</span><span>();
+</span><span>  </span><span>else
+</span><span>    yklocs[pc] = </span><span>yk_location_null</span><span>();
+</span><span>}
+</span></pre>
+<p>And we would insert the control point call into the main loop as follows
+(having suitably initialised yk with <code>yk_mt_new</code>):</p>
+<pre><span>YkMT *mt = </span><span>yk_mt_new</span><span>(</span><span>NULL</span><span>);
+</span><span>Instruction *code = ...;
+</span><span>YkLocation *yklocs = ...;
+</span><span>int</span><span> pc = </span><span>0</span><span>;
+</span><span>Value **stack = ...;
+</span><span>while </span><span>(</span><span>true</span><span>) {
+</span><span>  Instruction i = code[pc];
+</span><span>  </span><span>yk_mt_control_point</span><span>(mt, &amp;yklocs[pc]);
+</span><span>  </span><span>switch </span><span>(</span><span>GET_OPCODE</span><span>(i)) {
+</span><span>    </span><span>case</span><span> OP_LOOKUP: ...
+</span><span>    ...
+</span></pre>
+<p>At a basic level that’s really all that needs to be done in an interpreter.</p>
+<p>Now, there are deeper questions such as “what’s the right place to start a
+loop?”, “what is a loop?” (e.g. recursive function calls), and “what are good
+traces?” (too many can be as bad as too few). Some of those are solely for
+interpreter authors; some need help from yk; and we haven’t yet implemented all
+the bits that interpreter authors need. I won’t dwell further on that here: I
+hope to return to this in the near future, as we’ve experimented with various
+promising designs recently.</p>
+<h2><a name="deoptimisation"></a>Deoptimisation</h2>
+<p>Earlier I spoke quite a bit about “speculation” and “deoptimisation”. To recap:
+when we speculate on a value we leave behind a guard; if that guard fails, we
+deoptimise from the JIT-compiled code back to the C interpreter.</p>
+<p>For those in the know “deoptimise … back to the C interpreter” will sound, to
+use the technical term, bonkers. It implies that somehow we can jump back to an
+arbitrary point in the binary that LLVM compiled, which seems impossible.
+Fortunately, it is possible — though it required quite a bit of work, and the
+acceptance of some trade-offs.</p>
+<p>Before I go into detail, let’s think roughly about what needs to happen. When a
+control point starts executing JIT-compiled code, it doesn’t create a new
+function frame: instead it takes over the AOT (Ahead-Of-Time) LLVM-compiled
+binary’s function frame and then adds stuff of its own choosing at the end.
+When a guard fails, we need to: stop the program; adjust the stack so that it’s
+in the right shape for the AOT binary; put values in the right register; and
+jump to the right offset in the AOT binary.</p>
+<p>You may not be surprised to learn that LLVM was not built with such a use-case
+in mind. Fortunately it has the basic tool we need: <a href="https://llvm.org/docs/StackMaps.html"><em>stackmaps</em></a>,
+which tell us the layout of registers and the stack at a given point in the LLVM IR.
+We then roll our own concept of <em>safepoints</em> built upon stackmaps:
+in essence a safepoint pairs a normal LLVM instruction with a stackmap.</p>
+<p>In essence, ykllvm records a safepoint at each conditional and function call. When a guard is about to be created in a
+trace, yk then knows the stack of safepoints it relates to. The reason for a
+“stack” of safepoints is due to inlining: the conditional that the guard
+relates to may be many functions deep from where the trace started. By
+recording a safepoint just before each function call, we know what the stack of
+AOT frames (would have) look(ed) like.</p>
+<p>Stackmaps are conceptually simple. For a given LLVM variable <code>%7</code> they record
+information such as: this variable’s value is stored in registers <code>rdi</code>, <code>r8</code>,
+and at stack offset <code>0x7F</code>. Except they don’t quite do so, probably because
+this part of LLVM is still experimental. Stackmaps <a href="https://llvm.org/docs/StackMaps.html#stack-map-format">only record
+<em>one</em> location</a> for a
+value (e.g. <code>%7</code> is stored in <code>rdi</code>) but we need to know <em>all</em> of the
+locations. We also needed to know additional information such as the callee-saved
+registers passed to inlined functions. Stackmaps in ykllvm are thus extended to do just that.</p>
+<p>We then had to deal with the fact that LLVM happily moves stackmaps around,
+allowing instructions to be inserted between them and their once-neighbours.
+This means that they no longer contain accurate information, and certainly
+don’t serve as valid safepoints anymore! To solve that
+we introduced a <a href="https://github.com/ykjit/ykllvm/blob/main/llvm/lib/CodeGen/Yk/FixStackmapsSpillReloads.cpp">new pass</a>
+that reassociates stackmaps with the correct neighbouring instruction, updating the
+stackmap as appropriate.</p>
+<p>However, there are a few parts of LLVM
+which mess with things beyond our pass’s ability to fix. Our solution, alas, is
+simply to turn some optimisations off in functions that can be traced. This
+slows down the interpreter somewhat, but fortunately yk’s trace optimiser is
+able to recover the lost performance once code is traced.</p>
+<p>Deoptimisation also raises a completely different, more fundamental, problem
+which has nothing to do with LLVM: what happens to stack pointers? Consider this code:</p>
+<pre><span>int</span><span> x = ...;
+</span><span>int </span><span>*y = &amp;x;
+</span><span>if </span><span>(z) </span><span>printf</span><span>(&#34;</span><span>%d</span><span>\n</span><span>&#34;, *y);
+</span></pre>
+<p>Let’s imagine that <code>z</code> is <code>false</code> when we record the trace but <code>true</code> at some
+point later: we’ll deoptimise then call <code>printf</code> with a stack address. However,
+that stack address relates to when JIT-compiled code was running, when the
+stack had a very different layout: the chances of the address being the same
+on the AOT stack is slim.</p>
+<p>Fortunately, the fix for this is simple: we introduce a shadow stack (creating
+a fresh shadow stack for each newly created thread) and place all variables
+whose address is taken on it. The shadow stack is shared between AOT and JIT
+frames — the latter does not extend or alter it. So, whether we’re running in
+JIT or AOT compiled code, the address of <code>x</code> will be the same.</p>
+<h2><a name="conclusions"></a>Conclusions</h2>
+<p>A couple of weeks ago I finally got around to porting yklua from Lua-5.4.6 to
+Lua 5.5.0: that’s two year’s worth of changes to Lua. How long did
+it take me? Well under 2 hours. I lost 30 minutes to a boring linker-related
+oddity, and not much less time to some external Lua tests that no
+longer work on Lua-5.5. The “hard” part of the work took me at most an hour:
+in any previous system, such changes would probably have taken months, if
+not longer.</p>
+<p>Anecdote though it may be, I hope this gives you a sense that yk
+is a genuinely new point in the language performance design space, and that
+it has the potential to benefit many languages and users.</p>
+<p>All that said, I don’t want to pretend that yk is the finished article: it most
+definitely isn’t! There are all sorts of things that need improving. Some are
+minor and will be noticed by few. Some will have much more profound effects.
+For example, at the time of writing, ykmicropython happens to work in a way
+that hits several gaps in yk: the resulting performance can be comically bad.
+Most of these are known gaps: filling them in isn’t rocket science, but it is
+work.</p>
+<p>I hope, though, that you can see the promise that yk has to offer: that I
+could update yklua so quickly still seems magical to me! That said, we still have plenty of work
+to do to realise yk’s full promise, but we’re a very small team (as of April, 1½ people if
+you count generously), so please be realistic about the pace at which that can
+occur!</p>
+<p>For those who are interested in playing with yk, I suggest starting at the <a href="https://ykjit.github.io/yk/">yk
+book</a>. Enjoy!</p>
+<p><strong>Acknowledgements</strong>: Thanks to Edd Barrett and Lukas Diekmann for comments.</p>
+
+
+<p>
+
+2026-04-15 12:35
+
+<a href="https://hamy.xyz/laurie/blog/2026/pliss_2026.html">Older</a>
+
+</p>
+
+<div id="article-updates"><p>
+If you’d like updates on new blog posts: follow me on
+<a href="https://mastodon.social/@ltratt">Mastodon</a>
+or <a href="https://twitter.com/laurencetratt">Twitter</a>;
+or <a href="https://hamy.xyz/blog.rss">subscribe to the RSS feed</a>;
+or <a href="https://hamy.xyz/laurie/newsletter/">subscribe to email updates</a>:
+
+</p>
+
+</div>
+
+
+<h3>Footnotes</h3>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h3>Comments</h3>
+
+
+
+
+
+
+
+</div></div>
+  </body>
+</html>
