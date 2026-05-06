@@ -201,7 +201,10 @@ func getAllPosts(ctx context.Context, feeds []string) []*Post {
 
 	var posts []*Post
 	seen := map[string]bool{}
+	var consumerDone sync.WaitGroup
+	consumerDone.Add(1)
 	go func() {
+		defer consumerDone.Done()
 		for post := range postChan {
 			if seen[post.Link] {
 				continue
@@ -213,6 +216,7 @@ func getAllPosts(ctx context.Context, feeds []string) []*Post {
 
 	wg.Wait()
 	close(postChan)
+	consumerDone.Wait()
 
 	// Sort items chronologically descending
 	sort.Slice(posts, func(i, j int) bool {
