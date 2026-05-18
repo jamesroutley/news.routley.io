@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://fil-c.org/calling_convention">Original</a>
+    <h1>The Fil-C Optimized Calling Convention</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        
+        <main>
+
+
+<p>Fil-C achieves memory safety even for programs that behave adversarially. That includes casting function pointers to the wrong signature and then calling them, exporting a function with one signature in one module and then importing it with a different signature in another, or even exporting a symbol as a function in one module and importing it as data in another (and vice-versa). Passing too few arguments, arguments of the wrong type, misusing <code>va_list</code> (including escaping it), expecting too many values to be returned - these are all things that the Fil-C calling convention either catches with a panic or ascribes safe behavior to.</p>
+
+<p>But in the common case - like when the programmer is behaving themselves - Fil-C generates reasonably efficient code for the call. For example, a call like this:</p>
+
+<pre><code>int x = 42;
+const char* y = &#34;hello&#34;;
+int z = foo(x, y);
+</code></pre>
+
+<p>in one module (say <code>caller.c</code>) with <code>foo</code> defined in another module (say <code>foo.c</code>):</p>
+
+<pre><code>int foo(int x, const char* y)
+{
+    ... /* whatever */
+}
+</code></pre>
+
+<p>will be compiled at the callsite exactly as if you had done the following call in Yolo-C with an optimized arguments-in-registers ABI:</p>
+
+<pre><code>foo(my_thread, x, y);
+</code></pre>
+
+<p>Where <code>my_thread</code> is a pointer to the current Fil-C thread, which Fil-C passes around as the first argument in all calls. So, <code>my_thread</code>, <code>x</code>, and <code>y</code> will be passed in registers. The implementation of <code>foo</code> will not check that <code>x</code> is an <code>int</code> and that <code>y</code> is a <code>const char*</code> (though if you use <code>y</code>, it will check that the pointer is in bounds of the capability and that the capability allows whatever kind of access you do). The return value will be passed in a register, too. In this regard, Fil-C is almost as efficient as Yolo-C!</p>
+
+<p>And yet, if we changed <code>foo</code> to take extra arguments, we would get a panic. And if we changed the signature in any way (maybe <code>x</code> becomes a pointer and <code>y</code> becomes a <code>double</code>), we would either get a panic or a well-defined bitwise cast of the value to the other type.</p>
+
+<p>This document explains how Fil-C manages to <strong>avoid doing any safety checks for the common case of calls</strong> while either <em>panicking</em> or strictly following well-defined <a href="https://fil-c.org/gimso.html">GIMSO semantics</a> in case calls are misused in some type-violating way.</p>
+
+<p>First, the generic calling convention is explained. All optimizations obey identical semantics to the generic calling convention and the generic calling convention is the fallback when the optimizations would not be legal under those semantics. Second, the register calling convention optimization is described. This is what allows arguments and return values to be passed in registers in the common case. Finally, the direct call optimizations are described. These optimizations make it possible for the caller to avoid doing any checks about whether the callee agrees on the function signature.</p>
+
+<h2>Generic Calling Convention</h2>
+
+<p><em>This section is almost identical to the <a href="https://fil-c.org/gimso.html#call">call section in the GIMSO document</a>, except it combines how to get the callee with executing the call.</em></p>
+
+<p>In the generic case, calls proceed as follows.</p>
+
+<ol>
+<li>The callee is resolved. For indirect calls, the callee is a <a href="https://fil-c.org/invisicaps.html#flightptr">flight pointer</a> (tuple of capability pointer and pointer intval) we already have in hand, so this step is a no-op in that case. For direct calls, the callee is a symbol name. ELF linkers provide a built-in facility to automatically resolve symbol names to function pointers. But to support memory-safe linking and loading in Fil-C, we need symbol names to resolve to a flight pointer, so that we can then check that the thing that the pointer points at is suitable for whatever we want to do to it (the next step for calls is to check that we have a function capability; for global variable accesses we would check that the global is a data capability and that the access is in bounds). Hence, the Fil-C compiler lowers symbol resolution to a <a href="https://fil-c.org/runtime.html#linking">getter call</a>. The getter returns the callee flight pointer.</li>
+<li>The callee is checked. The following requirements must be met, or else a panic occurs:
+<ul>
+<li>Capability must not be null.</li>
+<li>Capability must be a function capability.</li>
+<li>The pointer&#39;s intval must match the capability&#39;s callable pointer value.</li>
+</ul></li>
+<li>The size of the argument buffer is computed by rounding up each argument&#39;s size to 8. Additionally, argument type alignment is obeyed, which may mean adding padding. Note that <code>byref</code> arguments have their value copied into the argument buffer, so the argument&#39;s type for the purpose of the computation is the reference&#39;d type, not <code>ptr</code>. Two thread-local CC (calling convention) buffers are allocated of that size. These buffers live only long enough for the callee to retrieve the arguments. One buffer is for the payload, and the other is for capabilities.</li>
+<li>Each argument is copied into the CC buffers. For <code>byref</code> arguments, the pointed-at value is copied into the buffers.</li>
+<li>Control is transferred to the callee&#39;s prologue and the callsite address is saved to a private callstack. The stack where the callsite address is stored is outside of Fil-C memory and cannot be accessed with any capability. The callee is told about the size of the arguments as well as the function capability. Passing the function capability is useful for <code>libffi</code> implementing closures, but is otherwise unused.</li>
+<li>The callee&#39;s prologue heap-allocates (as if with <code>alloca</code>) any <code>byref</code> parameters.</li>
+<li>All arguments are copied out of the CC buffers. For non-<code>byref</code> parameters, the arguments are copied into local data flow. For <code>byref</code> parameters, the arguments are copied into the allocations from step 6.</li>
+<li>If the callee uses any argument introspection (like <code>va_arg</code> or <code>zargs</code>), then the CC buffers are copied into a newly created readonly heap object. At this point, the CC buffer is dead. In practice, the implementation may reuse the same CC buffer repeatedly.</li>
+<li><strong>The callee executes.</strong> If an exception throw happens, then we return to the callsite with a flag indicating that an exception is in flight.</li>
+<li>When the callee returns normally, an almost identical process to argument passing happens, except for the return value. First the size of the return buffer is computed by rounding up the return type&#39;s size to 8. The CC buffer is allocated of that size. It will live until the callsite finishes retrieving the result.</li>
+<li>The return value is copied into the CC buffers.</li>
+<li>Control is transferred back to the callsite with a flag indicating that an exception is NOT in flight, as well as the size of the return value.</li>
+<li>The callsite loads the return value from the CC buffers and produces it in local data flow.</li>
+</ol>
+
+<p>If the callsite observes the exception flag being set, then the caller returns with the exception flag set.</p>
+
+<p>Let&#39;s consider an example of an indirect call like:</p>
+
+<pre><code>int arg1 = ...;
+char* arg2 = ...;
+double arg3 = ...;
+char* result = function_pointer(arg1, arg2, arg3);
+</code></pre>
+
+<p>The generic calling convention - before we did any of the optimizations in this document - would look like:</p>
+
+<pre><code>check_function_call(function_pointer); /* all of the capability checks */
+(int*)(my_thread-&gt;cc_inline_buffer + 0) = arg1;
+(void**)(my_thread-&gt;cc_inline_aux_buffer + 0) = NULL;
+(void**)(my_thread-&gt;cc_inline_buffer + 8) = arg2.intval;
+(void**)(my_thread-&gt;cc_inline_aux_buffer + 8) = arg2.lower;
+(double*)(my_thread-&gt;cc_inline_buffer + 16) = arg3;
+(void**)(my_thread-&gt;cc_inline_aux_buffer + 16) = NULL;
+struct pizlonated_return_value {
+    bool has_exception;
+    size_t return_size;
+};
+struct pizlonated_return_value rv =
+    ((pizlonated_function_type)function_pointer.intval)(
+        my_thread, function_pointer.lower, 24);
+if (rv.has_exception)
+    goto unwind_handler;
+if (rv.return_size &lt; 8)
+    goto panic;
+flight_ptr result;
+result.intval = *(void**)(my_thread-&gt;cc_inline_buffer + 0);
+result.lower = *(void**)(my_thread-&gt;cc_inline_aux_buffer + 0);
+</code></pre>
+
+<p>This calling convention is inefficient in three major ways:</p>
+
+<ol>
+<li>Arguments and return values are passed using thread-local CC buffers rather than in registers.</li>
+<li>The callee&#39;s capability must be checked.</li>
+<li>Direct calls require <a href="https://fil-c.org/runtime.html#linking">calling a getter</a> to get a capability to the callee.</li>
+</ol>
+
+<p>The next two sections describe the optimizations that eliminate this overhead in the common case. The section that immediately follows describes how to pass arguments and return values in registers in the common case. The section after that describes how to avoid checking the callee&#39;s capability or even calling the getter.</p>
+
+<h2>Register Calling Convention Using Arithmetically Encoded Signatures And Generic Call Thunks</h2>
+
+<p>Fil-C function pointers are quite rich:</p>
+
+<ul>
+<li>The pointer value seen by the user (the <em>intval</em>) can be whatever we (the implementors of Fil-C) want it to be, so long as it&#39;s consistent. We can make it just be a pointer to the base of some kind of object rather than an actual code pointer, so long as the implementation of the LLVM call and invoke opcodes knows what to do with it.</li>
+<li>All pointers have an <a href="https://fil-c.org/invisicaps.html">invisible</a> <em>lower</em> pointer, which points to just above the capability object. For special objects like functions, <em>lower</em> pointer also points to the bottom of an internal object that Fil-C controls and the user is not allowed to edit (all reads and writes are disallowed because special objects have the upper bound set to exactly the lower bound).</li>
+<li>Fil-C supports <a href="https://fil-c.org/stdfil.html#zclosure_new">closures</a>, which are function pointers that carry extra state that can be retrieved by the caller. Given any defined function, the user can create as many closure objects as they like, each with different data attached to them. This is necessary for supporting <code>libffi</code> closures without using JIT privileges. The presence of this feature means that when calling a Fil-C function, we are already passing it a pointer to the function object (aka the function capability) as one of the arguments.</li>
+</ul>
+
+<p>This power gives us a lot of opportunities! This first optimization makes the function object have these fields. Remember - these fields cannot be accessed directly by the Fil-C program, so they can make use of raw pointers.</p>
+
+<ul>
+<li><code>fast_entrypoint</code> - this is a raw pointer to a function entrypoint that uses a native, register-based calling convention for whatever signature the function was defined to use. The only ways that the calling convention differs from the Yolo-C one is that the first two arguments are the thread and the function object, the return value is a struct that includes a bit that tells if there was an exception, and pointers are passed as tuples of <em>lower</em> and <em>intval</em>.</li>
+<li><code>generic_entrypoint</code> - this is a raw pointer to a function entrypoint that uses the generic calling convention based on thread-local CC buffers. Note that this entrypoint takes the function object as one of its arguments. We will use this fact!</li>
+<li><code>signature</code> - a 64-bit <strong>arithmetic encoding</strong> of the function signature. Think of this as a perfect hash of the signature. If this value is 0 then it means that the function only has a generic entrypoint (so <code>fast_entrypoint</code> will be NULL).</li>
+<li>In case the function object is a closure, there&#39;s one more field: the <code>data_ptr</code>, which is a user-controlled <a href="https://fil-c.org/invisicaps.html#flightptr">flight pointer</a> (a tuple of <em>lower</em> and <em>intval</em>). We know that a function object is a closure if the <code>READONLY</code> object flag is not set.</li>
+</ul>
+
+<p>Let&#39;s talk about this optimization as follows. First, what does the callsite do. Second, what thunks are emitted by the caller and callee to rescue cases where the signature doesn&#39;t match. Finally, how the arithmetic encoding of signatures works.</p>
+
+<h3>The Callsite</h3>
+
+<p>We will consider calls to function pointers for now, since direct function calls require the linker resolution step that yields a function pointer. We&#39;ll optimize that out in a later optimization. So, given a source-level call like the one we saw before:</p>
+
+<pre><code>int arg1 = ...;
+char* arg2 = ...;
+double arg3 = ...;
+char* result = function_pointer(arg1, arg2, arg3);
+</code></pre>
+
+<p>We now emit code like:</p>
+
+<pre><code>check_function_call(function_pointer); /* all of the capability checks */
+filc_function* function_object = (filc_function*)function_pointer.lower;
+struct typed_return_value {
+    bool has_exception;
+    flight_ptr result;
+};
+struct typed_return_value (*fast_function_pointer)(
+    filc_thread*, filc_function_object*, int, flight_ptr, double);
+if (LIKELY(function_object-&gt;signature == 60125))
+    fast_function_pointer = function_object-&gt;fast_entrypoint;
+else
+    fast_function_pointer = pizlonated1ET60125;
+struct typed_return_value rv = fast_function_pointer(
+    my_thread, function_object, arg1, arg2, arg3);
+if (rv.has_exception)
+    goto unwind;
+result = rv.result;
+</code></pre>
+
+<p>Let&#39;s dig into how this works!</p>
+
+<p>The function call itself uses a native-ish calling convention and all of the arguments will get passed in registers. All of the return values will be passed in registers. The only differences from the actual native calling convention is that we have two additional arguments (the thread and the function object) and one additional return value (<code>has_exception</code>).</p>
+
+<p>Prior to the function call, we have to check if the callee uses the calling convention that we expect. 60125 is the arithmetic encoding of the <code>char* (*)(int, char*, double)</code> signature. If that matches, we use the <code>fast_entrypoint</code> directly. If it does not match, we use a locally defined <code>pizlonated1ET60125</code> thunk. This thunk doesn&#39;t know anything about our callee and it doesn&#39;t have to, since the second argument to the call is the function object. The next section discusses how the thunks work.</p>
+
+<p>Note that some callsites will choose to use the generic calling convention. In that case, they will call the <code>generic_entrypoint</code> directly and no caller entrypoint thunk is needed. This happens if the callsite function signature is not encodeable using our arithmetic encoding.</p>
+
+<h3>The Thunks</h3>
+
+<p>In case the calling convention does not match, we use a pair of thunks to translate between the caller and callee:</p>
+
+<ul>
+<li>The caller entrypoint thunk (like <code>pizlonated1ET60125</code>), which takes arguments according to the fast calling convention and calls the function object&#39;s <code>generic_entrypoint</code> using the generic calling convention.</li>
+<li>The callee entrypoint thunk (would be called something like <code>pizlonated2ET60125</code>), which takes arguments according to the generic calling convention and calls the function object&#39;s <code>fast_entrypoint</code> using the fast calling convention.</li>
+</ul>
+
+<p>Both thunks are generated as <code>linkonce_odr</code> in LLVM IR, which corresponds to being weak definitions in ELF. This means that if multiple modules define the same caller or callee entrypoint thunk, then the linker only picks one, based on the symbol name.</p>
+
+<p>Some functions will choose to only have a generic entrypoint. This will happen if they use variadic arguments, <a href="https://fil-c.org/stdfil.html#zreturn">variadic returns</a>, or if their signature is not encodeable using our arithmetic encoding. In that case, the callee will not generate an entrypoint thunk and the function object&#39;s generic entrypoint will point directly to the function implementation.</p>
+
+<h3>Caller Entrypoint Thunk Example</h3>
+
+<p>The caller entrypoint thunk accepts a register-based fast call and calls the generic entrypoint. The caller entrypoint thunk for signature 60125 looks like this in x86 assembly:</p>
+
+<pre><code>00000000000001d0 &lt;pizlonated1ET60125&gt;:
+ 1d0:   push   %rbx
+ 1d1:   mov    %rdi,%rbx
+ 1d4:   mov    %rdx,0x80(%rdi)
+ 1db:   mov    %rcx,0x88(%rdi)
+ 1e2:   movsd  %xmm0,0x90(%rdi)
+ 1ea:   movq   $0x0,0x180(%rdi)
+ 1f5:   mov    %r8,0x188(%rdi)
+ 1fc:   movq   $0x0,0x190(%rdi)
+ 207:   mov    $0x18,%edx
+ 20c:   call   *0x8(%rsi)
+ 20f:   test   $0x1,%al
+ 211:   jne    229 &lt;pizlonated1ET60125+0x59&gt;
+ 213:   cmp    $0x7,%rdx
+ 217:   jbe    22b &lt;pizlonated1ET60125+0x5b&gt;
+ 219:   mov    0x80(%rbx),%rdx
+ 220:   mov    0x180(%rbx),%rcx
+ 227:   pop    %rbx
+ 228:   ret    
+ 229:   pop    %rbx
+ 22a:   ret    
+ 22b:   mov    $0x8,%esi
+ 230:   mov    %rdx,%rdi
+ 233:   xor    %edx,%edx
+ 235:   call   23a &lt;pizlonated1ET60125+0x6a&gt;
+</code></pre>
+
+<p>Let&#39;s look at the key parts of this function. First, the arguments that were passed in registers are stored to the thread-local CC buffer:</p>
+
+<pre><code> 1d4:   mov    %rdx,0x80(%rdi)
+ 1db:   mov    %rcx,0x88(%rdi)
+ 1e2:   movsd  %xmm0,0x90(%rdi)
+ 1ea:   movq   $0x0,0x180(%rdi)
+ 1f5:   mov    %r8,0x188(%rdi)
+ 1fc:   movq   $0x0,0x190(%rdi)
+</code></pre>
+
+<p>Then we call the generic entrypoint of the function object, passing it 24 as the argument size:</p>
+
+<pre><code> 207:   mov    $0x18,%edx
+ 20c:   call   *0x8(%rsi)
+</code></pre>
+
+<p>Next we check for exceptions:</p>
+
+<pre><code> 20f:   test   $0x1,%al
+ 211:   jne    229 &lt;pizlonated1ET60125+0x59&gt;
+</code></pre>
+
+<p>And we check if the return value is at least 8 bytes:</p>
+
+<pre><code> 213:   cmp    $0x7,%rdx
+ 217:   jbe    22b &lt;pizlonated1ET60125+0x5b&gt;
+</code></pre>
+
+<p>Finally we load the return value into return value registers and return:</p>
+
+<pre><code> 219:   mov    0x80(%rbx),%rdx
+ 220:   mov    0x180(%rbx),%rcx
+ 227:   pop    %rbx
+ 228:   ret
+</code></pre>
+
+<h3>Callee Entrypoint Thunk Example</h3>
+
+<p>The callee entrypoint thunk accepts a generic call and calls the fast entrypoint. The callee entrypoint thunk for signature 60125 looks like this in x86 assembly:</p>
+
+<pre><code>0000000000000030 &lt;pizlonated2ET60125&gt;:
+  30:   push   %rbx
+  31:   cmp    $0x17,%rdx
+  35:   jbe    74 &lt;pizlonated2ET60125+0x44&gt;
+  37:   mov    %rdi,%rbx
+  3a:   mov    0x80(%rdi),%rdx
+  41:   mov    0x88(%rdi),%rcx
+  48:   movsd  0x90(%rdi),%xmm0
+  50:   mov    0x188(%rdi),%r8
+  57:   call   *(%rsi)
+  59:   test   $0x1,%al
+  5b:   jne    72 &lt;pizlonated2ET60125+0x42&gt;
+  5d:   mov    %rdx,0x80(%rbx)
+  64:   mov    %rcx,0x180(%rbx)
+  6b:   mov    $0x8,%edx
+  70:   pop    %rbx
+  71:   ret    
+  72:   pop    %rbx
+  73:   ret    
+  74:   mov    $0x18,%esi
+  79:   mov    %rdx,%rdi
+  7c:   xor    %edx,%edx
+  7e:   call   83 &lt;pizlonated2ET60125+0x53&gt;
+</code></pre>
+
+<p>Let&#39;s walk through this. First, the thunk checks that it was passed 24 bytes of arguments:</p>
+
+<pre><code>  31:   cmp    $0x17,%rdx
+  35:   jbe    74 &lt;pizlonated2ET60125+0x44&gt;
+</code></pre>
+
+<p>Next, the arguments are loaded from the thread-local CC buffer into argument registers:</p>
+
+<pre><code>  3a:   mov    0x80(%rdi),%rdx
+  41:   mov    0x88(%rdi),%rcx
+  48:   movsd  0x90(%rdi),%xmm0
+  50:   mov    0x188(%rdi),%r8
+</code></pre>
+
+<p>Then the fast entrypoint is called:</p>
+
+<pre><code>  57:   call   *(%rsi)
+</code></pre>
+
+<p>And we check for exceptions:</p>
+
+<pre><code>  59:   test   $0x1,%al
+  5b:   jne    72 &lt;pizlonated2ET60125+0x42&gt;
+</code></pre>
+
+<p>Finally we store the returned value into thread-local CC buffers and return (indicating that we are returning 8 bytes of return value):</p>
+
+<pre><code>  5d:   mov    %rdx,0x80(%rbx)
+  64:   mov    %rcx,0x180(%rbx)
+  6b:   mov    $0x8,%edx
+  70:   pop    %rbx
+</code></pre>
+
+<p>To summarize: in the common case, function calls use a register-based mostly-native calling convention where the only overhead is checking if the callee has the right signature. If it doesn&#39;t, a pair of thunks is used to translate between the caller&#39;s calling convention and the callee&#39;s calling convention. The translation relies on the generic calling convention Fil-C already had.</p>
+
+<h3>The Arithmetic Encoding</h3>
+
+<p>In the running example, we represented the signature <code>char* (*)(int, char*, double)</code> as 60125. This section explains how we encode any function signature matching the following constraints into a 64-bit integer:</p>
+
+<ul>
+<li>Maximum of 16 arguments.</li>
+<li>Maximum of 2 return values <em>(in C/C++ on X86_64 if a struct with up to two fields is returned, then LLVM sees it as a 2-value return; returning larger structs means being passed a pointer to a return value)</em>.</li>
+<li>The arguments and return values are of the following types:
+<ul>
+<li>Any integer up to 64-bit</li>
+<li>Float</li>
+<li>Double</li>
+<li>Long Double</li>
+<li>128-bit Vector</li>
+<li>256-bit Vector</li>
+<li>512-bit Vector</li>
+<li>Any pointer</li>
+</ul></li>
+</ul>
+
+<p>Additionally, the encoding has three reserved argument types. Hence, we have 11 types total. It&#39;s not an error if a function cannot be encoded using this encoding; functions with those signatures just fall back to the generic calling convention. Thanks to how permissive this is (up to 16 arguments!), the fall-back case is exceedingly rare. Most software packages I&#39;ve tested don&#39;t even have a single function that exceeds these limits.</p>
+
+<p>A key feature of the encoding is how to represent sequences of between 0 and N (inclusive) types. The simplest version of this is if we know ahead of time how many types are in the sequence. For example, say we have three types, A, B, C, each of which are integers from 0 to 10 (inclusive). We could represent the A, B, C sequence as A + 11 * B + 121 * C. But what if we want to represent both the sequence and the length of the sequence?</p>
+
+<p>The sequence-of-types encoding we will use works like this:</p>
+
+<ul>
+<li>0 means the sequence is empty.</li>
+<li>For a single type T, we use 1 + T.</li>
+<li>For two types, we use 1 + 11 + T1 + 11 * T2.</li>
+<li>For three types, we use 1 + 11 + 121 + T1 + 11 * T2 + 121 * T3.</li>
+<li>Etc.</li>
+</ul>
+
+<p>For example, to represent return values (0, 1, or 2 types), we need a range of 1 + 11 + 121 = 133 values. Let&#39;s call the return value encoding Ret.</p>
+
+<p>To represent arguments (0 to 16 types), we need a range of 50544702849929377 values. Let&#39;s call the arguments encoding Arg.</p>
+
+<p>The encoding works as follows:</p>
+
+<ul>
+<li>0 is the generic signature.</li>
+<li>For all other signatures, the encoding is 1 + Ret + Arg * 133</li>
+</ul>
+
+<p>This still leaves 11724298594668944475 values in the int64 (almost 2/3 of the encoding space). So in addition to having 3 reserved types, we also have 2/3 of the encoding space left for any kind of fancy next-generation signature encoding we would like to use.</p>
+
+<p>Let&#39;s dig into why <code>char* (*)(int, char*, double)</code> is 60125:</p>
+
+<ul>
+<li><code>char*</code> is a pointer, which has value 7.</li>
+<li><code>int</code> is 0.</li>
+<li><code>double</code> is 2.</li>
+</ul>
+
+<p>Hence Ret is 1 + 7 = 8.</p>
+
+<p>And Arg is 1 + 11 + 121 + 0 + 7 * 11 + 2 * 121 = 452.</p>
+
+<p>So the signature is 1 + 8 + 133 * 452 = 60125.</p>
+
+<p><strong>The register calling convention optimization results in a &gt;1% speed-up on PizBench9019.</strong></p>
+
+<h2>Avoiding Direct Caller Resolution</h2>
+
+<p>The final optimization is how to avoid having to resolve direct callers using getter calls and capability checks. The intuition for this optimization is that:</p>
+
+<ul>
+<li>When a function is defined, then in addition to exporting an ELF symbol for the function&#39;s flight pointer getter, we can also export an ELF symbol for the implementation. That symbol can be mangled to include the signature.</li>
+<li>When a function is called directly, then call the function&#39;s signature-mangled implementation directly.</li>
+<li>To defend against cases where there is a mismatch in signature, locally define a weak callsite thunk with the same name as the implementation, which performs the full call sequence (calls the getter, checks the capability, attempts the fast call).</li>
+</ul>
+
+<p>With this optimization, a direct call like:</p>
+
+<pre><code>int arg1 = ...;
+char* arg2 = ...;
+double arg3 = ...;
+char* result = foo(arg1, arg2, arg3);
+</code></pre>
+
+<p>Gets emitted to:</p>
+
+<pre><code>struct typed_return_value {
+    bool has_exception;
+    flight_ptr result;
+};
+struct typed_return_value rv = pizlonatedFI60125_foo(
+    my_thread, undef, arg1, arg2, arg3);
+if (rv.has_exception)
+    goto unwind;
+result = rv.result;
+</code></pre>
+
+<p>Where <code>pizlonatedFI60125_foo</code> is the signature-mangled implementation function name. Note that <code>undef</code> here is the LLVM <code>undef</code> value, which when used as a function argument means that the corresponding argument register is simply not set. <strong>That&#39;s a huge improvement!</strong> We have successfully eliminated the getter call for linker resolution, the function capability check, the signature check, the thread-local CC buffer accesses, and the argument/return value size checks!</p>
+
+<p>The simplest case of this is if <code>foo</code> is defined in the same module and <code>foo</code>&#39;s definition has a matching signature. In that case, the code above just works and we don&#39;t have to do anything else.</p>
+
+<p>If <code>foo</code> is extern, or if it is defined locally with a different signature, or if the definition uses closure features like <a href="https://fil-c.org/stdfil.html#zcallee"><code>zcallee</code></a> or <a href="https://fil-c.org/stdfil.html#zcallee_closure_data"><code>zcallee_closure_data</code></a> (meaning that the second argument - the function capability - must really be passed), the module with this callsite will emit a weak <code>pizlonatedFI60125_foo</code> that performs the getter call. We call this the known target callsite thunk. It also inlines the caller entrypoint thunk to avoid having triple indirection in the slowest case. Let&#39;s take a look at the weak callsite thunk:</p>
+
+<pre><code>00000000000011d0 &lt;pizlonatedFI60125_foo&gt;:
+    11d0:   push   %r15
+    11d2:   push   %r14
+    11d4:   push   %r12
+    11d6:   push   %rbx
+    11d7:   push   %rax
+    11d8:   movsd  %xmm0,(%rsp)
+    11dd:   mov    %r8,%r14
+    11e0:   mov    %rcx,%r15
+    11e3:   mov    %rdx,%r12
+    11e6:   mov    %rdi,%rbx
+    11e9:   xor    %esi,%esi
+    11eb:   call   1050 &lt;pizlonated_foo@plt&gt;
+    11f0:   mov    %rdx,%rsi
+    11f3:   test   %rdx,%rdx
+    11f6:   je     12ca &lt;pizlonatedFI60125_foo+0xfa&gt;
+    11fc:   mov    -0x8(%rsi),%rcx
+    1200:   movabs $0x780000000000000,%rdx
+    120a:   and    %rcx,%rdx
+    120d:   movabs $0x80000000000000,%rdi
+    1217:   cmp    %rdi,%rdx
+    121a:   jne    12ca &lt;pizlonatedFI60125_foo+0xfa&gt;
+    1220:   movabs $0xffffffffffff,%rdx
+    122a:   and    %rdx,%rcx
+    122d:   cmp    %rcx,%rax
+    1230:   jne    12ca &lt;pizlonatedFI60125_foo+0xfa&gt;
+    1236:   cmpq   $0xeadd,0x10(%rsi)
+    123e:   jne    1261 &lt;pizlonatedFI60125_foo+0x91&gt;
+    1240:   mov    (%rsi),%rax
+    1243:   mov    %rbx,%rdi
+    1246:   mov    %r12,%rdx
+    1249:   mov    %r15,%rcx
+    124c:   mov    %r14,%r8
+    124f:   movsd  (%rsp),%xmm0
+    1254:   add    $0x8,%rsp
+    1258:   pop    %rbx
+    1259:   pop    %r12
+    125b:   pop    %r14
+    125d:   pop    %r15
+    125f:   jmp    *%rax
+    1261:   mov    %r12,0x80(%rbx)
+    1268:   mov    %r15,0x88(%rbx)
+    126f:   movsd  (%rsp),%xmm0
+    1274:   movsd  %xmm0,0x90(%rbx)
+    127c:   movq   $0x0,0x180(%rbx)
+    1287:   mov    %r14,0x188(%rbx)
+    128e:   movq   $0x0,0x190(%rbx)
+    1299:   mov    $0x18,%edx
+    129e:   mov    %rbx,%rdi
+    12a1:   call   *0x8(%rsi)
+    12a4:   test   $0x1,%al
+    12a6:   jne    12c8 &lt;pizlonatedFI60125_foo+0xf8&gt;
+    12a8:   cmp    $0x7,%rdx
+    12ac:   jbe    12d2 &lt;pizlonatedFI60125_foo+0x102&gt;
+    12ae:   mov    0x80(%rbx),%rdx
+    12b5:   mov    0x180(%rbx),%rcx
+    12bc:   add    $0x8,%rsp
+    12c0:   pop    %rbx
+    12c1:   pop    %r12
+    12c3:   pop    %r14
+    12c5:   pop    %r15
+    12c7:   ret    
+    12c8:   jmp    12bc &lt;pizlonatedFI60125_foo+0xec&gt;
+    12ca:   mov    %rax,%rdi
+    12cd:   call   1030 &lt;filc_check_function_call_fail@plt&gt;
+    12d2:   mov    $0x8,%esi
+    12d7:   mov    %rdx,%rdi
+    12da:   xor    %edx,%edx
+    12dc:   call   1040 &lt;filc_cc_rets_check_failure@plt&gt;
+</code></pre>
+
+<p>This thunk performs the following work:</p>
+
+<ol>
+<li>Calls the getter for <code>foo</code>.</li>
+<li>Checks that the pointer returned by the getter is really a function.</li>
+<li>Checks if the signature matches; if it does, then does the fast call. This includes passing the function object. If the signature does not match, this calls the generic entrypoint.</li>
+</ol>
+
+<p>As gross as that is, this weak symbol only gets invoked in those cases where there was a signature mismatch. If there is no mismatch, the actual implementation of <code>foo</code> wins and the callsite calls that directly!</p>
+
+<p><strong>This almost works!</strong> The problems with this approach come down to ELF details, which I will try to share with you as best as I can:</p>
+
+<ol>
+<li>This relies on strong symbols winning against weak ones. But that only works during linking. It doesn&#39;t work during loading. During loading, the first symbol encountered by the loader wins.</li>
+<li>This doesn&#39;t work if the actual function definition is weak. There&#39;s no such thing as &#34;weaker than weak&#34;, so we can&#39;t say that our known target callsite thunk should lose against the real weak definition.</li>
+<li>A similar but more annoying version of the weak v. weak problem happens when we try to use this technique to optimize calls to C++ inline functions. These use <code>linkonce_odr</code> linking at the LLVM level, which translates to weak symbols in COMDATs at the ELF level.</li>
+</ol>
+
+<p>Let&#39;s dwell a bit on the implication of the first and second problems. In both cases, the result is that the weakly defined known target callsite thunk will win against the actual function definition. So, all calls will go to the thunk. Then, when the thunk calls the getter, the getter will return a function object whose <code>fast_entrypoint</code> points at the known target callsite thunk! The reason for this is that the function object is just part of an ELF data section with a relocation asking the linker/loader to resolve the pointer to something called <code>pizlonatedFI60125_foo</code>. If the winner is the known target callsite thunk then this results in an infinite loop anytime we try to call the function.</p>
+
+<p>The first problem is easy to solve: we always define the known target callsite thunk with hidden visibility. This ensures that the loader never sees them. The downside is that calls across dynamic library boundaries always have to go through the thunk, but we&#39;re counting on two things: (1) that&#39;s not much worse than what would have happened without this optimization and (2) calls within dynamic libraries are much more common than calls across the boundary.</p>
+
+<p>The second is solved by emitting the implementation under the symbol <code>pizlonatedFIP60125_foo</code> instead of <code>pizlonatedFI60125_foo</code>. Then, only if the function is strongly defined, we define a strong alias from <code>pizlonatedFI60125_foo</code> to <code>pizlonatedFIP60125_foo</code>. The function object always asks for <code>pizlonatedFIP60125_foo</code>. This ensures that calls to weak definitions don&#39;t get stuck in infinite loops. It also means that calls to weak definitions always go through the thunk. That&#39;s fine, since calls to weak definitions are rare. Note that this same trick is used to handle closure features - even if the function is strongly defined, we do not create the strong alias if the function uses <a href="https://fil-c.org/stdfil.html#zcallee"><code>zcallee</code></a> or <a href="https://fil-c.org/stdfil.html#zcallee_closure_data"><code>zcallee_closure_data</code></a>. We need to protect functions that use closure features in this way because the direct call optimization passes <code>undef</code> as the function object. On the other hand, the known target callsite thunk looks up the function object and always passes it to the function&#39;s entrypoint.</p>
+
+<p>But this reveals the third problem: say we have a C++ header file called <code>header.h</code> like:</p>
+
+<pre><code>inline int foo(int x) { /* lots of stuff */ }
+</code></pre>
+
+<p>For the purpose of this discussion, let&#39;s assume that <code>foo</code> is not inlineable - maybe because it&#39;s a very large function.</p>
+
+<p>Then let&#39;s say we have a module that does:</p>
+
+<pre><code>#include &#34;header.h&#34;
+
+void bar()
+{
+    /* stuff */
+    x = foo(x);
+    /* more stuff */
+}
+</code></pre>
+
+<p>We&#39;d sure like if <code>bar</code>&#39;s call to <code>foo</code> benefited from the optimization. But what happens is that <code>foo</code> is a weak definition. Worse, it&#39;s a weak definition with a COMDAT.</p>
+
+<p><em>I wish I could just share a link to a good description of COMDAT, but sadly, I cannot because they all suck. So instead I&#39;ll write my own description, which hopefully sucks less than the other ones at least for the purposes of describing the problem we&#39;re facing.</em></p>
+
+<p>The thing that C++ wants to do for <code>foo</code> is:</p>
+
+<ul>
+<li>Every module that includes <code>header.h</code> will have <code>foo</code>&#39;s machine code.</li>
+<li>But at link time, the linker keeps only one definition of <code>foo</code>.</li>
+</ul>
+
+<p>This can <em>almost</em> be achieved with a weak symbol. But weak symbols have two shortcomings:</p>
+
+<ol>
+<li>The linker won&#39;t actually drop the contents of the losing <code>foo</code>&#39;s.</li>
+<li>In both Yolo-C++ and Fil-C++, <code>foo</code> is not one symbol.
+<ul>
+<li>In Yolo-C++, there&#39;s <code>foo</code> plus extra symbols for things like <code>foo</code>&#39;s unwind data. When one <code>foo</code> wins, we want to make sure that its unwind data wins along with it. This is because although C++ compilers are deterministic, we have to support the case where different modules including <code>header.h</code> are compiled with different compiler flags.</li>
+<li>In Fil-C++, there&#39;s the <code>pizlonated_foo</code> getter, the implementation function, and the function object (at least). Again, we want to make sure that the loader never mixes-and-matches between different modules - it picks a winner from one module, and the whole constellation of <code>foo</code>-related symbols win or lose together.</li>
+</ul></li>
+</ol>
+
+<p>COMDAT solves both problems. We put the whole constellation of <code>foo</code>-related things into a single COMDAT group. This tells the linker that these symbols are all-or-nothing and that it&#39;s fine to drop the contents of the losers.</p>
+
+<p>Let&#39;s get back to why this is hard for the known target callsite thunks.</p>
+
+<p>First problem: the inline <code>foo</code> will be a weak definition. Hence, according to the rules we spelled out above, all calls to <code>foo</code> will have to go through the known target callsite thunk. None of them can be direct, since weak definitions only define the <code>pizlonatedFIP</code> symbol, and callers always call the <code>pizlonatedFI</code> symbol.</p>
+
+<p>We can solve this problem by adding this rule: <em>if we notice that the local module defines the <code>pizlonatedFIP</code> symbol for the function we&#39;re trying to call and the signature matches, then call that directly.</em></p>
+
+<p>But this produces a second problem: COMDAT resolution rules may cause the linker to drop the <code>pizlonatedFIP</code> function we tried to call! This is hard to achieve, since what Fil-C sees are symbols after C++ name mangling - so two C++ functions with the same name but different signatures will have different names from Fil-C&#39;s standpoint. But you can achieve it by putting C++ inline functions in <code>extern &#34;C&#34;</code>. So, we could have two modules that both COMDAT <code>foo</code> but with different Fil-C signatures, leading to one of the modules having a direct call to a function dropped by COMDAT resolution. Worse, calls to functions dropped by COMDAT don&#39;t result in linking or loading errors; the call just ends up calling NULL.</p>
+
+<p>The way I solved this is by:</p>
+
+<ol>
+<li>Changing LLVM to know that a global symbol that is locally defined, but not strongly, and that has a COMDAT may be NULL. Previously, LLVM always assumed that locally defined symbols can never be NULL. This required changes in two places (<code>ValueTracking.cpp</code> and <code>ConstantFold.cpp</code>).</li>
+<li>Emitting a null check whenever we emit a direct call to a <code>pizlonatedFIP</code> that is locally defined but has a COMDAT.</li>
+</ol>
+
+<p>The NULL check uses a different relocation than the call (it&#39;s a relocation that requests a pointer to the function to be materialized, rather than for the linker to patch a call). Amusingly, that relocation <em>does</em> cause linker errors in case COMDAT resolution drops the function we&#39;re calling. Hence, this unlikely safety issue is caught at link time rather than at run-time.</p>
+
+<p>With all of this in place, we are able to mostly leverage the direct call optimization for C++ inline function calls; they are only slightly less efficient than static function calls or same-library calls in that they must do one null check.</p>
+
+<p><strong>The direct call optimization results in another &gt;1% speed-up on PizBench9019.</strong></p>
+
+<h2>Conclusion</h2>
+
+<p>We started with direct calls having to call a getter, check the function&#39;s capability, store arguments to a buffer, have the callee check that they got enough arguments, have the caller check that they got enough return values, and load return values from a buffer.</p>
+
+<p>With all of these optimizations, the common case for a direct call does none of that: we just directly call the implementation, exchanging arguments and return values in registers.</p>
+
+<p>To get there, we had to employ some fancy ELF tricks and invent an arithmetic encoding for signatures so that signatures can fit into 64-bit integers.</p>
+        </main>
+    </div></div>
+  </body>
+</html>
