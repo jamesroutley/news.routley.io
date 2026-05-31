@@ -1,0 +1,1023 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://justine.lol/rseq/">Original</a>
+    <h1>Restartable Sequences</h1>
+    
+    <div id="readability-page-1" class="page">
+
+<p>
+May 31<sup>st</sup>, 2026 @ <a href="https://justine.lol/index.html">justine&#39;s web page</a>
+</p>
+
+<p><a href="https://justine.lol/rseq/rseq.png"><img src="https://worker.jart.workers.dev/rseq/rseq.png" alt="[Picture of Tux the Linux penguin mascot enthusiastically flapping looking down at a black circle loop with an arrowhead pointing over an egg, with arm64 assembly instructions inside]" width="360" height="238"/></a>
+</p>
+
+<p>
+The best kept secret at the frontier of system programming right now is
+the Linux 4.18+ (c. 2018) concept of restartable sequences or rseq for
+short. They allow you to create thread-safe data structures without
+locks or atomics which scale to microprocessors with many cores.
+
+</p><p>
+It&#39;s currently only possible to use rseq on Linux using handwritten
+assembly code. However I believe in the future, all operating systems
+will be updated to support <code>rseq()</code>, all system programming
+languages will be redesigned to be able to express restartable
+sequences, and all data structure libraries will be rewritten to use
+them.
+
+</p><p>
+So far the only software I&#39;ve seen using rseq is tcmalloc, jemalloc,
+glibc, and cosmopolitan. That&#39;s destined to change now that
+microprocessors with 128 or even 192 cores are becoming inexpensive. For
+example,
+
+</p><ul>
+<li>
+On my $160 <a href="https://amzn.to/3TYRti8">Raspberry Pi 5</a> (which
+has 4 cores), rseq makes my <code>malloc()</code>
+implementation <strong>3x faster</strong> versus having a dlmalloc
+mspace assigned to each thread. For most developers, that&#39;s a take it or
+leave it kind of improvement. However,
+
+</li><li>
+On my $4,834 <a href="https://system76.com/arm">System76 Thelio Astra
+with Ampere&#39;s 128 core 3GHz Altra CPU</a>, rseq makes cosmopolitan
+<code>malloc()</code> go <strong>34x faster</strong> (compared to
+sharding ops over an array of mspaces
+using <code>sched_getcpu()%32</code>)
+
+</li><li>
+On my $17,628.55 <a href="https://justine.lol/rseq/threadripper.html">AMD Threadripper Pro
+7995WX</a> with 96 cores, rseq makes
+my <code>malloc()</code> <strong>43x faster</strong> (versus using that
+same <code>sched_getcpu()</code> mutex sharding technique)
+
+</li></ul>
+
+<p>
+System programmers who don&#39;t have a workstation like the ones above are
+going to be left behind like a dinosaur, with no opportunity to pluck
+the low hanging fruit of 10x performance optimizations. For example, I
+wouldn&#39;t have been able to pull off the
+<a href="https://justine.lol/matmul/">speedups I made to matrix multiplication</a> last
+year if I hadn&#39;t splurged on a 96 core CPU. It put me in the poor house
+for a few months (since the cheaper Ampere workstations weren&#39;t
+available it the time) but was so worth it, since my work received
+<a href="https://www.phoronix.com/news/Llamafile-0.7">press
+coverage</a>,
+it <a href="https://x.com/jartine/status/1777094783745556876/photo/1">made
+me famous in the AI community</a>, it helped my project
+get <a href="https://x.com/jartine/status/1940859907567505498">adopted
+by 32% of organizations</a>, and even earned me a job offer from Google
+to work in their Gradient Canopy improving TPU performance for Gemini.
+
+</p><p>
+If you do have one of these microprocessors, then restartable sequences
+are going to be one of the most important tricks you&#39;ll use to exploit
+its capabilities. This tutorial will show you how they work, and provide
+you with a concrete example for pushing and popping which can be
+immediately useful.
+
+</p><h2 class="page">What Problems Do Restartable Sequences Solve?</h2>
+
+<p>
+Whenever the Cosmopolitan C runtime creates a thread on a Linux system,
+it issues an <code>rseq()</code> system call which gives the kernel 32
+bytes of TLS memory. Then, for the remainder of that thread&#39;s life, the
+kernel will update the TLS memory with the CPU number whenever the
+thread is rescheduled. I found that to be immediately helpful for
+improving my <code>sched_getcpu()</code> implementation. Since now it
+just needs a 1 nanosecond relaxed <code>mov</code> instruction to get
+the CPU number, whereas before I needed to wait an entire microsecond
+for the <code>getcpu()</code> system call.
+
+</p><p>
+However it gets better. There&#39;s a second field in the rseq TLS memory
+that allows the thread to send information back to the kernel. Normally
+the <code>rseq_cs</code> field is <code>NULL</code>, but it can be
+updated with a pointer specifying a sequence of assembly instructions in
+your program. Now, whenever the kernel preempts your thread and tries to
+move it to a different CPU, it&#39;ll notice your <code>rseq_cs</code> is
+non-null, and will check the program counter (a.k.a. %rip on x86) to see
+if it&#39;s currently within the specified interval. If that&#39;s the case,
+then the kernel will force the thread to jump to an abort handler you
+also specify, which can do things like jump back to the beginning of the
+function to retry the operation.
+
+</p><p>
+Here&#39;s why we need that. Let&#39;s say you have a GIL like this:
+
+</p><pre><span>static</span> <span>pthread_mutex_t</span> <span>lock</span>;
+<span>static struct</span> <span>List</span> *<span>list</span>;
+</pre>
+
+<p>
+If you&#39;re using that to protect your data structures, then it&#39;s going to
+go slow on systems with dozens of cores, since only a single thread can
+hold the lock at any given moment. So you might think, let&#39;s create a
+lockless list using atomics. That&#39;s pretty simple if we&#39;re only pushing,
+but if we want to also be able to pop, then we&#39;d need to account for the
+<a href="https://en.wikipedia.org/wiki/ABA_problem">ABA
+problem</a> with something like the following:
+
+</p><pre><span>#define</span> <span>MASQUE</span> 0x00fffffffffffff0  <span>// supports pml5t w/ malloc&#39;d memory</span>
+<span>#define</span> <span>PTR</span>(x) ((<span>uintptr_t</span>)(x) &amp; MASQUE)
+<span>#define</span> <span>TAG</span>(x) ROL((<span>uintptr_t</span>)(x) &amp; ~MASQUE, 8)
+<span>#define</span> <span>ABA</span>(p, t) ((<span>uintptr_t</span>)(p) | (ROR((<span>uintptr_t</span>)(t), 8) &amp; ~MASQUE))
+<span>#define</span> <span>ROL</span>(x, n) (((x) &lt;&lt; (n)) | ((x) &gt;&gt; (64 - (n))))
+<span>#define</span> <span>ROR</span>(x, n) (((x) &gt;&gt; (n)) | ((x) &lt;&lt; (64 - (n))))
+
+<span>struct</span> <span>List</span> {
+  <span>struct</span> <span>List</span> *next;
+  <span>// ...</span>
+};
+
+<span>_Atomic</span>(<span>struct</span> <span>List</span> *) <span>list</span>;
+
+<span>void</span> <span>push</span>(<span>struct</span> <span>List</span> *elem) {
+  <span>struct List</span> *tip;
+  <span>for</span> (tip = atomic_load_explicit(&amp;list, memory_order_relaxed);;) {
+    elem-&gt;next = (<span>struct</span> <span>List</span> *)PTR(tip);
+    <span>if</span> (atomic_compare_exchange_weak_explicit(
+            &amp;list, &amp;tip, (<span>struct</span> <span>List</span> *)ABA(elem, TAG(tip) + 1),
+            memory_order_release, memory_order_relaxed))
+      <span>break</span>;
+    pthread_yield_np();
+  }
+}
+
+<span>struct</span> <span>List</span> *<span>pop</span>(void) {
+  <span>struct</span> <span>List</span> *tip, *elem;
+  tip = atomic_load_explicit(&amp;list, memory_order_relaxed);
+  <span>while</span> ((elem = (<span>struct</span> <span>List</span> *)PTR(tip))) {
+    <span>if</span> (atomic_compare_exchange_weak_explicit(
+            &amp;list, &amp;tip, (<span>struct</span> <span>List</span> *)ABA(elem-&gt;next, TAG(tip) + 1),
+            memory_order_acquire, memory_order_relaxed))
+      <span>break</span>;
+    pthread_yield_np();
+  }
+  <span>return</span> elem;
+}
+</pre>
+
+<p>
+The issue is this will likely go just as slow if not slower. The mere
+act of sharing the same 64-byte region of memory (a.k.a. cacheline)
+between multiple cores, causes the CPU internally to basically use a
+mutex, and chances are the CPU&#39;s internal mutexes aren&#39;t as good as the
+ones you&#39;ve implemented in userspace.
+
+</p><p>
+So one potentially smarter approach is to shard the data structure, so
+each CPU gets its own area.
+
+</p><pre><span>static struct</span> {
+  <span>alignas</span>(64) <span>struct</span> <span>List</span> *list;
+} <span>lists</span>[CPU_SETSIZE];
+</pre>
+
+<p>
+Then all you have to do is index the <code>lists</code> array
+using <code>sched_getcpu()</code>. The issue is that doesn&#39;t work. We
+still need a mutex, due to how the operating system might preempt and
+relocate your thread twixt the cpu number load and any mutations you&#39;ve
+made.
+
+</p><pre><span>static struct</span> {
+  <span>alignas</span>(64) <span>pthread_mutex_t</span> lock;
+  <span>struct</span> <span>List</span> *list;
+} <span>gil</span>[CPU_SETSIZE];
+</pre>
+
+<p>
+So now that we&#39;ve fixed things, it looks like we ended up back where we
+started, except now we have to manage 1024 copies. However, despite
+appearances, this code actually is much more optimal. By having a
+separate mutex for each cpu, we&#39;ve ensured they&#39;ll only be contended
+when we hit corner cases. It matters because the difference between a
+contended versus uncontended lock is like the night and the day. With
+a <a href="https://justine.lol/mutex/">great mutex library like nsync</a> a contended
+lock operation will cost you <em>at least</em> 200 nanoseconds. However
+an uncontended lock/unlock operation only costs about 15 nanoseconds. We
+further use <code>alignas(64)</code> to ensure that the pointer is
+placed on a separate cacheline for each CPU, thereby reducing any
+hardware internal contention to a very low order of probability.
+
+</p><p>
+However if all we&#39;re doing is pushing and popping, then that 15
+nanoseconds is still an enormous cost compared to a thread local linked
+list push or pop which only costs about a nanosecond. So we really want
+to get rid of the mutex. The only thing standing in our way is a fringe
+rarely-occurring corner case where the operating system interrupts our
+tiny sequence of a few assembly instructions during which we mutate the
+list.
+
+</p><p>
+So how do we get rid of the mutex? At this point, you might be thinking
+you need an RTOS which guarantees your thread won&#39;t be preempted, or
+perhaps your existing OS might have a <code>sched_setscheduler()</code>
+policy that gives you back some semblance of control. For specialized
+deployments, that might work. There&#39;s also
+<code>sched_setaffinity()</code> which is supported on Linux, FreeBSD,
+and Windows. That will work for a given application, if you feel
+comfortable pinning your threads to particular CPUs. But all these
+approaches folks have invented in the past for controlling the OS
+scheduler can be potentially disastrous if your program&#39;s execution
+doesn&#39;t go the way you planned.
+
+</p><p>
+This is why Linux now provides
+<code>rseq()</code> which is a much more enlightened solution. With
+restartable sequences, you actually can get rid of both the mutex and
+atomics, while the OS continues to fully abstract scheduling. The way it
+works is you advise the kernel whenever your program enters a critical
+section of code that you don&#39;t want interrupted. It&#39;s probably going to
+be maybe 10 assembly instructions tops. The first assembly opcode should
+be a move instruction that sets the <code>rseq_cs</code> field. The last
+instruction needs to be the thing that makes the modification to your
+global data structure. Think of it sort of like a really tiny database
+transaction. What makes it go fast, is that the bidirectional
+communication with the kernel happens via shared memory.
+
+</p><h2 class="page" id="hitcounter"><a href="#hitcounter">Example No. 1: Building the Fastest Hit Counter</a></h2>
+
+<p>
+Here&#39;s your gentle introduction to restartable sequences. We&#39;re going to
+build a program that just increments a number. Since that&#39;s probably the
+simplest thing imaginable. Imagine you have a blog that gets billions of
+visitors per second, which is hosted on a multi-threaded webserver you
+wrote from scratch and you need to track visits. In that case, I can
+think of five ways you could build your hit counter
+(using <a href="https://justine.lol/cosmo3/">cosmocc</a> to build the example code).
+
+</p><div>
+<table>
+<tbody><tr>
+  <th colspan="6">
+    <a href="https://justine.lol/rseq/threadripper.html"><img src="https://justine.lol/rseq/threadripper-pro-800x800.jpg" alt="[photo of AMD Ryzen 4 ThreadRipper Pro box]" width="400" height="400"/></a><p>
+    96 core AMD Ryzen Threadripper Pro 7995WX (x86-64)
+
+</p></th></tr><tr>
+  <th>wall</th><th>wall</th><th>user</th><th>system</th><th>cpu</th><th>implementation
+
+</th></tr><tr>
+  <td>62,461
+  </td><td>30,739k
+  </td><td>118,631
+  </td><td>11,744,462
+  </td><td>161k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-mutex.c.html">hitcounter-mutex.c</a> (glibc)
+
+</td></tr><tr>
+  <td>29,389
+  </td><td>65,331k
+  </td><td>34,094
+  </td><td>13,259
+  </td><td>40,547k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-mutex.c.html">hitcounter-mutex.c</a> (cosmo)
+
+</td></tr><tr>
+  <td>23,412
+  </td><td>82,009k
+  </td><td>4,366,203
+  </td><td>0
+  </td><td>440k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-atomic.c.html">hitcounter-atomic.c</a>
+
+</td></tr><tr>
+  <td>543
+  </td><td>3,535,912k
+  </td><td>93,274
+  </td><td>0
+  </td><td>20,585k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-shard.c.html">hitcounter-shard.c</a>
+
+</td></tr><tr>
+  <td>20
+  </td><td>96,000,000k
+  </td><td>1,150
+  </td><td>12
+  </td><td>1,652,324k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-rseq.c.html">hitcounter-rseq.c</a>
+
+</td></tr><tr>
+  <td>7
+  </td><td>274,285,714k
+  </td><td>0
+  </td><td>11
+  </td><td>174,545,455k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-affinity.c.html">hitcounter-affinity.c</a>
+
+</td></tr></tbody></table>
+</div>
+
+<p>
+Earlier when I said rseq made my code go 34x or 43x faster, it&#39;s
+important to note that I was comparing it to the <em>portable</em>
+version of my <code>malloc()</code> implementation, which is already
+heavily optimized for multicore systems. If we compare rseq to a truly
+naïve solution, such as using a glibc mutex to guard an increment
+operation, then we see that rseq can actually make things go
+a <strong>million times faster</strong> judging by CPU time consumption.
+It sounds like I&#39;m joking, except I&#39;m not, since half the friends I
+asked told me that using the mutex was their first instinct here.
+
+</p><p>
+Now in terms of exploring the five approaches listed above, we can see
+that only three are worth considering.
+
+</p><ul>
+<li>
+Sharding is the best when you need portability to all operating systems.
+We use the <code>cosmo_shard()</code> function pointer to accomplish
+this. This will use <code>__get_rseq()-&gt;cpu_id</code> on modern Linux,
+falling back to alternatives like <code>lsl</code>&#39;ing the global
+descriptor table, <code>rdpid</code>, <code>rdtscp</code>, or
+<code>sched_getcpu()</code> when available, and if all else fails
+it&#39;ll use <code>murmur3(gettid())%32</code> as a last resort.
+
+</li><li>
+Affinity was the absolute fastest, but it requires micromanaging all
+threads. That rules it out for library authors. It&#39;s probably a bad idea
+for app authors too. I&#39;d be terrified of shooting myself in the foot if
+I tried that. However, I could potentially imagine some situations where
+it might be appropriate. However it&#39;s important to note that GCC
+cheated. By annihilating all volatile operations, we were able to
+leverage the compiler&#39;s knowledge of mathematics to find a closed form
+solution to increment, which is addition. So that&#39;s not cheating at all.
+If I use <code>alignas(64) volatile long x</code> in
+the <a href="https://justine.lol/rseq/hitcounter-affinity.c.html">hitcounter-affinity.c</a>
+example, then it ends up going exactly the same speed as the rseq
+example.
+
+</li><li>
+Restartable sequences make superior tradeoffs. They only currently work
+on modern Linux, so if you&#39;re building a library or something that&#39;s
+open source, you&#39;re going to need to support other strategies too. It
+requires writing code at a higher difficulty setting. I&#39;m afraid LLMs
+are not yet smart enough to help you build restartable sequences.
+However in the future I believe programming languages will change so we
+can elegantly express restartable sequences, similar to how C11
+introduced compiler APIs for atomics.
+
+</li></ul>
+
+<p>
+Now let&#39;s move on to my ARM workstation.
+
+</p><div>
+<table>
+<tbody><tr>
+  <th colspan="6">
+    <a href="https://system76.com/arm"><img src="https://justine.lol/rseq/system76-ampere-workstation.jpg" alt="Photo of System76 Ampere workstation, a black tower with a red stripe on the front" width="400" height="400"/></a><p>
+    System76 Thelio Astra w/ Ampere&#39;s 128 core 3GHz Altra CPU (ARM64)
+
+</p></th></tr><tr>
+  <th>wall</th><th>wall</th><th>user</th><th>system</th><th>cpu</th><th>implementation
+
+</th></tr><tr>
+  <td>219,484
+  </td><td>5,832k
+  </td><td>322,259
+  </td><td>15,790,712
+  </td><td>79k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-mutex.c.html">hitcounter-mutex.c</a> (glibc)
+
+</td></tr><tr>
+  <td>212,005
+  </td><td>6,038k
+  </td><td>144,163
+  </td><td>67,841
+  </td><td>6,038k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-mutex.c.html">hitcounter-mutex.c</a> (cosmo)
+
+</td></tr><tr>
+  <td>17,924
+  </td><td>71,413k
+  </td><td>2,162,867
+  </td><td>0
+  </td><td>592k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-atomic.c.html">hitcounter-atomic.c</a>
+
+</td></tr><tr>
+  <td>417
+  </td><td>3,069,544k
+  </td><td>42,972
+  </td><td>0
+  </td><td>29,787k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-shard.c.html">hitcounter-shard.c</a>
+
+</td></tr><tr>
+  <td>39
+  </td><td>32,820,513k
+  </td><td>2,966
+  </td><td>61
+  </td><td>422,861k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-rseq.c.html">hitcounter-rseq.c</a>
+
+</td></tr><tr>
+  <td>12
+  </td><td>106,666,667k
+  </td><td>15
+  </td><td>1
+  </td><td>80,000,000k
+  </td><td><a href="https://justine.lol/rseq/hitcounter-affinity.c.html">hitcounter-affinity.c</a>
+
+</td></tr></tbody></table>
+</div>
+
+<p>
+In the table above, the ops/sec columns are most directly comparable
+with the Threadripper results, since they&#39;re scaled with respect to the
+workload. More ops/sec is better. Looking at these numbers, a few things
+stand out:
+
+</p><ol>
+<li>
+Ampere&#39;s ARM Altra CPU has really fast atomics. One benefit of ARM is
+that it has a fancier memory model,
+which <a href="https://justine.lol/rseq/hitcounter-atomic.c.html">hitcounter-atomic.c</a>
+exploits using <code>atomic_fetch_add_explicit(&amp;counter, 1,
+memory_order_relaxed)</code>. Thanks to relaxed ordering, we get
+an <code>ldadd</code> instruction, which doesn&#39;t need to manage memory
+barriers. You can&#39;t do that on x86, since <code>xadd</code> is always
+strongly ordered. What&#39;s more interesting is that, even if I specify
+<code>memory_order_seq_cst</code> (for <code>ldaddal</code>) my Altra
+CPU <em>still</em> goes noticeably faster than my Threadripper. I
+suspect it might be hyperthreading that got it into trouble, because my
+Threadripper <em>claims</em> to have 192 CPUs.
+
+</li><li>
+Cosmopolitan&#39;s implementation of POSIX mutexes is very complicated. It
+does a better job than glibc, but I think we could improve our
+implementation to have better latency on ARM microprocessors.
+
+</li><li>
+The rest of the differences in numbers are mostly commensurate with the
+difference in price.
+
+</li><li>
+Using restartable sequences turned my 3GHz CPU into a 33GHz CPU.
+
+</li><li>
+Using mutexes turned my 3GHz CPU into a 219MHz CPU.
+
+</li></ol>
+
+<p>
+Here&#39;s what I think is cool about Ampere&#39;s ARM CPUs. I&#39;m actually huge
+fan of x86-64. I always have been. For years, I&#39;ve been reading people
+on forums like Hacker News talk about how x86 is bad because it has
+things like a complicated instruction decoder. RISC fans have always
+claimed that ARM, due to its intelligent design (like how all
+instructions are 4 bytes long) you can have more cores at a lower price.
+To that, my response has always been, &#34;then show me where I can buy one&#34;
+and no one has really given me an answer until now. Ampere made the
+dream of RISC finally come true. Now the CPU I own with the most cores
+is an ARM chip, and I was pleasantly surprised to discover that
+benchmarks exist where it&#39;s able to outperform a significantly more
+expensive x86 chip.
+
+</p><h2 class="page" id="pushpop"><a href="#pushpop">Example
+No. 2: Linked List Push Pop</a></h2>
+
+<p>
+Let&#39;s say you want to track object instances globally. Using rseq, it&#39;s
+relatively easy to implement the <code>push()</code>
+and <code>pop()</code> operations for a sharded linked list. Here&#39;s a
+working example that you can compile with
+<a href="https://justine.lol/cosmo3/">cosmocc</a>:
+
+</p><pre><span>#include</span> <span>&lt;assert.h&gt;</span>
+<span>#include</span> <span>&lt;cosmo.h&gt;</span>
+<span>#include</span> <span>&lt;linux/rseq.h&gt;</span>
+<span>#include</span> <span>&lt;pthread.h&gt;</span>
+<span>#include</span> <span>&lt;stdio.h&gt;</span>
+<span>#include</span> <span>&lt;stdlib.h&gt;</span>
+
+<span>#define</span> <span>ITERATIONS</span> 10000000l
+
+<span>struct</span> <span>List</span> {
+  <span>struct</span> <span>List</span> *next;
+};
+
+<span>struct</span> {
+  <span>alignas</span>(64) <span>struct</span> <span>List</span> *freelist;
+} <span>heaps</span>[CPU_SETSIZE];
+</pre>
+
+<p>
+Here we see that we finally got rid of the locks and atomics. We&#39;re
+using <code>alignas(64)</code> to ensure each CPU&#39;s memory is on a
+separate cacheline, which means there&#39;ll be no synchronization
+bloodbaths happening inside the hardware. Since Linux
+defines <code>CPU_SETSIZE</code> as 1024, we have to burn quite a bit of
+BSS memory, however most of it isn&#39;t going to be used. For single
+threaded programs, the Linux Kernel does a remarkably good job picking 1
+or 2 cores and sticking with it. We put a lot of faith in the kernel to
+not fragment our objects needlessly, since this design doesn&#39;t easily
+allow for a rebalancing of elements. It should not be needed.
+
+</p><pre><span>static inline void</span> <span>push</span>(<span>struct</span> <span>List</span> *chunk) {
+<span>#ifdef</span> __x86_64__
+  <span>asm volatile</span>(<span>&#34;.pushsection .rodata.rseq,\&#34;a\&#34;,@progbits\n&#34;</span>
+               <span>&#34;	.balign	32\n&#34;</span>
+               <span>&#34;300:	.long	0\n&#34;</span>                  <span>// rseq_cs::version</span>
+               <span>&#34;	.long	0\n&#34;</span>                  <span>// rseq_cs::flags</span>
+               <span>&#34;	.quad	301f\n&#34;</span>               <span>// rseq_cs::start_ip</span>
+               <span>&#34;	.quad	302f-301f\n&#34;</span>          <span>// rseq_cs::post_commit_offset</span>
+               <span>&#34;	.quad	303f\n&#34;</span>               <span>// rseq_cs::abort_ip</span>
+               <span>&#34;	.popsection\n&#34;</span>                <span>//</span>
+               <span>&#34;301:	lea	300b(%%rip),%%rcx\n&#34;</span>  <span>//</span>
+               <span>&#34;	mov	%%rcx,8(%1)\n&#34;</span>        <span>// rseq-&gt;rseq_cs</span>
+               <span>&#34;	mov	(%1),%%ecx\n&#34;</span>         <span>// rseq-&gt;cpu_id_start</span>
+               <span>&#34;	shl	$6,%%ecx\n&#34;</span>           <span>//</span>
+               <span>&#34;	mov	(%2,%%rcx),%%rdx\n&#34;</span>   <span>// rdx = freelist</span>
+               <span>&#34;	mov	%%rdx,(%0)\n&#34;</span>         <span>// chunk-&gt;next = rdx</span>
+               <span>&#34;	mov	%0,(%2,%%rcx)\n&#34;</span>      <span>// freelist = chunk</span>
+               <span>&#34;302:	.pushsection .text.unlikely,\&#34;ax\&#34;,@progbits\n&#34;</span>
+               <span>&#34;	.byte	0x0f,0xb9,0x4d\n&#34;</span>
+               <span>&#34;	.long	0x53053053\n&#34;</span>
+               <span>&#34;303:	jmp	301b\n&#34;</span>               <span>// restart on abort</span>
+               <span>&#34;	.popsection&#34;</span>
+               : <span>/* no outputs */</span>
+               : <span>&#34;r&#34;</span>(chunk), <span>&#34;r&#34;</span>(__get_rseq()), <span>&#34;r&#34;</span>(heaps)
+               : <span>&#34;rcx&#34;</span>, <span>&#34;rdx&#34;</span>, <span>&#34;memory&#34;</span>);
+<span>#elifdef</span> __aarch64__
+  <span>asm volatile</span>(<span>&#34;.pushsection .rodata.rseq,\&#34;a\&#34;,@progbits\n&#34;</span>
+               <span>&#34;	.balign	32\n&#34;</span>
+               <span>&#34;300:	.long	0\n&#34;</span>                  <span>// rseq_cs::version</span>
+               <span>&#34;	.long	0\n&#34;</span>                  <span>// rseq_cs::flags</span>
+               <span>&#34;	.quad	301f\n&#34;</span>               <span>// rseq_cs::start_ip</span>
+               <span>&#34;	.quad	302f-301f\n&#34;</span>          <span>// rseq_cs::post_commit_offset</span>
+               <span>&#34;	.quad	303f\n&#34;</span>               <span>// rseq_cs::abort_ip</span>
+               <span>&#34;	.popsection\n&#34;</span>                <span>//</span>
+               <span>&#34;301:	adrp	x4, 300b\n&#34;</span>           <span>// load address of rseq_cs</span>
+               <span>&#34;	add	x4, x4, :lo12:300b\n&#34;</span> <span>//</span>
+               <span>&#34;	str	x4, [%1, #8]\n&#34;</span>       <span>// rseq-&gt;rseq_cs</span>
+               <span>&#34;	ldr	w4, [%1]\n&#34;</span>           <span>// rseq-&gt;cpu_id_start</span>
+               <span>&#34;	lsl	w4, w4, #6\n&#34;</span>         <span>//</span>
+               <span>&#34;	ldr	x5, [%2, x4]\n&#34;</span>       <span>// x5 = freelist</span>
+               <span>&#34;	str	x5, [%0]\n&#34;</span>           <span>// chunk-&gt;next = x5</span>
+               <span>&#34;	str	%0, [%2, x4]\n&#34;</span>       <span>// freelist = chunk</span>
+               <span>&#34;302:	.pushsection .text.unlikely,\&#34;ax\&#34;,@progbits\n&#34;</span>
+               <span>&#34;	.long	0xd428bc00\n&#34;</span>
+               <span>&#34;303:	adrp	x5, 301b\n&#34;</span>           <span>// load page address of 301b</span>
+               <span>&#34;	add	x5, x5, :lo12:301b\n&#34;</span> <span>// add low 12 bits</span>
+               <span>&#34;	br	x5\n&#34;</span>                 <span>// branch to 301b via register</span>
+               <span>&#34;	.popsection&#34;</span>
+               : <span>/* no outputs */</span>
+               : <span>&#34;r&#34;</span>(chunk), <span>&#34;r&#34;</span>(__get_rseq()), <span>&#34;r&#34;</span>(heaps)
+               : <span>&#34;x4&#34;</span>, <span>&#34;x5&#34;</span>, <span>&#34;memory&#34;</span>);
+<span>#endif</span>
+}
+
+<span>static inline struct</span> <span>List</span> *<span>pop</span>(<span>void</span>) {
+  <span>struct</span> <span>List</span> *chunk;
+<span>#ifdef</span> __x86_64__
+  <span>asm volatile</span>(<span>&#34;.pushsection .rodata.rseq,\&#34;a\&#34;,@progbits\n&#34;</span>
+               <span>&#34;	.balign	32\n&#34;</span>
+               <span>&#34;300:	.long	0\n&#34;</span>                  <span>// rseq_cs::version</span>
+               <span>&#34;	.long	0\n&#34;</span>                  <span>// rseq_cs::flags</span>
+               <span>&#34;	.quad	301f\n&#34;</span>               <span>// rseq_cs::start_ip</span>
+               <span>&#34;	.quad	302f-301f\n&#34;</span>          <span>// rseq_cs::post_commit_offset</span>
+               <span>&#34;	.quad	303f\n&#34;</span>               <span>// rseq_cs::abort_ip</span>
+               <span>&#34;	.popsection\n&#34;</span>                <span>//</span>
+               <span>&#34;301:	lea	300b(%%rip),%%rcx\n&#34;</span>  <span>//</span>
+               <span>&#34;	mov	%%rcx,8(%1)\n&#34;</span>        <span>// rseq-&gt;rseq_cs</span>
+               <span>&#34;	mov	(%1),%%ecx\n&#34;</span>         <span>// rseq-&gt;cpu_id_start</span>
+               <span>&#34;	shl	$6,%%ecx\n&#34;</span>           <span>//</span>
+               <span>&#34;	mov	(%2,%%rcx),%0\n&#34;</span>      <span>// chunk = chunks[cpu].freelist</span>
+               <span>&#34;	test	%0,%0\n&#34;</span>              <span>//</span>
+               <span>&#34;	jz	302f\n&#34;</span>               <span>//</span>
+               <span>&#34;	mov	(%0),%%rdx\n&#34;</span>         <span>// rdx = chunk-&gt;next</span>
+               <span>&#34;	mov	%%rdx,(%2,%%rcx)\n&#34;</span>   <span>// freelist = rdx</span>
+               <span>&#34;302:	.pushsection .text.unlikely,\&#34;ax\&#34;,@progbits\n&#34;</span>
+               <span>&#34;	.byte	0x0f,0xb9,0x4d\n&#34;</span>
+               <span>&#34;	.long	0x53053053\n&#34;</span>
+               <span>&#34;303:	jmp	301b\n&#34;</span>               <span>// restart on abort</span>
+               <span>&#34;	.popsection&#34;</span>
+               : <span>&#34;=&amp;r&#34;</span>(chunk)
+               : <span>&#34;r&#34;</span>(__get_rseq()), <span>&#34;r&#34;</span>(heaps)
+               : <span>&#34;rcx&#34;</span>, <span>&#34;rdx&#34;</span>, <span>&#34;memory&#34;</span>);
+<span>#elifdef</span> __aarch64__
+  <span>asm volatile</span>(<span>&#34;.pushsection .rodata.rseq,\&#34;a\&#34;,@progbits\n&#34;</span>
+               <span>&#34;	.balign	32\n&#34;</span>
+               <span>&#34;300:	.long	0\n&#34;</span>                  <span>// rseq_cs::version</span>
+               <span>&#34;	.long	0\n&#34;</span>                  <span>// rseq_cs::flags</span>
+               <span>&#34;	.quad	301f\n&#34;</span>               <span>// rseq_cs::start_ip</span>
+               <span>&#34;	.quad	302f-301f\n&#34;</span>          <span>// rseq_cs::post_commit_offset</span>
+               <span>&#34;	.quad	303f\n&#34;</span>               <span>// rseq_cs::abort_ip</span>
+               <span>&#34;	.popsection\n&#34;</span>                <span>//</span>
+               <span>&#34;301:	adrp	x4, 300b\n&#34;</span>           <span>// load address of rseq_cs</span>
+               <span>&#34;	add	x4, x4, :lo12:300b\n&#34;</span> <span>//</span>
+               <span>&#34;	str	x4, [%1, #8]\n&#34;</span>       <span>// rseq-&gt;rseq_cs</span>
+               <span>&#34;	ldr	w4, [%1]\n&#34;</span>           <span>// rseq-&gt;cpu_id_start</span>
+               <span>&#34;	lsl	w4, w4, #6\n&#34;</span>         <span>//</span>
+               <span>&#34;	ldr	%0, [%2, x4]\n&#34;</span>       <span>// chunk = chunks[cpu].freelist</span>
+               <span>&#34;	cbz	%0, 302f\n&#34;</span>           <span>//</span>
+               <span>&#34;	ldr	x5, [%0]\n&#34;</span>           <span>// x5 = chunk-&gt;next</span>
+               <span>&#34;	str	x5, [%2, x4]\n&#34;</span>       <span>// freelist = x5</span>
+               <span>&#34;302:	.pushsection .text.unlikely,\&#34;ax\&#34;,@progbits\n&#34;</span>
+               <span>&#34;	.long	0xd428bc00\n&#34;</span>
+               <span>&#34;303:	adrp	x5, 301b\n&#34;</span>           <span>// load page address of 301b</span>
+               <span>&#34;	add	x5, x5, :lo12:301b\n&#34;</span> <span>// add low 12 bits</span>
+               <span>&#34;	br	x5\n&#34;</span>                 <span>// branch to 301b via register</span>
+               <span>&#34;	.popsection&#34;</span>
+               : <span>&#34;=&amp;r&#34;</span>(chunk)
+               : <span>&#34;r&#34;</span>(__get_rseq()), <span>&#34;r&#34;</span>(heaps)
+               : <span>&#34;x4&#34;</span>, <span>&#34;x5&#34;</span>, <span>&#34;memory&#34;</span>);
+<span>#endif</span>
+  <span>return</span> chunk;
+}
+</pre>
+
+<p>
+Now let&#39;s go over the assembly code, in the hopes of demystifying it.
+For starters, we&#39;re using <a href="https://justine.lol/dox/rmsiface.txt">Richard
+Stallman&#39;s Math 55 assembly notation</a>, which I documented for
+personal reference on x86 many years ago in that text file. The GNU
+assembler mixed with the C/C++ constraints system is the most powerful
+thing there is. For starters,
+
+</p><pre>	<span>.pushsection</span> .rodata.rseq,<span>&#34;a&#34;</span>,<span>@progbits</span>
+	<span>// ...</span>
+	<span>.popsection</span>
+</pre>
+
+<p>
+lets us teleport content to a totally different area of the executable
+file. In this case, we&#39;re using the section
+name <code>.rodata.rseq</code> because the standard GNU linker scripts
+(e.g. <code>/usr/lib/x86_64-linux-gnu/ldscripts/elf_x86_64.x</code>) are
+hard-coded to recognize sections named <code>.rodata</code>
+or <code>.rodata.*</code> and then puts them into an ELF program header
+segment that&#39;ll be marked <code>PROT_READ</code> on process startup. The
+code within the pushpop:
+
+</p><pre><span>300</span>:	<span>.long</span>	0                  <span>// rseq_cs::version</span>
+	<span>.long</span>	0                  <span>// rseq_cs::flags</span>
+	<span>.quad</span>	301<span>f</span>               <span>// rseq_cs::start_ip</span>
+	<span>.quad</span>	302<span>f</span>-301<span>f</span>          <span>// rseq_cs::post_commit_offset</span>
+	<span>.quad</span>	303<span>f</span>               <span>// rseq_cs::abort_ip</span>
+</pre>
+
+<p>
+lays out the <code>static const struct rseq_cs</code> content (see
+definition below) which describes the restartable sequence. It&#39;s
+important to use System V style numeric labels here with the forwards
+(f) and backwards (b) references. That&#39;s because they can be repeated in
+the assembly multiple times, which means the assembler won&#39;t break if
+our function is inlined multiple times by the compiler. Alternatively,
+it&#39;s also possible to create labels like <code>.Ldescription.%=</code>
+since that&#39;ll generate a unique ID for each <code>asm()</code> block.
+
+</p><pre><span>301</span>:	<span>lea</span>	300b(<span>%%rip</span>),<span>%%rcx</span>
+	<span>mov</span>	<span>%%rcx</span>,8(<span>%1</span>)
+</pre>
+
+We use the <code>301</code> label for the actual restartable sequence.
+These first two opcodes in our sequence is basically saying
+<code>__get_rseq()-&gt;rseq_cs = &amp;300b</code> (note: the <code>%1</code> is
+used to reference the asm block arguments by index, which in this case
+is <code>&#34;r&#34;(__get_rseq())</code>, further noting that
+the <code>r</code> causes the rseq address to be stored in an arbitrary
+register). That&#39;s basically modifying a piece of <acronym title="Thread
+Local Storage">TLS</acronym> memory we shared with the kernel. The
+<code>lea</code> instruction is needed to
+support <acronym title="Position Independent Code">PIC</acronym>, but
+the above could be shortened to <code>movq $300b,8(%1)</code> if you&#39;re
+using Cosmopolitan.
+
+<p>
+When the kernel decides to preempt our thread, it&#39;ll check
+the <code>rseq_cs</code> field and read the rodata structure we created
+earlier, to determine whether or not the program counter (%rip) is
+currently located inside <code>300</code> label. If it is, then kernel
+changes the program counter to the <code>abort_ip</code> which we
+specified as pointing to label <code>303</code>.
+
+</p><pre>	<span>mov</span>	(<span>%1</span>),<span>%%ecx</span>         <span>// rseq-&gt;cpu_id_start</span>
+	<span>shl</span>	<span>$6</span>,<span>%%ecx</span>           <span>//</span>
+</pre>
+
+<p>
+Next up, we load the <code>__get_rseq()-&gt;cpu_id_start</code> field
+documented below. This tells us the index of the CPU on which our thread
+is currently running. Then we shift it left by 6 places, which is a fast
+way to multiply by 64. It&#39;s important that this happen inside the
+sequence. Since you&#39;ll notice our abort handler simply jumps back to the
+start of the sequence. At that point, after being preempted and
+relocated, the CPU index is obviously going to change, so the memory
+index needs to be recomputed.
+
+</p><pre>	<span>mov</span>	(<span>%2</span>,<span>%%rcx</span>),<span>%%rdx</span>   <span>// rdx = heaps[rcx].freelist</span>
+	<span>mov</span>	<span>%%rdx</span>,(<span>%0</span>)         <span>// chunk-&gt;next = rdx</span>
+	<span>mov</span>	<span>%0</span>,(<span>%2</span>,<span>%%rcx</span>)      <span>// heaps[rcx].freelist = chunk</span>
+<span>302</span>:
+</pre>
+
+Finally, we perform the actual push operation. Note that we don&#39;t
+actually mutate global memory until the last instruction. The whole
+sequence works like a transaction. The last instruction is special,
+since it&#39;s what commits the change.
+
+<pre>	<span>.pushsection</span> .text.unlikely,<span>&#34;ax&#34;</span>,<span>@progbits</span>
+	<span>.byte</span>	0x0f,0xb9,0x4d
+	<span>.long</span>	0x53053053
+<span>303</span>:	<span>jmp</span>	301<span>b</span>               <span>// restart on abort</span>
+	<span>.popsection</span>
+</pre>
+
+<p>
+Our abort handler is simple enough. All it does is jump back to the
+start of our restartable sequence. The only thing surprising about this
+code is that the kernel requires it to be prefixed by an arbitrary
+32-bit word that was passed to the <code>rseq()</code> system call
+earlier. Since that Cosmopolitan C runtime is responsible for issuing
+that system call, cosmo defines that magic number as
+<code>RSEQ_SIG</code> in the <code>&lt;linux/rseq.h&gt;</code> header
+file documented below. Another thing we do is we teleport the abort
+handler code to the <code>.text.unlikely</code> section of our binary,
+since that&#39;s another GNU standard section name explicitly defined by
+stock linker scripts.
+
+</p><p>
+All you see here is basically the technique I used in
+my <code>malloc()</code> implementation for Cosmopolitan Libc. When a
+small allocation (fewer than 512 bytes) is requested, it tries to pop a
+piece of memory from a global sharded list like the above. If one isn&#39;t
+there, then it asks <code>mmap()</code> for a new page of memory,
+divides it into chunks, pushes them all, and then the allocation
+operation tries again. It&#39;s a fast, simple, and elegant design. But the
+tradeoff is that it&#39;s difficult to release memory back to the system,
+since here we&#39;re basically assuming <code>List</code> memory is
+permanent.
+
+</p><p>
+Now let&#39;s write some code for testing our push and pop functions.
+
+</p><pre><span>void</span> *<span>worker</span>(<span>void</span> *arg) {
+  <span>struct</span> <span>List</span> *elem;
+  <span>for</span> (<span>long</span> i = 0; i &lt; ITERATIONS; ++i) {
+    <span>switch</span> (i % (ITERATIONS / 10000)) {
+      <span>case</span> 0:
+        push(malloc(<span>sizeof</span>(<span>struct</span> <span>List</span>)));
+        <span>break</span>;
+      <span>default</span>:
+        <span>if</span> ((elem = pop()))
+          push(elem);
+        <span>break</span>;
+    }
+  }
+  <span>return</span> 0;
+}
+
+<span>void</span> <span>cleanup</span>(<span>void</span>) {
+  <span>for</span> (<span>int</span> i = 0; i &lt; CPU_SETSIZE; ++i) {
+    <span>struct</span> <span>List</span> *chunk;
+    <span>while</span> ((chunk = heaps[i].freelist)) {
+      heaps[i].freelist = chunk-&gt;next;
+      free(chunk);
+    }
+  }
+}
+
+<span>int</span> <span>main</span>(<span>void</span>) {
+  <span>if</span> (__get_rseq()-&gt;cpu_id &lt; 0) {
+    fprintf(stderr, <span>&#34;rseq is not supported on this system\n&#34;</span>);
+    <span>return</span> 1;
+  }
+  <span>int</span> threads = cosmo_cpu_count();
+  <span>pthread_t</span> th[threads];
+  <span>for</span> (<span>long</span> i = 0; i &lt; threads; ++i)
+    pthread_create(&amp;th[i], 0, worker, 0);
+  <span>for</span> (<span>long</span> i = 0; i &lt; threads; ++i)
+    pthread_join(th[i], 0);
+  cleanup();
+}
+</pre>
+
+<p>
+So there you have it. A gentle introduction to restartable sequences, by
+way of a concrete example offering decent code you can use today, to
+make your global linked lists more scalable on CPUs with many cores.
+
+</p>
+
+<pre><span>#define</span> <span>RSEQ_CPU_ID_UNINITIALIZED</span>       -1
+<span>#define</span> <span>RSEQ_CPU_ID_REGISTRATION_FAILED</span> -2
+
+<span>#define</span> <span>RSEQ_FLAG_UNREGISTER</span> 1
+
+<span>#define</span> <span>RSEQ_CS_FLAG_NO_RESTART_ON_PREEMPT</span> 1  <span>/* deprecated */</span>
+<span>#define</span> <span>RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL</span>  2  <span>/* deprecated */</span>
+<span>#define</span> <span>RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE</span> 4  <span>/* deprecated */</span>
+
+<span>#ifdef</span> __x86_64__
+<span>#define</span> <span>RSEQ_SIG</span> 0x53053053 <span>/* ud1 0x53053053(%rip),%edi */</span>
+<span>#elif</span> <span>defined</span>(__aarch64__)
+<span>#define</span> <span>RSEQ_SIG</span> 0xd428bc00 <span>/* brk #0x45e0 */</span>
+<span>#endif</span>
+
+<span>/* consider putting this in the .rodata.rseq section of your binary */</span>
+<span>struct</span> <span>rseq_cs</span> {
+  <span>uint32_t</span> version;
+  <span>uint32_t</span> flags;
+  <span>uint64_t</span> start_ip;
+  <span>uint64_t</span> post_commit_offset;
+  <span>uint64_t</span> abort_ip;
+} <span>forcealign</span>(32);
+
+<span>/* this memory should go in thread local storage */</span>
+<span>struct</span> <span>rseq</span> {
+
+  <span>/* The difference between the two is that `cpu_id_start` is always in
+     range, whereas `cpu_id` may contain error values. The kernel
+     provides both in order to support computation of values derived
+     from the CPU ID that happens before entering the critical section.
+     We could do this with one CPU ID, but it would require an extra
+     branch to distinguish &#34;not initialized&#34; from &#34;CPU ID changed after
+     fetching it&#34;. On the other hand if (like tcmalloc) you only fetch
+     the CPU Id within a critical section, then you need only one field
+     because you have only one branch: am I initialized. There is no
+     such thing as a CPU mismatch because instead you are just restarted
+     when the CPU ID changes. —Quoth tcmalloc (rseq.md) */</span>
+  <span>uint32_t</span> cpu_id_start;
+
+  <span>/* this should be initialized to RSEQ_CPU_ID_UNINITIALIZED when this
+     data structure is registered with the kernel. you&#39;ll then be able
+     to test if the host OS is Linux 4.18+ by simply checking cpu_id≥0 */</span>
+  <span>volatile int</span> cpu_id;
+
+  <span>/* when this points to `struct rseq_cs` the kernel will be advised on
+     how to handle the interrupting of this thread */</span>
+  <span>uint64_t</span> rseq_cs;
+
+  <span>uint32_t</span> flags;
+  <span>uint32_t</span> node_id;
+  <span>uint32_t</span> mm_cid;
+  <span>char</span> end[];
+} <span>forcealign</span>(32);
+
+<span>#define</span> <span>__get_rseq</span>() ((<span>struct</span> <span>rseq</span> *)__get_tls()-&gt;tib_rseq)
+</pre>
+
+<h2 class="page" id="methodology"><a href="#methodology">Methodology</a></h2>
+
+<p>
+Cosmopolitan creates portable binaries, which means the code I
+compiled <em>by default</em> targets K8 on x86-64 and ARMv8.0-a on
+Ampere. Now, obviously, cosmocc still uses tricks to exploit modern
+capabilities at runtime. For example, atomic instructions on ARM are
+compiled to emit a function call that dispatches to the modern LSE
+opcodes when <code>HWCAP_ATOMICS</code> is advertised by the kernel. But
+it&#39;s worth mentioning that, if you don&#39;t care about portable binaries,
+you can squeeze another 10% performance from these programs if you build
+your ARM code just for Altra using <code>aarch64-unknown-cosmo-cc
+-mcpu=neoverse-n1 -fpermitted-flt-eval-methods=c11</code>.
+
+</p><p>
+In the first section of this blog post, I threw out a bunch of numbers
+like &#34;malloc() goes 34x faster&#34;. I measured that using the following
+code, which simply spawns a thread for each CPU and repeatedly allocates
+and frees small pieces of memory.
+
+</p><pre><span>#include</span> <span>&lt;cosmo.h&gt;</span>
+<span>#include</span> <span>&lt;pthread.h&gt;</span>
+<span>#include</span> <span>&lt;stdio.h&gt;</span>
+<span>#include</span> <span>&lt;stdlib.h&gt;</span>
+
+<span>#define</span> <span>NUM_THREADS</span>    cosmo_cpu_count()
+<span>#define</span> <span>NUM_ITERATIONS</span> 10000000
+
+<span>void</span> *<span>identity</span>(<span>void</span> *arg) {
+  <span>return</span> arg;
+}
+
+<span>void</span> *(*<span>pIdentity</span>)(<span>void</span> *) = identity;
+
+<span>void</span> *<span>thread_func</span>(<span>void</span> *arg) {
+  <span>for</span> (<span>unsigned long</span> i = 0; i &lt; NUM_ITERATIONS; i++)
+    free(pIdentity(malloc(i % 256)));
+  <span>return</span> <span>NULL</span>;
+}
+
+<span>int</span> <span>main</span>() {
+  <span>pthread_t</span> threads[NUM_THREADS];
+  <span>for</span> (<span>int</span> i = 0; i &lt; NUM_THREADS; i++)
+    <span>if</span> (pthread_create(&amp;threads[i], <span>NULL</span>, thread_func, <span>NULL</span>))
+      <span>return</span> 1;
+  <span>for</span> (<span>int</span> i = 0; i &lt; NUM_THREADS; i++)
+    <span>if</span> (pthread_join(threads[i], <span>NULL</span>))
+      <span>return</span> 1;
+}
+</pre>
+
+<p>
+When I build this program with cosmocc, it&#39;s possible for me to disable
+malloc&#39;s use of rseq by setting an environment variable, which specifies
+the maximum number of rseq memory pages allowed.
+
+</p><pre>cosmocc -O -o bench bench.c
+<span>time</span> ./bench
+<span>export</span> COSMOPOLITAN_M_RSEQ_MAX=0
+<span>time</span> ./bench
+</pre>
+
+<p>
+That environment variable is super useful, since it gives you a clear
+picture on your Linux workstation of what your malloc performance is
+going to look like when you run your actually portable executables on
+every other OS. I&#39;m also using it as a bulwark against pathological
+cases I could envision with memory consumption.
+
+</p><h2 class="page" id="advanced"><a href="#advanced">Advanced Reading</a></h2>
+
+<ol>
+<li>
+The <a href="https://github.com/google/tcmalloc/blob/master/docs/rseq.md">tcmalloc
+documentation</a> explains how they used rseq in their malloc
+implementation. For example, the trick they use to have multiple global
+memory writes is they use an array (instead of linked lists) and they
+have an integer indicating how much of that array has been committed so
+far. That way they can write whatever they want to the uncommitted area,
+and then roll forward the integer when they&#39;re done.
+
+</li><li>
+The <code>MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ</code> command was
+introduced to the <code>membarrier()</code> system call in Linux v5.10.
+This is what tcmalloc uses to facilitate cross-CPU modifications to rseq
+data structures.
+
+</li></ol>
+
+<h2 class="page" id="credits"><a href="#credits">Credits</a></h2>
+
+<p>
+The graphic of the Genthree Linux penguin above was drawn in
+collaboration with ChatGPT.
+
+</p><p>
+The code font on this page is
+<a href="https://fsd.it/shop/fonts/pragmatapro-variable/">PragmataPro
+Variable</a> (€299) which was designed by Fabrizio Schiavi in Italy.
+
+</p><p>
+The <code>rseq()</code> system call was developed
+by <a href="https://www.linuxplumbersconf.net/2013/ocw//system/presentations/1695/original/LPC%20-%20PerCpu%20Atomics.pdf">Paul
+Turner and Andrew Hunter at Google</a>
+and <a href="https://github.com/compudj">Mathieu Desnoyers</a> at
+<a href="https://efficios.com/">EfficiOS</a> who
+<a href="https://github.com/torvalds/linux/commit/d7822b1e24f2df5df98c76f0e94a5416349ff759">introduced</a>
+it into the Linux Kernel in 2018.
+
+</p>
+
+<p>
+You&#39;re invited to join my <a href="https://discord.gg/FwAVVu7eJ4">redbean
+discord</a> server, where you can hang out with me and cosmo developers.
+
+</p><h2 class="page" id="funding"><a href="#funding">Funding</a></h2>
+
+<p>
+  <a href="https://justine.lol/lemuria.png">
+    <picture>
+      <source srcset="//worker.jart.workers.dev/sectorlisp2/lemuria.webp" type="image/webp"/>
+      <img src="https://worker.jart.workers.dev/sectorlisp2/lemuria.png" width="850" height="360" alt="[United States of Lemuria - two dollar bill - all debts public and primate]"/>
+    </picture>
+  </a>
+
+</p><p>
+System76 and Ampere were kind enough to let me purchase their
+workstation at a discounted rate, to help my open source work on
+projects like llamafile. My
+<a href="https://github.com/sponsors/jart">GitHub sponsors</a>,
+and
+<a href="https://www.patreon.com/jart">Patreon subscribers</a> have done
+much to help make my blogging and open source work possible these last
+five years. This article has Amazon Associate hyperlinks, so purchasing
+the recommended products is another way you can support me. Lastly
+Google and Mozilla are the two companies you can thank most for helping
+enable me to do what I do.
+
+</p>
+<img src="https://ipv4.games/claim?name=jart"/>
+</div>
+  </body>
+</html>
