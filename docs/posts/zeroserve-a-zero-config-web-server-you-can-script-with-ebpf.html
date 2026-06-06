@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://su3.io/posts/introducing-zeroserve">Original</a>
+    <h1>Zeroserve: A zero-config web server you can script with eBPF</h1>
+    
+    <div id="readability-page-1" class="page"><div><!----><p><i>Disclaimer: This article is co-authored with GPT-5.5 and Claude Opus 4.8.</i>
+</p>
+
+<p><a href="https://github.com/losfair/zeroserve" target="_blank" rel="noreferrer noopener">zeroserve</a> is a small, fast, zero-config HTTPS server. You hand it a tarball of a website and it serves it - over HTTP/2 and TLS 1.3, with hot reload and a tiny resident footprint. The twist is that you can drop eBPF programs into the tarball and they run on every request, in userspace, as sandboxed middleware - rewriting, authenticating, and rate-limiting requests, or reverse-proxying them to a backend when you want it to act as a gateway in front of your app.</p>
+<p>In short:</p>
+<ul>
+<li><strong>Fast</strong>: on one core it beats nginx across most workloads - small and large static files, scripted middleware, and small-response proxying, all over HTTPS.</li>
+<li><strong>Efficient eBPF scripting</strong>: scripts are JIT-compiled to native code and sandboxed in userspace, cheap enough to run on every request.</li>
+<li><strong>Program-as-configuration</strong>: your eBPF program is the whole configuration, deciding what happens to each request.</li>
+<li><strong><code>io_uring</code> throughout</strong>: every network and disk operation is submitted through <code>io_uring</code>.</li>
+<li><strong>Modern TLS in the box</strong>: TLS 1.3, HTTP/2, Encrypted Client Hello, SNI certificate selection, and JA4 fingerprinting.</li>
+<li><strong>Simple to operate</strong>: serve a whole site from one tarball and hot-reload it (and the TLS material) with a <code>SIGHUP</code>.</li>
+</ul>
+<p>It&#39;s meant to be an alternative to nginx and Caddy, and the design bet is about <em>configuration</em>. Those servers give you a declarative config language - <code>location</code> blocks, <code>rewrite</code> rules, <code>map</code> directives, <code>try_files</code> - and then, once the declarative language hits its limits, an optional scripting runtime bolted on the side (Lua, or Caddy&#39;s plugins). Behavior ends up split across two layers: directives that quietly grow their own control flow, plus scripts that run somewhere in the request lifecycle you have to keep in your head.</p>
+<p>zeroserve collapses that into one thing. There is no config file. The eBPF program <em>is</em> the configuration - a single, ordinary, sandboxed program that sees every request and decides what happens: routing, headers, auth, rate limiting, proxying. I want the whole request path in one program I can read top to bottom.</p>
+<h2 id="one-tarball-served-in-place">One tarball, served in place</h2>
+<p>The whole site is a single <code>tar</code> file. zeroserve indexes it on load - building a <code>path -&gt; byte-range</code> map - and then serves files by issuing byte-range reads against the tarball itself. Nothing is ever unpacked to disk. The site lives entirely in that one file, so there&#39;s no document root for a stray <code>location</code> rule to expose, and a deploy is a single atomic file swap. To package a directory:</p>
+<pre><code>zeroserve --pack ./public &gt; site.tar
+zeroserve --addr 0.0.0.0:8080 site.tar
+</code></pre>
+<p>Deploying a new version is &#34;replace the tarball and send <code>SIGHUP</code>&#34;. The reload swaps the site, the scripts, and the TLS material atomically, in the same process, with no dropped connections:</p>
+<pre><code>killall -SIGHUP zeroserve
+</code></pre>
+<p>All network and disk I/O goes through <code>io_uring</code> (via the <a href="https://github.com/bytedance/monoio" target="_blank" rel="noreferrer noopener">monoio</a> runtime). Each instance is a single-threaded event loop. That sounds like a limitation, and per-process it is - but it&#39;s the right shape when your scaling unit is &#34;more processes&#34;, and it&#39;s why many of them coexist happily on one box.</p>
+<h2 id="scripting-with-ebpf-in-userspace">Scripting with eBPF, in userspace</h2>
+<p>This is the part I find most fun. Any <code>.c</code> file you put under <code>.zeroserve/scripts/</code> gets compiled to an eBPF object at pack time (with <code>clang</code> and <code>llc</code>) and runs on every request. The eBPF runs entirely in userspace: zeroserve loads the bytecode into a runtime (<a href="https://crates.io/crates/async-ebpf" target="_blank" rel="noreferrer noopener">async-ebpf</a>) inside its own ordinary, unprivileged process, so the kernel&#39;s BPF subsystem and <code>CAP_BPF</code> stay out of it. async-ebpf JIT-compiles the bytecode to native machine code (it vendors <a href="https://github.com/iovisor/ubpf" target="_blank" rel="noreferrer noopener">uBPF</a>), so your &#34;config&#34; runs as native x86-64.</p>
+<p>A <em>pointer cage</em> does the job the kernel verifier normally would, keeping the program from reading or writing memory it shouldn&#39;t: every memory access in the JIT-compiled code is masked into the program&#39;s own arena, so a stray access stays confined to the script&#39;s own memory.</p>
+<p>The script runs directly on zeroserve&#39;s single event loop. To keep one slow script from stalling every other connection, the runtime is fully preemptible: a timer can interrupt JIT-compiled native code mid-execution and hand control back to the event loop.</p>
+<p>The programming model is a chain of scripts, run in sorted filename order, sharing a per-request metadata map. If a script calls <code>zs_respond</code> or <code>zs_reverse_proxy</code>, the chain short-circuits. Here&#39;s a script that runs first and enriches every request:</p>
+<pre><code>#include &lt;zeroserve.h&gt;
+
+ZS_ENTRY
+zs_u64 entry(void) {
+  char peer[64];
+  if (zs_req_peer(peer, sizeof(peer)) &lt;= 0) zs_strcpy(peer, &#34;unknown&#34;);
+
+  // publish values for the HTML template pass
+  zs_meta_set(ZS_STR(&#34;visitor&#34;), ZS_STR(peer));
+  // attach a header to *every* response: static files, zs_respond, proxied
+  zs_meta_set(ZS_STR(&#34;zs.response.header.x-served-by&#34;), ZS_STR(&#34;zeroserve-ebpf&#34;));
+  return 0;
+}
+</code></pre>
+<p>The metadata it sets does two things. Keys under <code>zs.response.header.*</code> become response headers on everything. And other keys feed a tiny template pass: a <code>&lt;zs-meta&gt;visitor&lt;/zs-meta&gt;</code> placeholder in an HTML file gets substituted on the way out. So you get dynamic-ish static pages without a template engine.</p>
+<p>The <a href="https://github.com/losfair/zeroserve/blob/main/sdk/zeroserve.h" target="_blank" rel="noreferrer noopener">helper surface</a> a script can call is broad:</p>
+<ul>
+<li><strong>Request inspection and mutation</strong>: read the method, path, query params, headers, and peer address; rewrite the URI or set and remove headers before the response goes out.</li>
+<li><strong>Crypto and encoding</strong>: SHA-256, HMAC-SHA256, base64, hex, and <code>getrandom</code>.</li>
+<li><strong>JSON</strong>: parse a request body, build and mutate a document tree, and reply with <code>zs_json_respond</code>.</li>
+<li><strong>Rate limiting</strong>: per-key token buckets keyed on anything from a peer IP to an API key, with state that survives hot reloads.</li>
+<li><strong>AWS SigV4</strong>: signed <code>Authorization</code> headers and presigned URLs for talking to S3 and other AWS services.</li>
+<li><strong>OIDC login</strong>: a complete relying-party flow (Authorization Code + PKCE) that carries the entire login session in sealed XChaCha20-Poly1305 cookies, so you can gate a static site behind &#34;log in with Google&#34; while the server stays stateless.</li>
+</ul>
+<p>A dynamic endpoint is just a script that responds:</p>
+<pre><code>ZS_ENTRY
+zs_u64 entry(void) {
+  char path[64];
+  zs_req_path(path, sizeof(path));
+  if (zs_strcmp(path, &#34;/health&#34;) != 0) return 0;
+
+  zs_meta_set(ZS_STR(&#34;zs.response.header.content-type&#34;), ZS_STR(&#34;application/json&#34;));
+  zs_respond(200, ZS_STR(&#34;{\&#34;status\&#34;:\&#34;ok\&#34;}\n&#34;));
+  return 0;
+}
+</code></pre>
+<p>Each script runs under a memory-footprint cap (256 KB by default), the runtime time-slices long-running scripts off the executor and throttles the runaways, and scripts can even call each other (<code>zs_call</code>) up to a bounded depth. A script that spins forever stalls only its own request - the preemption timer interrupts it and the server keeps serving everyone else.</p>
+<p>The TLS story underneath is more complete than the zero-config framing suggests: TLS 1.3 only, terminated by BoringSSL, with native <strong>Encrypted Client Hello</strong> (so the real SNI never appears in cleartext), SNI certificate selection from a directory, JA4 client fingerprinting exposed to scripts, and a transparent ECH relay mode that byte-for-byte forwards undecryptable handshakes to a real upstream so a protected name blends in behind a public one. That&#39;s a lot of transport security to ship in a single zero-config binary.</p>
+<h2 id="how-fast-is-it">How fast is it?</h2>
+<p>I benchmarked zeroserve against nginx 1.26 and Caddy 2.11 over HTTPS on an 8-core Ryzen 7 3700X, each serving the same content with the same self-signed certificate. Because a zeroserve instance is single-threaded by design, the only fair comparison is <em>per core</em>: I pinned every server to one CPU with <code>taskset</code> (and held nginx to <code>worker_processes 1</code> and Caddy to <code>GOMAXPROCS=1</code>; zeroserve is single-threaded already) and drove load with <code>wrk -t4 -c100</code> from other cores, taking the median of three 10-second runs. <code>wrk</code> speaks HTTP/1.1, so these are HTTP/1.1-over-TLS-1.3 numbers with the handshake amortized across long-lived keep-alive connections: the steady-state cost of serving an already-open HTTPS connection.</p>
+<p><strong>Small static file (174 B)</strong> - the bread and butter of static sites:</p>
+<table>
+<thead>
+<tr>
+<th>server</th>
+<th>req/s</th>
+<th>p99</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>zeroserve</td>
+<td><strong>36,681</strong></td>
+<td>5.4 ms</td>
+</tr>
+<tr>
+<td>nginx</td>
+<td>31,226</td>
+<td>7.8 ms</td>
+</tr>
+<tr>
+<td>Caddy</td>
+<td>12,830</td>
+<td>22 ms</td>
+</tr>
+</tbody></table>
+<p>zeroserve serves small files about 17% faster than nginx on a single core, with a tighter tail. HTML pages, small JSON, CSS - this is the case zeroserve is tuned for.</p>
+<p><strong>Large static file (100 KB):</strong></p>
+<table>
+<thead>
+<tr>
+<th>server</th>
+<th>req/s</th>
+<th>throughput</th>
+<th>p99</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>zeroserve</td>
+<td><strong>8,000</strong></td>
+<td>782 MB/s</td>
+<td>22 ms</td>
+</tr>
+<tr>
+<td>nginx</td>
+<td>7,600</td>
+<td>773 MB/s</td>
+<td>28 ms</td>
+</tr>
+<tr>
+<td>Caddy</td>
+<td>6,084</td>
+<td>590 MB/s</td>
+<td>44 ms</td>
+</tr>
+</tbody></table>
+<p>All three are close here, with zeroserve a hair ahead at around 780 MB/s on one core. nginx&#39;s usual trump card for large files is <code>sendfile()</code>, which splices file pages from the page cache to the socket with zero userspace copies. Under TLS that path goes unused: the bytes have to be encrypted in userspace anyway (short of kernel TLS, which all three leave off), so every server is bound by the same encrypt-and-write loop, and zeroserve&#39;s <code>io_uring</code> read-and-write path is a touch faster at it.</p>
+<h2 id="ebpf-vs-lua">eBPF vs Lua</h2>
+<p>The obvious comparison for the scripting is nginx + LuaJIT (<code>ngx_http_lua_module</code>), the usual way to run fast code inside a web server. So I wrote the equivalent Lua for two cases and put them head to head.</p>
+<p>One tuning knob matters a lot here. zeroserve ships with a conservative default: it arms the script-preemption timer every <strong>2 ms</strong>. Fine granularity makes it quick to throttle a misbehaving script, but it taxes every well-behaved one - at the default, eBPF trails nginx Lua on a fully dynamic response (about 32k req/s against 41k). Bumping <code>--preempt-timer-interval-ms</code> to 10 recovers ~40% of scripting throughput and turns that around:</p>
+<p><strong>Per-request header-injection middleware</strong> (script runs, static file is still served):</p>
+<table>
+<thead>
+<tr>
+<th>engine</th>
+<th>req/s</th>
+<th>p99</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>zeroserve eBPF (10 ms)</td>
+<td><strong>43,709</strong></td>
+<td>5.1 ms</td>
+</tr>
+<tr>
+<td>zeroserve eBPF (2 ms default)</td>
+<td>31,334</td>
+<td>6.7 ms</td>
+</tr>
+<tr>
+<td>nginx Lua (<code>header_filter</code>)</td>
+<td>28,653</td>
+<td>8.4 ms</td>
+</tr>
+</tbody></table>
+<p><strong>Fully dynamic JSON response:</strong></p>
+<table>
+<thead>
+<tr>
+<th>engine</th>
+<th>req/s</th>
+<th>p99</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>zeroserve eBPF (10 ms)</td>
+<td><strong>46,945</strong></td>
+<td>4.5 ms</td>
+</tr>
+<tr>
+<td>nginx Lua (<code>content_by_lua</code>)</td>
+<td>41,231</td>
+<td>6.4 ms</td>
+</tr>
+<tr>
+<td>zeroserve eBPF (2 ms default)</td>
+<td>32,393</td>
+<td>6.7 ms</td>
+</tr>
+</tbody></table>
+<p>At the 10 ms interval, tuned eBPF wins both cases. On the middleware case - a script shaping an otherwise-static response - it beats nginx Lua by about 50%, with a tighter tail. On the fully synthetic response it edges nginx&#39;s heavily-tuned <code>content_by_lua</code> too (47k against 41k). Both engines compile to native code (LuaJIT is a tracing JIT; async-ebpf JITs the eBPF through uBPF), and with TLS encryption as a shared per-request cost, the tuned eBPF path comes out ahead on throughput. At the 2 ms default, eBPF keeps the middleware win but gives up the synthetic-response lead, so I&#39;d run production scripts at 10 ms.</p>
+<h2 id="as-a-reverse-proxy">As a reverse proxy</h2>
+<p>Serving files is half the job; the other half is proxying to a backend, which is the main reason most people reach for nginx or Caddy in the first place. zeroserve does it from a script - <code>zs_reverse_proxy(&#34;http://127.0.0.1:9000&#34;)</code> - and keeps a pool of upstream connections (up to 128 per backend, 30 s idle) and reuses them across requests.</p>
+<p>Getting a fair fight here takes care: nginx&#39;s famous default closes upstream connections after each request, so keep-alive is enabled explicitly (<code>keepalive 128</code>, <code>proxy_http_version 1.1</code>, and a cleared <code>Connection</code> header), with Caddy reusing connections as it does by default. Each proxy terminates TLS on a single core and forwards to a shared plaintext backend, a separate 2-core server that sustains 100k req/s on its own, so the measurement isolates the proxy&#39;s own overhead.</p>
+<p>Proxying a small (174 B) response:</p>
+<table>
+<thead>
+<tr>
+<th>proxy</th>
+<th>req/s</th>
+<th>p50</th>
+<th>p99</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>zeroserve</td>
+<td><strong>26,486</strong></td>
+<td>3.3 ms</td>
+<td>8 ms</td>
+</tr>
+<tr>
+<td>nginx</td>
+<td>21,761</td>
+<td>4.2 ms</td>
+<td>10.5 ms</td>
+</tr>
+<tr>
+<td>Caddy</td>
+<td>7,683</td>
+<td>10.3 ms</td>
+<td>33 ms</td>
+</tr>
+</tbody></table>
+<p>zeroserve&#39;s pooled <code>io_uring</code> proxy leads here, about 22% ahead of nginx (26.5k against 21.8k) and roughly 3.4× Caddy. For the typical proxy workload - forwarding API calls, small JSON, an app server&#39;s HTML - zeroserve terminates TLS and shuttles the request to the backend faster than the reference implementation.</p>
+<p>Large bodies tip the balance back. Proxying a 100 KB response:</p>
+<table>
+<thead>
+<tr>
+<th>proxy</th>
+<th>req/s</th>
+<th>throughput</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>nginx</td>
+<td><strong>5,882</strong></td>
+<td>585 MB/s</td>
+</tr>
+<tr>
+<td>Caddy</td>
+<td>4,285</td>
+<td>406 MB/s</td>
+</tr>
+<tr>
+<td>zeroserve</td>
+<td>3,631</td>
+<td>359 MB/s</td>
+</tr>
+</tbody></table>
+<p>Once the proxied body is large, nginx&#39;s buffering moves bytes more efficiently and pulls ahead, with Caddy slotting in between and zeroserve trailing. If your proxied responses are large, nginx is the better tool; if they&#39;re small and numerous, zeroserve is faster.</p>
+<h2 id="memory">Memory</h2>
+<p>Idle, a single zeroserve instance sits around 15 MB PSS - more than nginx&#39;s ~6 MB, less than Caddy&#39;s ~60 MB. On its own that&#39;s unremarkable. What makes it matter is that the unit is a whole process: when you run a copy per core, they all map the same binary, so the code pages are shared, and each extra process adds little beyond its own working set.</p>
+<hr/>
+<p>zeroserve is <a href="https://github.com/losfair/zeroserve" target="_blank" rel="noreferrer noopener">open source on GitHub</a> - try it yourself!</p>
+<!----></div></div>
+  </body>
+</html>
