@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://fergusfinn.com/blog/kv-entropy-coder/">Original</a>
+    <h1>Speculative KV coding: losslessly compressing KV cache by up to ~4×</h1>
+    
+    <div id="readability-page-1" class="page"><div data-astro-cid-2q5oecfc="">  <p>The size of LLM context grows by the day. KV caching is what makes running
+those long contexts affordable: it trades compute for memory so the model
+doesn’t re-prefill work it has already done. But as agentic workflows push
+contexts ever longer, storing and moving the cache starts to dominate
+everything. To get to the next order of magnitude of LLM capability, we need
+it to be smaller.</p>
+<p>You can make it smaller lossily. <a href="https://arxiv.org/abs/2504.19874">TurboQuant</a> is a
+(somewhat controversial<span data-sidenote-id="sidenote-fpltnot7o"><label for="sidenote-fpltnot7o"></label><span><span></span>Performance <a href="https://vllm.ai/blog/turboquant">exploration</a>, accusations of academic <a href="https://dev.to/gaoj0017/turboquant-and-rabitq-what-the-public-story-gets-wrong-1i00">misconduct</a>.</span></span>) recent example, dropping the bit-width of K and V and absorbing the resulting
+quality loss. The cost of that route is that the loss isn’t something you
+specify in advance: you find out what degraded by running evals and hoping they
+catch whatever you killed. Lossless compression sidesteps the question entirely,
+by reconstructing the cache exactly.</p>
+<p>We explored lossless compression of LLM weights in a recent
+<a href="https://fergusfinn.com/blog/weight-entropy">post</a>. The numbers for KV cache look much the same:
+empirically, the bytewise entropy of a bf16 cache is about 11 bits per scalar,
+around 30% smaller than the raw representation. Worse, as we <a href="https://fergusfinn.com/blog/weight-entropy">showed
+then</a><span data-sidenote-id="sidenote-w8i045nsw"><label for="sidenote-w8i045nsw"></label><span><span></span>That post was about weight compression, but KV cache is reasonably similar. See <a href="https://arxiv.org/html/2509.03377v3">here</a> for a nice paper.</span></span>, this slack collapses as the bitwidth comes
+down. FP4 weights are within 5-7% of saturating
+their format, and the same goes for caches stored at lower precision. Given
+that low bitwidths have such obvious benefits for performance, we ought to
+treat them as the baseline.</p>
+<p>In this post we introduce <em>Speculative KV coding</em>, a method for losslessly
+compressing the KV cache of a large target model by up to ~<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4</mn><mo>×</mo></mrow><annotation encoding="application/x-tex">4\times</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>4</span><span>×</span></span></span></span><span data-sidenote-id="sidenote-4ifydpwbx"><label for="sidenote-4ifydpwbx"></label><span><span></span>This <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4</mn><mo>×</mo></mrow><annotation encoding="application/x-tex">4\times</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>4</span><span>×</span></span></span></span> is <em>on top</em> of lossy fp8 compression of the cache - the gross benefit is ~<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>8</mn><mo>×</mo></mrow><annotation encoding="application/x-tex">8\times</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>8</span><span>×</span></span></span></span>.</span></span> using
+a cheaper <em>predictor model</em> — a faster model whose forward pass on the same
+prompt predicts what the target’s cache will be. By analogy with <a href="https://arxiv.org/abs/2211.17192">speculative
+decoding</a> (Leviathan et al., 2022), the
+predictor runs in parallel on both encode and decode sides; an arithmetic
+coder then encodes the true cache at a bitrate set by how well the predictor
+fits the target.</p>
+<h2 id="a-kv-cache-isnt-really-random">A KV cache isn’t really random<a aria-label="Link to this section" href="#a-kv-cache-isnt-really-random"><span>§</span></a></h2>
+<p>Quick refresher on entropy coding<span data-sidenote-id="sidenote-cjiewq600"><label for="sidenote-cjiewq600"></label><span><span></span>I’ve written about the mechanics of arithmetic coding before — see the <a href="https://fergusfinn.com/blog/understanding-rans/">rANS</a> and <a href="https://fergusfinn.com/blog/understanding-tans/">tANS</a> posts. For this post all you need is the bitrate formula above; the coder is a black box that achieves it.</span></span>. You have a stream of symbols drawn
+from some distribution <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi></mrow><annotation encoding="application/x-tex">p</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>p</span></span></span></span>. <a href="https://en.wikipedia.org/wiki/Shannon%27s_source_coding_theorem">Shannon’s source coding
+theorem</a>
+says the best any lossless coder can do, on average, is <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>H</mi><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">H(p)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>H</span><span>(</span><span>p</span><span>)</span></span></span></span> bits per
+symbol. Real coders work with a <em>model</em> distribution <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi></mrow><annotation encoding="application/x-tex">q</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>q</span></span></span></span> instead of the true
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi></mrow><annotation encoding="application/x-tex">p</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>p</span></span></span></span>, and end up paying <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>H</mi><mo stretchy="false">(</mo><mi>p</mi><mo separator="true">,</mo><mi>q</mi><mo stretchy="false">)</mo><mo>=</mo><mi>H</mi><mo stretchy="false">(</mo><mi>p</mi><mo stretchy="false">)</mo><mo>+</mo><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow><mo stretchy="false">(</mo><mi>p</mi><mtext> </mtext><mi mathvariant="normal">∥</mi><mtext> </mtext><mi>q</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">H(p, q) = H(p) + \mathrm{KL}(p \,\|\, q)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>H</span><span>(</span><span>p</span><span>,</span><span></span><span>q</span><span>)</span><span></span><span>=</span><span></span></span><span><span></span><span>H</span><span>(</span><span>p</span><span>)</span><span></span><span>+</span><span></span></span><span><span></span><span><span>KL</span></span><span>(</span><span>p</span><span></span><span>∥</span><span></span><span>q</span><span>)</span></span></span></span> bits per
+symbol. The
+<a href="https://en.wikipedia.org/wiki/Kullback%E2%80%93Leibler_divergence">KL</a> term
+is the slack: the price you pay for your model not being the truth.</p>
+<p>The KV cache isn’t really a list of samples from a random source. The whole
+cache is the deterministic output of a forward pass through known weights on a
+known prompt. There’s exactly one tensor it can be. So the “true” distribution
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi></mrow><annotation encoding="application/x-tex">p</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>p</span></span></span></span> is a delta on that tensor, and a delta has zero entropy. Every bit the
+coder spends is pure KL: <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>H</mi><mo stretchy="false">(</mo><mi>p</mi><mo separator="true">,</mo><mi>q</mi><mo stretchy="false">)</mo><mo>=</mo><mo>−</mo><mi>ln</mi><mo>⁡</mo><mi>q</mi><mo stretchy="false">(</mo><mi>K</mi><msub><mi>V</mi><mrow><mi mathvariant="normal">t</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">u</mi><mi mathvariant="normal">e</mi></mrow></msub><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">H(p, q) = -\ln q(KV_\mathrm{true})</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>H</span><span>(</span><span>p</span><span>,</span><span></span><span>q</span><span>)</span><span></span><span>=</span><span></span></span><span><span></span><span>−</span><span></span><span>ln</span><span></span><span>q</span><span>(</span><span>K</span><span><span>V</span><span><span><span><span><span><span></span><span><span><span>true</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span>)</span></span></span></span>. The bitrate is a
+direct measurement of how much weight your model <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi></mrow><annotation encoding="application/x-tex">q</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>q</span></span></span></span> gives the correct KV
+cache.</p>
+<p>What we need, then, is a calibrated model of the specific forward pass that
+produced one, in a form an arithmetic coder can consume.</p>
+<h2 id="what-should-qqq-look-like">What should <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi></mrow><annotation encoding="application/x-tex">q</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>q</span></span></span></span> look like?<a aria-label="Link to this section" href="#what-should-qqq-look-like"><span>§</span></a></h2>
+<p>Suppose for the moment that we had access to something that, given the
+prompt, produced a reasonable per-scalar prediction <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi></mrow><annotation encoding="application/x-tex">\mu</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span></span></span></span> of the KV cache
+and a calibrated sense <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>σ</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">\sigma^2</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span></span></span></span> of how wrong that prediction tends to be.
+The natural way to turn that into a real distribution is a Gaussian centred
+on <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi></mrow><annotation encoding="application/x-tex">\mu</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span></span></span></span> with variance <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>σ</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">\sigma^2</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span></span></span></span>, so that
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi><mo stretchy="false">(</mo><mi>x</mi><mo stretchy="false">)</mo><mo>=</mo><mi mathvariant="script">N</mi><mo stretchy="false">(</mo><mi>x</mi><mo separator="true">;</mo><mtext> </mtext><mi>μ</mi><mo separator="true">,</mo><msup><mi>σ</mi><mn>2</mn></msup><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">q(x) = \mathcal{N}(x;\, \mu, \sigma^2)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>q</span><span>(</span><span>x</span><span>)</span><span></span><span>=</span><span></span></span><span><span></span><span>N</span><span>(</span><span>x</span><span>;</span><span></span><span></span><span>μ</span><span>,</span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span><span>)</span></span></span></span>, in which case the cost (in nats
+per scalar) of encoding the true value splits cleanly into two terms:</p>
+<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mo>−</mo><mi>ln</mi><mo>⁡</mo><mi>q</mi><mo stretchy="false">(</mo><msub><mtext>KV</mtext><mtext>full</mtext></msub><mo stretchy="false">)</mo><mtext>  </mtext><mo>=</mo><mtext>  </mtext><munder><munder><mrow><mstyle displaystyle="false" scriptlevel="0"><mfrac><mn>1</mn><mn>2</mn></mfrac></mstyle><mi>ln</mi><mo>⁡</mo><mo stretchy="false">(</mo><mn>2</mn><mi>π</mi><msup><mi>σ</mi><mn>2</mn></msup><mo stretchy="false">)</mo></mrow><mo stretchy="true">⏟</mo></munder><mtext>spread cost</mtext></munder><mtext>  </mtext><mo>+</mo><mtext>  </mtext><munder><munder><mfrac><mrow><mo stretchy="false">(</mo><msub><mtext>KV</mtext><mtext>full</mtext></msub><mo>−</mo><mi>μ</mi><msup><mo stretchy="false">)</mo><mn>2</mn></msup></mrow><mrow><mn>2</mn><msup><mi>σ</mi><mn>2</mn></msup></mrow></mfrac><mo stretchy="true">⏟</mo></munder><mtext>miss cost</mtext></munder><mi mathvariant="normal">.</mi></mrow><annotation encoding="application/x-tex">-\ln q(\text{KV}_\text{full}) \;=\;
+\underbrace{\tfrac{1}{2}\ln(2\pi\sigma^2)}_{\text{spread cost}}
+\;+\; \underbrace{\frac{(\text{KV}_\text{full} - \mu)^2}{2\sigma^2}}_{\text{miss cost}}.</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>−</span><span></span><span>ln</span><span></span><span>q</span><span>(</span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span>)</span><span></span><span></span><span>=</span><span></span><span></span></span><span><span></span><span><span><span><span><span><span></span><span><span><span><span>spread cost</span></span></span></span></span><span><span></span><span><span><span><span><span><span></span><span><span><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"></path></svg></span><span><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"></path></svg></span><span><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"></path></svg></span></span></span><span><span></span><span><span><span></span><span><span><span><span><span><span></span><span><span><span>2</span></span></span></span><span><span></span><span></span></span><span><span></span><span><span><span>1</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span><span></span></span><span></span><span>ln</span><span>(</span><span>2</span><span>π</span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span><span>)</span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span><span></span><span></span><span>+</span><span></span><span></span></span><span><span></span><span><span><span><span><span><span></span><span><span><span><span>miss cost</span></span></span></span></span><span><span></span><span><span><span><span><span><span></span><span><span><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"></path></svg></span><span><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"></path></svg></span><span><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"></path></svg></span></span></span><span><span></span><span><span><span></span><span><span><span><span><span><span></span><span><span>2</span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span></span></span><span><span></span><span></span></span><span><span></span><span><span>(</span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span></span><span>−</span><span></span><span>μ</span><span><span>)</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span><span></span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span><span>.</span></span></span></span></span></p><p>The two terms pull in opposite directions: the spread cost wants <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>σ</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">\sigma^2</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span></span></span></span>
+small, while the miss cost punishes us when <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mtext>KV</mtext><mtext>full</mtext></msub></mrow><annotation encoding="application/x-tex">\text{KV}_\text{full}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> lands
+far from <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi></mrow><annotation encoding="application/x-tex">\mu</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span></span></span></span> relative to <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>σ</span></span></span></span>, and blows up entirely if we set
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>σ</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">\sigma^2</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span></span></span></span> too small for the actual error. Taking the expectation over the
+data and minimising in <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>σ</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">\sigma^2</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span></span></span></span> puts the optimum at
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>σ</mi><mn>2</mn></msup><mo>=</mo><mi mathvariant="double-struck">E</mi><mo stretchy="false">[</mo><mo stretchy="false">(</mo><msub><mtext>KV</mtext><mtext>full</mtext></msub><mo>−</mo><mi>μ</mi><msup><mo stretchy="false">)</mo><mn>2</mn></msup><mo stretchy="false">]</mo></mrow><annotation encoding="application/x-tex">\sigma^2 = \mathbb{E}[(\text{KV}_\text{full} - \mu)^2]</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span><span></span><span>=</span><span></span></span><span><span></span><span>E</span><span>[(</span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span></span><span>−</span><span></span></span><span><span></span><span>μ</span><span><span>)</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span><span>]</span></span></span></span>, with an expected
+per-scalar bitrate of <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><mn>1</mn><mn>2</mn></mfrac><mi>ln</mi><mo>⁡</mo><mo stretchy="false">(</mo><mn>2</mn><mi>π</mi><mi>e</mi><mtext> </mtext><msup><mi>σ</mi><mn>2</mn></msup><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\tfrac{1}{2}\ln(2\pi e\, \sigma^2)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span></span><span><span><span><span><span><span></span><span><span><span>2</span></span></span></span><span><span></span><span></span></span><span><span></span><span><span><span>1</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span><span></span></span><span></span><span>ln</span><span>(</span><span>2</span><span>π</span><span>e</span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span><span>)</span></span></span></span>, which is just
+the log of the typical error magnitude. Better <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi></mrow><annotation encoding="application/x-tex">\mu</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span></span></span></span> buys us bits directly;
+miscalibrated <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>σ</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">\sigma^2</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span></span></span></span> wastes them either way, paying for spread we
+didn’t need if too large and seeing the miss cost run away if too small.</p>
+<h2 id="what-predicts-a-kv-cache">What predicts a KV cache?<a aria-label="Link to this section" href="#what-predicts-a-kv-cache"><span>§</span></a></h2>
+<p>The natural class of things to use as a <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi></mrow><annotation encoding="application/x-tex">\mu</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span></span></span></span> predictor is any model whose
+forward pass on the same prompt carries information about the target’s KV
+cache. The bitrate we can hope to reach is bounded below by the conditional
+entropy <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>H</mi><mo stretchy="false">(</mo><msub><mtext>KV</mtext><mtext>full</mtext></msub><mo>∣</mo><msub><mi>M</mi><mtext>pred</mtext></msub><mo stretchy="false">(</mo><mtext>prompt</mtext><mo stretchy="false">)</mo><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">H(\text{KV}_\text{full} \mid M_\text{pred}(\text{prompt}))</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>H</span><span>(</span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span></span><span>∣</span><span></span></span><span><span></span><span><span>M</span><span><span><span><span><span><span></span><span><span><span>pred</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span>(</span><span><span>prompt</span></span><span>))</span></span></span></span>, and
+the question of how much compression is available reduces to how small that
+conditional entropy can be made by choosing <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>M</mi><mtext>pred</mtext></msub></mrow><annotation encoding="application/x-tex">M_\text{pred}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>M</span><span><span><span><span><span><span></span><span><span><span>pred</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> well.</p>
+<p>The full pipeline is then:</p>
+<p><span data-sidenote-id="sidenote-87042f2n5"><span>Both sides re-run the predictor on the prompt to reconstruct the same per-scalar <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span>. Only the encoder touches the target model. The arithmetic coder turns <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><msub><mtext>KV</mtext><mtext>full</mtext></msub><mo separator="true">,</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\text{KV}_\text{full}, \mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span>,</span><span></span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span> into bits on the encode side, and turns <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><mtext>bits</mtext><mo separator="true">,</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\text{bits}, \mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span><span>bits</span></span><span>,</span><span></span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span> back into <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mtext>KV</mtext><mtext>full</mtext></msub></mrow><annotation encoding="application/x-tex">\text{KV}_\text{full}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> on the decode side.</span></span></p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 460" font-family="&#39;Berkeley Mono&#39;,&#39;Courier New&#39;,monospace" role="img" aria-label="Encoder/decoder pipeline for KV cache compression"><defs><marker id="kv-coder-pipeline-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 8 4.5 L 0 9 z"></path></marker></defs><text x="205" y="28" text-anchor="middle">ENCODE</text><text x="605" y="28" text-anchor="middle">DECODE</text><line x1="410" y1="20" x2="410" y2="440"></line><rect x="165" y="55" width="80" height="36" rx="6" fill="#eee9d8"></rect><text x="205" y="78" text-anchor="middle">prompt</text><path d="M 205 91 L 205 110 L 110 110 L 110 130" marker-end="url(#kv-coder-pipeline-arrow)"></path><path d="M 205 91 L 205 110 L 300 110 L 300 130" marker-end="url(#kv-coder-pipeline-arrow)"></path><rect x="50" y="130" width="120" height="50" rx="10" fill="#f4d6c0"></rect><text x="110" y="160" text-anchor="middle">target model</text><rect x="240" y="130" width="120" height="50" rx="10" fill="#cee2f5"></rect><text x="300" y="160" text-anchor="middle">predictor</text><path d="M 110 180 L 110 248 L 175 248 L 175 270" marker-end="url(#kv-coder-pipeline-arrow)"></path><text x="118" y="220">KV_full</text><path d="M 300 180 L 300 248 L 235 248 L 235 270" marker-end="url(#kv-coder-pipeline-arrow)"></path><text x="270" y="220" text-anchor="end">(μ, σ)</text><rect x="145" y="270" width="120" height="50" rx="10" fill="#d4e8d0"></rect><text x="205" y="300" text-anchor="middle">coder</text><rect x="565" y="55" width="80" height="36" rx="6" fill="#eee9d8"></rect><text x="605" y="78" text-anchor="middle">prompt</text><path d="M 605 91 L 605 130" marker-end="url(#kv-coder-pipeline-arrow)"></path><rect x="545" y="130" width="120" height="50" rx="10" fill="#cee2f5"></rect><text x="605" y="160" text-anchor="middle">predictor</text><path d="M 605 180 L 605 270" marker-end="url(#kv-coder-pipeline-arrow)"></path><text x="613" y="225">(μ, σ)</text><rect x="545" y="270" width="120" height="50" rx="10" fill="#d4e8d0"></rect><text x="605" y="300" text-anchor="middle">coder</text><path d="M 605 320 L 605 370" marker-end="url(#kv-coder-pipeline-arrow)"></path><rect x="565" y="370" width="80" height="36" rx="6" fill="#eee9d8"></rect><text x="605" y="393" text-anchor="middle">KV_full</text><path d="M 265 295 L 545 295" marker-end="url(#kv-coder-pipeline-arrow)" stroke-width="1.6"></path><text x="405" y="287" text-anchor="middle">bits</text></svg>
+<p>Both sides hold the prompt<span data-sidenote-id="sidenote-fnu0zcgp1"><label for="sidenote-fnu0zcgp1"></label><span><span></span>Or the prompt is transferred with the bits — it’s of negligible size relative to the KV cache itself.</span></span>. Both sides run the predictor and reconstruct the
+same <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span> deterministically. The encoder additionally runs the
+target model, feeds <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><msub><mtext>KV</mtext><mtext>full</mtext></msub><mo separator="true">,</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\text{KV}_\text{full}, \mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span>,</span><span></span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span> into the
+arithmetic coder, and emits the bitstream; the decoder consumes the
+bitstream alongside its locally-reconstructed <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span> and recovers
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mtext>KV</mtext><mtext>full</mtext></msub></mrow><annotation encoding="application/x-tex">\text{KV}_\text{full}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> exactly. The scheme is lossless because the coder
+is, and because both sides reconstruct <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span> from the same prompt
+and the same predictor.</p>
+<p>What this leaves us picking is the predictor, and the choice is a
+cost-versus-bits tradeoff bounded by two extremes. At one end the predictor
+is the target model itself, so <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi><mo>=</mo><msub><mtext>KV</mtext><mtext>full</mtext></msub></mrow><annotation encoding="application/x-tex">\mu = \text{KV}_\text{full}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span><span></span><span>=</span><span></span></span><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> and
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">\sigma = 0</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>σ</span><span></span><span>=</span><span></span></span><span><span></span><span>0</span></span></span></span>, no bits ever cross the wire, and we’ve paid an extra full
+target-model forward pass to compress nothing of our own forward pass,
+which is silly. At the other end the predictor outputs pure noise, so
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi></mrow><annotation encoding="application/x-tex">\mu</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span></span></span></span> is arbitrary and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>σ</span></span></span></span> has to be set large enough to cover the
+bf16 range; the predictor is essentially free, but the coder ends up
+paying close to 16 bits per scalar. Real predictors sit between the two,
+and the question for any particular construction is how cheaply we can
+drive the conditional entropy down.</p>
+<h3 id="an-optimised-version-of-the-same-model">An optimised version of the same model<a aria-label="Link to this section" href="#an-optimised-version-of-the-same-model"><span>§</span></a></h3>
+<p>The most direct predictor we can pick is an optimised version of the same
+model: same architecture, same prompt, with some structure-preserving
+optimisation applied to make it cheaper to run while keeping its forward
+pass close to the original. The output <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mtext>KV</mtext><mtext>opt</mtext></msub></mrow><annotation encoding="application/x-tex">\text{KV}_\text{opt}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>opt</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> lives in the
+same shape as <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mtext>KV</mtext><mtext>full</mtext></msub></mrow><annotation encoding="application/x-tex">\text{KV}_\text{full}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> and lies close to it elementwise,
+because a small, well-behaved perturbation of the parameters perturbs the
+forward pass in a small, structured way. The residual
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mtext>KV</mtext><mtext>full</mtext></msub><mo>−</mo><msub><mtext>KV</mtext><mtext>opt</mtext></msub></mrow><annotation encoding="application/x-tex">\text{KV}_\text{full} - \text{KV}_\text{opt}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span></span><span>−</span><span></span></span><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>opt</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> is small and structured,
+which is exactly the regime in which <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi><mo>=</mo><msub><mtext>KV</mtext><mtext>opt</mtext></msub></mrow><annotation encoding="application/x-tex">\mu = \text{KV}_\text{opt}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span><span></span><span>=</span><span></span></span><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>opt</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> pays
+cheaply under the Gaussian model from the previous section.</p>
+<p>For example, take quantisation. The optimised model is the target with its
+weights cast to a narrower format (FP8, INT4, MXFP4, and so on)<span data-sidenote-id="sidenote-vnpe2w7xp"><label for="sidenote-vnpe2w7xp"></label><span><span></span>The predictor doesn’t have to be specially constructed; quantised variants of major open-weights models ship alongside their full-precision counterparts, so both sides of the pipeline can pull the same artifact off the shelf.</span></span>, and
+the perturbation in question is the rounding noise introduced at every
+weight tensor.</p>
+<p>Quantisation is well-studied enough that we know its forward-pass error is
+small for any reasonable scheme; that property is what makes serving a
+quantised model a viable substitute for the full one in the first place,
+and the same property gives us <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mtext>KV</mtext><mtext>opt</mtext></msub></mrow><annotation encoding="application/x-tex">\text{KV}_\text{opt}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>opt</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> as a low-residual
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi></mrow><annotation encoding="application/x-tex">\mu</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span></span></span></span> for free, with no training step in sight. The per-channel statistics of the residual
+(which we plug in as <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>σ</span></span></span></span>) can be measured once on a small calibration
+set and then frozen, so encoding and decoding both reduce to running the
+quantised model on the prompt and feeding <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span> into the coder.</p>
+<h2 id="early-results">Early results<a aria-label="Link to this section" href="#early-results"><span>§</span></a></h2>
+<p>The simplest concrete instance: predictor is the FP8 version of the target,
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi><mo>=</mo><msub><mtext>KV</mtext><mtext>quant</mtext></msub></mrow><annotation encoding="application/x-tex">\mu = \text{KV}_\text{quant}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span><span></span><span>=</span><span></span></span><span><span></span><span><span><span>KV</span></span><span><span><span><span><span><span></span><span><span><span>quant</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> taken directly, and <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mi>σ</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">\sigma^2</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span></span></span></span> is fitted once on
+training data as the per-(kv, head, channel) empirical residual variance,
+pooled across positions.</p>
+<p>We use the <a href="https://huggingface.co/Qwen/Qwen3-32B-FP8">Qwen3</a> model family, since we have both:</p>
+<ol>
+<li>A wide range of model sizes</li>
+<li>Off the shelf fp8 block-quants for each model in the family</li>
+</ol>
+<p>On top of <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span>, we found that encoding under a three-component mixture boosted compression rates<span data-sidenote-id="sidenote-wb2ckibqx"><label for="sidenote-wb2ckibqx"></label><span><span></span>The idea is that in practise, the distribution of ‘residuals’ <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><msub><mi>V</mi><mrow><mi mathvariant="normal">f</mi><mi mathvariant="normal">u</mi><mi mathvariant="normal">l</mi><mi mathvariant="normal">l</mi></mrow></msub><mo>−</mo><mi>K</mi><msub><mi>V</mi><mrow><mi mathvariant="normal">q</mi><mi mathvariant="normal">u</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">t</mi></mrow></msub></mrow><annotation encoding="application/x-tex">KV_\mathrm{full} - KV_\mathrm{quant}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>K</span><span><span>V</span><span><span><span><span><span><span></span><span><span><span>full</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span></span><span>−</span><span></span></span><span><span></span><span>K</span><span><span>V</span><span><span><span><span><span><span></span><span><span><span>quant</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> isn’t really a Gaussian; it’s long-tailed, with outliers.</span></span>:</p>
+<p><span><span><span><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><semantics><mrow><mi>q</mi><mo stretchy="false">(</mo><mi>x</mi><mo stretchy="false">)</mo><mtext>  </mtext><mo>=</mo><mtext>  </mtext><mn>0.95</mn><mtext> </mtext><mi mathvariant="script">N</mi><mo stretchy="false">(</mo><mi>x</mi><mo separator="true">;</mo><mtext> </mtext><mi>μ</mi><mo separator="true">,</mo><msup><mi>σ</mi><mn>2</mn></msup><mo stretchy="false">)</mo><mtext>  </mtext><mo>+</mo><mtext>  </mtext><mn>0.03</mn><mtext> </mtext><mi mathvariant="script">N</mi><mo stretchy="false">(</mo><mi>x</mi><mo separator="true">;</mo><mtext> </mtext><mi>μ</mi><mo separator="true">,</mo><mo stretchy="false">(</mo><mn>3</mn><mi>σ</mi><msup><mo stretchy="false">)</mo><mn>2</mn></msup><mo stretchy="false">)</mo><mtext>  </mtext><mo>+</mo><mtext>  </mtext><mn>0.02</mn><mtext> </mtext><msub><mover accent="true"><mi>p</mi><mo stretchy="true">^</mo></mover><mtext>bf16</mtext></msub><mo stretchy="false">(</mo><mi>x</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">q(x) \;=\; 0.95\,\mathcal{N}(x;\, \mu, \sigma^2)
+\;+\; 0.03\,\mathcal{N}(x;\, \mu, (3\sigma)^2)
+\;+\; 0.02\, \widehat{p}_\text{bf16}(x)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>q</span><span>(</span><span>x</span><span>)</span><span></span><span></span><span>=</span><span></span><span></span></span><span><span></span><span>0.95</span><span></span><span>N</span><span>(</span><span>x</span><span>;</span><span></span><span></span><span>μ</span><span>,</span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span><span>)</span><span></span><span></span><span>+</span><span></span><span></span></span><span><span></span><span>0.03</span><span></span><span>N</span><span>(</span><span>x</span><span>;</span><span></span><span></span><span>μ</span><span>,</span><span></span><span>(</span><span>3</span><span>σ</span><span><span>)</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span><span>)</span><span></span><span></span><span>+</span><span></span><span></span></span><span><span></span><span>0.02</span><span></span><span><span><span><span><span><span><span></span><span>p</span></span><span><span></span><span><svg xmlns="http://www.w3.org/2000/svg" width="100%" height="0.24em" viewBox="0 0 1062 239" preserveAspectRatio="none"><path d="M529 0h5l519 115c5 1 9 5 9 10 0 1-1 2-1 3l-4 22
+c-1 5-5 9-11 9h-2L532 67 19 159h-2c-5 0-9-4-11-9l-5-22c-1-6 2-12 8-13z"></path></svg></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span><span><span><span><span><span><span></span><span><span><span>bf16</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span>(</span><span>x</span><span>)</span></span></span></span></span></p><p>where <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover accent="true"><mi>p</mi><mo stretchy="true">^</mo></mover><mtext>bf16</mtext></msub></mrow><annotation encoding="application/x-tex">\widehat{p}_\text{bf16}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span><span><span><span><span><span></span><span>p</span></span><span><span></span><span><svg xmlns="http://www.w3.org/2000/svg" width="100%" height="0.24em" viewBox="0 0 1062 239" preserveAspectRatio="none"><path d="M529 0h5l519 115c5 1 9 5 9 10 0 1-1 2-1 3l-4 22
+c-1 5-5 9-11 9h-2L532 67 19 159h-2c-5 0-9-4-11-9l-5-22c-1-6 2-12 8-13z"></path></svg></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span><span><span><span><span><span><span></span><span><span><span>bf16</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> is the empirical bf16-symbol distribution
+measured on training data. The wide-Gaussian component covers
+moderately-mispredicted values; the empirical-marginal component absorbs
+deep outliers at roughly the unconditional bf16 cost (~11 bits) instead
+of letting the Gaussian’s tail blow up on them.</p>
+<p>The following results are for the held-out C4-validation set, after calibrating on 128 train examples from C4 at 1024 tokens each.
+Swept across Qwen3 target sizes:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>target</th><th><span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="script">N</mi><mo stretchy="false">(</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\mathcal{N}(\mu,\sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>N</span><span>(</span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span></th><th>mixture</th><th>ratio</th></tr></thead><tbody><tr><td>0.6B</td><td>6.8651</td><td><strong>6.7419</strong></td><td>2.37×</td></tr><tr><td>1.7B</td><td>6.6385</td><td><strong>6.5303</strong></td><td>2.45×</td></tr><tr><td>4B</td><td>6.4188</td><td><strong>6.3290</strong></td><td>2.53×</td></tr><tr><td>8B</td><td>6.2576</td><td><strong>6.1793</strong></td><td>2.59×</td></tr><tr><td>14B</td><td>6.0760</td><td><strong>6.0097</strong></td><td>2.66×</td></tr><tr><td>32B</td><td>5.9785</td><td><strong>5.9185</strong></td><td>2.70×</td></tr></tbody></table>
+<p>The bitrate falls monotonically with target size — bigger targets compress
+better, by a clean 0.9 bits/scalar from 0.6B to 32B.</p>
+<h3 id="native-fp8-kv-caches">Native FP8 KV caches<a aria-label="Link to this section" href="#native-fp8-kv-caches"><span>§</span></a></h3>
+<p>Lossy compression of KV caches is already well-studied, and FP8 caches are
+increasingly the default: shipped in <a href="https://vllm.ai/blog/fp8-kvcache">vLLM</a>,
+SGLang, and TRT-LLM, and adopted in recent model releases like
+<a href="https://huggingface.co/blog/deepseekv4">DeepSeek V4</a>, which defaults to FP8
+KV cache for non-RoPE entries. What’s perhaps most interesting here is not
+only that our method stacks well with lossy quantization — it’s actually
+<em>more</em> effective when applied to pre-quantized caches. Re-running the same
+pipeline against an FP8 e4m3 target<span data-sidenote-id="sidenote-ag2vsdxdv"><label for="sidenote-ag2vsdxdv"></label><span><span></span>Specifically vLLM’s <code>kv_cache_dtype=&#34;fp8&#34;</code>, SGLang’s generic FP8 path, and TRT-LLM’s <code>fp8_kv</code>. One fp32 scale per (layer, kv), RTN to e4m3.</span></span> and encoding the FP8 symbols under
+the bin-integrated <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="script">N</mi><mo stretchy="false">(</mo><mi>μ</mi><mo separator="true">,</mo><msup><mi>σ</mi><mn>2</mn></msup><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">\mathcal{N}(\mu, \sigma^2)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>N</span><span>(</span><span>μ</span><span>,</span><span></span><span><span>σ</span><span><span><span><span><span><span></span><span><span>2</span></span></span></span></span></span></span></span><span>)</span></span></span></span> predictor:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>target</th><th>b/FP8-elem</th><th>vs raw FP8 (8 b)</th></tr></thead><tbody><tr><td>0.6B</td><td>2.594</td><td>3.08×</td></tr><tr><td>1.7B</td><td>2.454</td><td>3.26×</td></tr><tr><td>4B</td><td>2.323</td><td>3.44×</td></tr><tr><td>8B</td><td>2.220</td><td>3.60×</td></tr><tr><td>14B</td><td>2.109</td><td>3.79×</td></tr><tr><td>32B</td><td>2.053</td><td>3.90×</td></tr></tbody></table>
+<p>Composed with the underlying bf16 → FP8 quantization, that’s between 6× and
+8× total compression on the original bf16 cache, depending on target size.</p>
+<h2 id="whats-next">What’s next<a aria-label="Link to this section" href="#whats-next"><span>§</span></a></h2>
+<p>This is currently an early research note, but the data are promising. How can
+we do better?</p>
+<h3 id="a-better-residual-model">A better residual model<a aria-label="Link to this section" href="#a-better-residual-model"><span>§</span></a></h3>
+<p>The Gaussian-plus-mixture distribution above is a convenient first go, but not
+a very principled one. The residual the predictor leaves is heavier-tailed than a
+Gaussian, has meaningful joint structure across positions, channels, and
+layers, and varies enough in size from one prompt or position to another that
+a static per-channel <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi></mrow><annotation encoding="application/x-tex">\sigma</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>σ</span></span></span></span> pays both ways. Modelling any of this, without
+touching the predictor itself, buys back further bits.</p>
+<h3 id="a-different-predictor-model">A different predictor model<a aria-label="Link to this section" href="#a-different-predictor-model"><span>§</span></a></h3>
+<p>The FP8-of-target predictor used here is the easiest case and the most
+expensive one. The more interesting direction is a genuinely different model:
+different size, different family, different training, anything whose forward
+pass on the same prompt happens to carry information about the target’s KV
+cache. What’s missing is a shape match, since the predictor’s hidden size,
+head dimension, layer count, and number of attention heads all differ from
+the target’s; we can no longer take the predictor’s KV directly as <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi></mrow><annotation encoding="application/x-tex">\mu</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span></span></span></span>, and
+some small piece of machinery has to bridge the gap.</p>
+<p><span data-sidenote-id="sidenote-lo9drrfiv"><span>The predictor (left) is a smaller transformer with light fine-tuning; its per-layer K, V outputs are passed through a learned linear map W into the shape of the target’s per-layer KV cache, giving <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi></mrow><annotation encoding="application/x-tex">\mu</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>μ</span></span></span></span>. The target itself (right, dashed) is frozen and never run on the predictor side; only its KV-cache shape matters here.</span></span></p>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" font-family="&#39;Berkeley Mono&#39;,&#39;Courier New&#39;,monospace" role="img" aria-label="Cross-model predictor: a smaller fine-tuned transformer&#39;s KV stack mapped through a learned linear layer to the target model&#39;s KV-cache shape, producing μ."><defs><marker id="kv-coder-cross-arrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 8 4.5 L 0 9 z"></path></marker></defs><text x="150" y="28" text-anchor="middle">predictor</text><text x="150" y="46" text-anchor="middle">(small, fine-tuned)</text><text x="610" y="28" text-anchor="middle">target model</text><text x="610" y="46" text-anchor="middle">(large, frozen)</text><rect x="80" y="70" width="140" height="50" rx="8" fill="#cee2f5"></rect><text x="150" y="100" text-anchor="middle">layer L</text><rect x="80" y="130" width="140" height="50" rx="8" fill="#cee2f5"></rect><text x="150" y="160" text-anchor="middle">⋮</text><rect x="80" y="190" width="140" height="50" rx="8" fill="#cee2f5"></rect><text x="150" y="220" text-anchor="middle">layer 2</text><rect x="80" y="250" width="140" height="50" rx="8" fill="#cee2f5"></rect><text x="150" y="280" text-anchor="middle">layer 1</text><path d="M 230 75 L 240 75 L 240 295 L 230 295"></path><rect x="540" y="70" width="140" height="44" rx="8" fill="#f4d6c0"></rect><text x="610" y="97" text-anchor="middle">layer N</text><rect x="540" y="120" width="140" height="44" rx="8" fill="#f4d6c0"></rect><text x="610" y="147" text-anchor="middle">⋮</text><rect x="540" y="170" width="140" height="44" rx="8" fill="#f4d6c0"></rect><text x="610" y="197" text-anchor="middle">⋮</text><rect x="540" y="220" width="140" height="44" rx="8" fill="#f4d6c0"></rect><text x="610" y="247" text-anchor="middle">layer 3</text><rect x="540" y="270" width="140" height="44" rx="8" fill="#f4d6c0"></rect><text x="610" y="297" text-anchor="middle">layer 2</text><rect x="540" y="320" width="140" height="44" rx="8" fill="#f4d6c0"></rect><text x="610" y="347" text-anchor="middle">layer 1</text><path d="M 530 75 L 520 75 L 520 360 L 530 360"></path><rect x="350" y="180" width="60" height="36" rx="6" fill="#d4e8d0"></rect><text x="380" y="203" text-anchor="middle">W</text><path d="M 250 198 L 350 198" marker-end="url(#kv-coder-cross-arrow)"></path><text x="300" y="190" text-anchor="middle">K, V</text><path d="M 410 198 L 520 198" marker-end="url(#kv-coder-cross-arrow)"></path><text x="465" y="190" text-anchor="middle">μ</text></svg>
+<h3 id="engineering-throughput-and-bit-identical-predictors">Engineering: throughput and bit-identical predictors<a aria-label="Link to this section" href="#engineering-throughput-and-bit-identical-predictors"><span>§</span></a></h3>
+<p>For this to pay off in practice, the arithmetic coder has to keep up with
+whatever consumes the decompressed cache. If compressed bytes live behind a
+slow channel at bandwidth <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mtext>slow</mtext></msub></mrow><annotation encoding="application/x-tex">B_\text{slow}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>B</span><span><span><span><span><span><span></span><span><span><span>slow</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span> and feed a consumer at <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mtext>fast</mtext></msub></mrow><annotation encoding="application/x-tex">B_\text{fast}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>B</span><span><span><span><span><span><span></span><span><span><span>fast</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span>,
+the framework needs a compression ratio of at least <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mtext>fast</mtext></msub><mi mathvariant="normal">/</mi><msub><mi>B</mi><mtext>slow</mtext></msub></mrow><annotation encoding="application/x-tex">B_\text{fast}/B_\text{slow}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>B</span><span><span><span><span><span><span></span><span><span><span>fast</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span><span>/</span><span><span>B</span><span><span><span><span><span><span></span><span><span><span>slow</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span>
+and a decoder sustained at <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>B</mi><mtext>fast</mtext></msub></mrow><annotation encoding="application/x-tex">B_\text{fast}</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span><span>B</span><span><span><span><span><span><span></span><span><span><span>fast</span></span></span></span></span><span>​</span></span><span><span><span></span></span></span></span></span></span></span></span></span>.</p>
+<p>Separately, the predictor has to produce bit-identical <span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false">(</mo><mi>μ</mi><mo separator="true">,</mo><mi>σ</mi><mo stretchy="false">)</mo></mrow><annotation encoding="application/x-tex">(\mu, \sigma)</annotation></semantics></math></span><span aria-hidden="true"><span><span></span><span>(</span><span>μ</span><span>,</span><span></span><span>σ</span><span>)</span></span></span></span> on both
+sides, since the arithmetic coder doesn’t tolerate even one-ULP CDF
+disagreement. This is much more tractable than it used to be (see Thinking
+Machines on <a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">defeating nondeterminism in LLM
+inference</a>).</p>
+<h2 id="whats-it-good-for">What’s it good for<a aria-label="Link to this section" href="#whats-it-good-for"><span>§</span></a></h2>
+<p>Wherever a KV cache has to move across a slow channel or sit in scarce
+memory, compressing it trades compute on each end for bandwidth or capacity.
+Some places that could pay off:</p>
+<ol>
+<li><strong>Cross-datacenter disaggregated prefill</strong>: Disaggregated prefill splits
+prefill from decode and transfers KV cache between them. That works inside
+a high-bandwidth domain but breaks across slower links, where the cache is
+too big to move. <a href="https://arxiv.org/abs/2604.15039">Recent work</a> from the
+Kimi team argues the cross-DC version becomes viable once KV size is cut
+enough, getting 10–36× reductions from hybrid attention. Speculative KV coding compresses what’s left, losslessly, and
+stacks multiplicatively with that lever.</li>
+<li><strong>Bigger prefix caches</strong>: LLM serving caches KV for shared prefixes
+(system prompts, retrieved documents, repeated turns in agentic loops) so
+requests don’t re-prefill them. Compressing stored entries grows the effective cache at the cost of a
+decompression pass on each hit. The same idea extended to host-RAM offload
+across PCIe pays for itself more cleanly: you spend decompression compute
+to shrink a transfer that’s already bandwidth-bound.</li>
+</ol>
+<p>The question that comes up in each is: can we make the predictor pay for
+itself? Figuring that out is the work that comes next.</p>  </div></div>
+  </body>
+</html>
