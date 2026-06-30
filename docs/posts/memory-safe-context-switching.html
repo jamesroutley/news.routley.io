@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://fil-c.org/context_switches">Original</a>
+    <h1>Memory Safe Context Switching</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        
+        <main>
+
+
+<p><strong>Support for <code>ucontext</code> APIs is new since release 0.680. If you want to play with <code>setcontext</code>, <code>getcontext</code>, <code>makecontext</code>, and <code>swapcontext</code> then you have to <a href="https://fil-c.org/install_source.html">build from source</a>.</strong></p>
+
+<p>This document describes how Fil-C supports <code>longjmp</code>, <code>setjmp</code>, <code>setcontext</code>, <code>getcontext</code>, <code>makecontext</code>, and <code>swapcontext</code> in a totally memory-safe way. In particular, no misuse of those APIs in Fil-C can lead to stack corruption or any other violation of Fil-C&#39;s capability model.</p>
+
+<p>These APIs are widely used:</p>
+
+<ul>
+<li><p><code>longjmp</code> and <code>setjmp</code> are used in C programs to implement exception handling. It&#39;s especially common to use them to implement exceptions &#34;thrown&#34; from signal handlers.</p></li>
+<li><p><code>getcontext</code>, <code>setcontext</code>, <code>makecontext</code>, and <code>swapcontext</code> (aka the <code>ucontext</code> APIs) are used to implement coroutines and fibers. For example, <a href="https://www.boost.org/">Boost</a> uses <code>ucontext</code> as part of its fiber implementation.</p></li>
+</ul>
+
+<p>The <code>ucontext</code> APIs are less commonly used than <code>longjmp</code>/<code>setjmp</code> and some OSes (like Darwin) have deprecated them. However, they remain well supported in <a href="https://www.gnu.org/software/libc/">glibc</a>.</p>
+
+<p>Implementing these APIs in a way that preserves memory safety is hard since their misuse can result in restoring a dangling stack. For example, you could either <code>setjmp</code> or <code>getcontext</code> within some function, and then do any of the following things:</p>
+
+<ul>
+<li><p>Return from that function. At this point, the context that was saved will attempt to restore a stack frame that no longer exists.</p></li>
+<li><p>Exit from the thread. At this point, the context that was saved will attempt to restore execution on a stack that has been freed.</p></li>
+</ul>
+
+<p>Even more friendly APIs like <code>makecontext</code> and <code>swapcontext</code> can be straightforwardly misused:</p>
+
+<ul>
+<li><p>You can use <code>makecontext</code> to create a context that points to some stack, then free that stack, and then either <code>swapcontext</code> or <code>setcontext</code> to that context. In Yolo-C, this will result in running on a dangling stack. Fil-C makes this not an error.</p></li>
+<li><p>You can call <code>swapcontext</code> with the second argument being the context that is currently executing. This might happen if you confuse the first and second arguments. In Yolo-C, in the best case, this will behave like a <code>longjmp</code>; in the worst case, it will result in executing on a dangling stack. In Fil-C, this is a safety error that panics your program.</p></li>
+</ul>
+
+<p>In Yolo-C, execution on a dangling stack results in the most confusing kinds of crashes, since the debugger won&#39;t even be able to print a stack trace! Worse, if the program has subtle bugs in its handling of contexts, then an attacker could exploit those bugs to cause the program to do whatever the attacker likes. In Fil-C, execution on a dangling stack is not possible: all such cases are either panics at the point where you misused <code>longjmp</code> or one of the <code>ucontext</code> APIs, or they are reliably legal execution because of how Fil-C manages stacks.</p>
+
+<p>Fil-C implements <code>setjmp</code>/<code>longjmp</code> and the <code>ucontext</code> APIs quite differently.</p>
+
+
+
+<p>There is an impressive amount of depth to the depravity of <code>setjmp</code>. Before going into the details of how Fil-C implements <code>setjmp</code>/<code>longjmp</code>, we need to discuss exactly what makes this function so amazingly evil.</p>
+
+<p><code>setjmp</code> saves the context as it was at the moment when it was called so that when <code>longjmp</code> is called later, <code>setjmp</code> will <em>return a second time</em>. It is the fact that it <em>returns twice</em> that makes it so vile, and so we need to understand the implications precisely.</p>
+
+<h2>An Example</h2>
+
+<p>Consider this simple program:</p>
+
+<pre><code>#include &lt;setjmp.h&gt;
+#include &lt;stdio.h&gt;
+
+int main(int argc, char** argv)
+{
+    volatile int x = 42;
+    jmp_buf jb;
+    if (setjmp(jb)) {
+        printf(&#34;x = %d\n&#34;, x);
+        return 0;
+    }
+    x = 666;
+    longjmp(jb, 1);
+    printf(&#34;Should not get here.\n&#34;);
+    return 1;
+}
+</code></pre>
+
+<p>This program prints:</p>
+
+<pre><code>x = 666
+</code></pre>
+
+<p>And then exits. The flow is:</p>
+
+<ol>
+<li>On the first call to <code>setjmp</code>, it returns 0 and saves its caller&#39;s context in <code>jb</code>.</li>
+<li>Then we set <code>x</code> to 666 and <code>longjmp</code> to <code>jb</code> with the value 1.</li>
+<li><code>setjmp</code> returns 1, so we <code>printf</code> and exit.</li>
+</ol>
+
+<p>Note that we have to mark <code>x</code> as <code>volatile</code> for the program to reliably print 666. Otherwise, the compiler is allowed to optimize the access to <code>x</code> and have it return 42 instead. This might happen in the following ways:</p>
+
+<ul>
+<li>The compiler could constant fold <code>x</code> to 42. This will happen in the example if we remove <code>volatile</code> and use any optimization level above <code>-O0</code>. Then <code>x = 42</code> gets printed.</li>
+<li>Say that constant folding doesn&#39;t happen, maybe because we insert a <code>asm(&#34;&#34; : &#34;+r&#34;(x))</code> right after the definition of <code>x</code>. In that case, the compiler could register-allocate <code>x</code> in a callee-save register, in which case the register ends up saved by <code>setjmp</code>. This also leads to <code>x = 42</code> being printed.</li>
+<li>Say that we experience register pressure for some reason, and <code>x</code> doesn&#39;t make it into a callee-save register, but instead gets spilled. At any optimization level above <code>-O0</code>, the compiler will split <code>x</code> into two variables: one for <code>x = 42</code> and one for <code>x = 666</code>, and the printf will reference the first one (since <code>x = 42</code> <a href="https://en.wikipedia.org/wiki/Dominator_%28graph_theory%29">dominates</a> the <code>printf</code>). Those two variables will <em>almost always</em> get separate spill slots. Hence, when we come out of the <code>setjmp</code> the second time, reading <code>x</code> will still give 42.</li>
+</ul>
+
+<p>Three things to reflect upon:</p>
+
+<ul>
+<li>To get the property that <code>x</code>&#39;s value is observed to be 666 in the printf, we need to make sure that the compiler treats <code>x</code> as a stack allocation rather than a variable. Using <code>volatile</code> achieves this. Also, passing a pointer to <code>x</code> to anywhere is likely to accomplish this.</li>
+<li>Spill slots are not the same as stack allocations. If a variable is stack-allocated, then it will get one stack allocation. If a variable is spilled, it may get multiple spills (often, a separate spill per assignment).</li>
+<li>The compiler is allowed to analyze the lifetime of spill slots and stack allocations. It&#39;s allowed to reuse spill slots. <em>How does the compiler know that the <code>x = 42</code> spill slot should stay alive until the <code>longjmp</code> happens? How come it won&#39;t get reused, resulting in <code>x</code> having either 666 or any random garbage when we fall out of the <code>setjmp</code> a second time?</em></li>
+</ul>
+
+<p>Here&#39;s a more diabolical version of the example that triggers spilling of <code>x</code> to two different spill slots (one for 42 and one for 666) in gcc, clang, and filcc.</p>
+
+<pre><code>#include &lt;setjmp.h&gt;
+#include &lt;stdio.h&gt;
+
+int main(int argc, char** argv)
+{
+    int x = 42;
+    asm volatile(&#34;&#34; : &#34;+r&#34;(x));
+    jmp_buf jb;
+    int a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 9, i = 10;
+    /* Force some spilling */
+    asm volatile(&#34;&#34; : &#34;+r&#34;(a), &#34;+r&#34;(b), &#34;+r&#34;(d), &#34;+r&#34;(e), &#34;+r&#34;(f), &#34;+r&#34;(g), &#34;+r&#34;(h), &#34;+r&#34;(i));
+    if (setjmp(jb)) {
+        asm volatile(&#34;&#34; : &#34;+r&#34;(a), &#34;+r&#34;(b), &#34;+r&#34;(d), &#34;+r&#34;(e), &#34;+r&#34;(f), &#34;+r&#34;(g), &#34;+r&#34;(h), &#34;+r&#34;(i));
+        printf(&#34;x = %d\n&#34;, x);
+        return 0;
+    }
+    x = 666;
+    void (*jump)(jmp_buf, int) = longjmp;
+    asm volatile(&#34;&#34; : &#34;+r&#34;(x));
+    asm volatile(&#34;&#34; : &#34;+r&#34;(jump), &#34;+r&#34;(a), &#34;+r&#34;(b), &#34;+r&#34;(d), &#34;+r&#34;(e), &#34;+r&#34;(f), &#34;+r&#34;(g), &#34;+r&#34;(h), &#34;+r&#34;(i));
+    jump(jb, 1);
+    asm volatile(&#34;&#34; : &#34;+r&#34;(jump), &#34;+r&#34;(a), &#34;+r&#34;(b), &#34;+r&#34;(d), &#34;+r&#34;(e), &#34;+r&#34;(f), &#34;+r&#34;(g), &#34;+r&#34;(h), &#34;+r&#34;(i));
+    asm volatile(&#34;&#34; : &#34;+r&#34;(x));
+    printf(&#34;Should not get here.\n&#34;);
+    return 1;
+}
+</code></pre>
+
+<p>This program will print <code>x = 42</code> even though <code>x</code> is not constant folded or register-allocated.</p>
+
+<p>Note that all of the examples so far work in Fil-C. Even the <a href="https://fil-c.org/inlineasm.html">inline assembly</a> that we&#39;re using to obfuscate variable values works in Fil-C, and has the desired effect.</p>
+
+<h2>What Is Even Happening</h2>
+
+<p>Let&#39;s take a look at how simple <code>setjmp</code> is by looking at the musl implementation on x86_64:</p>
+
+<pre><code>__setjmp:
+_setjmp:
+setjmp:
+    mov %rbx,(%rdi)         /* rdi is jmp_buf, move registers onto it */
+    mov %rbp,8(%rdi)
+    mov %r12,16(%rdi)
+    mov %r13,24(%rdi)
+    mov %r14,32(%rdi)
+    mov %r15,40(%rdi)
+    lea 8(%rsp),%rdx        /* this is our rsp WITHOUT current ret addr */
+    mov %rdx,48(%rdi)
+    mov (%rsp),%rdx         /* save return addr ptr for new rip */
+    mov %rdx,56(%rdi)
+    xor %eax,%eax           /* always return 0 */
+    ret
+</code></pre>
+
+<p>This is only saving the callee-save registers, plus the stack pointer and instruction pointer as they were at the callsite. It&#39;s not saving the stack itself.</p>
+
+<p>Later, when <code>longjmp</code> is called, the register state is restored with only one difference: <code>%eax</code> (the return value register) will get the argument passed to <code>longjmp</code>.</p>
+
+<p><strong>Hence, the most basic safety issue with <code>setjmp</code> is that if we call it and then return from the function that had called it, the context saved by <code>setjmp</code> is not valid to <code>longjmp</code> to.</strong> Jumping to such a context will result in a torn machine state:</p>
+
+<ul>
+<li><p>The callee-save registers, stack pointer, and instruction pointer will be exactly as they had been at the time that <code>setjmp</code> had been called.</p></li>
+<li><p>The <em>stack contents</em> - in particular, the frame that the stack pointer is pointing at - will be whatever they were at the time that <code>longjmp</code> had been called.</p></li>
+</ul>
+
+<p><code>longjmp</code> is only safe if it&#39;s called at a time when the stack frame used by <code>setjmp</code> could not have possibly been overwritten, since that is the only way to guarantee that the register state restored by <code>longjmp</code> matches the stack frame that the stack pointer points to. The easiest way to guarantee this is to ensure that <code>longjmp</code> is only called from within the function that called <code>setjmp</code>, or from some function called by the function that called <code>setjmp</code> (transitively).</p>
+
+<p><strong>But that&#39;s not all!</strong></p>
+
+<p><em>The compiler has to know that <code>setjmp</code> returns twice to ensure that spill slots are not reused unsoundly.</em> In fact, compilers detect calls to <code>setjmp</code> and treat the functions that call it specially by disabling any optimization that would lead to a reuse of spill slots. <a href="https://stackoverflow.com/questions/17917720/function-attribute-returns-twice">This is surfaced a bit to compiler users with the <code>returns_twice</code> attribute.</a></p>
+
+<p>Let&#39;s consider our diabolical example, but with the <code>setjmp</code> call obfuscated:</p>
+
+<pre><code>#include &lt;setjmp.h&gt;
+#include &lt;stdio.h&gt;
+
+int main(int argc, char** argv)
+{
+    int x = 42;
+    asm volatile(&#34;&#34; : &#34;+r&#34;(x));
+    jmp_buf jb;
+    int a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 9, i = 10;
+    asm volatile(&#34;&#34; : &#34;+r&#34;(a), &#34;+r&#34;(b), &#34;+r&#34;(d), &#34;+r&#34;(e), &#34;+r&#34;(f), &#34;+r&#34;(g), &#34;+r&#34;(h), &#34;+r&#34;(i));
+    int (*setjump)(jmp_buf) = setjmp;
+    asm volatile(&#34;&#34; : &#34;+r&#34;(setjump));
+    if (setjump(jb)) {
+        asm volatile(&#34;&#34; : &#34;+r&#34;(a), &#34;+r&#34;(b), &#34;+r&#34;(d), &#34;+r&#34;(e), &#34;+r&#34;(f), &#34;+r&#34;(g), &#34;+r&#34;(h), &#34;+r&#34;(i));
+        printf(&#34;x = %d\n&#34;, x);
+        return 0;
+    }
+    x = 666;
+    void (*jump)(jmp_buf, int) = longjmp;
+    asm volatile(&#34;&#34; : &#34;+r&#34;(x));
+    asm volatile(&#34;&#34; : &#34;+r&#34;(jump), &#34;+r&#34;(a), &#34;+r&#34;(b), &#34;+r&#34;(d), &#34;+r&#34;(e), &#34;+r&#34;(f), &#34;+r&#34;(g), &#34;+r&#34;(h), &#34;+r&#34;(i));
+    jump(jb, 1);
+    asm volatile(&#34;&#34; : &#34;+r&#34;(jump), &#34;+r&#34;(a), &#34;+r&#34;(b), &#34;+r&#34;(d), &#34;+r&#34;(e), &#34;+r&#34;(f), &#34;+r&#34;(g), &#34;+r&#34;(h), &#34;+r&#34;(i));
+    asm volatile(&#34;&#34; : &#34;+r&#34;(x));
+    printf(&#34;Should not get here.\n&#34;);
+    return 1;
+}
+</code></pre>
+
+<p>Now, the results I see are:</p>
+
+<ul>
+<li>With gcc version 11.4.0, the program prints <code>x = 666</code>.</li>
+<li>With clang version 14.0.0, the program prints garbage like <code>x = -291233296</code>.</li>
+<li>filcc refuses to compile the program. In fact, it ICEs. (<a href="https://github.com/pizlonator/fil-c/issues/89">Fil-C has a longstanding bug that it emits compile-time diagnostics with internal compiler errors instead of printing something useful.</a>)</li>
+</ul>
+
+<p>The unsafe thing that is happening (and that Fil-C prevents by refusing to compile this program) is that if the compiler compiles a call to <code>setjmp</code> <em>without knowing that it&#39;s calling <code>setjmp</code></em> then the spill slot used by <code>x = 42</code> might get reused by some other variable in the code after the <code>if (setjmp) { ... }</code>.</p>
+
+<h2>Putting It All Together</h2>
+
+<p>Fil-C makes <code>longjmp</code>/<code>setjmp</code> memory safe by ensuring that:</p>
+
+<ul>
+<li>The <code>jmp_buf</code> just contains a pointer to an opaque <code>zjmp_buf</code> object. The contents of this object cannot be accessed from Fil-C. Only the Fil-C runtime can manipulate it. This works because most code never inspects the innards of <code>jmp_buf</code> (and code that does will not work in Fil-C). Note that if you do overwrite <code>jmp_buf</code>, then you&#39;ll most likely cause a Fil-C panic when you try to <code>longjmp</code>, because the internal implementation of <code>longjmp</code> will check that it can load a <code>zjmp_buf</code> from the <code>jmp_buf</code>. There is no way to spoof a <code>zjmp_buf</code> from Fil-C.</li>
+<li>It&#39;s only possible to mention the <code>setjmp</code> symbol by calling it directly; anything else will ICE the compiler. (And in the future, it might even cause the compiler to emit a proper diagnostic.) This ensures that the compiler&#39;s machinery for recognizing <code>setjmp</code> (and inhibiting spill slot reuse) always works.</li>
+<li>The <code>setjmp</code> call is compiled to allocate a new <code>zjmp_buf</code> opaque object and to register the <code>zjmp_buf</code> with the stack frame. Each stack frame can tell you the weak set of <code>zjmp_bufs</code> that are valid jump targets for that frame. (It&#39;s weak because if the <code>zjmp_buf</code>&#39;s are otherwise unreachable, they are removed from that set.)</li>
+<li><code>longjmp</code> panics unless it is called from a stack frame that is an ancestor of a stack frame that considers the <code>zjmp_buf</code> to be valid. This is accomplished by walking the stack and asking each stack frame: do you have my <code>zjmp_buf</code> in your set? Note that repeated <code>setjmp</code>s on the same <code>jmp_buf</code> create new <code>zjmp_buf</code>s, and the <code>zjmp_buf</code> is immutable. Hence, membership in the weak set really means that the <code>longjmp</code> call is from an ancestor frame.</li>
+<li>The Fil-C implementations of <code>longjmp</code> and <code>setjmp</code> save and restore a lot of internal runtime state, including the state needed to track GC roots. In particular, <code>zjmp_buf</code> holds a copy of the GC roots of the frame at the time that <code>setjmp</code> was called. So long as the <code>zjmp_buf</code> is live, we&#39;ll continue to mark those roots.</li>
+</ul>
+
+<p>The <em>sketchiest part</em> of this is that the Fil-C runtime strongly assumes that if a pointer variable was materialized as an SSA value in LLVM IR at the time that the <a href="https://fil-c.org/compiler.html"><code>FilPizlonator</code></a> runs, then <code>longjmp</code>ing restores that value to the state it had at the time of the <code>setjmp</code>, so long as the <code>setjmp</code> is flagged as returning twice. I have so far confirmed that this is the case, but it&#39;s extremely confusing - <strong>if there was a bug</strong> in my <code>longjmp</code>/<code>setjmp</code>, <em>this is where it would be</em>, and it would manifest as follows: after the <code>longjmp</code>, the GC&#39;s view of the stack frame&#39;s roots is as if all of the local pointers were restored to their values before the <code>setjmp</code>, but some pointer&#39;s value was not restored and has a new value from after the <code>setjmp</code> call but before the <code>longjmp</code> call. Note that you cannot trigger the bug with something like making a pointer <code>volatile</code>, since that causes the pointer to be a stack allocation, not an SSA value - and in that case, my transformation does the right thing (the &#34;pointer&#34; really ends up being an object in the heap, and the SSA value is a pointer to that pointer box).</p>
+
+<p><em>Assuming my analysis of this hideous abomination is right</em>, these rules are sufficient to allow almost all safe uses of <code>longjmp</code>/<code>setjmp</code> while prohibiting any possible use that corrupts the stack or causes any possible violation of the Fil-C capability model.</p>
+
+
+
+<p>It&#39;s almost possible to use <code>setjmp</code>/<code>longjmp</code> in to implement fibers in Yolo-C. But two problems arise if we try to do this:</p>
+
+<ol>
+<li>Fibers need a context switch that simultaneously restores some state (the <code>longjmp</code>) while saving the the state (the <code>setjmp</code>). It&#39;s extremely confusing to write this in terms of <code>setjmp</code>/<code>longjmp</code>.</li>
+<li>It&#39;s not obvious how to bootstrap when we start a new fiber. We want to allocate a stack and produce a <code>jmp_buf</code> that we can <code>longjmp</code> to so that we start running the main function of the newly created fiber.</li>
+</ol>
+
+<p><a href="https://usenix.org/legacy/publications/library/proceedings/usenix2000/general/full_papers/engelschall/engelschall_html/index.html">It turns out you can do this with the <code>sigaltstack</code> hack</a>, but as brilliant as this hack is, folks usually prefer to use the much nicer <code>ucontext</code> APIs:</p>
+
+<p><code>getcontext</code> snapshots the current state into a context. This is like <code>setjmp</code>, though it&#39;s rarely used that way; it&#39;s mostly used for prepopulating a <code>ucontext_t</code> before calling <code>makecontext</code>.</p>
+
+<p><code>setcontext</code> is a one-way context switch to a context (it does not save the state before switching). This is mostly just used for exiting a fiber.</p>
+
+<p><code>makecontext</code> creates a new context that is bootstrapped to call some main function. In a bizarre twist of history, this function&#39;s contract requires a prior call to <code>getcontext</code> even though it mostly overwrites all of the state snapshotted by <code>getcontext</code>. Most modern uses of <code>getcontext</code> are just due to this twist.</p>
+
+<p><code>swapcontext</code> is a context switch that simultaneously saves the current context to one <code>ucontext_t</code> and switches to another <code>ucontext_t</code>.</p>
+
+<p>Here&#39;s an example of how to use this API from the <a href="https://linux.die.net/man/3/swapcontext">Linux man pages</a> (I made some small changes to reduce its size):</p>
+
+<pre><code>#include &lt;ucontext.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+static ucontext_t uctx_main, uctx_func1, uctx_func2;
+
+static void func1(void)
+{
+    printf(&#34;func1: swapcontext(&amp;uctx_func1, &amp;uctx_func2)\n&#34;);
+    swapcontext(&amp;uctx_func1, &amp;uctx_func2);
+    printf(&#34;func1: returning\n&#34;);
+}
+
+static void func2(void)
+{
+    printf(&#34;func2: swapcontext(&amp;uctx_func2, &amp;uctx_func1)\n&#34;);
+    swapcontext(&amp;uctx_func2, &amp;uctx_func1);
+    printf(&#34;func2: returning\n&#34;);
+}
+
+int main()
+{
+    char func1_stack[16384];
+    char func2_stack[16384];
+
+    getcontext(&amp;uctx_func1);
+    uctx_func1.uc_stack.ss_sp = func1_stack;
+    uctx_func1.uc_stack.ss_size = sizeof(func1_stack);
+    uctx_func1.uc_link = &amp;uctx_main;
+    makecontext(&amp;uctx_func1, func1, 0);
+
+    getcontext(&amp;uctx_func2);
+    uctx_func2.uc_stack.ss_sp = func2_stack;
+    uctx_func2.uc_stack.ss_size = sizeof(func2_stack);
+    uctx_func2.uc_link = &amp;uctx_func1;
+    makecontext(&amp;uctx_func2, func2, 0);
+
+    printf(&#34;main: swapcontext(&amp;uctx_main, &amp;uctx_func2)\n&#34;);
+    swapcontext(&amp;uctx_main, &amp;uctx_func2);
+
+    printf(&#34;main: exiting\n&#34;);
+    return 0;
+}
+</code></pre>
+
+<p>This program prints:</p>
+
+<pre><code>main: swapcontext(&amp;uctx_main, &amp;uctx_func2)
+func2: swapcontext(&amp;uctx_func2, &amp;uctx_func1)
+func1: swapcontext(&amp;uctx_func1, &amp;uctx_func2)
+func2: returning
+func1: returning
+main: exiting
+</code></pre>
+
+<p>Some notes:</p>
+
+<ul>
+<li>We aren&#39;t using <code>setcontext</code>. Lots of users of this API never use <code>setcontext</code>. <code>setcontext</code> is only useful if you&#39;re using <code>getcontext</code>/<code>setcontext</code> as replacements for <code>longjmp</code>/<code>setjmp</code> (which I&#39;ve never seen any code do in the wild), or if you&#39;re doing a final context switch away from a context, and so you don&#39;t need to save your context.</li>
+<li><code>getcontext</code> only serves one purpose: to initialize those parts of the <code>ucontext_t</code> that <code>makecontext</code> doesn&#39;t initialize. The contract here is bizarre. If we don&#39;t call <code>getcontext</code>, then we would have to somehow initialize all of the parts of <code>ucontext_t</code> that we&#39;re not supposed to know about (fields that are defined in the system header, but that aren&#39;t part of the published API). Also, we&#39;d have to remember to initialize <code>uc_sigmask</code> (<code>getcontext</code> initializes it to the current sigmask). On Linux/X86_64, the other fields that <code>getcontext</code> initializes are mostly to do with FPU exception state. The fact that this contract is so opaque is going to help us make this API memory-safe.</li>
+<li>Once we start using <code>func1_stack</code> and <code>func2_stack</code> in the contexts, we aren&#39;t supposed to rely on their contents anymore. We could read it, but then we aren&#39;t guaranteed anything about what is in there. And if we write to it, then all bets are off. In this example, we aren&#39;t giving these any guard pages, so these stacks are strictly less secure than the normal kind of stack that a thread gets.</li>
+<li>It&#39;s purely convention that the first argument of <code>swapcontext</code> is the context that we were running at the time we called it. We could have passed any context that is safe to overwrite. We can see this in the example with the initial <code>swapcontext(&amp;uctx_main, &amp;uctx_func2)</code> call. Here, <code>uctx_main</code> has not been initialized prior to that call, and we&#39;re picking it as the context to hold the main thread&#39;s context. This is fine.</li>
+<li>Note the use of <code>uc_link</code> - this is the context to <code>setcontext</code> to when a context&#39;s main function returns.</li>
+</ul>
+
+<p>For making this API memory-safe, we&#39;ll focus on the idiom above where <code>getcontext</code> is only for initializing <code>ucontext</code> before a call to <code>makecontext</code>.</p>
+
+<h2>Laws For Safe <code>ucontext</code></h2>
+
+<p>Let&#39;s enumerate the laws we will enforce for <code>ucontext</code>. Note that these laws are more restrictive than what is strictly necessary to make <code>ucontext</code> memory-safe, but I wanted to start with the most conservative possible implementation that is useful to real users of the API.</p>
+
+<p><strong>Opaque state.</strong> We&#39;ll repeat the trick we used to make <code>jmp_buf</code> safe: inside the <code>ucontext_t</code>, we&#39;ll have a pointer to an opaque <code>zfiber_context</code> object. Fil-C code cannot access <code>zfiber_context</code> except by calling <a href="https://github.com/pizlonator/fil-c/blob/deluge/filc/include/pizlonated_runtime.h">its API in <code>pizlonated_runtime.h</code></a>.</p>
+
+<p><strong><code>ss_sp</code> doesn&#39;t matter.</strong> The implementation completely ignores the stack you provided in the <code>ss_sp</code> field. Internally, <code>zfiber_context</code> will allocate a stack that you cannot see. It will use your <code>ss_size</code> as the size of that stack (but it will add some padding that&#39;s necessary for Fil-C&#39;s stack overflow handling to work). The stack is allocated when you call <code>makecontext</code>.</p>
+
+<p><strong><code>zfiber_context</code> has a restricted state machine.</strong> The states are:</p>
+
+<ul>
+<li><em>uninitialized</em> - this is the initial state after a <code>zfiber_context</code> is allocated. It&#39;s only legal to call <code>zfiber_context_getcontext</code> or use the context as the <code>from</code> argument (the first argument) to <code>zfiber_context_swapcontext</code>.</li>
+<li><em>after_getcontext</em> - this is the state after <code>getcontext</code> returns. In this state, it&#39;s only legal to call <code>zfiber_context_makecontext</code> or use the context as the <code>from</code> argument to <code>zfiber_context_swapcontext</code>.</li>
+<li><em>runnable</em> - these states are the result of calling <code>makecontext</code> or after you pass the context as the <code>from</code> argument to <code>swapcontext</code>. When in this state, it&#39;s only legal to call <code>setcontext</code> or use the context as the <code>to</code> argument to <code>swapcontext</code>.</li>
+<li><em>running</em> - this state happens after you start running the context using <code>setcontext</code> or <code>swapcontext</code>. It&#39;s only legal to pass the context as the <code>from</code> argument to <code>swapcontext</code> provided that this is the currently running context on the calling thread (each thread tracks the currently running context). Note that some context could be <em>running</em> but we switch away from it either using <code>setcontext</code> or <code>swapcontext</code> with the <code>from</code> argument being some other <em>uninitialized</em> context; in that case the context will remain in the <em>running</em> state forever, since the only thing you can do with a <em>running</em> context is swap from it and that only works if the <em>running</em> context is the currently running one according to the calling thread.</li>
+</ul>
+
+<p>This state machine forbids using <code>ucontext</code> for <code>longjmp</code>/<code>setjmp</code> because you cannot switch to a <em>after_getcontext</em> context. You can only switch to a <em>runnable</em> context, and the only way to get one is to either <code>makecontext</code> a new one or to save the current context using <code>swapcontext</code>.</p>
+
+<p><strong>Thread affinity.</strong> The <a href="https://fil-c.org/calling_convention.html">Fil-C ABI</a> threads the <code>filc_thread*</code> through every function call and because the compiler is allowed to expect that no function call can ever change the <code>filc_thread*</code> that we&#39;re running on. This means that we cannot allow <code>ucontext</code> to cause a stack that had run on one thread to run on any other thread. Hence, <code>zfiber_context</code> tracks which <code>zthread</code> it was created on and disallows any calls into any <code>zfiber_context</code> API from other threads.</p>
+
+<h2>GC Integration</h2>
+
+<p>When the GC asks the <code>zfiber_context</code> object to mark its outgoing pointers during the mark phase and the context is <em>runnable</em>, the <code>zfiber_context</code> has to do the equivalent of what threads do when a stack scan is <a href="https://fil-c.org/safepoints.html">requested during a soft handshake</a>.</p>
+
+<p>But what if the following happens during a single GC mark phase:</p>
+
+<ol>
+<li>The GC marks a <em>runnable</em> <code>zfiber_context</code> and puts it on the mark stack.</li>
+<li>The GC pops the <code>zfiber_context</code> from the mark stack and marks its outgoing pointers. Let&#39;s say that the context is still <em>runnable</em>. So, we scan its stack.</li>
+<li>Mutator switches to that <code>zfiber_context</code> using either <code>setcontext</code> or <code>swapcontext</code>. Now, the <code>zfiber_context</code> is <em>running</em>, so its stack is not visible to the GC. This is fine, since the stack is owned by a thread, and <a href="https://fil-c.org/fugc.html">the GC uses grey stacks; i.e. it will always rescan the stacks before declaring termination</a>.</li>
+<li>Mutator switches away from that <code>zfiber_context</code> using <code>swapcontext</code>, making the <code>zfiber_context</code> <em>runnable</em> again.</li>
+</ol>
+
+<p>Now we have a problem! The GC was expecting that whatever was on the stack doesn&#39;t need to be actively tracked by any barriers because we&#39;ll just rescan the grey stacks before termination. But now, that stack is no longer owned by any thread; instead it&#39;s owned by a <em>runnable</em> <code>zfiber_context</code>. Worse, that <code>zfiber_context</code> is <em>black</em>: we not only set its mark bit but we already popped it off the mark stack and marked its outgoing pointers - so the GC will not visit it again!</p>
+
+<p>The way we solve this is by tracking <em>grey</em> zfiber_contexts. When we <code>swapcontext</code> from a context during marking, if the context is not already <em>grey</em>, then we add it to the current thread&#39;s <code>grey_fibers</code> list and set its <em>grey</em> bit. Whenever a thread is asked to rescan its stack, it reruns the stack walk of every grey fiber in its list, clears the <em>grey</em> bits of those fibers, and clears the list.</p>
+
+<p>There&#39;s a fun almost-race at termination that may happen due to the use of soft handshakes. In an <a href="https://fil-c.org/fugc.html">on-the-fly GC</a>, we may have the following sequence of events:</p>
+
+<ol>
+<li>The GC runs out of work, so it triggers a soft handshake to scan all stacks.</li>
+<li>Thread 1 performs a stack scan, including walking and resetting its grey fibers, and finds no new objects.</li>
+<li>Thread 1 <code>swapcontext</code>s to a different context, causing its grey fibers to be nonempty.</li>
+<li>Thread 2 performs a stack scan and finds no new objects.</li>
+<li>There are no other threads, and since none of the threads found any new objects, the GC declares termination <em>even though thread 1 has a grey fiber</em>.</li>
+</ol>
+
+<p>Currently, we just reset the grey fiber lists after termination. Reason: if thread 1 found no new objects to mark in step 2, thread 2 also found no new live objects, and the GC was out of work in step 1, then there&#39;s no way that any other unmarked objects could have been introduced into the context before we swapped from it. This is true because:</p>
+
+<ul>
+<li>Newly allocated objects are marked.</li>
+<li>Objects stored into the heap are marked by the barrier at time of store.</li>
+<li>The GC having run out of work means all objects that had been marked had all of their outgoing pointers marked.</li>
+</ul>
+
+<p>There&#39;s simply no way that thread 1 could have loaded an unmarked pointer from the heap in this scenario!</p>
+
+<p>That being said, <em>if there was a bug in my <code>ucontext</code> implementation</em>, <strong>this is where it would be</strong>.</p>
+
+<h2>Putting It All Together</h2>
+
+<p>We only support <code>ucontext</code> APIs in the glibc build of Fil-C. Hence, you get it in <a href="https://fil-c.org/optfil.html"><code>/opt/fil</code></a> and <a href="https://fil-c.org/pizlix.html">Pizlix</a>, but not in the <a href="https://fil-c.org/pizfix.html">pizfix</a>. It&#39;s implemented as follows:</p>
+
+<p><code>getcontext</code> allocates a new <code>zfiber_context</code> with <code>zfiber_context_new</code> and calls <code>zfiber_context_bind_sigset</code> (to cause <code>zfiber_context</code> to replicate its internal sigmask with the user-visible <code>uc_sigmask</code>) and then <code>zfiber_context_getcontext</code>.</p>
+
+<p><code>setcontext</code> calls <code>zfiber_context_setcontext</code>.</p>
+
+<p><code>makecontext</code> creates its own trampoline that manages passing arguments to the user-passed main function. It also manages handling fiber exit (switching to <code>uc_link</code> or calling <code>exit</code>). Other than that, it just calls <code>zfiber_context_makecontext</code>.</p>
+
+<p><code>swapcontext</code> mostly just does a <code>zfiber_context_swapcontext</code>. If the <code>from</code> context (aka the <code>oucp</code>) was not initialized, then it allocates a <code>zfiber_context</code> for it using <code>zfiber_context_new</code> and calls <code>zfiber_context_bind_sigset</code>.</p>
+
+<p>Note that Fil-C does not allow using <code>longjmp</code>/<code>setjmp</code> as an alternate context switch path for <code>ucontext</code>. Some software mixes <code>ucontext</code> with <code>longjmp</code>/<code>setjmp</code>, though all cases of this that I&#39;ve found (OpenSSL, I&#39;m looking at you) has flags to disable the mixing, because Fil-C isn&#39;t the only security technology that breaks if you do that.</p>
+
+
+
+<p>Fil-C supports memory-safe context switches using either the <code>longjmp</code>/<code>setjmp</code> style and the <code>ucontext</code> style. The <code>ucontext</code> style is new since after version 0.680, so you&#39;ll need to build from source to play with it (and it&#39;s not yet thoroughly tested). The <code>longjmp</code>/<code>setjmp</code> implementation is older, and probably quite rugged by now.</p>
+
+<p>As this document shows, it&#39;s possible to have memory-safe C even if you make the effort to support even the most depraved features!</p>
+        </main>
+    </div></div>
+  </body>
+</html>
