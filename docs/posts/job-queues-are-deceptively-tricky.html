@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://typesanitizer.com/blog/job-queues.html">Original</a>
+    <h1>Job queues are deceptively tricky</h1>
+    
+    <div id="readability-page-1" class="page"><article>
+          <section>
+	          
+<p>One of the fun things about being a programmer
+is that as I look more into systems that I didn’t
+know much about, what superficially appears to be
+a simple system actually reveals interesting facets
+of underlying complexity. In other words,
+<a href="https://johnsalvatier.org/blog/2017/reality-has-a-surprising-amount-of-detail">reality has a surprising amount of detail</a>.</p>
+<p>In this post, I want to talk about job queues,
+which I’ve been thinking about for the past few days
+(and while drafting this post in my head, I realized
+I’d thought about them for longer at a previous job,
+but not nearly with as much clarity.)</p>
+<p>What do I mean by “job queue”? I mean a system
+where there is some notion of submitting batch jobs,
+scheduling them, and running them. Generally,
+the system is expected to be FIFO or FIFO-like,
+but that’s not required. Usually, the queue bundles
+together a native way to schedule jobs periodically
+– this lets you specify submissions using configuration
+files (e.g. using JSON or YAML).</p>
+<p>Job queues arise naturally in all sorts of situations
+where throughput requirements are high, but latency
+requirements are not that high. Continuous integration
+is a common example. Another example is summaries
+for the purpose of data analysis.</p>
+<p>Over the past year or two, a handful of lenses that
+I’ve found useful when thinking about system design are:</p>
+<ul>
+<li><p>Being wary of queues: Queues tend to typically be
+<a href="https://lmax-exchange.github.io/disruptor/disruptor.html&lt;sub&gt;the_problems_of_queues">close to full or close to empty</a>,
+requiring some thought around appropriate sizing.
+I’ve also learnt a bunch of counter-intuitive
+behavior of queues when it comes to latency
+from Marc Brooker’s blog.<span><label for="sn-0"></label><span>In blog posts I’ve read about queues, the focus is generally on latency, not on throughput, which is I think partly why I never really mentally linked “queues” and “job queues” earlier.</span></span></p></li>
+<li><p>Limits:
+This is based on the <a href="https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md">Tiger Style</a>
+guide written by the folks at TigerBeetle,
+which talks about explicit limits on various things.
+On generalization, this leads to the notion of
+tolerances and having budgets for modular reasoning.<span><label for="sn-1"></label><span>Funnily enough, near the start of my career at Apple, I remember being mildly bemused at certain discussions where teams would discuss how much memory budget they would have to bargain for, especially for low-level code. I have grown more respect for that approach over time.</span></span></p></li>
+<li><p>Fault models: Roughly speaking, a fault model
+describes your assumptions related to errors
+and reliability in your dependencies.</p>
+<p>I’ve learnt a bunch on this topic from the talks
+and tweets by the TigerBeetle CEO Joran Dirk Greef,
+as well as <a href="https://transactional.blog/">writing by Alex Miller</a>.</p></li>
+</ul>
+<p>I will try to demonstrate how these lenses can apply
+for system design later in this post.</p>
+<h2 id="the-problem-at-hand">The problem at hand</h2>
+<p>At <code>$WORK</code>, we have a background job for packing “reference repos”.
+A reference repo is a git repo which has been aggressively repacked
+– if you’re unfamiliar with repacking, you can think
+of this as more “aggressively compressed”.</p>
+<p>These are stored in object storage, and a new repo can be
+set up on a machine by downloading the reference repo,
+and fetching a delta of changes for the tip of the default branch.
+When it comes to very large repos, for the downloader,
+this approach helps cut down latency compared to the
+more typical approach of doing a <code>git clone</code> operation.</p>
+<p>The actual details of how git does aggressive repacking is not super
+relevant for this post. What does matter is that there are,
+roughly speaking, two forms of repacking available:</p>
+<ul>
+<li>Wholesale repacking: This will lead to git ignoring any
+baseline information about how packing should be done,
+and recompute everything from scratch. Say for the repo
+under test, this takes 7 hours.<span><label for="sn-2"></label><span>If you’re surprised at the thought of a git operation taking several hours, (1) you should be happy that you don’t have this problem and (2) some of the sub-operations here are seemingly single-threaded, regardless of repo size.</span></span></li>
+<li>Incremental repacking: This will lead to git reusing the
+baseline information already stored in the repo about packing,
+so it will only repack things which have changed.
+So if you did a <code>clone</code>, then did a <code>fetch</code>, then only
+the newer changes from <code>fetch</code> will be repacked,
+and only some cursory checks will be performed
+on the history received from the <code>clone</code> operation.
+Say this takes 2 hours.</li>
+</ul>
+<p>OK. So that’s the setup.</p>
+<p>We have the option of doing the
+more expensive thing, which takes 7 hours. This buys us
+a smaller reference repo, which means faster downloads,
+faster un-tarring and lower disk usage.
+To give a size ballpark, a wholesale repacked repo
+can be up around 50-60% smaller than an incrementally
+packed repo.</p>
+<p>We have the option of doing the cheaper thing,
+which takes 2 hours. This buys us more up-to-date reference repos,
+which means that if the downloader still cares
+about getting the latest changes,
+the delta it will fetch subsequently will be smaller,
+so it’ll be faster and put less load on the server.
+But also, if the extra disk usage is in the hundreds
+of megabytes or gigabytes, then that’s not great.</p>
+<p>One more thing to note is that since this is a code repository,
+downstream consumers are much more active on weekdays
+than on weekends.</p>
+<h2 id="the-best-of-both-worlds">The best of both worlds?</h2>
+<p>A natural next step upon seeing the above dichotomy
+is to propose the following: why not do the wholesale
+repacking on the weekends, and do the incremental
+repacking on the weekdays? That seems like it buys
+up-to-dateness on weekdays (where more consumers
+are active), and the wholesale repacking on the weekend
+would ensure that the reference repo size grows more
+slowly.</p>
+<p>For simplicity, let’s say we’re writing the reference
+repos with some key <code>&lt;myrepo&gt;-&lt;timestamp&gt;.tar</code>
+into some bucket.</p>
+<p>To keep the size of the incrementally packed repo smaller,
+one can either:</p>
+<ul>
+<li>Write the wholesale repacked repos using the same key scheme,
+and have the incremental repacking jobs bootstrap
+from the last successful repack (wholesale or incremental),
+instead of from a <code>clone</code> operation.</li>
+<li>Write the wholesale repacked repos using an altered key scheme,
+say <code>&lt;myrepo&gt;-&lt;timestamp&gt;-packed.tar</code>, and bootstrap
+the incremental repack from that key location.
+However, this potentially creates the need to update
+other consumers so that they don’t lag behind
+too much on weekends (assuming incremental repacking
+is not running on weekends).</li>
+</ul>
+<p>Let’s say we go with the first one because it seems simpler.</p>
+<p>So now the question is, how are we going to handle this scheduling?</p>
+<p>Typical job queues only expose limited control of scheduling
+to clients for good reason – providing a large number
+of knobs increases the risk of surprising scheduling
+decisions.</p>
+<p>When I wrote the “natural next step” above, I’m essentially
+thinking from the point of view of writing the control loop.
+But when I’m using a job queue, I do not (by definition)
+have access to the control loop – someone else has written
+that loop, and I need to see what configuration knobs are
+available to me to customize the behavior.</p>
+<p>For now, let’s say the queue exposes two configuration knobs:</p>
+<ul>
+<li>Scheduling interval: The job is started on a timer configured
+with this interval.</li>
+<li>Concurrency limit: The maximum number of running jobs for
+the particular configuration.</li>
+</ul>
+<p>Before we started this optimization journey,
+let’s say these configuration knobs were set as:</p>
+<ul>
+<li>Scheduling interval: 9 hours, to leave some headroom
+from the 7 hour running time of the job.</li>
+<li>Concurrency limit: 1, because there’s not much point
+in having concurrent jobs do the same thing here.</li>
+</ul>
+<p>Again, a natural next step here might be to think:
+“So the 9 hour interval was sufficient
+for a 7 hour running time job. Since the incremental
+repack job on weekdays will take 2 hours, let’s set
+the interval to be 3 hours. On the weekends,
+when the wholesale repacking
+job is running, it will not have finished in 3 hours,
+so even if the timer triggers again,
+the concurrency limit will prevent any other jobs from running,
+so things should be fine.”</p>
+<p>Unfortunately, dear reader,
+this simplistic reasoning does not work.</p>
+<h2 id="the-set-of-possible-semantics">The set of possible semantics</h2>
+<p>For a moment, let’s stop thinking about trying to
+think about how we can <em>use</em> the job queue.
+Rather, let’s think about <em>implementing</em> a job queue.</p>
+<p>Let’s say there’s a job which is running <code>J<sub>1</sub></code> based
+on some configuration <code>J</code>. After the scheduling interval
+elapses, say we want to create a new job <code>J<sub>2</sub></code>,
+and <code>J<sub>1</sub></code> hasn’t completed yet.
+What should we do with <code>J<sub>2</sub></code>? Essentially,
+there are only four options:</p>
+<ul>
+<li>Parallel Spawn: If the concurrency limit is higher than 2,
+then we can just start running <code>J<sub>2</sub></code>.</li>
+<li>If the concurrency limit is 1, then we have three choices:
+<ul>
+<li>Prefer New: Stop <code>J<sub>1</sub></code> and start <code>J<sub>2</sub></code>.</li>
+<li>Wait: Wait for <code>J<sub>1</sub></code> to finish and then start <code>J<sub>2</sub></code>.</li>
+<li>Prefer Old: Auto-cancel <code>J<sub>2</sub></code> and let <code>J<sub>1</sub></code> continue running.</li>
+</ul></li>
+</ul>
+<p>Pause for a moment here, and ask yourself what’s your
+intuitive answer to the following question: which of these
+possible semantics are worth implementing or could
+be called reasonable?</p>
+<p>If you’re anything like me, you would probably have
+said Parallel Spawn, Prefer New, and Wait are perhaps
+defensible, whereas Prefer Old feels weird/backward.
+For Prefer New vs Prefer Old in particular,
+you may have justified this to yourself with reasoning like:
+“if this situation happens, the job owner probably
+cares about more recent results than older results
+so it makes sense to support Prefer New
+but it seems strange to support Prefer Old,
+who would ever want <em>that</em>?”</p>
+<hr/>
+<p>Recall the lenses from earlier: vigilance about queues,
+limits and fault models.</p>
+<p>So the first thing to note is that the Wait option
+requires a (logical) per-job-config queue. The queue should
+probably be bounded (per Limits). OK, so how should
+the limit be decided? What should happen when the limit is hit?
+At what utilization level should we start alerting
+(i.e. what’s a <em>soft</em> limit for the queue size)?
+Should the queue be strictly FIFO?
+Those are good questions to ask! There’s no one-size-fits-all
+answer, but an important thing to realize is that
+these questions <em>should</em> be asked,
+if the Wait semantics are supported.</p>
+<p>If we think about limits, the Prefer New semantics
+imply that the scheduling interval is also a hard limit.
+Conceptually, these are different things –
+you could imagine varying them independently if the
+latter was offered as a separate configuration knob.</p>
+<p>Lastly, what are the fault models under which these
+semantics make sense?</p>
+<ul>
+<li><p>Prefer New: <code>J<sub>1</sub></code>’s running time exceeded the
+scheduling interval because of some
+non-deterministic reason (e.g. a rate limit being hit).
+We are optimistic, so it’s possible that
+<code>J<sub>2</sub></code> will not hit the same issue.</p>
+<p>In other words, we expect the job to be successful
+again sooner rather than later.</p></li>
+<li><p>Wait: Same as above. Additionally, there is a
+non-functional requirement (or assumption!)
+that dropping jobs is not preferable.</p></li>
+<li><p>Prefer Old: Assume that <code>J<sub>1</sub></code> is not hung,
+so it will probably finish if given more time.<span><label for="sn-3"></label><span>You would still want to have a hard limit separate from the scheduling interval to prevent runaway resource usage.</span></span>
+We are pessimistic, so we assume that
+<code>J<sub>2</sub></code>’s running time will also exceed the scheduling
+interval. So it’s wisest to cancel <code>J<sub>2</sub></code>,
+so that at least <code>J<sub>1</sub></code> has a chance to finish.</p></li>
+</ul>
+<h2 id="i-just-wanted-to-do-a-simple-thing">I just wanted to do a simple thing</h2>
+<p>To jog your memory on what we were trying to do:</p>
+<ul>
+<li>We wanted to run the same job with a fast path
+on weekdays (taking 2 hours) and a slow path
+on weekends (taking 7 hours).</li>
+<li>We had one configuration knob for the scheduling
+interval. We were thinking of setting it to 3 hours
+to get more up-to-date results on weekdays.</li>
+<li>We had a concurrency limit of 1 to avoid running
+multiple jobs at the same time.</li>
+</ul>
+<p>Let’s try to see how such a configuration would
+fare on the weekend for the different semantics
+we discussed:<span><label for="sn-4"></label><span>For simplicity, assume that scheduling operations are instantaneous.</span></span></p>
+<ul>
+<li>Prefer New: When the 7 hour job would hit
+the 3 hour mark, it would be canceled. A new 7
+hour job would be triggered, and canceled after
+3 hours again. Essentially, we’d waste 48 hours
+of compute across 16 jobs, because none of
+these would ever finish.</li>
+<li>Wait: Over the 48 hours of the weekend, we’d
+trigger 16 jobs, with a total compute demand
+of 16×7 = 112 hours. If the queue limit was
+higher than (112-48)/7 = 64/7 = 9.15, we’d emerge
+out of the weekend with about 64 hours of
+pending work. However, the weekdays only offer
+(24×5×(3-2)/3) = 40 spare hours, so
+we wouldn’t finish draining this queue before
+the start of the subsequent weekend.</li>
+<li>Prefer Old: In 48 hours, we could almost finish
+seven 7 hour jobs, with ~1 hour of pending work.
+We would’ve canceled 9/16 jobs.
+We’d get back on schedule quickly on Monday
+since we only have 1 hour of extra work
+left from the weekend.</li>
+</ul>
+<p>So it seems like Prefer Old is the best fit here.
+Yes, it might still seem counter-intuitive;
+we’ll get to that shortly.</p>
+<p>The other extra fun thing here is that if you
+were using the Wait strategy, you can easily
+end up masking the problem without actually
+helping. Maybe you got paged on the weekend
+for the queue being non-empty for an extended period of time.
+So you decide to increase the concurrency.
+You pick a good round number like 4.
+The new runners start to chew through the jobs, great!
+Now, you have these expensive jobs running for 7 hours,
+but most of their results are only useful for ~3 hours
+on the weekend, before they get superseded. 😬</p>
+<p>Coming back to the appropriateness of Prefer Old,
+let’s look again at what we wrote for the fault
+models:</p>
+<blockquote>
+<ul>
+<li>Prefer New: [..] we expect the job to be successful
+again sooner rather than later.</li>
+<li>Wait: Same as above. Additionally, there is a
+non-functional requirement (or assumption!)
+that dropping jobs is not preferable.</li>
+<li>Prefer Old: [..] we assume that
+<code>J<sub>2</sub></code> itself will also exceed the scheduling
+interval. [..]</li>
+</ul>
+</blockquote>
+<p>For the schedule that we were trying to have on the
+weekend (7 hour jobs with a 3 hour interval),
+it closely matches the assumptions of Prefer Old
+very well, but it directly goes against the assumptions
+of Prefer New and Wait.</p>
+<p>Additionally, our weekend workload is totally fine with
+dropping jobs in case something is running.
+But the Wait semantics would make us pay dearly
+for something we did not care about, and would
+likely require more expensive solutions on top.</p>
+<p>If the Prefer Old semantics are not offered,
+you can’t really emulate them using the two primitives
+of regular scheduling and limiting concurrency.
+For the workload above, if you had a richer primitive
+such as cron-like scheduling, you could split the work
+into two separate jobs – one which only runs on weekdays,
+and one which only runs on weekends.</p>
+<h2 id="things-couldve-been-worse">Things could’ve been worse</h2>
+<p>Earlier, we were thinking about fault models.
+That was cute, right?</p>
+<p>Imagine a separate system compared to the one we’ve been talking about.
+There’s a global concurrency limit to keep costs under control.
+You have a bunch of different jobs coming in,
+mostly kicked off in the background.
+Everything goes in a FIFO queue.
+Nobody put in a global size limit.</p>
+<p>Every few months, a customer comes in and tries the
+feature related to the job queue.
+They kick off some new jobs manually
+and see the queue position as 100K+ (or even, 1M+).
+They’re like “uhh, this feature doesn’t seem to work?”
+They escalate to a support engineer.
+It becomes a ticket on your kanban board.
+An engineer goes in and clears the queue by running a <code>DELETE</code> manually,
+with some displeasure.</p>
+<p>The new manager asks “what can we do to solve this problem in a systemic way.”
+You spend a few days analyzing the problem.
+You look at the running times. You look at the queue growth charts.
+Ah, it’s hard to predict how long these jobs take,
+or how many of them come along.
+Maybe we reduce the jobs created?
+You look at the database columns,
+and you realize you don’t actually have
+enough information to go on to properly check
+which jobs came from the same configuration.
+The flexibility of job creation makes it seem
+quite tricky to retrofit a notion of job de-duplication.</p>
+<p>The manager comes back “can we have an 80-20 solution?”
+You add a hack which tries to pick an already
+queued job which looks similar-ish,
+and overwrite it in-place when doing the enqueue operation.
+The queue is now mostly bounded in size,
+because newly queued jobs overwrite old ones if present,
+but there are still some configuration knobs which a customer
+could tune and break the system out of equilibrium.
+You declare it “user error” to tweak those configuration knobs,
+and move on to the next ticket.</p>
+<hr/>
+<p>While writing this, I was reminded of apenwarr’s
+line from <a href="https://apenwarr.ca/log/20190216">The log/event processing pipeline you can’t have</a>:</p>
+<blockquote>
+<p>(I suddenly feel a lot of pity for myself after reading that paragraph. I think I am more scars than person at this point.)</p>
+</blockquote>
+<p>Just randomly, for no good reason whatsoever.</p>
+<p>ANYWAY</p>
+<h2 id="heres-some-hope-as-lifed-be-too-depressing-otherwise">Here’s some hope as life’d be too depressing otherwise</h2>
+<p>It seems possible to design systems while thinking
+explicitly about queues, limits and fault models
+– and thinking about these seems to lend itself
+to designs which degrade more gracefully,
+and handle unexpected situations better,
+especially if the design is made under pessimistic
+assumptions.</p>
+<p>In particular, explicitly spelling these out is
+valuable as a system designer, because it lets
+potential consumers evaluate the system quickly
+for their own workloads even before they go through
+a detailed step-by-step simulation in their head
+about what would happen in different situations.</p>
+<p>Conversely, when you’re using a new system
+that you haven’t used before, it’s useful
+to find out this information if it’s documented
+(or you have access to the code).
+That way, you can check how well the designer’s assumptions
+apply to (or are violated by) your intended workload.</p>
+<p>In particular, when there are configuration files involved,
+especially those which tweak <em>control flow</em>,
+not just data that flows through,
+it’s valuable to pause for a bit to dig into
+the various error cases that are involved in the
+corresponding control loop, because configuration
+files tend to hide this information away.</p>
+<p>For systems which lend themselves to simple models,
+you might even be able to model the different cases
+using just pen-and-paper, like we’ve done above,
+without the need for simulations. Doing so
+can help illustrate gaps in our own thinking,
+where it’s easy to gloss over what happens when
+things don’t go quite as swimmingly as we expect.</p>
+          </section>
+        </article></div>
+  </body>
+</html>
