@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://pythonspeed.com/articles/branchless-binary-search/">Original</a>
+    <h1>Faster binary search: from compiled code to mechanical sympathy</h1>
+    
+    <div id="readability-page-1" class="page"><div itemprop="articleBody">
+      <p>How do you speed up computational Python code? A common, and useful,
+starting point is:</p>
+
+<ol>
+  <li>Pick a good algorithm.</li>
+  <li>Use a compiled language to write a Python extension.</li>
+  <li>Maybe add parallelism so you can use multiple CPU cores.</li>
+</ol>
+
+<p>But what if you need more speed? Consider the following real problem,
+one of the steps in scikit-learn’s gradient histogram boosting
+algorithm:</p>
+
+<ul>
+  <li>You have a large array of floating point numbers.</li>
+  <li>You want to assign them to the integer range 0-254, spread out evenly.</li>
+</ul>
+
+<p>scikit-learn implements this by splitting up the full range of float
+values into 255 buckets, creating a sorted array of bucket boundaries,
+and then using binary search to choose the appropriate bucket for each
+value. The binary search is implemented in a compiled language, and it
+can run in parallel on multiple cores.</p>
+
+<p>Recently, as part of my work at
+<a href="https://labs.quansight.org/">Quansight</a>, and inspired by
+<a href="https://pvk.ca/Blog/2012/07/03/binary-search-star-eliminates-star-branch-mispredictions/">two</a>
+<a href="https://pvk.ca/Blog/2015/11/29/retrospective-on-binary-search-and-on-compression-slash-compilation/">posts</a>
+by Paul Khuong, I sped up this implementation significantly. How? By
+making sure the code wasn’t fighting against the CPU.</p>
+
+<p>In this article I’m going to walk you through that speed-up,
+demonstrated on a simplified example. Then I’m going to demonstrate a
+series of additional optimizations, with the final version running 6×
+faster than the original one.</p>
+
+<p>It’s worth knowing that I will be speeding through mentions of many
+different low-level hardware topics: instruction-level parallelism,
+branch (mis)prediction, and more. This is only one
+article, it can only briefly introduce you to what’s possible, it can’t
+function as an in-depth tutorial. So I’ll talk about how you can learn
+more about these topics at the end of the article.</p>
+
+<p><strong>Updates:</strong></p>
+
+<ul>
+  <li>Fixed stupid mistake involving f64 comparisons, you can just do them.
+SIMD doesn’t help anymore—but that’s OK, the code is even faster.</li>
+  <li>Clarified benefits of precalculating <code>halves</code>.</li>
+</ul>
+
+<!-- TEASER_END -->
+
+<h2 id="the-starting-point-standard-binary-search">The starting point: Standard binary search</h2>
+
+<p>The original scikit-learn code was implemented in Cython, but I’m going
+to use Rust for this article. Here’s a pretty standard implementation of
+binary search (based on the one in NumPy), designed for this use case of
+finding a bucket given an array of boundaries:</p>
+
+<div><div><pre><code><span>/// Convert floating points values into integer values by finding</span>
+<span>/// which bucket they fit in, given bucket boundaries.</span>
+<span>fn</span> <span>bucketize_classic_impl</span><span>(</span>
+    <span>arr</span><span>:</span> <span>&amp;</span><span>[</span><span>f64</span><span>],</span>
+    <span>boundaries</span><span>:</span> <span>&amp;</span><span>[</span><span>f64</span><span>],</span>
+<span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>usize</span><span>&gt;</span> <span>{</span>
+    <span>// A Vec or vector is Rust&#39;s equivalent of a Python</span>
+    <span>// list. Here I create an empty Vec with enough memory</span>
+    <span>// allocated to store `arr.len()` values:</span>
+    <span>let</span> <span>mut</span> <span>result</span> <span>=</span> <span>Vec</span><span>::</span><span>with_capacity</span><span>(</span><span>arr</span><span>.len</span><span>());</span>
+    <span>for</span> <span>value</span> <span>in</span> <span>arr</span> <span>{</span>
+        <span>// Standard binary search algorithm:</span>
+        <span>let</span> <span>mut</span> <span>min_idx</span> <span>=</span> <span>0</span><span>;</span>
+        <span>let</span> <span>mut</span> <span>max_idx</span> <span>=</span> <span>boundaries</span><span>.len</span><span>();</span>
+        <span>while</span> <span>min_idx</span> <span>&lt;</span> <span>max_idx</span> <span>{</span>
+            <span>let</span> <span>middle</span> <span>=</span> <span>min_idx</span> <span>+</span> <span>((</span><span>max_idx</span> <span>-</span> <span>min_idx</span><span>)</span> <span>/</span> <span>2</span><span>);</span>
+            <span>if</span> <span>boundaries</span><span>[</span><span>middle</span><span>]</span> <span>&lt;</span> <span>*</span><span>value</span> <span>{</span>
+                <span>min_idx</span> <span>=</span> <span>middle</span> <span>+</span> <span>1</span><span>;</span>
+            <span>}</span> <span>else</span> <span>{</span>
+                <span>max_idx</span> <span>=</span> <span>middle</span><span>;</span>
+            <span>}</span>
+        <span>}</span>
+        <span>// This is equivalent to a_list.append() in Python:</span>
+        <span>result</span><span>.push</span><span>(</span><span>min_idx</span><span>);</span>
+    <span>}</span>
+    <span>// Return the result:</span>
+    <span>result</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>For completeness, here’s how you can hook it up to Python, so it takes
+and returns NumPy arrays; this is boilerplate, so I’m not going to show
+it for later functions. You can just skip it if you’re not familiar with
+Rust and PyO3, or don’t particularly care; it’s not relevant to the rest
+of the article.</p>
+
+<details>
+  <summary>
+Click here to see the code
+</summary>
+
+  <div><div><pre><code><span>use</span> <span>pyo3</span><span>::</span><span>prelude</span><span>::</span><span>*</span><span>;</span>
+<span>use</span> <span>numpy</span><span>::</span><span>ndarray</span><span>::</span><span>Array</span><span>;</span>
+<span>use</span> <span>numpy</span><span>::{</span><span>PyArray1</span><span>,</span> <span>PyReadonlyArray1</span><span>};</span>
+
+<span>#[pyfunction]</span>
+<span>fn</span> <span>bucketize_classic</span><span>&lt;</span><span>&#39;py</span><span>&gt;</span><span>(</span>
+    <span>py</span><span>:</span> <span>Python</span><span>&lt;</span><span>&#39;py</span><span>&gt;</span><span>,</span>
+    <span>// These two arguments are 1-dimensional arrays of</span>
+    <span>// floats:</span>
+    <span>arr</span><span>:</span> <span>PyReadonlyArray1</span><span>&lt;</span><span>f64</span><span>&gt;</span><span>,</span>
+    <span>boundaries</span><span>:</span> <span>PyReadonlyArray1</span><span>&lt;</span><span>f64</span><span>&gt;</span><span>,</span>
+<span>)</span> <span>-&gt;</span> <span>PyResult</span><span>&lt;</span><span>Bound</span><span>&lt;</span><span>&#39;py</span><span>,</span> <span>PyArray1</span><span>&lt;</span><span>usize</span><span>&gt;&gt;&gt;</span> <span>{</span>
+    <span>let</span> <span>result</span> <span>=</span> <span>bucketize_classic_impl</span><span>(</span>
+        <span>arr</span><span>.as_slice</span><span>()</span><span>.unwrap</span><span>(),</span>
+        <span>boundaries</span><span>.as_slice</span><span>()</span><span>.unwrap</span><span>(),</span>
+    <span>);</span>
+    <span>// Convert a Rust vector into a 1D NumPy array we can</span>
+    <span>// pass back to Python:</span>
+    <span>let</span> <span>result</span> <span>=</span>
+        <span>PyArray1</span><span>::</span><span>from_owned_array</span><span>(</span><span>py</span><span>,</span> <span>Array</span><span>::</span><span>from_vec</span><span>(</span><span>result</span><span>));</span>
+    <span>Ok</span><span>(</span><span>result</span><span>)</span>
+<span>}</span>
+</code></pre></div>  </div>
+
+</details>
+
+<h2 id="branch-mispredictions-slow-your-code-down">Branch mispredictions slow your code down</h2>
+
+<p>How can I speed up this implementation of binary search? It’s already
+using a scalable algorithm, and a compiled language. Parallelism is
+certainly an option, but I’m going to use a different approach:
+mechanical sympathy, a better understanding of how the CPU works. I’ll
+start with a very quick review of how modern CPUs run code in parallel
+<em>within a single core</em>.</p>
+
+<p>A reasonable mental model of Python code is that the code is executed
+one instruction at a time. Do twice as many arithmetic operations, and
+the code will run twice as slow. Once you switch to a compiled language,
+with operations sometimes mapping to one or two CPU instructions, that
+mental model is no longer correct. Modern CPUs can sometimes run
+multiple independent CPU instructions at once (“instruction-level
+parallelism”) on a single CPU core, resulting in faster execution.</p>
+
+<div><div><pre><code><span>fn</span> <span>two_adds</span><span>(</span><span>a</span><span>:</span> <span>i64</span><span>,</span> <span>b</span><span>:</span> <span>i64</span><span>,</span> <span>c</span><span>:</span> <span>i64</span><span>,</span> <span>d</span><span>:</span> <span>i64</span><span>)</span> <span>-&gt;</span> <span>i64</span> <span>{</span>
+    <span>// Your CPU can probably run these two adds in parallel,</span>
+    <span>// on a single core, automatically:</span>
+    <span>let</span> <span>t1</span> <span>=</span> <span>a</span> <span>+</span> <span>b</span><span>;</span>
+    <span>let</span> <span>t2</span> <span>=</span> <span>c</span> <span>+</span> <span>d</span><span>;</span>
+    <span>// Return the result:</span>
+    <span>t1</span> <span>+</span> <span>t2</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>However, branches in the code created by <code>if</code>/<code>while</code>/<code>for</code> expressions
+pose a problem: your code might go one way, or the other. Given two
+choices, which set of possible future instructions should the CPU try to
+execute in parallel?</p>
+
+<div><div><pre><code><span>fn</span> <span>maybe_add</span><span>(</span><span>a</span><span>:</span> <span>i64</span><span>,</span> <span>b</span><span>:</span> <span>i64</span><span>,</span> <span>c</span><span>:</span> <span>i64</span><span>,</span> <span>d</span><span>:</span> <span>i64</span><span>,</span> <span>add</span><span>:</span> <span>bool</span><span>)</span> <span>-&gt;</span> <span>i64</span> <span>{</span>
+    <span>let</span> <span>t1</span> <span>=</span> <span>a</span> <span>+</span> <span>b</span><span>;</span>
+    <span>// Which of these two branches should the CPU run in</span>
+    <span>// parallel with `a + b`?</span>
+    <span>let</span> <span>t2</span> <span>=</span> <span>if</span> <span>add</span> <span>{</span>
+        <span>c</span> <span>+</span> <span>d</span>
+    <span>}</span> <span>else</span> <span>{</span>
+        <span>c</span> <span>*</span> <span>d</span>
+    <span>};</span>
+    <span>t1</span> <span>+</span> <span>t2</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>To ensure fast execution, the CPU has a branch predictor that
+heuristically chooses which branch to execute in parallel. If the guess
+is correct, your code is faster. If the guess is wrong, the CPU will
+eventually notice, undo the incorrect work, and then go execute the
+correct branch… which means your code is slower. In some cases, much
+slower.</p>
+
+<p>The binary search algorithm above is unfortunately very unpredictable
+given the input data. Recall that the bucket boundaries are chosen so
+that the input values are spread evenly across all buckets. That means
+that choosing whether to go left or right in the binary search is not at
+all predictable:</p>
+
+<div><div><pre><code><span>// The CPU can&#39;t reliably guess which path will be taken:</span>
+<span>if</span> <span>boundaries</span><span>[</span><span>middle</span><span>]</span> <span>&lt;</span> <span>*</span><span>value</span> <span>{</span>
+    <span>min_idx</span> <span>=</span> <span>middle</span> <span>+</span> <span>1</span><span>;</span>
+<span>}</span> <span>else</span> <span>{</span>
+    <span>max_idx</span> <span>=</span> <span>middle</span><span>;</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Similarly, the number of iterations may vary:</p>
+
+<div><div><pre><code><span>// How many times will this loop continue before stopping?</span>
+<span>// It&#39;s impossible to know given the particular data being</span>
+<span>// used.</span>
+<span>while</span> <span>min_idx</span> <span>&lt;</span> <span>max_idx</span> <span>{</span>
+    <span>// ...</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>To validate this hypothesis, I can use the CPU’s hardware counters
+(exposed to Python via
+<a href="https://github.com/pythonspeed/py-perf-event/"><code>py-perf-event</code></a>) to
+measure how many branches the running code executes, and how many of
+these branches get mispredicted. Here are the inputs I’ll be using:</p>
+
+<div><div><pre><code><span>import</span> <span>numpy</span> <span>as</span> <span>np</span>
+<span>from</span> <span>numba</span> <span>import</span> <span>jit</span>
+
+<span># Values between 0 and 1:
+</span><span>DATA</span> <span>=</span> <span>np</span><span>.</span><span>random</span><span>.</span><span>random</span><span>(</span><span>1_000_000</span><span>)</span>
+
+<span># Bucket boundaries, evenly spaced out:
+</span><span>BOUNDARIES</span> <span>=</span> <span>np</span><span>.</span><span>linspace</span><span>(</span><span>0.0</span><span>,</span> <span>1.0</span><span>,</span> <span>255</span><span>)[</span><span>1</span><span>:</span><span>-</span><span>1</span><span>]</span>
+</code></pre></div></div>
+
+<p>And here’s the result of running the code:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Code</th>
+      <th>➘ Elapsed µ-seconds</th>
+      <th> </th>
+      <th>➘ Branch instructions</th>
+      <th>➘ Branch misprediction %</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>bucketize_classic(DATA, BOUNDARIES)</code></td>
+      <td>44,572.7</td>
+      <td> </td>
+      <td>26,996,904</td>
+      <td>16.6%</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>➘ Lower numbers are better</p>
+
+<p>16% of branches being mispredicted isn’t great, and there’s also quite a
+lot of branches per value. <code>DATA</code> has 1,000,000 values, so with 27
+million branches total that’s 27 branches per value.</p>
+
+<h2 id="switching-to-branchless-execution">Switching to branchless execution</h2>
+
+<p>I’m going to get rid of both sources of unpredictable branches. As far
+as the number of <code>while</code> loop iterations, I’m instead going to iterate a
+fixed number of times, log2 of the number of buckets. For some value
+this might involve a bit more work, if previously the bucket would be
+found in an iteration or two, but the saving in speed from avoiding
+branch mispredictions will make it worth it.</p>
+
+<p>For the <code>if</code> expression, the current code sometimes set one variable,
+sometimes another. I’m going to replace that with code that always sets
+the same variable, even if it’s unchanged. Then, I’m going to use Rust’s
+<a href="https://doc.rust-lang.org/std/hint/fn.select_unpredictable.html"><code>std::hint::select_unpredictable()</code></a>,
+which tells the compiler to avoid emitting branches, if possible. Often
+CPUs have special instructions for conditionally choosing between two
+values, without a branch.</p>
+
+<p>Here’s what the new, branchless version looks like:</p>
+
+<div><div><pre><code><span>use</span> <span>std</span><span>::</span><span>hint</span><span>::</span><span>select_unpredictable</span><span>;</span>
+
+<span>fn</span> <span>bucketize_branchless_impl</span><span>(</span>
+    <span>arr</span><span>:</span> <span>&amp;</span><span>[</span><span>f64</span><span>],</span>
+    <span>boundaries</span><span>:</span> <span>&amp;</span><span>[</span><span>f64</span><span>],</span>
+<span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>usize</span><span>&gt;</span> <span>{</span>
+    <span>let</span> <span>size</span> <span>=</span> <span>boundaries</span><span>.len</span><span>();</span>
+    <span>let</span> <span>n_iterations</span> <span>=</span> <span>(</span><span>size</span> <span>as</span> <span>f64</span><span>)</span><span>.log2</span><span>()</span><span>.ceil</span><span>()</span> <span>as</span> <span>usize</span><span>;</span>
+    <span>let</span> <span>mut</span> <span>result</span> <span>=</span> <span>Vec</span><span>::</span><span>with_capacity</span><span>(</span><span>arr</span><span>.len</span><span>());</span>
+
+    <span>for</span> <span>value</span> <span>in</span> <span>arr</span> <span>{</span>
+        <span>let</span> <span>mut</span> <span>left</span> <span>=</span> <span>0</span><span>;</span>
+        <span>let</span> <span>mut</span> <span>remaining_size</span> <span>=</span> <span>size</span><span>;</span>
+
+        <span>// Branchless binary search: keep cutting the search</span>
+        <span>// area in half.</span>
+        <span>for</span> <span>_</span> <span>in</span> <span>0</span><span>..</span><span>n_iterations</span> <span>{</span>
+            <span>let</span> <span>half</span> <span>=</span> <span>remaining_size</span> <span>/</span> <span>2</span><span>;</span>
+            <span>let</span> <span>middle</span> <span>=</span> <span>left</span> <span>+</span> <span>half</span><span>;</span>
+            <span>// Conditional operation: if bool, then a, else</span>
+            <span>// b. Hopefully generated by the compiler</span>
+            <span>// without an actual branch.</span>
+            <span>left</span> <span>=</span> <span>select_unpredictable</span><span>(</span>
+                <span>boundaries</span><span>[</span><span>middle</span><span>]</span> <span>&lt;</span> <span>*</span><span>value</span><span>,</span>
+                <span>middle</span><span>,</span>
+                <span>left</span><span>,</span>
+            <span>);</span>
+            <span>remaining_size</span> <span>-=</span> <span>half</span><span>;</span>
+        <span>}</span>
+
+        <span>// Fix an off-by-one difference from the original</span>
+        <span>// algorithm.</span>
+        <span>left</span> <span>=</span> <span>select_unpredictable</span><span>(</span>
+            <span>boundaries</span><span>[</span><span>left</span><span>]</span> <span>&lt;</span> <span>*</span><span>value</span><span>,</span>
+            <span>left</span> <span>+</span> <span>1</span><span>,</span>
+            <span>left</span><span>,</span>
+        <span>);</span>
+        <span>result</span><span>.push</span><span>(</span><span>left</span><span>);</span>
+    <span>}</span>
+    <span>result</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>Here’s a comparison of the performance of the two versions:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Code</th>
+      <th>➘ Elapsed µ-seconds</th>
+      <th> </th>
+      <th>➘ CPU instructions</th>
+      <th>➘ Branch instructions</th>
+      <th>➘ Branch misprediction %</th>
+      <th>➚ IPC</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>bucketize_classic(DATA, BOUNDARIES)</code></td>
+      <td>44,588.9</td>
+      <td> </td>
+      <td>112,979,346</td>
+      <td>26,996,942</td>
+      <td>16.5%</td>
+      <td>0.7</td>
+    </tr>
+    <tr>
+      <td><code>bucketize_branchless(DATA, BOUNDARIES)</code></td>
+      <td>9,849.3</td>
+      <td>🏆</td>
+      <td>111,101,146</td>
+      <td>19,020,518</td>
+      <td>0.0%</td>
+      <td>3.1</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>➘ Lower numbers are better, ➚ Higher numbers are better</p>
+
+<p>Notice that:</p>
+
+<ol>
+  <li>The new version has fewer branches: 19 per value, instead of 27.</li>
+  <li>Branch mispredictions are completely gone.</li>
+  <li>IPC (instructions per cycle) is much higher. This measures the CPU’s
+ability to run multiple instructions in parallel, and higher is
+better: with fewer and more predictable branches, the CPU can now
+use more instruction parallelism.</li>
+</ol>
+
+<p>The result is an implementation that is far faster, even though it uses
+slightly more CPU instructions.</p>
+
+<h2 id="getting-rid-of-branches-and-wasted-work">Getting rid of branches and wasted work</h2>
+
+<p>Having improved the code’s mechanical sympathy, I now have the
+opportunity to return to other sources of speed: tuning compilation, and
+making the code more algorithmically efficient by doing less work.</p>
+
+<p>First, the branchless code still has 19 branches per value in the input
+array. 7 or 8 of those are the <code>for _ in 0..n_iterations</code>: deciding if
+the <code>for</code> loop should continue or finish requires a branch, and
+<code>n_iterations</code> is log2 of 255 or so. But where are the rest coming from?</p>
+
+<p>These additional branches exist because the Rust compiler adds bounds
+checks to vector and array access. Every indexed read and write has a
+check to see if the index is out of bounds, in order to ensure memory
+safety: writing to index 100 of a vector of length 10 can lead to
+crashes or memory corruption. Bounds checks are good, insofar as they
+catch bugs, but they’re bad insofar as they add more computation. So I’m
+going to use Rust <code>unsafe</code> code to call APIs like
+<a href="https://doc.rust-lang.org/std/primitive.slice.html#method.get_unchecked"><code>get_unchecked()</code></a>
+that bypass the bounds checks, meaning it’s now my responsibility to
+ensure that the code is still correct.</p>
+
+<p>Second, notice the calculation for <code>half</code>/<code>remaining_size</code> is exactly
+the same for every single binary search. That’s wasted work. So I’m
+going to try to precalculate those values, doing less computational
+work.</p>
+
+<p>Here’s what the resulting code looks like:</p>
+
+<div><div><pre><code><span>fn</span> <span>bucketize_branchless2_impl</span><span>(</span>
+    <span>arr</span><span>:</span> <span>&amp;</span><span>[</span><span>f64</span><span>],</span>
+    <span>boundaries</span><span>:</span> <span>&amp;</span><span>[</span><span>f64</span><span>],</span>
+<span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>usize</span><span>&gt;</span> <span>{</span>
+    <span>let</span> <span>size</span> <span>=</span> <span>boundaries</span><span>.len</span><span>();</span>
+    <span>let</span> <span>n_iterations</span> <span>=</span> <span>(</span><span>size</span> <span>as</span> <span>f64</span><span>)</span><span>.log2</span><span>()</span><span>.ceil</span><span>()</span> <span>as</span> <span>usize</span><span>;</span>
+
+    <span>// Precalculate the halving values. Create a Vec of size</span>
+    <span>// n_iterations, filled with zeros:</span>
+    <span>let</span> <span>mut</span> <span>halves</span> <span>=</span> <span>vec!</span><span>[</span><span>0usize</span><span>;</span> <span>n_iterations</span><span>];</span>
+    <span>let</span> <span>mut</span> <span>remaining_size</span> <span>=</span> <span>size</span><span>;</span>
+    <span>for</span> <span>i</span> <span>in</span> <span>0</span><span>..</span><span>n_iterations</span> <span>{</span>
+        <span>let</span> <span>half</span> <span>=</span> <span>remaining_size</span> <span>/</span> <span>2</span><span>;</span>
+        <span>halves</span><span>[</span><span>i</span><span>]</span> <span>=</span> <span>half</span><span>;</span>
+        <span>remaining_size</span> <span>-=</span> <span>half</span><span>;</span>
+    <span>}</span>
+    <span>// Tell Rust (and reader) that halves is not mutable</span>
+    <span>// anymore:</span>
+    <span>let</span> <span>halves</span> <span>=</span> <span>halves</span><span>;</span>
+
+    <span>// Safety check for invariants that later unsafe</span>
+    <span>// operations depend on: sum of halves is less than the</span>
+    <span>// length of boundaries.</span>
+    <span>assert!</span><span>(</span>
+        <span>halves</span><span>.iter</span><span>()</span><span>.copied</span><span>()</span><span>.sum</span><span>::</span><span>&lt;</span><span>usize</span><span>&gt;</span><span>()</span> <span>&lt;</span> <span>boundaries</span><span>.len</span><span>()</span>
+    <span>);</span>
+
+    <span>let</span> <span>mut</span> <span>result</span> <span>=</span> <span>Vec</span><span>::</span><span>with_capacity</span><span>(</span><span>arr</span><span>.len</span><span>());</span>
+    <span>for</span> <span>value</span> <span>in</span> <span>arr</span> <span>{</span>
+        <span>let</span> <span>mut</span> <span>left</span> <span>=</span> <span>0</span><span>;</span>
+
+        <span>for</span> <span>half</span> <span>in</span> <span>&amp;</span><span>halves</span> <span>{</span>
+            <span>let</span> <span>middle</span> <span>=</span> <span>left</span> <span>+</span> <span>half</span><span>;</span>
+            <span>left</span> <span>=</span> <span>select_unpredictable</span><span>(</span>
+                <span>// SAFETY: `left` and `middle` can be at</span>
+                <span>// most the sum of `halves`, and the code</span>
+                <span>// above asserts that this sum is smaller</span>
+                <span>// than the length of `boundaries`.</span>
+                <span>unsafe</span> <span>{</span>
+                    <span>*</span><span>boundaries</span><span>.get_unchecked</span><span>(</span><span>middle</span><span>)</span>
+                <span>}</span> <span>&lt;</span> <span>*</span><span>value</span><span>,</span>
+                <span>middle</span><span>,</span>
+                <span>left</span><span>,</span>
+            <span>);</span>
+        <span>}</span>
+
+        <span>left</span> <span>=</span> <span>select_unpredictable</span><span>(</span>
+            <span>// SAFETY: See comment above.</span>
+            <span>unsafe</span> <span>{</span> <span>*</span><span>boundaries</span><span>.get_unchecked</span><span>(</span><span>left</span><span>)</span> <span>}</span> <span>&lt;</span> <span>*</span><span>value</span><span>,</span>
+            <span>left</span> <span>+</span> <span>1</span><span>,</span>
+            <span>left</span><span>,</span>
+        <span>);</span>
+        <span>result</span><span>.push</span><span>(</span><span>left</span><span>);</span>
+    <span>}</span>
+    <span>result</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>And here’s its performance:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Code</th>
+      <th>➘ Elapsed µ-seconds</th>
+      <th> </th>
+      <th>➘ CPU instructions</th>
+      <th>➘ Branch instructions</th>
+      <th>➘ Branch misprediction %</th>
+      <th>➚ IPC</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>bucketize_branchless(DATA, BOUNDARIES)</code></td>
+      <td>9,865.5</td>
+      <td> </td>
+      <td>111,101,224</td>
+      <td>19,020,519</td>
+      <td>0.0%</td>
+      <td>3.1</td>
+    </tr>
+    <tr>
+      <td><code>bucketize_branchless2(DATA, BOUNDARIES)</code></td>
+      <td>7,278.5</td>
+      <td>🏆</td>
+      <td>66,101,667</td>
+      <td>6,020,614</td>
+      <td>0.0%</td>
+      <td>2.5</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>➘ Lower numbers are better, ➚ Higher numbers are better</p>
+
+<p>As expected, there are now fewer branches. Overall, there are fewer
+instructions (good), and a modest decline in IPC (bad), and most
+importantly the code is faster.</p>
+
+<h2 id="increasing-instruction-level-parallelism-within-a-single-cpu-core">Increasing instruction-level parallelism (within a single CPU core)</h2>
+
+<p>Finally, I will return to mechanical sympathy. Our little loop for each
+value is limited in instruction parallelism, because <code>left</code> in each
+iteration depends on the previous iteration’s <code>left</code>. That’s a
+dependency that makes it hard to run instructions in parallel.</p>
+
+<p>To solve this, it’s worth noticing that different values in the input
+array get basically the same operation done on them. In our original
+version, the number of inner iterations differed, but now the same
+number of iterations is happening for each.</p>
+
+<p>I will therefore restructure the code so the iteration over <code>halves</code> is
+an <em>outer</em> loop, and iterating over values in <code>arr</code> is an <em>inner</em> loop;
+previously it was the other way around. That way there are operations
+happening on different, independent values within the inner loop,
+hopefully allowing the CPU to run more instructions in parallel:</p>
+
+<div><div><pre><code><span>fn</span> <span>bucketize_branchless3_impl</span><span>(</span>
+    <span>arr</span><span>:</span> <span>&amp;</span><span>[</span><span>f64</span><span>],</span>
+    <span>boundaries</span><span>:</span> <span>&amp;</span><span>[</span><span>f64</span><span>],</span>
+<span>)</span> <span>-&gt;</span> <span>Vec</span><span>&lt;</span><span>usize</span><span>&gt;</span> <span>{</span>
+    <span>let</span> <span>size</span> <span>=</span> <span>boundaries</span><span>.len</span><span>();</span>
+    <span>let</span> <span>n_iterations</span> <span>=</span> <span>(</span><span>size</span> <span>as</span> <span>f64</span><span>)</span><span>.log2</span><span>()</span><span>.ceil</span><span>()</span> <span>as</span> <span>usize</span><span>;</span>
+
+    <span>let</span> <span>mut</span> <span>halves</span> <span>=</span> <span>vec!</span><span>[</span><span>0usize</span><span>;</span> <span>n_iterations</span><span>];</span>
+    <span>let</span> <span>mut</span> <span>remaining_size</span> <span>=</span> <span>size</span><span>;</span>
+    <span>for</span> <span>i</span> <span>in</span> <span>0</span><span>..</span><span>n_iterations</span> <span>{</span>
+        <span>let</span> <span>half</span> <span>=</span> <span>remaining_size</span> <span>&gt;&gt;</span> <span>1</span><span>;</span>
+        <span>halves</span><span>[</span><span>i</span><span>]</span> <span>=</span> <span>half</span><span>;</span>
+        <span>remaining_size</span> <span>-=</span> <span>half</span><span>;</span>
+    <span>}</span>
+    <span>let</span> <span>halves</span> <span>=</span> <span>halves</span><span>;</span>
+
+    <span>assert!</span><span>(</span>
+        <span>halves</span><span>.iter</span><span>()</span><span>.copied</span><span>()</span><span>.sum</span><span>::</span><span>&lt;</span><span>usize</span><span>&gt;</span><span>()</span> <span>&lt;</span> <span>boundaries</span><span>.len</span><span>()</span>
+    <span>);</span>
+
+    <span>let</span> <span>mut</span> <span>result</span> <span>=</span> <span>Vec</span><span>::</span><span>with_capacity</span><span>(</span><span>arr</span><span>.len</span><span>());</span>
+    <span>// Iterate in chunks of 16:</span>
+    <span>for</span> <span>chunk</span> <span>in</span> <span>arr</span><span>.chunks</span><span>(</span><span>16</span><span>)</span> <span>{</span>
+        <span>// Create an array (like a Vec, but fixed length and</span>
+        <span>// on the stack) of length 16 and filled with zeros:</span>
+        <span>let</span> <span>mut</span> <span>lefts</span> <span>=</span> <span>[</span><span>0</span><span>;</span> <span>16</span><span>];</span>
+
+        <span>// Instead of iterating over values first, iterate</span>
+        <span>// over halves first, and then iterate over a chunk</span>
+        <span>// of values. Iterating over all values once per</span>
+        <span>// `half` would worsen memory cache locality, thus</span>
+        <span>// the use of chunks.</span>
+        <span>for</span> <span>half</span> <span>in</span> <span>&amp;</span><span>halves</span> <span>{</span>
+            <span>// The operations we run in this inner loop are</span>
+            <span>// easier for the CPU to run in parallel.</span>
+            <span>for</span> <span>(</span><span>i</span><span>,</span> <span>value</span><span>)</span> <span>in</span> <span>chunk</span><span>.iter</span><span>()</span><span>.enumerate</span><span>()</span> <span>{</span>
+                <span>let</span> <span>left</span> <span>=</span> <span>unsafe</span> <span>{</span> <span>lefts</span><span>.get_unchecked</span><span>(</span><span>i</span><span>)</span> <span>};</span>
+                <span>let</span> <span>middle</span> <span>=</span> <span>left</span> <span>+</span> <span>half</span><span>;</span>
+                <span>*</span><span>unsafe</span> <span>{</span> <span>lefts</span><span>.get_unchecked_mut</span><span>(</span><span>i</span><span>)</span> <span>}</span> <span>=</span>
+                    <span>select_unpredictable</span><span>(</span>
+                        <span>unsafe</span> <span>{</span>
+                            <span>*</span><span>boundaries</span><span>.get_unchecked</span><span>(</span><span>middle</span><span>)</span>
+                        <span>}</span> <span>&lt;</span> <span>*</span><span>value</span><span>,</span>
+                        <span>middle</span><span>,</span>
+                        <span>*</span><span>left</span><span>,</span>
+                    <span>);</span>
+            <span>}</span>
+        <span>}</span>
+
+        <span>for</span> <span>(</span><span>value</span><span>,</span> <span>mut</span> <span>left</span><span>)</span> <span>in</span> <span>chunk</span><span>.iter</span><span>()</span><span>.zip</span><span>(</span><span>lefts</span><span>)</span> <span>{</span>
+            <span>left</span> <span>=</span> <span>select_unpredictable</span><span>(</span>
+                <span>unsafe</span> <span>{</span>
+                    <span>*</span><span>boundaries</span><span>.get_unchecked</span><span>(</span><span>left</span><span>)</span>
+                <span>}</span> <span>&lt;</span> <span>*</span><span>value</span><span>,</span>
+                <span>left</span> <span>+</span> <span>1</span><span>,</span>
+                <span>left</span><span>,</span>
+            <span>);</span>
+            <span>result</span><span>.push</span><span>(</span><span>left</span><span>);</span>
+        <span>}</span>
+    <span>}</span>
+    <span>result</span>
+<span>}</span>
+</code></pre></div></div>
+
+<p>And here’s a performance comparison of all the variations; the latest
+one is the fastest:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Code</th>
+      <th>➘ Elapsed µ-seconds</th>
+      <th> </th>
+      <th>➘ CPU instructions</th>
+      <th>➘ Branch instructions</th>
+      <th>➘ Branch misprediction %</th>
+      <th>➚ IPC</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>bucketize_classic(DATA, BOUNDARIES)</code></td>
+      <td>45,200.4</td>
+      <td> </td>
+      <td>112,982,287</td>
+      <td>26,996,749</td>
+      <td>16.6%</td>
+      <td>0.7</td>
+    </tr>
+    <tr>
+      <td><code>bucketize_branchless(DATA, BOUNDARIES)</code></td>
+      <td>9,685.2</td>
+      <td> </td>
+      <td>111,100,888</td>
+      <td>19,020,464</td>
+      <td>0.0%</td>
+      <td>3.2</td>
+    </tr>
+    <tr>
+      <td><code>bucketize_branchless2(DATA, BOUNDARIES)</code></td>
+      <td>7,280.4</td>
+      <td> </td>
+      <td>66,101,483</td>
+      <td>6,020,571</td>
+      <td>0.0%</td>
+      <td>2.5</td>
+    </tr>
+    <tr>
+      <td><code>bucketize_branchless3(DATA, BOUNDARIES)</code></td>
+      <td>5,453.4</td>
+      <td>🏆</td>
+      <td>96,476,415</td>
+      <td>8,833,047</td>
+      <td>0.0%</td>
+      <td>4.9</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>➘ Lower numbers are better, ➚ Higher numbers are better</p>
+
+<p>This final version is even faster: it uses more instructions, but the
+CPU can run more of them in parallel as you can see from the much higher
+IPC.</p>
+
+<h2 id="you-can-speed-up-your-code-too">You can speed up your code too</h2>
+
+<p>There are more opportunities for speed here. First, and most
+significantly, I could use parallelism to take advantage of multiple CPU
+cores. And there are additional potential ways to speed up the
+single-threaded code too; I’ve successfully implemented one, just to see
+if it would work.</p>
+
+<p>But in the end this is just an article with some code examples. The real
+value here is not me demonstrating another 14% speedup, it’s you going
+and speeding up <em>your</em> code. This is something you can learn, just like
+I did: I can now write far faster software than I could when I started,
+even if there’s still plenty more for me to learn.</p>
+
+<p>Some books that can help you build mechanical sympathy include:</p>
+
+<ul>
+  <li><a href="https://csapp.cs.cmu.edu/"><em>Computer Systems: A Programmer’s Perspective, 3rd
+edition</em></a>, by Bryant and O’Halloran. This
+textbook covers how CPUs work, but unlike most it focuses only on the
+parts that are relevant to programmers.</li>
+  <li><a href="https://easyperf.net/"><em>Performance Analysis and Tuning on Modern CPUs, 2nd
+Edition</em></a>, by Denis Bakhalov. This free book
+talks about critical tools for measuring performance, and how to
+interpret their results; I paid for the printed version. He also has a
+<a href="https://github.com/dendibakh/perf-ninja">free online course</a>.</li>
+  <li><a href="https://en.algorithmica.org/hpc/"><em>Algorithms for Modern Hardware</em></a>,
+by Sergey Slotin, is a free online book.</li>
+</ul>
+
+<p>These books mostly focus on mechanical sympathy, rather than on other
+sources of performance. They assume you know some amount of C. And
+because these are general purpose books, you will need to translate what
+you’ve learned into the kind of code you’re writing.</p>
+
+<p>So if you are specifically speeding up data science or scientific
+computing software used from Python, you might want to start with
+reading my <a href="https://pythonspeed.com/products/practicesperformance/">new book on Python
+performance</a>,
+now in early access. Besides its focus on this particular domain of
+software, the book:</p>
+
+<ul>
+  <li>Acts as a broader introduction to computational performance, covering
+different approaches to speed: algorithmic efficiency, compilation,
+mechanical sympathy, and parallelism.</li>
+  <li>Only assumes you know Python.</li>
+  <li>Introduces you to all of the concepts I discussed in this article, and
+many others besides.</li>
+</ul>
+
+<p><a href="https://pythonspeed.com/products/practicesperformance/">You can learn more about the <em>Practices of Performance</em>
+here.</a></p>
+
+  </div></div>
+  </body>
+</html>
