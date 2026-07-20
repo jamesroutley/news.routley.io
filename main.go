@@ -85,6 +85,7 @@ var (
 		"https://helius.substack.com/feed",
 		"https://www.experimental-history.com/feed",
 		"https://importai.substack.com/feed",
+		"https://www.bloomberg.com/opinion/authors/ARbTQlRLRjE/matthew-s-levine.rss",
 	}
 
 	// Show up to 60 days of posts
