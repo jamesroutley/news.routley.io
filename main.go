@@ -76,6 +76,15 @@ var (
 		"https://anewsletter.alisoneroman.com/feed",
 
 		"https://routley.io/reserialised/great-expectations/2022-08-24/index.xml",
+
+		"https://www.derekthompson.org/feed",
+		"https://simonwillison.net/tags/ai.atom",
+		"https://www.astralcodexten.com/feed",
+		"https://apenwarr.ca/log/rss.php",
+		"https://brooker.co.za/blog/rss.xml",
+		"https://helius.substack.com/feed",
+		"https://www.experimental-history.com/feed",
+		"https://importai.substack.com/feed",
 	}
 
 	// Show up to 60 days of posts
