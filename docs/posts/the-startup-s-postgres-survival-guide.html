@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://hatchet.run/blog/postgres-survival-guide">Original</a>
+    <h1>The startup&#39;s Postgres survival guide</h1>
+    
+    <div id="readability-page-1" class="page"><section data-theme="">
+<p>Over the past half year or so, I’ve been writing an internal doc for our engineers trying to distill two years of Postgres battles into a somewhat cohesive document. While I love <a href="https://www.postgresql.org/docs/18/index.html">the Postgres manual</a>, I find it’s hard to turn to when shit hits the fan because it’s just so darn comprehensive. I thought this might be useful for others and would appreciate feedback (or other tidbits that you’ve learned running Postgres in production).</p>
+<p>Before starting Hatchet, while I was familiar with SQL, the extent of my knowledge was basically: if a query is slow, you need an index. That’s the starting point for this doc; I’m going to assume you’re familiar with SQL basics, rows, tables, and know roughly what an index is.</p>
+<p><em>And if Claude is writing all of your queries, this might be a waste of time! I recommend <a href="https://github.com/supabase/agent-skills">supabase/agent-skills</a></em></p>
+<hr/>
+<h4 id="a-quick-note-on-orms"><a href="#a-quick-note-on-orms">A quick note on ORMs</a></h4>
+<p>This guide should still be useful, but you might need to translate some of these tips into your ORM of choice. Lots of optimizations as you scale just aren’t possible with ORMs unless you can break past the abstraction layer and write SQL. You can do this gracefully or non-gracefully; <a href="https://www.prisma.io/docs/orm/prisma-client/using-raw-sql/typedsql">Prisma TypedSQL</a> or equivalents look interesting for this. We use <code>sqlc</code> at Hatchet which gets us very similar behavior; highly recommend if you’re a Go stack.</p>
+<h4 id="table-of-contents"><a href="#table-of-contents">Table of contents</a></h4>
+<ul>
+<li><a href="#the-simple-stuff-good-reads-writes-and-schemas">The simple stuff: good reads, writes and schemas</a>
+<ul>
+<li><a href="#writing-a-good-schema">Writing a good schema</a></li>
+<li><a href="#writing-good-read-queries">Writing good read queries</a></li>
+<li><a href="#writing-performant-joins">Writing performant joins</a></li>
+<li><a href="#compound-indexes-and-aligning-order-by-to-your-indexes">Compound indexes and aligning ORDER BY to your indexes</a></li>
+<li><a href="#writing-good-write-queries">Writing good write queries</a></li>
+<li><a href="#migrations">Migrations</a></li>
+<li><a href="#connection-management">Connection management</a></li>
+</ul>
+</li>
+<li><a href="#intermediate-the-query-planner-bulk-updates-and-autovacuum">Intermediate: the query planner, bulk updates, and autovacuum</a>
+<ul>
+<li><a href="#introducing-the-leakiest-of-abstractions-the-query-planner">Introducing the leakiest of abstractions, the query planner</a></li>
+<li><a href="#sometimes-it-just-makes-sense-to-seq-scan">Sometimes it just makes sense to seq scan</a></li>
+<li><a href="#writing-lots-of-data">Writing lots of data</a></li>
+<li><a href="#default-autovacuum-settings-can-kill-your-database">Default autovacuum settings can kill your database</a></li>
+<li><a href="#other-types-of-bloat">Other types of bloat</a></li>
+</ul>
+</li>
+<li><a href="#some-advanced-stuff">Some advanced stuff</a>
+<ul>
+<li><a href="#for-update-skip-locked">FOR UPDATE SKIP LOCKED</a></li>
+<li><a href="#partitioning">Partitioning</a></li>
+<li><a href="#tricks-for-large-table-migrations">Tricks for large table migrations</a></li>
+</ul>
+</li>
+</ul>
+<h3 id="the-simple-stuff-good-reads-writes-and-schemas"><a href="#the-simple-stuff-good-reads-writes-and-schemas">The simple stuff: good reads, writes and schemas</a></h3>
+<p>Let’s start with the basics: queries and schemas at low volume.</p>
+<h4 id="writing-a-good-schema"><a href="#writing-a-good-schema">Writing a good schema</a></h4>
+<p>After you’re deployed, schemas are by far the hardest to change moving forward, so it’s worth spending some time on them. I’d recommend building your schema iteratively: start with a rough approximation for your tables and primary keys, then write some queries on those tables based on your application needs. You can approximate this with some questions: <em>Is this a high-read and/or high-write table? What are the most common filters on reads? Which columns am I updating the most?</em></p>
+<p>If you want to be more formal about it, you can look into <a href="https://www.digitalocean.com/community/tutorials/database-normalization">database normalization</a> into 1NF/2NF/3NF, but I’ve found normal forms to sometimes be at odds with query efficiency and ease of use, which is critical when you’re moving fast—sometimes it’s just easier to dump data into a <code>jsonb</code> column.</p>
+<p>My rules of thumb for schemas are:</p>
+<ul>
+<li>Use identity columns (auto-incrementing integers, slightly more performant than <code>bigserial</code>) or built-in UUIDs for primary keys</li>
+<li>Always use <code>timestamptz</code></li>
+<li>Always use primary keys</li>
+<li>Use foreign keys with cascading deletes for low-volume tables, particularly where database consistency and correctness are important. Careful at higher volume.</li>
+</ul>
+<h4 id="writing-good-read-queries"><a href="#writing-good-read-queries">Writing good read queries</a></h4>
+<p>Let’s start with <code>SELECT</code> queries. A useful—albeit slightly inaccurate—mental model for fast selects is: under the hood, Postgres is either going to find a single row in a table very quickly, or it’s going to read every single row in your table using something called a <em>sequential scan</em> <span>😞</span>.</p>
+<p>It’s going to find a single row very quickly when you filter by:</p>
+<ul>
+<li>An explicit index</li>
+<li>A unique constraint (just a special case of index)</li>
+<li>A primary key (these are automatically indexed in Postgres)</li>
+</ul>
+<p>Indexes by default use a <code>btree</code> implementation. It’s most helpful to think of indexes as just another table in Postgres, with data stored in a specific format which is optimized for lookups (more on this later). These trees are great because finding a single row happens in approximately <code>log(n)</code> time, where <code>n</code> is the number of rows in the table—in other words, really fast.</p>
+<p>When Postgres can’t use an index, it’ll use something called a sequential scan, or <code>seq scan</code>. Seq scans are much slower than index lookups, but modern databases are so fast at loading rows into memory that you probably won’t even notice at first: seq scans on tables with less than 20k rows are pretty much instant.</p>
+<h4 id="writing-performant-joins"><a href="#writing-performant-joins">Writing performant joins</a></h4>
+<p>For inner joins, there’s rarely an argument for not using primary keys as the inner join; it usually speaks to a schema design or normalization problem. Treat <code>ON</code> clauses with the same respect as a <code>WHERE</code> clause—the same principles apply. Use an index.</p>
+<h4 id="compound-indexes-and-aligning-order-by-to-your-indexes"><a href="#compound-indexes-and-aligning-order-by-to-your-indexes">Compound indexes and aligning ORDER BY to your indexes</a></h4>
+<p>Often the first slow query in your application will be a list query across a large table. Something like:</p>
+<div data-codeblock=""><p>Loading syntax highlighting...</p></div>
+<p>In this case, you can use a compound index—a sensible one might be:</p>
+<div data-codeblock=""><p>Loading syntax highlighting...</p></div>
+<p>In more complex cases, a good rule of thumb is: the <code>ORDER BY</code> columns should be the last columns in the index, and you should align columns to the ordering in the <code>ORDER BY</code>. Note that Postgres can scan btrees in both directions, so sometimes the <code>DESC</code> is irrelevant—but for compound indexes it’s good practice. More information <a href="https://www.cybertec-postgresql.com/en/benefits-of-a-descending-index">here</a>.</p>
+<h4 id="writing-good-write-queries"><a href="#writing-good-write-queries">Writing good write queries</a></h4>
+<p>The premise of successful writes is:</p>
+<ol>
+<li><strong>Keep transactions short.</strong> Don’t go querying an external service in the middle of a transaction unless you have a really good reason to.</li>
+<li><strong>Be careful of the rows you’re locking</strong> for writing; in other words, only lock what you need. Every time you update a row, you’re taking out a lock on that row for a short period of time until the transaction commits.</li>
+</ol>
+<p>As your system gets busier, you’re going to start noticing the impact of locks more. In particular, you might try to create an index at some point in the future with a simple <code>CREATE INDEX</code> command: turns out this locks your table and prevents inserts and updates! When creating an index on an existing large table, always use <code>CREATE INDEX CONCURRENTLY</code>.</p>
+<h4 id="migrations"><a href="#migrations">Migrations</a></h4>
+<p>Getting really good at writing migrations is an important technical advantage: it helps you iterate much faster and increases your uptime. As a starting point, try to keep migrations additive (in other words, don’t delete or remove columns) and run them in a transaction wherever possible; this will make rollbacks and partial migrations much easier to deal with. As you get more advanced, you can start looking into <a href="https://martinfowler.com/bliki/ParallelChange.html">expand and contract</a> migrations.</p>
+<p>The simplest mental model for good migrations is: does this block all of my writes, or does it not? Creating an index without <code>CONCURRENTLY</code> blocks all your writes, so you might see downtime. Generally, operations which call <code>ALTER TABLE</code> should be worth a second look; for example, adding a new check constraint to a very large table can block your writes as well (unless you add it with the <code>NOT VALID</code> keyword).</p>
+<h4 id="connection-management"><a href="#connection-management">Connection management</a></h4>
+<p>Every time you execute a transaction or query against your database, you’re utilizing a connection. Connections are expensive in a number of dimensions (cpu and memory), and high connection churn can lead to a lot of unnecessary resource waste, so connections should be long-lived. Connection storms (when you start using up a ton of new connections at the same time) can also lead to very hard to debug edge cases related to internal Postgres locks.</p>
+<p>Because of all these connection footguns, external connection poolers like pgbouncer are great! If you can’t add this for whatever reason, in-memory connection poolers are a great second option. For example, because Hatchet is open-source, we don’t assume that all user databases use connection poolers, so we use <a href="https://pkg.go.dev/github.com/jackc/pgx/v5/pgxpool">pgxpool</a> (an in-memory connection pool for Go) for this purpose.</p>
+<h3 id="intermediate-the-query-planner-bulk-updates-and-autovacuum"><a href="#intermediate-the-query-planner-bulk-updates-and-autovacuum">Intermediate: the query planner, bulk updates, and autovacuum</a></h3>
+<h4 id="introducing-the-leakiest-of-abstractions-the-query-planner"><a href="#introducing-the-leakiest-of-abstractions-the-query-planner">Introducing the leakiest of abstractions, the query planner</a></h4>
+<p>At a certain point, your queries might become complex enough that a simple index won’t cut it (and you shouldn’t endlessly add indexes to your tables—they come with overhead). The queries might involve many <code>JOIN</code> statements or different types of joins where the correct path for querying the data isn’t clear.</p>
+<p>At this point, you will need to concern yourself with the <em>query planner</em>. At best, the query planner is a <a href="https://www.joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions/">leaky abstraction</a>. It’s an internal implementation, and you have virtually no control over it, but you have to know its spontaneous and sometimes irrational behavior. It’s like working with an LLM!</p>
+<p>The query planner looks at the query you pass in, and it figures out how it should translate your query into a set of internal operations in the database. For example, it might look at your query, and realize that it needs to use an index. In an ideal world, the query planner would know, for every query and set of parameters, the perfect plan to use. But the query planner is operating on limited information, and sometimes it doesn’t pick the best option.</p>
+<p>This limited information is the table statistics. You can actually query it directly in Postgres:</p>
+<div data-codeblock=""><p>Loading syntax highlighting...</p></div>
+<p>These statistics are collected for every <code>ANALYZE</code>. This also happens when autovacuum is run (see below), so more frequent autovacuums also mean that your query statistics will be more up to date. A common reason why your query is behaving improperly is not analyzing frequently enough.</p>
+<p>The reason I think it’s useful to view queries as binary—they either seq scan or they don’t seq scan—is: the more you micro-optimize a query, the more of a risk you take that the query planner goes rogue. If you stick to querying by primary keys and indexes, the query planner will have a much easier time.</p>
+<p>Let’s say that there’s nothing obviously wrong in your query, but it’s still slow—how do you go about debugging this? Some Postgres database providers (like Google CloudSQL) will sample your queries and save slow ones—but many don’t. This is where <code>EXPLAIN ANALYZE</code> is your friend. This outputs the query plan for the query and executes the query (careful running this in production—you can use <code>EXPLAIN</code> without <code>ANALYZE</code> to get a query plan), and then compares its estimates based on the table statistics to the actual number of rows scanned. I usually place my sql query in a file, prefix it with <code>EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS, FORMAT JSON)</code> and run:</p>
+<div data-codeblock=""><p>Loading syntax highlighting...</p></div>
+<p>And then use <a href="https://explain.dalibo.com">explain.dalibo.com</a> to visualize the execution plan.</p>
+<h4 id="sometimes-it-just-makes-sense-to-seq-scan"><a href="#sometimes-it-just-makes-sense-to-seq-scan">Sometimes it just makes sense to seq scan</a></h4>
+<p>There are cases where you think an index should be used, but the query planner is still seq scanning anyway, despite table statistics being up to date and the index being valid. In these cases, Postgres is usually estimating that the cost of the seq scan will be smaller than the cost of the index scan. Index scans do come with some overhead; indexes are stored separately from the actual data in the table (called the heap)—finding all of the rows in the heap can be expensive!</p>
+<p>Unless you can dramatically restructure your query, you might have to accept that it’s going to seq scan, or think about something like partitioning (more on that below).</p>
+<h4 id="writing-lots-of-data"><a href="#writing-lots-of-data">Writing lots of data</a></h4>
+<p>Let’s say your application is scaling and you need to write a lot of data fast. Each query has some overhead associated with it (separate from the connection overhead we talked about before): this includes the round-trip time to the database, the time it takes the internal application connection pool to acquire a connection, and the time it takes Postgres to process the query (including a set of <a href="https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/README">internal Postgres locks</a> which can be bottlenecks in high-throughput scenarios).</p>
+<p>To reduce this overhead, we can pack a batch of rows into each query. The simplest way to do this is to send all queries to the Postgres server at once in an implicit transaction (in Go, we can use <code>pgx</code> to execute a <code>SendBatch</code>). Batching is very powerful: we found that it can ~10× your throughput. I wrote more about this plus some other tips for writing data quickly <a href="https://hatchet.run/blog/fastest-postgres-inserts">here</a>.</p>
+<h4 id="default-autovacuum-settings-can-kill-your-database"><a href="#default-autovacuum-settings-can-kill-your-database">Default autovacuum settings can kill your database</a></h4>
+<p>Autovacuum is a critical operation in Postgres databases that sometimes needs to be tuned, especially in high-write scenarios. The autovacuum daemon is responsible for a number of things, including cleaning up dead tuples and managing transaction ids.</p>
+<p>What’s a <em>dead tuple</em>? A tuple is an instance of a row on the filesystem. Every time you update or delete a row, a version of that row is left in Postgres until all transactions which started before that row was updated or deleted have committed or rolled back. These rows which can no longer be read by any transactions are <em>dead tuples</em>.</p>
+<p>If you’re writing data quickly enough, sometimes autovacuum can’t keep up, which will get you into a very unhealthy state, very quickly. You’ll see this when you query for active processes on the database:</p>
+<div data-codeblock=""><p>Loading syntax highlighting...</p></div>
+<p>If you see an autovacuum query running for more than ~1 hour, you might want to consider changing your autovacuum settings! See <a href="https://www.cybertec-postgresql.com/en/tuning-autovacuum-postgresql/">this article</a> for more information.</p>
+<p>It’s worth monitoring this: if you use up all transaction ids in the system before they can be reclaimed by autovacuum, you’ll reach a dreaded state called <strong>transaction id wraparound</strong>. This will mean a big chunk of downtime.</p>
+<h4 id="other-types-of-bloat"><a href="#other-types-of-bloat">Other types of bloat</a></h4>
+<p>Besides dead tuples, there are two other kinds of bloat you’ll often encounter in a busy Postgres system:</p>
+<ol>
+<li>Table bloat caused by partially filled pages. Postgres stores rows on pages on disk, each of which are 8kb in size. When Postgres can’t fit new rows onto an existing page, it creates a new one. But when dead tuples are reclaimed, this can lead to pages not being entirely filled, which can increase the disk usage of Postgres, sometimes significantly. The best way to avoid table bloat is by tuning autovacuum before you’re bloated. But there are some extensions to help with bloated tables, like <code>pg_repack</code>, because the built-in Postgres <code>VACUUM FULL</code> is rarely a good idea. Note that Postgres 19 is getting <code>REPACK...CONCURRENTLY</code>, which I haven’t tested, but seems like potentially a good solution for concurrent table repacking.</li>
+<li>Index bloat is a special case of table bloat, and is similarly solved by good autovacuum settings. But Postgres has a built-in command for dealing with this, which is <code>REINDEX INDEX CONCURRENTLY</code>.</li>
+</ol>
+<h3 id="some-advanced-stuff"><a href="#some-advanced-stuff">Some advanced stuff</a></h3>
+<p>I wanted to end with a set of advanced Postgres features which have been particularly useful for us at Hatchet.</p>
+<h4 id="for-update-skip-locked"><a href="#for-update-skip-locked">FOR UPDATE SKIP LOCKED</a></h4>
+<p>The best way to think about this Postgres feature is that it reserves the rows that you’re selecting for use in your transaction without interfering with other queries. We use it primarily for implementing our <a href="https://hatchet.run/blog/multi-tenant-queues">job queue</a>; a single-query queue in Postgres can be implemented like this:</p>
+<div data-codeblock=""><p>Loading syntax highlighting...</p></div>
+<p>It’s also very useful in cases where you’re doing many independent updates of rows, or you’re managing leases on objects in your system across many instances of your application (for example, we use this to distribute tenant leases across Hatchet engines).</p>
+<h4 id="partitioning"><a href="#partitioning">Partitioning</a></h4>
+<p>Postgres has built-in partitioning which allows you to subdivide your tables based on row values, like timestamps or hashes. This can be incredibly useful for time-series data (in our case, historical task data) because:</p>
+<ol>
+<li>Each partition can be autovacuumed independently, allowing you to scale up autovacs on your table</li>
+<li>Deleting old data is near-instant—you simply drop the table partition, rather than iterating through rows</li>
+</ol>
+<p>Partitioning does come with drawbacks: there can be overhead on read queries if Postgres doesn’t prune partitions during the planning phase (something that Postgres has gotten much better at in recent releases).</p>
+<p>I’ve written more about our experience with partitioning <a href="https://hatchet.run/blog/postgres-partitioning">here</a>.</p>
+<h4 id="tricks-for-large-table-migrations"><a href="#tricks-for-large-table-migrations">Tricks for large table migrations</a></h4>
+<p>(note that this isn’t referring to a database migration, but rather moving large amounts of data from one table to another, which we find ourselves doing a few times a year)</p>
+<p>If you try to migrate really large tables, it can take many hours to copy data in a single transaction. This isn’t good—long-running transactions prevent autovacuum from doing its job properly, and therefore make the entire system bloated with dead tuples. Also if you want to keep writing to the old tables, the new table won’t see the new data.</p>
+<p>So we need to figure out how to migrate data safely without a transaction, with new writes (after the migration has started) being copied to the new table. One of the tricks we’ve learned is to use Postgres triggers and run a large batched backfill outside of a transaction, using unique constraints on the primary key to prevent duplicate writes.</p>
+<hr/>
+<p>That’s it! If you have any other tidbits about Postgres scaling—or questions about Postgres scaling in general—feel free to reach out.</p></section></div>
+  </body>
+</html>
