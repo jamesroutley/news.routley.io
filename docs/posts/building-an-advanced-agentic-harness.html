@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://data4sci.com/blog/building-an-advanced-agentic-harness">Original</a>
+    <h1>Building an Advanced Agentic Harness</h1>
+    
+    <div id="readability-page-1" class="page"><article> <p>That Basic Harness loop is correct, but <em>naive</em>. A lone pilot in a well-built jet might win a dogfight, but nobody runs an air campaign that way. <a href="https://amzn.to/4vqYj0o">Real operations</a> add mission planners who decide what sorties to fly before anyone takes off, squadrons that fly independent sorties in parallel, fuel budgets and bingo calls that force a return to base before the tanks run dry, flight recorders that make every mission reconstructible after the fact, and after-action reviews that decide whether the mission actually succeeded. None of these replace the pilot. They wrap the pilot in structure so that the whole system stays fast, safe, debuggable, and measurable.</p>
+<p>Claude Code, Devin, Cursor, Hermes, and other production agents do exactly the same thing to the basic loop. In this post we upgrade every piece of our basic harness toward that production shape, without hiding any of the mechanics behind a framework. The guiding question for the whole exercise is a simple one:</p>
+<p>How do you turn a single LLM call into a reliable system that can plan, act, recover, and prove it did the right thing?</p>
+<p>Our answer is composition. We build small, testable primitives: typed tools, a plan <a href="https://en.wikipedia.org/wiki/Directed_acyclic_graph">DAG</a>, tiered memory, a verification hierarchy, budgets, and a tracer, and wire them together with a deliberately thin orchestrator. Each primitive exists because naive agents fail in a specific, predictable way. LLMs invent invalid tool arguments, so we add typed tools with <a href="https://pydantic.dev/docs/validation/latest/get-started/">Pydantic</a> validation. Everything runs sequentially, so we add a dependency graph and parallel execution. The context window fills with junk, so we add multi-tier memory under a retrieval budget. Bad outputs propagate silently, so we add a verification hierarchy. One prompt tries to do everything, so we split it into <em><strong>Planner</strong></em> , <em><strong>Worker</strong></em> , and <em><strong>Critic</strong></em> roles. Costs run away, so we add multi-dimensional budgeting with graceful degradation.</p>
+<p>Proving the harness <em>usually</em> works, with an eval suite, retrieval benchmarks, and specialized worker pools will get a full fledge treatment in a future post.</p>
+<h2 id="the-running-example">The running example</h2>
+<p>Throughout the post we build a city comparison agent: given a list of cities, it produces a report comparing them on population, timezone, and a short narrative summary of each. The task looks almost insultingly simple, but it was chosen carefully. Each city-attribute lookup is independent of every other one, which means a three-city request naturally decomposes into nine tool calls that could all run at the same time. The final report, on the other hand, depends on all of the lookups finishing first, so we’re. well beyond a flat list of steps. We can programmatically check that every requested city actually appears in the report to verify the results. And the tools have wildly different costs: population and timezone lookups are in-memory dictionary reads, while the per-city summaries and the final aggregation each call the LLM, which gives us realistic budget pressure to manage.</p>
+<p>For the sake of reproducibility, lookup tools read from a small mocked dictionary, <em><strong>CITY_FACTS</strong></em> , so the notebook is fully reproducible without network access. The LLM-backed pieces can run against either a real Anthropic model or a deterministic mock, which brings us to the first primitive.</p>
+<h2 id="a-pluggable-brain">A pluggable brain</h2>
+<p>Every component we are about to build eventually calls an LLM: the planner, the summarizer, the aggregator, the critic. If that call is hard-wired to one SDK, the entire harness becomes untestable and vendor-locked.</p>
+<p>So before anything else, we define a base class that provides an abstraction over the details of the various LLM calling APIs</p>
+<pre tabindex="0" data-language="python"><code><span><span>class</span><span> LLMProvider</span><span>:</span></span>
+<span><span>    &#34;&#34;&#34;Shared interface. Subclass to plug in a different backend.&#34;&#34;&#34;</span></span>
+<span></span>
+<span><span>    def</span><span> complete</span><span>(self, system: </span><span>str</span><span>, user: </span><span>str</span><span>, role: </span><span>str</span><span> =</span><span> “default”) -&gt; </span><span>str</span><span>:</span></span>
+<span><span>        raise</span><span> NotImplementedError</span></span>
+<span></span>
+<span><span>    async</span><span> def</span><span> acomplete</span><span>(self, system: </span><span>str</span><span>, user: </span><span>str</span><span>, role: </span><span>str</span><span> =</span><span> “default”) -&gt; </span><span>str</span><span>:</span></span>
+<span><span>        # Wrap sync call in a thread; works for any SDK.</span></span>
+<span><span>        return</span><span> await</span><span> asyncio.to_thread(</span><span>self</span><span>.complete, system, user, role)</span></span></code></pre>
+<p>We also implement a <em><strong>MockProvider</strong></em> for testing and debugging purposes that returns deterministic, role-aware responses: a canonical plan when asked to plan, a templated one-line summary when asked to summarize, a rule-based pass/fail verdict when asked to judge. This allows us to separate “is my orchestration wrong?” from “is the model planning badly?” during development, and it is the reason every experiment in this post is reproducible on any machine.</p>
+
+<p>In the <a href="https://data4sci.substack.com/p/building-a-basic-agentic-harness">basic harness</a> we validated tool arguments by hand, an approach collapses quickly: every new tool duplicates validation logic, the LLM never sees a formal schema and just guesses argument shapes, and the resulting errors are ad hoc strings the model can’t self-correct from.</p>
+<p>The upgrade is to declare each tool’s arguments as a Pydantic model and let one definition drive everything:</p>
+<pre tabindex="0" data-language="python"><code><span><span>@dataclass</span></span>
+<span><span>class</span><span> TypedTool</span><span>:</span></span>
+<span><span>    name: </span><span>str</span></span>
+<span><span>    description: </span><span>str</span></span>
+<span><span>    args_model: type[BaseModel]     </span><span># Pydantic model defining the arg schema</span></span>
+<span><span>    fn: Callable[</span><span>...</span><span>, Any]</span></span>
+<span><span>    cost_hint: </span><span>float</span><span> =</span><span> 0.0</span><span>          # relative cost for budget accounting</span></span>
+<span></span>
+<span><span>    def</span><span> schema</span><span>(self) -&gt; </span><span>dict</span><span>:</span></span>
+<span><span>        &#34;&#34;&#34;Shape expected by Anthropic/OpenAI tool-use APIs.&#34;&#34;&#34;</span></span>
+<span></span>
+<span><span>        return</span><span> {</span></span>
+<span><span>            &#34;name&#34;</span><span>: </span><span>self</span><span>.name,</span></span>
+<span><span>            &#34;description&#34;</span><span>: </span><span>self</span><span>.description,</span></span>
+<span><span>            &#34;input_schema&#34;</span><span>: </span><span>self</span><span>.args_model.model_json_schema(),</span></span>
+<span><span>        }</span></span>
+<span></span>
+<span><span>    def</span><span> run</span><span>(self, raw_args: </span><span>dict</span><span>) -&gt; Any:</span></span>
+<span><span>        args, err </span><span>=</span><span> self</span><span>.validate_args(raw_args)</span></span>
+<span></span>
+<span><span>        if</span><span> err </span><span>is</span><span> not</span><span> None</span><span>:</span></span>
+<span><span>            raise</span><span> ValueError</span><span>(err)</span></span>
+<span><span>        return</span><span> self</span><span>.fn(</span><span>**</span><span>args.model_dump())</span></span></code></pre>
+<p>This approach gets us runtime validation, a JSON Schema in exactly the shape that the Anthropic and OpenAI tool-use APIs expect, documentation (each <em><strong>Field(</strong>…, <strong>description</strong> =…<strong>)</strong></em> becomes part of the catalog the planner reads), and a hook for cost accounting via cost_hint. Failing <strong>before</strong> execution allows us to avoid expensive tool calls with potential side effects. A bad plan should <em>fail fast</em> , at the validation layer, and not deep inside a database query. This approach is similar to what full fledge frameworks like LangChain tools, Anthropic tool use, and OpenAI function calling all converge on.</p>
+<p>Our registry holds four tools with three cost tiers: get_population and <em><strong>get_timezone()</strong></em> are essentially free dictionary lookups (<em><strong>cost_hint</strong> =0.1</em>), <em><strong>summarize_city()</strong></em> makes one LLM call per city (<em><strong>cost_hint</strong> =1.0</em>), and <em><strong>aggregate_report()</strong></em> makes the token-heavy synthesis call that produces the final markdown (<em><strong>cost_hint</strong> =2.0</em>). Note that the last two are tools that call the LLM internally. LLMs are just like any other tool. The worker sees a uniform tool interface, but some tools are wrappers around sub-prompts, which means you can cache, rate-limit, or swap the inner model independently of the harness.</p>
+<h2 id="the-plan-is-a-graph">The plan is a Graph</h2>
+<p>The basic harness executed one action per turn. That works when steps are strictly sequential, but our task has nine independent lookups feeding a single aggregation:</p>
+<p><a href="https://substackcdn.com/image/fetch/$s_!bqrk!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fdda72665-ee70-4a2e-9194-eed00992aaad_1057x778.png"><img src="https://substackcdn.com/image/fetch/$s_!bqrk!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fdda72665-ee70-4a2e-9194-eed00992aaad_1057x778.png" alt=""/></a></p>
+<p>A while-loop runs these one at a time. A <a href="https://en.wikipedia.org/wiki/Directed_acyclic_graph">Directed Acyclic Graph</a> expresses the dependencies explicitly and lets an executor run everything that is ready right now, concurrently. So instead of asking the LLM for one action at a time, we ask the <strong>Planner</strong> for the whole graph up front. The LLM declares the structure before we execute anything. Since the planner is an LLM, it can hallucinate structure too: dependencies on node IDs that don’t exist, or circular dependencies that can never complete. So the very first thing we do with a plan is to validate it before possibly wasting tokens trying to execute a broken plan.</p>
+<pre tabindex="0" data-language="python"><code><span><span>def</span><span> ready_nodes</span><span>(self) -&gt; list[PlanNode]:</span></span>
+<span><span>    &#34;&#34;&#34;Nodes whose deps are all DONE and are themselves PENDING.&#34;&#34;&#34;</span></span>
+<span></span>
+<span><span>    out </span><span>=</span><span> []</span></span>
+<span><span>    for</span><span> n </span><span>in</span><span> self</span><span>.nodes.values():</span></span>
+<span><span>        if</span><span> n.status </span><span>!=</span><span> NodeStatus.</span><span>PENDING</span><span>:</span></span>
+<span><span>            continue</span></span>
+<span></span>
+<span><span>        if</span><span> all</span><span>(</span><span>self</span><span>.nodes[d].status </span><span>==</span><span> NodeStatus.</span><span>DONE</span><span> for</span><span> d </span><span>in</span><span> n.deps):</span></span>
+<span><span>            out.append(n)</span></span>
+<span></span>
+<span><span>    return</span><span> out</span></span></code></pre>
+<p><em><strong>ready_nodes()</strong></em> is the heart of the scheduler: at any moment, it returns the set of nodes whose dependencies are all satisfied. For our three-city goal, the planner emits ten nodes: nine fetches with empty dependency lists, all eligible to run in parallel, and one <em><strong>aggregate_report</strong></em> capstone that depends on all nine.</p>
+<h2 id="executing-the-graph-in-parallel">Executing the graph in parallel</h2>
+<p>The executor is a level-synchronous DAG walker: compute the ready set, launch every ready node concurrently with <em><strong>asyncio.gather</strong></em> , mark each one done or failed, and repeat until nothing is left or no forward progress is possible.</p>
+<pre tabindex="0" data-language="python"><code><span><span>MAX_CONCURRENT</span><span> =</span><span> 5</span><span>  # cap concurrent tool/LLM calls</span></span>
+<span></span>
+<span><span>async</span><span> def</span><span> execute_dag</span><span>(dag, tools, on_step</span><span>=</span><span>None</span><span>):</span></span>
+<span><span>    semaphore </span><span>=</span><span> asyncio.Semaphore(</span><span>MAX_CONCURRENT</span><span>)</span></span>
+<span></span>
+<span><span>    async</span><span> def</span><span> run_node</span><span>(node):</span></span>
+<span><span>        node.status </span><span>=</span><span> NodeStatus.</span><span>RUNNING</span></span>
+<span></span>
+<span><span>        async</span><span> with</span><span> semaphore:</span></span>
+<span><span>            try</span><span>:</span></span>
+<span><span>                # Sync tools run in a thread pool so other nodes can proceed</span></span>
+<span><span>                node.result </span><span>=</span><span> await</span><span> asyncio.to_thread(tools[node.tool].run, node.args)</span></span>
+<span><span>                node.status </span><span>=</span><span> NodeStatus.</span><span>DONE</span></span>
+<span></span>
+<span><span>            except</span><span> Exception</span><span> as</span><span> exc:</span></span>
+<span><span>                node.error </span><span>=</span><span> f”{</span><span>type</span><span>(exc).</span><span>__name__</span><span>}: {exc}”</span></span>
+<span><span>                node.status </span><span>=</span><span> NodeStatus.</span><span>FAILED</span></span>
+<span></span>
+<span><span>    while</span><span> not</span><span> dag.is_done():</span></span>
+<span><span>        ready </span><span>=</span><span> dag.ready_nodes()</span></span>
+<span></span>
+<span><span>        if</span><span> not</span><span> ready:</span></span>
+<span><span>            break</span><span>  # remaining nodes depend on FAILED ancestors</span></span>
+<span></span>
+<span><span>        await</span><span> asyncio.gather(</span><span>*</span><span>(run_node(n) </span><span>for</span><span> n </span><span>in</span><span> ready))</span></span></code></pre>
+<p>Two small decisions carry most of the weight here. First, <em>asyncio.to_thread</em> runs our synchronous tool functions in a thread pool, which means we never have to rewrite tools as <em><strong>async def</strong></em> or couple the harness to async-native SDKs. Second, the semaphore caps concurrency, because without it a fifty-node plan would spawn fifty simultaneous LLM calls and promptly hit rate limits or a cost spike. This is deliberately not a full dynamic scheduler with work-stealing and priority queues. For agent workloads like ours, where each node is an API call lasting hundreds of milliseconds to seconds, level-synchronous parallelism captures most of the win. Sequentially, wall time is roughly the sum of the fetch latencies; in parallel, it is roughly the maximum of them plus the aggregation step.</p>
+<h2 id="remembering-the-right-things">Remembering the right things</h2>
+<p>Naive agents dump everything into the prompt: the full chat history, every tool output, every prior task. That fails twice over — you pay for tokens you’ll never use, and models measurably degrade when irrelevant text dilutes the goal. Production agents instead use tiered memory, loosely inspired by cognitive science. Working memory is the always-in-context scratchpad: the current goal, a plan summary, and the last few results. <strong>Episodic memory</strong> stores the outcomes of past runs and is retrieved when a past task looks similar to the current one. <strong>Semantic memory</strong> holds background facts, retrieved the same way but not tied to any particular run.</p>
+<p>We never inject everything; we pull the top-k memories by similarity to the current goal and then assemble the context under a hard character budget:</p>
+<pre tabindex="0" data-language="python"><code><span><span>def</span><span> build_context</span><span>(working: WorkingMemory, store: MemoryStore,</span></span>
+<span><span>                  budget_chars: </span><span>int</span><span> =</span><span> 4000</span><span>) -&gt; </span><span>str</span><span>:</span></span>
+<span><span>    &#34;&#34;&#34;Assemble working memory + retrieved memories, respecting a char budget.&#34;&#34;&#34;</span></span>
+<span></span>
+<span><span>    pieces </span><span>=</span><span> [working.to_prompt()]</span></span>
+<span><span>    used </span><span>=</span><span> len</span><span>(pieces[</span><span>0</span><span>])</span></span>
+<span></span>
+<span><span>    # Episodic first (past similar tasks), then semantic (facts)</span></span>
+<span><span>    for</span><span> kind </span><span>in</span><span> (”episodic”, “semantic”):</span></span>
+<span><span>        for</span><span> m </span><span>in</span><span> store.retrieve(working.goal, </span><span>k</span><span>=</span><span>3</span><span>, </span><span>kind</span><span>=</span><span>kind):</span></span>
+<span><span>            snippet </span><span>=</span><span> f”[{kind}] {m.content}”</span></span>
+<span></span>
+<span><span>            if</span><span> used </span><span>+</span><span> len</span><span>(snippet) </span><span>+</span><span> 1</span><span> &gt;</span><span> budget_chars:</span></span>
+<span><span>                return</span><span> “\</span><span>n”.join(pieces) + “\n(...truncated at budget...)”</span></span>
+<span></span>
+<span><span>            pieces.append(snippet)</span></span>
+<span><span>            used </span><span>+=</span><span> len</span><span>(snippet) </span><span>+</span><span> 1</span></span>
+<span></span>
+<span><span>    return</span><span> &#34;</span><span>\n</span><span>&#34;</span><span>.join(pieces)</span></span></code></pre>
+<p>Episodic memories get priority over semantic ones because past mistakes on similar tasks are usually more actionable than generic facts, and when the budget runs out, truncation is explicit rather than silent. Context should be actively <em>assembled</em> , not passively <em>accumulated</em>.</p>
+<p>For the similarity function itself, the store supports two backends. <a href="https://en.wikipedia.org/wiki/Jaccard_index">Jaccard similarity</a> costs nothing and is fine for teaching, but it fails on paraphrase: “famous landmarks in France” shares almost no words with “Paris is known for the Eiffel Tower.” Real sentence embeddings using 384 dimensional vectors generated by <a href="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2">all-MiniLM-L6-v2</a> map paraphrases to nearby vectors. Our <em><strong>MemoryStore</strong></em> tries embeddings first with Jaccard as a backup if the model isn’t available. Quantifying the effect of this upgrade requires a proper benchmark, which we’ll run in a future post.</p>
+<h2 id="trust-and-verify">Trust, and verify</h2>
+<p>Agents produce fluent, confident, and <em>wrong</em> output. Without verification, a report that silently dropped a city ships to the user, and regressions go unnoticed until a human happens to read the output. But not all checks cost the same, so we arrange them as a hierarchy: deterministic structural checks that are essentially free, and an LLM judge for subjective quality that costs real tokens. The rule is to always run the cheap tier first and only escalate survivors.</p>
+<pre tabindex="0" data-language="python"><code><span><span>def</span><span> verify_report</span><span>(report, goal, required_cities, provider) -&gt; Verdict:</span></span>
+<span><span>    det </span><span>=</span><span> deterministic_check_report(report, required_cities)</span></span>
+<span></span>
+<span><span>    if</span><span> not</span><span> det.passed:</span></span>
+<span><span>        return</span><span> det                </span><span># Cheap tier caught it — don’t bother the LLM</span></span>
+<span></span>
+<span><span>    # Deterministic passed → escalate to LLM judge for subjective quality</span></span>
+<span><span>    return</span><span> llm_judge_report(report, goal, provider)</span></span></code></pre>
+<p>Feed this a deliberately incomplete report (say, Paris only, when three cities were requested) and it will fail at the deterministic tier with <strong>reason=</strong> ”Missing cities: [’Tokyo’, ‘New York’]”. Zero tokens were spent on judging, and the reason string is actionable enough that a replanner step (or a human) can see exactly what went wrong. This two-tier gate is a robust pattern behind most production eval pipelines: cheap filters first, expensive judges on survivors only. And just as important as the hierarchy is the separation of concerns behind it: the <em><strong>Worker</strong></em> produces and the <em><strong>Critic</strong></em> evaluates, so the generator is never grading its own homework.</p>
+<h2 id="meet-the-crew-planner-worker-critic">Meet the crew: Planner, Worker, Critic</h2>
+<p>A single prompt that plans, executes, summarizes, and self-critiques tends to confuse its objectives (planning constraints bleed into writing style) and is unable to isolate “the planning part” complicating both testing and swapping.</p>
+<p>We split the work into narrow agents, each with a short system prompt and a single contract. The <em><strong>Planner</strong></em> receives the goal plus the tool schemas and returns DAG JSON, which we validate before running. The <em><strong>Worker</strong></em> receives the DAG and simply executes it. The <em><strong>Critic</strong></em> receives the goal and the finished report and returns a verdict. The <em><strong>Planner</strong></em> ’s system prompt has the live tool catalog spliced directly into it, so it can only reference tools that actually exist:</p>
+<pre tabindex="0" data-language="python"><code><span><span>PLANNER_SYSTEM</span><span> =</span><span> &#34;&#34;&#34;You are a Planner agent. Given a GOAL, produce a dependency graph</span></span>
+<span><span>of tool calls that will satisfy it.</span></span>
+<span></span>
+<span><span>Output ONLY JSON in this shape (no prose, no markdown):</span></span>
+<span></span>
+<span><span>{”nodes”: [{”id”: “...”, “tool”: “...”, “args”: {...}, “deps”: [...]}, ...]}</span></span>
+<span></span>
+<span><span>Nodes may run in parallel if their `deps` are empty or already satisfied.</span></span>
+<span><span>The final aggregate_report node must depend on all upstream fetch/summary nodes.</span></span>
+<span><span>Prefer id “aggregate” for that capstone node (any unique id is acceptable).</span></span>
+<span><span>Available tools (name and schema):</span></span>
+<span></span>
+<span><span>&lt;&lt;TOOLS_JSON&gt;&gt;</span></span>
+<span><span>&#34;&#34;&#34;</span></span></code></pre>
+<p>With a real model behind the planner, plans come back structurally valid but stylistically varied, and pinning down the one node the orchestrator needs to find later is much cheaper in the prompt than in cleanup code.</p>
+<p><a href="https://substackcdn.com/image/fetch/$s_!5A9N!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6b4fb9de-22ea-419c-a112-1d77ffbb4611_1131x1711.png"><img src="https://substackcdn.com/image/fetch/$s_!5A9N!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6b4fb9de-22ea-419c-a112-1d77ffbb4611_1131x1711.png" alt=""/></a></p>
+<p>This mirrors what production systems like AutoGPT-style planners, SWE-agent workers, or LLM-as-judge evaluators actually do while staying minimal enough to read in one sitting. And because all three roles go through the same <em><strong>LLMProvider.complete(</strong></em>…, <em><strong>role</strong></em> =…<em><strong>)</strong></em> interface, swapping the planner model or mocking the critic is a one-line change.</p>
+<h2 id="fuel-gauges-and-failure-modes">Fuel gauges and failure modes</h2>
+<p>The basic harness had a single <em><strong>max_steps</strong></em> counter, which hides the real constraints: you can have steps left but no tokens left, be under the token budget but rate-limited on tool calls, or have a hung network call burn wall-clock time without incrementing any counter at all. <em><strong>BudgetMulti</strong></em> tracks tokens, tool calls, wall time, and estimated dollars simultaneously, and a run stops when any dimension is exhausted. Its most useful output is a single scalar:</p>
+<pre tabindex="0" data-language="python"><code><span><span>def</span><span> pressure</span><span>(self) -&gt; </span><span>float</span><span>:</span></span>
+<span></span>
+<span><span>    return</span><span> max</span><span>(</span></span>
+<span><span>        self</span><span>.tokens_used </span><span>/</span><span> self</span><span>.max_tokens,</span></span>
+<span><span>        self</span><span>.tool_calls_used </span><span>/</span><span> self</span><span>.max_tool_calls,</span></span>
+<span><span>        self</span><span>.elapsed() </span><span>/</span><span> self</span><span>.max_wall_seconds,</span></span>
+<span><span>        self</span><span>.cost_usd </span><span>/</span><span> self</span><span>.max_cost_usd,</span></span>
+<span><span>    )</span></span></code></pre>
+<p>Pressure is the maximum utilization across all dimensions. You are limited by whichever resource runs out first, exactly like real billing. That one number drives graceful degradation: below 0.7 the full pipeline runs, including the LLM judge; above 0.9 the orchestrator skips the expensive critic and falls back to deterministic checks only; at 1.0 the run halts with partial results. Production agents use the same kind of signal to switch to cheaper models, reduce retrieval depth, or ask the user for confirmation.</p>
+<p>The other half of operational sanity is recognizing that not every error deserves the same response. A rate limit or timeout is transient with exponential back off (with jitter, so a fleet of agents doesn’t retry in lockstep) and retry. A validation error is <em>tool misuse</em> and we feed the structured error back to the LLM so it can correct its own arguments. An unknown entity is <em>missing information</em> so retrying is actively harmful, because retrying a hallucinated city name will fail identically every time; the right move is to re-plan without it. And a policy violation is <em>fatal</em> , we should halt immediately. A small <em><strong>classify_error()</strong></em> function maps error strings into these four classes, and the recovery policy follows from the class rather than from blind retries.</p>
+<h2 id="the-flight-recorder">The flight recorder</h2>
+<p>When an agent fails, we need an append-only log of structured events that can answer what happened in what order, how long each step took, which role consumed the tokens, and whether budget pressure was rising before things went wrong. Every event in our <em><strong>Tracer</strong></em> captures identity (a <em>step ID</em> and a <em>parent ID</em> linking worker steps back to the plan that spawned them), semantics (the role and the action taken), economics (latency, tokens, cost, and a snapshot of budget pressure at write time), and, for critic events, the verdict. The schema is flat and boring: a list of JSON-serializable dicts you can dump to a file, ship to OpenTelemetry or LangSmith, or plot directly in matplotlib. You don’t need a proprietary format to get real observability, just a sufficient schema.</p>
+<p>Per-step latency, colored by role, shows immediately that the <em><strong>summarize_city()</strong></em> and <em><strong>aggregate_report()</strong></em> nodes dominate wall time while the lookups are flat. LLM calls are where the seconds go, which is exactly why running them in parallel matters.</p>
+<p><a href="https://substackcdn.com/image/fetch/$s_!xL9O!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffc684dfe-280c-4e3a-aaf6-bbb28f58f366_5844x2844.png"><img src="https://substackcdn.com/image/fetch/$s_!xL9O!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffc684dfe-280c-4e3a-aaf6-bbb28f58f366_5844x2844.png" alt=""/></a>Per-step latency by role</p>
+<p>Budget pressure over time rises monotonically with a sharp jump at the aggregator, and if it crosses the 0.9 degradation threshold before the critic runs, the trace itself explains why the LLM judge was skipped.</p>
+<p><a href="https://substackcdn.com/image/fetch/$s_!7_R8!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff1bb4ea-8569-4e51-a81d-fc411115565f_3684x2484.png"><img src="https://substackcdn.com/image/fetch/$s_!7_R8!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff1bb4ea-8569-4e51-a81d-fc411115565f_3684x2484.png" alt=""/></a></p>
+<p>Finally, tokens by role shows whether planning or execution is consuming the budget.This task it skews heavily toward the worker, with its many summarize calls.</p>
+<p><a href="https://substackcdn.com/image/fetch/$s_!5U5q!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1ef2844d-5bb2-4053-9dc7-9b1c2cbc2a6f_3684x2484.png"><img src="https://substackcdn.com/image/fetch/$s_!5U5q!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1ef2844d-5bb2-4053-9dc7-9b1c2cbc2a6f_3684x2484.png" alt=""/></a>Token usage by role. Worker dominates on this task.</p>
+<h2 id="putting-it-all-together">Putting it all together</h2>
+<p>With the primitives in place, the <em><strong>Orchestrator</strong></em> becomes almost boring. It builds context from memory, asks the <em><strong>Planner</strong></em> for a DAG, hands the DAG to the <em><strong>Worker</strong></em> with a callback that records a trace event and charges the budget on every tool call, checks for failures, verifies the result with pressure-aware degradation, stores the outcome in episodic memory for future runs, and returns a <em><strong>RunResult</strong></em> bundling the report, verdict, DAG, trace, and budget. The only new behavior it adds is the re-planning loop. If execution fails and the error classifies as missing information, it sends the failure context back to the <em><strong>Planner</strong></em> instead of retrying blindly, up to a configurable <em><strong>max_replans</strong></em>.</p>
+<p>The heart of the method fits in a few lines:</p>
+<pre tabindex="0" data-language="python"><code><span><span>for</span><span> attempt </span><span>in</span><span> range</span><span>(</span><span>self</span><span>._max_replans </span><span>+</span><span> 1</span><span>):</span></span>
+<span><span>    dag </span><span>=</span><span> self</span><span>.planner.plan(goal) </span><span>if</span><span> attempt </span><span>==</span><span> 0</span><span> else</span><span> self</span><span>.planner.replan(goal, dag)</span></span>
+<span></span>
+<span><span>    await</span><span> self</span><span>.worker.execute(dag, </span><span>on_step</span><span>=</span><span>on_step)</span></span>
+<span></span>
+<span><span>    if</span><span> dag.any_failed():</span></span>
+<span><span>        failed </span><span>=</span><span> (n </span><span>for</span><span> n </span><span>in</span><span> dag.nodes.values() </span><span>if</span><span> n.status </span><span>==</span><span> NodeStatus.</span><span>FAILED</span><span>)</span></span>
+<span></span>
+<span><span>        if</span><span> any</span><span>(classify_error(n.error </span><span>or</span><span> “”) </span><span>==</span><span> ErrorClass.</span><span>MISSING_INFO</span><span> for</span><span> n </span><span>in</span><span> failed) \</span></span>
+<span><span>                and</span><span> attempt </span><span>&lt;</span><span> self</span><span>._max_replans </span><span>and</span><span> budget.has_room():</span></span>
+<span><span>            continue</span><span>          # informed re-plan, not a blind retry</span></span>
+<span></span>
+<span><span>        return</span><span> RunResult(</span><span>...</span><span>, </span><span>status</span><span>=</span><span>”failed_execute”)</span></span>
+<span><span>    break</span><span>                     # success</span></span>
+<span></span>
+<span><span># Pressure-aware degradation: skip the LLM judge if budget is tight</span></span>
+<span><span>if</span><span> budget.pressure() </span><span>&gt;</span><span> 0.9</span><span>:</span></span>
+<span><span>    verdict </span><span>=</span><span> deterministic_check_report(report, required_cities)</span></span>
+<span><span>else</span><span>:</span></span>
+<span><span>    verdict </span><span>=</span><span> self</span><span>.critic.judge(report, goal, required_cities)</span></span></code></pre>
+<p>The mock planner always names the capstone node <em><strong>aggregate</strong></em> , and an early version of the orchestrator simply looked it up by that id. Switch to a real model and that assumption quietly breaks. The planner often mirrors the tool name <em><strong>aggregate_report</strong></em> or invents its own id, producing a plan that is structurally valid but not what the mock trained us to expect. The fix is twofold: the DAG now resolves the capstone by tool rather than by id <em><strong>dag.aggregate_node()</strong></em> returns the unique <em><strong>aggregate_report</strong></em> node, (and refuses plans that contain more than one), and the planner prompt gained the explicit capstone instructions we saw earlier. Never take the LLM at its word, not even about node names.</p>
+<h2 id="what-were-still-missing">What we’re still missing</h2>
+<p>Between the <a href="https://data4sci.substack.com/p/building-a-basic-agentic-harness">Basic Harness</a> and this Advanced one, we covered practically all the main concepts and ideas you need to build a successful custom harness. We took the ~35-line loop from the previous post and layered on seven production-shaped primitives: typed tools that give validation and LLM introspection from one schema, a DAG executor that buys parallelism without rewriting a single tool, tiered memory that assembles relevant context under a hard budget, a verification hierarchy that spends tokens only on outputs that survive the cheap checks, narrow Planner/Worker/Critic roles that can be tested and swapped independently, multi-dimensional budgets that degrade gracefully instead of crashing, and a tracer that turns runs into comparable experiments instead of anecdotes.</p>
+<p>None of these pieces requires the others, but they compose. Add a tool to the registry and the planner automatically sees its schema. Tighten <em><strong>verify_report()</strong></em> and every future run is held to the new bar. Swap the entire LLM backend and the harness reruns unchanged. Composability is the difference between a PoC and an extensible harness, and is why the orchestrator stayed thin.</p>
+<p>A few caveats are in order: memory here is in-process, while production systems persist embeddings to Chroma, Weaviate, or pgvector; tool outputs are trusted as instructions, where production systems <strong>must</strong> sandbox them as data against prompt injection; irreversible actions should require human approval; and our token accounting estimates from character counts where real systems read usage metadata from the SDK. Each of those is one more compositional layer away — which is precisely the point.</p>
+<p>There is also one deliberate omission. A single successful demo proves the harness can work; nothing in this post proves it actually works in most cases. That is the job of an eval harness, and it is where we pick up in a future follow up post</p> </article></div>
+  </body>
+</html>
