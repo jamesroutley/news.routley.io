@@ -1,0 +1,1763 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://go.dev/blog/goroutine-leak-profiles">Original</a>
+    <h1>Goroutine Leak Profiles</h1>
+    
+    
+<div id="blog"><div id="content">
+  <div id="content">
+
+    <div class="Article" data-slug="/blog/goroutine-leak-profiles">
+    
+    <h1 class="small"><a href="/blog/">The Go Blog</a></h1>
+    
+
+    <h1>Goroutine Leak Profiles</h1>
+      
+      <p class="author">
+      Vlad Saioc<br>
+      2 September 2026
+      </p>
+      
+      <div class='markdown'>
+<p>Go&rsquo;s <a href="/tour/concurrency/1">concurrency features</a> are powerful and easy to use, but
+that same ease can sometimes lead even seasoned developers to make
+mistakes.
+Fortunately, the Go ecosystem comes equipped with useful tools for
+debugging, e.g., the <a href="/doc/articles/race_detector">race detector</a>,
+but even existing tools may miss some concurrency bugs,
+such as the topic of this article, the <em>goroutine leak</em>.</p>
+<p>Goroutines synchronize or exchange information
+via shared concurrency primitives, e.g., channels, locks, and wait groups.
+While communicating, goroutines often <em>block</em> on these primitives,
+as in, wait until some condition is met;
+ubiquitous examples include waiting to acquire a held mutex,
+or receive a message over a channel.
+Goroutines can also block on operating system operations, like reading from a network socket or a file.</p>
+<p>We may consider a goroutine leaked if it is blocked,
+but the conditions needed to unblock it can never be met.
+Over time, an accumulation of leaked goroutines degrades
+performance through excessive memory usage (by the leaked
+goroutines themselves or the memory they reference), as well as
+CPU usage from the garbage collector, especially
+if <code>GOMEMLIMIT</code> is in use.</p>
+<p>Goroutine leaks can be notoriously difficult to detect.
+In unit testing, the most significant breakthroughs include
+the <a href="https://github.com/uber-go/goleak" rel="noreferrer" target="_blank">open-source library <code>goleak</code></a>,
+which can instrument individual tests to signal any
+un-terminated goroutines after the test wraps up as suspicious.
+Similarly, Go 1.25 introduced the <a href="/blog/testing-time"><code>synctest</code> package</a> to
+the standard library; it can significantly improve
+the quality of unit tests in concurrent code by giving
+Go developers more control over the ordering of concurrent events
+in order to reliably test hard-to-reproduce scenarios.</p>
+<p>Unfortunately, neither approach can check for goroutine leaks
+in production systems, especially at larger scales,
+which may behave in ways unaccounted for by tests.
+Goroutine profiles are a rudimentary way to check for operations
+that block too many goroutines, or analyze growth trends.
+However, goroutine profiles cannot distinguish between
+goroutines which are leaked, and those which are temporarily blocked
+in high numbers by design, e.g., as caused by increased
+traffic in a microservice.
+Likewise, leaks which are low in number may slip by undetected for many years.</p>
+<p>Go 1.27 introduces the <strong>goroutine leak profiler</strong>,
+a flexible and lightweight mechanism for finding
+goroutine leaks in running Go programs, including production systems.
+Unlike previous approaches, which require human analysis,
+this mechanism is precise and generates little-to-no false positives.
+The trade-off is that it is limited to a subset of goroutine leaks:
+goroutines permanently blocked on channels or primitives
+in the <a href="/pkg/sync"><code>sync</code> package</a>.
+Luckily for us, this already covers a very large subset of goroutine leaks,
+as we&rsquo;ll see in our examples.</p>
+<p>In the following sections, we showcase how to use the feature, followed by
+some additional examples of detectable leaks, and a description of the
+underlying implementation and trade-offs.</p>
+<h2 id="example-concurrent-workers">Example: concurrent workers</h2>
+<p>Consider a function that processes work items concurrently:</p>
+<pre><code class="language-go">type result struct {
+    res workResult
+    err error
+}
+
+func processWorkItems(ws []workItem) ([]workResult, error) {
+    // Process work items in parallel, aggregating results in ch.
+    ch := make(chan result)
+    for _, w := range ws {
+        go func() {
+            res, err := processWorkItem(w)
+            ch &lt;- result{res, err}
+        }()
+    }
+
+    // Collect the results from ch, or return an error if one is found.
+    var results []workResult
+    for range len(ws) {
+        r := &lt;-ch
+        if r.err != nil {
+            // This early return may cause goroutine leaks.
+            return nil, r.err
+        }
+        results = append(results, r.res)
+    }
+    return results, nil
+}
+</code></pre>
+<p>Because <code>ch</code> is an unbuffered channel, each worker goroutine blocks when sending
+its result until the main goroutine receives from the channel.
+If <code>processWorkItems</code> returns early due to an error, the receiving loop terminates,
+and all remaining sender goroutines block forever.</p>
+<p>This example is emblematic of a common mistake discovered in real Go programs,
+including Uber production services.
+Let&rsquo;s see how we can find these leaks by using the
+new goroutine leak profiler.</p>
+<h3 id="debugging-with-the-goroutine-leak-profiler">Debugging with the goroutine leak profiler</h3>
+<p>The profile is available through the
+<a href="/pkg/runtime/pprof"><code>runtime/pprof</code> package</a>, as the
+<code>goroutineleak</code> profile type, or by installing the profile handlers defined
+by the <a href="/pkg/net/http/pprof"><code>net/http/pprof</code> package</a>.
+If you already have <code>net/http/pprof</code> set up in your service,
+then you don&rsquo;t need to do anything else! The profile will be
+automatically made available for collection at the <code>/debug/pprof/goroutineleak</code>
+endpoint on whatever host and port the handlers are installed.</p>
+<p>Let&rsquo;s put our concurrency bug in context and set up the <code>net/http/pprof</code> package.
+This way, you can try it yourself!</p>
+<pre><code class="language-go">package main
+
+import (
+    &quot;errors&quot;
+    &quot;log&quot;
+    &quot;net/http&quot;
+    _ &quot;net/http/pprof&quot;
+    &quot;time&quot;
+)
+
+type workItem int
+type workResult int
+
+func processWorkItem(w workItem) (workResult, error) {
+    time.Sleep(10 * time.Millisecond)
+    if w == 5 {
+        return 0, errors.New(&quot;simulated error&quot;)
+    }
+    return workResult(w * 2), nil
+}
+
+type result struct {
+    res workResult
+    err error
+}
+
+func processWorkItems(ws []workItem) ([]workResult, error) {
+    ch := make(chan result)
+    for _, w := range ws {
+        go func() {
+            res, err := processWorkItem(w)
+            ch &lt;- result{res, err}
+        }()
+    }
+
+    var results []workResult
+    for range len(ws) {
+        r := &lt;-ch
+        if r.err != nil {
+            return nil, r.err
+        }
+        results = append(results, r.res)
+    }
+    return results, nil
+}
+
+func main() {
+    // Start pprof server
+    go func() {
+        log.Println(http.ListenAndServe(&quot;localhost:6060&quot;, nil))
+    }()
+
+    // Repeatedly trigger the leak
+    for {
+        items := []workItem{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+        _, err := processWorkItems(items)
+        if err != nil {
+            log.Printf(&quot;Error processing items: %v&quot;, err)
+        }
+
+        time.Sleep(time.Second)
+    }
+}
+</code></pre>
+<p>Build the program above, then run it:</p>
+<pre><code>$ go build -o leaky
+$ ./leaky
+</code></pre>
+<h3 id="collecting-the-profile">Collecting the profile</h3>
+<p>It won&rsquo;t take long for the program to start accumulating
+leaks, which you can then view by using the web UI
+at http://localhost:6060/debug/pprof.</p>
+<p>Alternatively, you can collect the goroutine
+leak profile using <code>curl</code>, and then examine it with <code>go tool pprof</code>:</p>
+<pre><code>$ curl http://localhost:6060/debug/pprof/goroutineleak &gt; leak.prof
+$ go tool pprof leak.prof
+Type: goroutineleak
+Time: 2026-03-01 13:19:49 UTC
+Entering interactive mode (type &quot;help&quot; for commands, &quot;o&quot; for options)
+(pprof) list processWorkItems
+Total: 116
+ROUTINE ======================== main.processWorkItems.func1 in .../main.go
+         0        116 (flat, cum)   100% of Total
+         .          .     31:           go func() {
+         .          .     32:                   res, err := processWorkItem(w)
+         .        116     33:                   ch &lt;- result{res, err}
+         .          .     34:           }()
+</code></pre>
+<p>The profile reveals the goroutines leaked at
+<code>ch &lt;- result{res, err}</code> (line 33), pinpointing the culprit operation.
+Notably, the longer the program is running, the larger the number of leaked
+goroutines.</p>
+<h3 id="addressing-the-leak">Addressing the leak</h3>
+<p>This leak can be simply fixed by giving <code>ch</code> a <strong>buffer</strong>:</p>
+<pre><code class="language-go">ch := make(chan result, len(ws))
+</code></pre>
+<p>This allows all the work item goroutines to send a message without blocking
+in the event of a premature return of <code>processWorkItems</code>.</p>
+<p>We list more real-world examples in <a href="/blog/goroutine-leak-profiles#examples">this section</a>.</p>
+<h2 id="implementation">Implementation</h2>
+<p>This section is for those interested how leak detection
+works under the hood of the goroutine leak profiler.
+For details strictly pertaining to performance overhead and limitations,
+skip ahead to <a href="/blog/goroutine-leak-profiles#limitations">this section</a>.</p>
+<h3 id="core-concept">Core concept</h3>
+<p>Let&rsquo;s start with an initial observation: if a goroutine
+is blocked over some concurrency primitive that no other goroutine has access to
+(in this case, via a reference in memory), then it is obviously leaked.
+This is already a strong lead, we can generalize it further into a definition
+for when a goroutine is <em>not</em> leaked, a property we term as <em>liveness</em>.
+We formally define liveness, an inductive property
+as follows:</p>
+<blockquote>
+<p>A goroutine is <em>live</em> if:</p>
+<ol>
+<li>it is not blocked by a concurrency primitive, or</li>
+<li>at least one concurrency primitive that blocks it is referenced
+by another live goroutine.</li>
+</ol>
+</blockquote>
+<p>In the trivial case, goroutines which are not blocked are obviously
+not leaked.
+In the inductive case, the underlying assumption is that
+any goroutine which is not leaked may eventually use
+concurrency primitives it references to unblock any
+other goroutines blocked by those primitives.</p>
+<p>To find all live goroutines, we start from the obviously live
+unblocked goroutines and trace any references
+they hold, i.e., through their local variables, to find
+the concurrency primitives they have access to.
+We then incrementally include any goroutines blocked over those
+primitives as live, and repeat the process until no
+additional live goroutines are discovered.</p>
+<p>Fortunately for us, the Go runtime already computes memory reachability
+through the <a href="/doc/gc-guide">garbage collector</a> (GC),
+so the next step is to adapt the GC to suit our purposes.
+You can quickly compare the two GCs with the following diagrams:</p>
+<div class="centered">
+    <figure>
+        <img src="goroutine-leak-profiles/gc-original.svg" />
+    </figure>
+    <figure>
+        <img src="goroutine-leak-profiles/gc-modified.svg" />
+    </figure>
+</div>
+<p>A complete overhaul of the GC is not necessary.
+The Go runtime uses a concurrent tri-color mark-and-sweep garbage collector,
+(now with the <a href="/blog/greenteagc">Green Tea</a> variant!),
+so its MO already neatly aligns with our goals.
+Only a few key changes are needed:</p>
+<ol>
+<li>In the initial phases, the regular GC marks <strong>all</strong> goroutines (and global variables)
+as reachable, such that they would never be considered garbage,
+i.e., they are <em>mark roots</em>.
+We change it to instead <strong>only</strong> include unblocked goroutines,
+since these are guaranteed to be live.</li>
+<li>This is followed by the marking phase, where the GC traces objects referenced
+(transitively) by the mark roots, and <em>marks</em> them as usable memory.
+Even though we do not modify this phase directly, the changes in step 1.
+implicitly ensure that the GC only marks memory referenced by live goroutines.</li>
+<li>The marking phase is finalized by inspecting all the blocked
+goroutines not included as mark roots in step 1.
+If a goroutine is blocked by at least one concurrency
+primitive that has been marked in step 2., it is added as a mark root,
+and the GC resumes the marking phase from step 2.
+This coincides with the inductive step in the definition
+of liveness.</li>
+<li>Once all live goroutines have been discovered, any goroutine
+which has not been added as a mark root has its status set to leaked.</li>
+<li>The marking phase then resumes one last time with all the leaked goroutines
+added   as mark roots, allowing the GC to mark all the memory it would have
+marked during a regular run.</li>
+</ol>
+<p>Once the GC cycle is complete, the goroutine leak profiler picks up
+like in a regular goroutine profile, and filters for strictly
+leaked goroutines.</p>
+<h3 id="limitations">Limitations</h3>
+<p>The examples above demonstrate the usefulness of goroutine leak profiles.
+Nevertheless, the garbage collector has some limitations that may lead
+it to miss leaks:</p>
+<ol>
+<li>
+<p><strong>Memory overreach</strong>: if a concurrency primitive is
+consistently reachable through <strong>global variables</strong> or <strong>runnable goroutines</strong>,
+then goroutines blocking on it are never reported as leaked, even if
+that concurrency primitive is never used in the future.</p>
+<p>This can be alleviated by better regimenting access to
+concurrency primitive references, and more clearly
+delineating their lifecycle.</p>
+</li>
+<li>
+<p><strong>Non-standard blocking</strong>:
+For the sake of correctness, goroutine leak detection is strictly limited
+to Go first-class concurrency primitives, which includes:
+channel send and receive operations (including over <code>nil</code> channels),
+blocking <code>select</code> statements, i.e., with no <code>default</code> case, up to, and including
+<code>select</code> statements with no cases, and members of the
+<a href="/pkg/sync"><code>sync</code></a> package, specifically <code>Mutex</code>,
+<code>RWMutex</code>, <code>WaitGroup</code> and <code>Cond</code>.</p>
+<p>Goroutines blocked for any other reason, e.g.,
+file and network IO, or direct system calls
+are never considered as leaked.
+This likewise applies for custom, user-defined concurrency,
+e.g., spin locks, unless they rely on the primitives outlined above
+for their underlying implementation.</p>
+</li>
+<li>
+<p><strong>Non-determinism</strong>: leaks can be detected only after
+they have occurred, but cannot be otherwise predicted,
+so reproducing and diagnosing leaks in flaky programs
+continues to be a challenge.
+For the best results, we encourage mixing approaches, by using
+goroutine leak profiles at various layers, up to, and including production,
+as well as comprehensive test suites instrumented with <code>goleak</code> and <code>synctest</code>.</p>
+</li>
+</ol>
+<h3 id="performance">Performance impact</h3>
+<p>Goroutine leak detection is carefully designed to minimize
+performance impact, but there are, nevertheless, some costs.</p>
+<p>While memory overhead is negligible, only limited to small additions
+required for bookkeeping, goroutine leak detection can be slower
+than the regular GC.
+This is best illustrated through a pathological case we
+call the &ldquo;daisy-chain&rdquo;:
+<img src="goroutine-leak-profiles/daisy-chain.svg" />
+In this leak-free example, runnable goroutine G₀ has a
+reference to primitive P₁ which blocks G₁, and so on.</p>
+<p>This implies that proving liveness for some Pᵢ₊₁,
+requires proving liveness for Pᵢ, which introduces
+two costs:</p>
+<ol>
+<li>The GC marking phase is effectively serialized relative to the
+order in which goroutines can be scanned, as all the memory reachable
+from some Pᵢ must be marked before Pᵢ₊₁ can be added as a root.</li>
+<li>The inspection currently checks all blocked goroutines
+at the end of each marking round, for a worst-case of O(n²) steps for one
+GC cycle, where n is the total number of goroutines.</li>
+</ol>
+<p>While the second point can eventually be optimized for,
+the first point is an intrinsic limitation of leak detection
+that cannot be circumvented.</p>
+<p>Regardless, we remind the reader that, unless configured otherwise
+via runtime flags, the GC still operates concurrently with user code.
+Furthermore, if a goroutine leak can be observed at some point in time, then it
+can also be observed at any future point during the same execution.
+Periodic profiling infrastructures can therefore tune profiling frequency,
+e.g., every 4 hours, to minimize overhead at virtually no cost in
+leak detection capabilities.</p>
+<h2 id="acknowledgements">Acknowledgements</h2>
+<p>Goroutine leak detection is the result of a research collaboration between
+Aarhus University, Washington University in St. Louis, and Uber, as presented in
+<a href="https://dl.acm.org/doi/pdf/10.1145/3676641.3715990" rel="noreferrer" target="_blank">&ldquo;Dynamic Partial Deadlock Detection and Recovery via Garbage Collection&rdquo;</a>
+(Saioc et al., ASPLOS 2025).</p>
+<p>The transition from academic prototype to actual Go feature was made possible
+with the guidance of Michael Knyszek and Michael Pratt on the Go team at Google, and
+PJ Malloy (<a href="https://github.com/thepudds" rel="noreferrer" target="_blank">@thepudds</a>).</p>
+<h2 id="examples">Additional examples</h2>
+<p>The following are coding patterns that lead to leaks, as
+observed in industrial-scale codebases and open source projects,
+in ascending order of complexity.</p>
+<p>You can quickly test drive the goroutine leak detector on them in
+<a href="/play/p/S4Uw66sMbpj-">the Go playground</a>, as well as
+experiment with your own leaks.</p>
+<h3 id="example-double-send">Example: Double send</h3>
+<p>Some of the simplest leaks occur when more messages
+are sent over a channel than expected.
+Below, a goroutine is expected to send one message to the main goroutine
+over an unbuffered channel.
+However, the <code>return</code> statement is missing after the send operation
+in the error case.
+For every error, the sender will, therefore, attempt to send two messages,
+which causes a leak.</p>
+<pre><code class="language-go">func DoubleSend() {
+    ch := make(chan any)
+    go func(err error) {
+        if err != nil {
+            // In case of an error, send nil.
+            ch &lt;- nil
+            // Return statement is missing.
+        }
+        // Otherwise, continue with normal behaviour.
+        // This send is still executed, which causes a leak in the error case.
+        ch &lt;- struct{}{}
+    }(fmt.Errorf(&quot;error&quot;))
+    // Receive only one message.
+    &lt;-ch
+}
+</code></pre>
+<p>While the profile does not explicitly highlight the missing <code>return</code>
+as the cause, it at least directs you to the faulty function, by
+highlighting the leaking send operation.</p>
+<pre><code>(pprof) list DoubleSend
+Total: 1
+ROUTINE ======================== main.DoubleSend.func1 in .../main.go
+         0          1 (flat, cum)   100% of Total
+         .          .    118:   go func(err error) {
+         .          .    119:           if err != nil {
+         .          .    121:                   ch &lt;- nil
+         .          .    123:           }
+         .          1    126:           ch &lt;- struct{}{}
+         .          .    127:   }(fmt.Errorf(&quot;error&quot;))
+         .          .    129:   &lt;-ch
+</code></pre>
+<p>This leak can be addressed simply by adding a <code>return</code> statement after the
+send operation in the error case.</p>
+<h3 id="example-early-return">Example: Early return</h3>
+<p>The inverse situation is just as common, where the receiver
+omits communication on some control flow paths,
+in what is effectively a simplified version of the introductory example.</p>
+<pre><code class="language-go">// Incoming error simulates an error produced internally.
+func EarlyReturn(err error) {
+    ch := make(chan any)
+
+    // Create a worker goroutine.
+    go func() {
+        // Send something to the channel.
+        // Leaks if the parent goroutine terminates early.
+        ch &lt;- struct{}{}
+    }()
+
+    if err != nil {
+        // The parent goroutine quits too early in case of an error.
+        // Sender leaks.
+        return
+    }
+
+    // Receive is only executed if there is no error.
+    &lt;-ch
+}
+</code></pre>
+<p>The goroutine leak is exposed by the profile:</p>
+<pre><code>ROUTINE ======================== main.EarlyReturn.func1 in .../main.go
+         0          1 (flat, cum)   100% of Total
+         .          .    140:   go func() {
+         .          1    143:           ch &lt;- struct{}{}
+         .          .    144:   }()
+         .          .    145:
+         .          .    146:   if err != nil {
+</code></pre>
+<p>The leak can be addressed by giving <code>ch</code> a buffer of size 1.</p>
+<h3 id="example-timeout">Example: Timeout</h3>
+<p>A variation of the <strong>Early return</strong> pattern above involves contexts
+and non-deterministic choice (<code>select</code> statements):</p>
+<pre><code class="language-go">func Timeout(ctx context.Context) {
+    // An unbuffered channel is used to coordinate
+    // a worker and parent thread
+    ch := make(chan any)
+
+    // Create worker goroutine
+    go func() {
+        // Perform some work then signal to the parent thread.
+        ch &lt;- struct{}{}
+    }()
+
+    // Wait for message from worker or context
+    // to be cancelled or timed out.
+    select {
+    case &lt;-ch: // Receive message from worker
+    case &lt;-ctx.Done():
+        // Sender leaks because there is no
+        // future rendezvous over the channel.
+    }
+}
+</code></pre>
+<p>If the context is cancelled before the sender synchronizes with the parent,
+the sender will leak:</p>
+<pre><code>(pprof) list Timeout
+Total: 10
+ROUTINE ======================== main.Timeout.func1.1 in .../main.go
+         0         10 (flat, cum)   100% of Total
+         .          .    198:           go func() {
+         .         10    201:                   ch &lt;- struct{}{}
+         .          .    202:           }()
+</code></pre>
+<p>As in the previous example, the fix is to give the channel
+buffer of size 1.</p>
+<h3 id="example-range-over-channel-without-closing">Example: Range over channel without closing</h3>
+<p><a href="/tour/concurrency/4">Iterating over channels</a> by using <code>range</code>
+allows you to repeatedly receive values from a channel in a loop.
+Once the channel is closed and all values that have been enqueued
+in the channel&rsquo;s buffer have been received, the loop exits.</p>
+<p>Importantly, <strong>if the channel is never closed</strong>, a <code>range</code> loop will block
+the executing goroutine forever.
+Omitting the <code>close</code> operation is a common mistake, as below:</p>
+<pre><code class="language-go">// Incoming list of items and the number of workers.
+func noCloseRange(list []any, workers int) {
+    // Create a channel that distributes work items.
+    ch := make(chan any)
+
+    // Create the worker goroutines.
+    for i := 0; i &lt; workers; i++ {
+        go func() {
+            // Each worker pulls items from the channel
+            // and then processes it.
+            for item := range ch {
+                // Process each item
+                _ = item
+            }
+        }()
+    }
+
+    // Queue items to the workers by using the channel.
+    for _, item := range list {
+        // The parent leaks by sending an item if workers == 0
+        // or if all the workers panic, but the panic is recovered.
+        ch &lt;- item
+    }
+    // Otherwise, the channel is never closed, so workers
+    // leak once there are no more items left to process.
+}
+
+...
+go noCloseRange([]any{1, 2, 3}, 3) // Leaks all 3 workers
+</code></pre>
+<p>A goroutine leak profile for such a program would include the following:</p>
+<pre><code>Type: goroutineleak
+(pprof) list noCloseRange.func1
+Total: 4
+ROUTINE ======================== main.noCloseRange.func1 in .../main.go
+         0          3 (flat, cum) 75.00% of Total
+         .          .     82:           go func() {
+         .          3     84:                   for item := range ch {
+         .          .     86:                           _ = item
+         .          .     87:                   }
+         .          .     88:           }()
+</code></pre>
+<p>We see the 3 workers blocked at the <code>range ch</code> operation, which
+gives an ample hint as to the cause of the leak. The leak can be
+addressed by simply closing the channel once all messages have been sent:</p>
+<pre><code class="language-go">    for _, item := range list {
+        ch &lt;- item
+    }
+    // All items have been sent. It is now safe to close.
+    close(ch)
+</code></pre>
+<p><strong>Bonus!</strong> Eagle-eyed readers may have spotted another potential
+leak in this example, if the number of workers is mistakenly set to zero,
+which will lead the parent sender to leak:</p>
+<pre><code class="language-go">go noCloseRange([]any{1, 2, 3}, 0) // Sender leaks with 0 workers
+</code></pre>
+<p>This is also captured by the profile:</p>
+<pre><code>(pprof) list noCloseRange$
+Total: 4
+ROUTINE ======================== main.noCloseRange in .../main.go
+         0          1 (flat, cum) 25.00% of Total
+         .          .     76:func noCloseRange(list []any, workers int) {
+...
+         .          .     92:   for _, item := range list {
+         .          1     95:           ch &lt;- item
+         .          .     96:   }
+</code></pre>
+<p>While <code>workers &gt; 0</code> can be assumed to hold in realistic production systems,
+goroutine leak profiles can nevertheless be used to implicitly monitor for off-chance
+violations without conservative <code>workers &lt;= 0</code> checks.</p>
+<h3 id="example-method-contract-violations">Example: Method contract violations</h3>
+<p>The patterns seen so far have been relatively constrained in their lexical scope.
+However, as functionality is spread out across functions, methods and packages, and
+implementations are obfuscated by interfaces, the difficulty of manually detecting
+leaks drastically increases.</p>
+<p>Such a case is exemplified in this section, with the custom <code>worker</code> type that embeds two channel
+fields, <code>ch</code> and <code>done</code> and creates a looping goroutine with its <code>Start</code> method that
+reads from both channels with a <code>select</code> statement.
+Said goroutine can only be terminated by receiving a message through the <code>done</code> channel,
+which is closed by the <code>Stop</code> method.</p>
+<p>The <code>Start</code> method can be invoked any number of times, but if it is invoked
+at least once, <code>Stop</code> should eventually be called.</p>
+<p>As a result, <code>Start</code> and <code>Stop</code> form an implicit contract that dictates the order
+in which the methods should be invoked.
+Breaking that contract can lead to undesirable behavior,
+in this case, goroutine leaks:</p>
+<pre><code class="language-go">func MethodContractViolation() {
+    items := make([]any, 10)
+    // Create a new worker
+    w := NewWorker()
+
+    // Start worker
+    w.Start()
+
+    // Operate on worker
+    for _, item := range items {
+        w.AddToQueue(item)
+    }
+    // Exits without calling ’Stop’.
+}
+
+type worker struct {
+    ch   chan any
+    done chan any
+}
+
+type Worker interface {
+    Start()
+    Stop()
+    AddToQueue(item any)
+}
+
+func NewWorker() Worker {
+    return &amp;worker{
+        ch:   make(chan any),
+        done: make(chan any),
+    }
+}
+
+// Start spawns a background goroutine that extracts items pushed to the queue.
+func (w *worker) Start() {
+    go func() {
+        for {
+            select {
+            case &lt;-w.ch: // Normal workflow
+            case &lt;-w.done:
+                return // Shut down
+            }
+        }
+    }()
+}
+
+func (w *worker) Stop() {
+    // Allows goroutine created by Start to terminate
+    close(w.done)
+}
+
+func (w *worker) AddToQueue(item any) {
+    w.ch &lt;- item
+}
+</code></pre>
+<p>This issue is further exacerbated in practice, where such custom types are only
+exported as interfaces, in this case, through the non-descript
+<code>Worker</code> type.
+Clients may not even be aware of the underlying implementation and,
+consequently, violate the implicit contract without realizing.</p>
+<p>Fortunately, soliciting a goroutine leak profile can reveal the defect:</p>
+<pre><code>(pprof) list Start
+Total: 1
+ROUTINE ======================== main.(*worker).Start.func1 in .../main.go
+         0          1 (flat, cum)   100% of Total
+         .          .    266:   go func() {
+         .          .    267:           for {
+         .          1    268:                   select {
+         .          .    269:                   case &lt;-w.ch:
+         .          .    270:                   case &lt;-w.done:
+         .          .    271:                           return
+</code></pre>
+<p>Naturally, the fix involves following the trail to the <code>Start</code> call
+and adding an invocation of <code>Stop</code>.</p>
+<h3 id="example-cockroach-missing-unlock">Example (Cockroach): Missing unlock</h3>
+<p>The following <a href="https://github.com/cockroachdb/cockroach/pull/584" rel="noreferrer" target="_blank">example</a>
+is taken from <a href="https://github.com/cockroachdb/cockroach" rel="noreferrer" target="_blank">CockroachDB</a>.
+It involves acquiring and releasing a lock in a loop,
+but forgetting to unlock it
+before executing a <code>break</code> statement:</p>
+<pre><code class="language-go">type Gossip struct {
+    mu     sync.Mutex
+    closed bool
+}
+
+func (g *Gossip) bootstrap() {
+    for {
+        g.mu.Lock()
+        if g.closed {
+            // Missing g.mu.Unlock
+            break
+        }
+        g.mu.Unlock()
+    }
+}
+
+func Cockroach584() {
+    g := &amp;Gossip{
+        closed: true,
+    }
+    // ...
+    g.bootstrap()
+    g.bootstrap() // Causes a leak
+}
+</code></pre>
+<p>In such a case, the goroutine will leak when failing to acquire the lock.</p>
+<pre><code>(pprof) list Gossip
+Total: 1
+ROUTINE ======================== main.(*Gossip).bootstrap in .../main.go
+         0          1 (flat, cum)   100% of Total
+         .          .    165:func (g *Gossip) bootstrap() {
+         .          .    166:   for {
+         .          1    167:           g.mu.Lock()
+         .          .    168:           if g.closed {
+         .          .    170:                   break
+         .          .    171:           }
+         .          .    172:           g.mu.Unlock()
+</code></pre>
+<p>Adding a call to <code>Unlock</code> before the <code>break</code> addresses the issue.</p>
+<h3 id="example-etcd-unexpected-channel-operation-orderings">Example (etcd): Unexpected channel operation orderings</h3>
+<p>This <a href="https://github.com/etcd-io/etcd/pull/6857" rel="noreferrer" target="_blank">example</a>,
+found in <a href="https://github.com/etcd-io/etcd" rel="noreferrer" target="_blank">etcd</a>,
+shows how an unexpected ordering between channel
+operations can lead to a goroutine leak:</p>
+<pre><code class="language-go">type node struct {
+    status chan chan struct{}
+    stop   chan struct{}
+    done   chan struct{}
+}
+
+func (n *node) Status() struct{} {
+    c := make(chan struct{})
+    n.status &lt;- c
+    return &lt;-c
+}
+
+func (n *node) run() {
+    for {
+        select {
+        case c := &lt;-n.status:
+            c &lt;- struct{}{}
+        case &lt;-n.stop:
+            close(n.done)
+            return
+        }
+    }
+}
+
+func (n *node) Stop() {
+    select {
+    case n.stop &lt;- struct{}{}:
+    case &lt;-n.done:
+        return
+    }
+    &lt;-n.done
+}
+
+func Etcd6857() {
+    n := &amp;node{
+        status: make(chan chan struct{}),
+        stop:   make(chan struct{}),
+        done:   make(chan struct{}),
+    }
+    go n.run()
+    go n.Status()
+    go n.Stop()
+}
+</code></pre>
+<p>The <code>run</code> method fires a loop which expects to
+repeatedly receive messages over the <code>status</code> channel
+(sent by invoking the <code>Status</code> method).
+At the same time, it can also receive one message over the
+<code>stop</code> channel (sent via the <code>Stop</code> method),
+at which point it closes the <code>done</code> channel and exits.
+The <code>Stop</code> method itself then waits to receive message
+over <code>done</code>, which is unblocked once <code>done</code> is closed.</p>
+<p>A leak may occur if the <code>run</code>, <code>Status</code>, and <code>Stop</code> methods
+run concurrently.
+The <code>Stop</code> and <code>run</code> goroutines can synchronize
+and exit without receiving the message issued
+by <code>Status</code>, causing it to block forever.</p>
+<pre><code>(pprof) list Status
+Total: 8
+ROUTINE ======================== main.(*node).Status in .../main.go
+         0          8 (flat, cum)   100% of Total
+         .          .     16:func (n *node) Status() struct{} {
+         .          .     17:   c := make(chan struct{})
+         .          8     18:   n.status &lt;- c
+         .          .     19:   return &lt;-c
+         .          .     20:}
+</code></pre>
+<p>Wrapping the send to <code>status</code> in a <code>select</code> statement
+where the other <code>case</code> branch tries to receive a message
+over <code>done</code> allows the goroutine running to <code>Status</code>
+to gracefully exit if it lost the race with a <code>Stop</code>
+call.</p>
+<h3 id="example-kubernetes-mutual-blocking-between-channels-and-mutexes">Example (Kubernetes): Mutual blocking between channels and mutexes</h3>
+<p>This <a href="https://github.com/kubernetes/kubernetes/pull/6632" rel="noreferrer" target="_blank">example</a>
+occurs in <a href="https://github.com/kubernetes/kubernetes" rel="noreferrer" target="_blank">Kubernetes</a>,
+as a result of mixing channels and locks:</p>
+<pre><code class="language-go">type Connection struct {
+    closeChan chan bool
+}
+
+type idleAwareFramer struct {
+    resetChan chan bool
+    writeLock sync.Mutex
+    conn      *Connection
+}
+
+func (i *idleAwareFramer) monitor() {
+    var resetChan = i.resetChan
+    for range i.conn.closeChan {
+        i.writeLock.Lock()
+        close(resetChan)
+        i.resetChan = nil
+        i.writeLock.Unlock()
+        break
+    }
+}
+
+func (i *idleAwareFramer) WriteFrame() {
+    i.writeLock.Lock()
+    defer i.writeLock.Unlock()
+    if i.resetChan == nil {
+        return
+    }
+    i.resetChan &lt;- true
+}
+
+func NewIdleAwareFramer() *idleAwareFramer {
+    return &amp;idleAwareFramer{
+        resetChan: make(chan bool),
+        conn: &amp;Connection{
+            closeChan: make(chan bool),
+        },
+    }
+}
+
+func Kubernetes6632() {
+    i := NewIdleAwareFramer()
+
+    go func() {
+        i.conn.closeChan &lt;- true
+    }()
+    go i.monitor()
+    go i.WriteFrame()
+}
+</code></pre>
+<p>The goroutine running <code>WriteFrame</code> may acquire the
+idle-aware framer lock, followed by sending a message over the
+<code>resetChan</code> channel, while the <code>monitor</code> goroutine
+waits to receive a message over the <code>closeChan</code> channel.
+Once a message has been dispatched, the <code>monitor</code> goroutine
+will attempt to acquire the same lock.
+However, since there isn&rsquo;t any traffic over <code>resetChan</code>, the send operation
+blocks forever, preventing the <code>monitor</code> goroutine from releasing
+the lock.
+This, in turn, causes both goroutines to leak.</p>
+<pre><code>(pprof) list AwareFramer
+Total: 200
+ROUTINE ======================== main.(*idleAwareFramer).WriteFrame in .../main.go
+         0        100 (flat, cum) 50.00% of Total
+         .          .     32:func (i *idleAwareFramer) WriteFrame() {
+         .          .     33:   i.writeLock.Lock()
+         .          .     34:   defer i.writeLock.Unlock()
+         .          .     35:   if i.resetChan == nil {
+         .          .     36:           return
+         .          .     37:   }
+         .        100     38:   i.resetChan &lt;- true
+         .          .     39:}
+ROUTINE ======================== main.(*idleAwareFramer).monitor in .../main.go
+         0        100 (flat, cum) 50.00% of Total
+         .          .     21:func (i *idleAwareFramer) monitor() {
+         .          .     22:   var resetChan = i.resetChan
+         .          .     23:   for range i.conn.closeChan {
+         .        100     24:           i.writeLock.Lock()
+         .          .     25:           close(resetChan)
+</code></pre>
+<p>The fix is to set up a separate goroutine after a message is received
+over <code>closeChan</code> in the <code>monitor</code> goroutine that drains the <code>resetChan</code>
+before attempting to acquire the lock.</p>
+<h3 id="example-moby-misusing-syncwaitgroup">Example (Moby): Misusing <code>sync.WaitGroup</code></h3>
+<p>The <a href="https://github.com/moby/moby/pull/25384" rel="noreferrer" target="_blank">following example</a> in
+<a href="https://github.com/moby/moby" rel="noreferrer" target="_blank">Moby</a> showcases how wait groups may
+cause leaks:</p>
+<pre><code class="language-go">type Manager struct {
+    plugins []int
+}
+
+func (pm *Manager) init() {
+    var group sync.WaitGroup
+    group.Add(len(pm.plugins))
+    for _, p := range pm.plugins {
+        go func(p int) {
+            defer group.Done()
+        }(p)
+        group.Wait() // Block here
+    }
+}
+
+func Moby25384() {
+    pm := &amp;Manager{
+        plugins: []int{1, 2},
+    }
+    go pm.init()
+}
+</code></pre>
+<p>The <code>group</code> wait group increments its counter
+depending on the number of plugins held by the
+plugin manager <code>pm</code>, then iterates over each plugin
+and spawns a goroutine.
+Each goroutine decrements the counter once it finishes
+its task with the <code>Done</code> method.
+However, <code>group</code> erroneously invokes <code>Wait</code> inside
+the loop body, instead of after it!
+This will cause any goroutine running the <code>init</code> method
+when the manager has more than one plugin to leak.</p>
+<pre><code>(pprof) list init
+Total: 1
+ROUTINE ======================== main.(*Manager).init in .../main.go
+         0          1 (flat, cum)   100% of Total
+         .          .     17:   group.Add(len(pm.plugins))
+         .          .     18:   for _, p := range pm.plugins {
+         .          .     19:           go func(p int) {
+         .          .     20:                   defer group.Done()
+         .          .     21:           }(p)
+         .          1     22:           group.Wait() // Block here
+         .          .     23:   }
+</code></pre>
+<p>This can be easily addressed by moving the <code>Wait</code> outside
+the loop.</p>
+<h3 id="example-moby-mutual-blocking-between-channels-and-mutexes">Example (Moby): Mutual blocking between channels and mutexes</h3>
+<p>Another <a href="https://github.com/moby/moby/pull/28462" rel="noreferrer" target="_blank">example</a>
+in <a href="https://github.com/moby/moby" rel="noreferrer" target="_blank">Moby</a>
+showcases a mixed channel-lock leak:</p>
+<pre><code class="language-go">type (
+    State struct {
+        Health *Health
+    }
+    Container struct {
+        sync.Mutex
+        State *State
+    }
+
+    Store struct {
+        ctr *Container
+    }
+
+    Daemon struct {
+        containers Store
+    }
+
+    Health struct {
+        stop chan struct{}
+    }
+)
+
+func (d *Daemon) StateChanged() {
+    c := d.containers.ctr
+    c.Lock()
+    d.updateHealthMonitorElseBranch(c)
+    defer c.Unlock()
+}
+
+func (d *Daemon) updateHealthMonitorElseBranch(c *Container) {
+    c.State.Health.CloseMonitorChannel()
+}
+
+func (s *Health) CloseMonitorChannel() {
+    if s.stop != nil {
+        s.stop &lt;- struct{}{}
+    }
+}
+
+func monitor(c *Container, stop chan struct{}) {
+    for {
+        select {
+        case &lt;-stop:
+            return
+        default:
+            handleProbeResult(c)
+        }
+    }
+}
+
+func handleProbeResult(c *Container) {
+    c.Lock()
+    defer c.Unlock()
+    // Additional work...
+}
+
+func NewDaemonAndContainer() (*Daemon, *Container) {
+    c := &amp;Container{
+        State: &amp;State{&amp;Health{
+            stop: make(chan struct{}),
+        }},
+    }
+    d := &amp;Daemon{Store{c}}
+    return d, c
+}
+
+func Moby28462() {
+    d, c := NewDaemonAndContainer()
+    go monitor(c, c.State.Health.stop)
+    go d.StateChanged()
+}
+</code></pre>
+<p>The goroutine invoking <code>StateChanged</code> may acquire the lock
+of the container stored by the daemon, then invoke
+the <code>updateHealthMonitorElseBranch</code> method on
+the daemon, which attempts to send a message over
+the <code>stop</code> channel of the container.
+However, the goroutine running <code>monitor</code>
+may fail to receive a message over <code>stop</code>, if the message
+is not already in-flight, and instead unblock by picking
+the <code>default</code> case of the <code>select</code> statement.
+This will lead it to try to acquire the same container
+lock that is already held by the <code>StateChanged</code>
+goroutine, leading both goroutines to leak.</p>
+<pre><code>(pprof) list .CloseMonitorChannel
+Total: 2
+ROUTINE ======================== main.(*Health).CloseMonitorChannel in .../main.go
+         0          1 (flat, cum) 50.00% of Total
+         .          .     66:func (s *Health) CloseMonitorChannel() {
+         .          .     67:   if s.stop != nil {
+         .          1     68:           s.stop &lt;- struct{}{}
+         .          .     69:   }
+         .          .     70:}
+(pprof) list main.handleProbeResult
+Total: 2
+ROUTINE ======================== main.handleProbeResult in .../main.go
+         0          1 (flat, cum) 50.00% of Total
+         .          .     83:func handleProbeResult(c *Container) {
+         .          1     84:   c.Lock()
+         .          .     85:   // Additional work...
+         .          .     86:   defer c.Unlock()
+         .          .     87:}
+</code></pre>
+<p>The fix is to close the <code>stop</code> channel instead
+of sending a message over it.
+Since closing a channel is not a blocking operation,
+the <code>StateChanged</code> goroutine is then able to release
+the lock.
+In turn, this unblocks the <code>monitor</code> goroutine,
+which may now terminate by picking unblocked
+<code>&lt;-stop</code> case branch in the <code>select</code> statement
+on the next loop iteration.</p>
+</div>
+
+    </div>
+
+    
+    <div class="Article prevnext">
+    
+    
+      
+        <p>
+        
+        
+          
+            <b>Previous article: </b><a href="/blog/generic-methods">Generic Methods</a><br>
+          
+        
+        <b><a href="/blog/all">Blog Index</a></b>
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+    </div>
+    
+
+  </div>
+</div>
+
+<script src="/js/play.js"></script>
+
+
+  </body>
+</html>
