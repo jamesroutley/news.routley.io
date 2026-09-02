@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://blog.veitheller.de/numpy.html">Original</a>
+    <h1>Tracing np.add, all the way down</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+      <p>The notes for this blog post have been sitting in my drafts folder
+for half a year now. I’ve done a little work on NumPy itself in the past
+year. Nothing notable, but enough to have to find my way around the
+source. That gave me the idea to write this, but then, as other
+obligations overshadowed my NumPy contributions, it just started rotting
+quietly. One or two NumPy releases later I finally picked it up again,
+retraced my steps, and here we are.</p>
+<p>Here’s the premise: <code>np.add(a, b)</code> might well be among the
+most executed lines of numerical Python in the world, and most of us
+have a working mental model that’s equivalent to “it adds the arrays, in
+C, quickly”. That model is correct, but there’s a lot of machinery
+between the Python call and the loop that does the adding, and I think
+it’s a fun machine to take apart. So today we’ll trace a single call,
+<code>np.add(a, b)</code> with two <code>float64</code> arrays, from the
+Python entry point all the way down to the SIMD kernel, reading the
+actual NumPy source as we go. We’ll learn a lot, I hope!</p>
+<p>Everything below is pinned to <a href="https://github.com/numpy/numpy/tree/v2.5.2">NumPy 2.5.2</a>, the
+current release as I write this, and all links point into that tag. The
+internals move around between versions<sup><a href="#1">1</a></sup>, so
+if you’re spelunking along at home, check out the matching tag. I’ll
+assume you’re at least somewhat comfortable reading C, but no NumPy
+internals knowledge is required, that’s what we’re here for.</p>
+<h2 id="the-map">The map</h2>
+<p>Before we dive in, here’s the treasure map, so you always know where
+we are:</p>
+<pre><code>np.add(a, b)                      (Python)
+   │
+   ▼
+ufunc_generic_fastcall            (C: parse arguments)
+   │
+   ▼
+__array_ufunc__ override check    (may divert to other libraries)
+   │
+   ▼
+promotion &amp; dispatch              (find the float64 loop, cache it)
+   │
+   ▼
+trivial loop  or  NpyIter         (iteration strategy)
+   │
+   ▼
+DOUBLE_add                        (the actual inner loop, SIMD)</code></pre>
+<p>Each of these is a section below. Let’s start at the top.</p>
+<h2 id="np.add-is-an-object">np.add is an object</h2>
+<p>The first thing to know is that <code>np.add</code> is not a normal
+Python function. It’s an instance of <code>numpy.ufunc</code>, a
+C-defined type<sup><a href="#2">2</a></sup>:</p>
+<div id="cb2"><pre><code><span id="cb2-1"><a aria-hidden="true" href="#cb2-1" tabindex="-1"></a><span>&gt;&gt;&gt;</span> <span>type</span>(np.add)</span>
+<span id="cb2-2"><a aria-hidden="true" href="#cb2-2" tabindex="-1"></a><span>&lt;</span><span>class</span> <span>&#39;numpy.ufunc&#39;</span><span>&gt;</span></span>
+<span id="cb2-3"><a aria-hidden="true" href="#cb2-3" tabindex="-1"></a><span>&gt;&gt;&gt;</span> np.add.nin, np.add.nout</span>
+<span id="cb2-4"><a aria-hidden="true" href="#cb2-4" tabindex="-1"></a>(<span>2</span>, <span>1</span>)</span>
+<span id="cb2-5"><a aria-hidden="true" href="#cb2-5" tabindex="-1"></a><span>&gt;&gt;&gt;</span> <span>len</span>(np.add.types)</span>
+<span id="cb2-6"><a aria-hidden="true" href="#cb2-6" tabindex="-1"></a><span>22</span></span>
+<span id="cb2-7"><a aria-hidden="true" href="#cb2-7" tabindex="-1"></a><span>&gt;&gt;&gt;</span> np.add.types[<span>11</span>:<span>14</span>]</span>
+<span id="cb2-8"><a aria-hidden="true" href="#cb2-8" tabindex="-1"></a>[<span>&#39;ee-&gt;e&#39;</span>, <span>&#39;ff-&gt;f&#39;</span>, <span>&#39;dd-&gt;d&#39;</span>]</span></code></pre></div>
+<p>A ufunc is, at its core, a bundle of inner loops. One small C
+function per supported type signature, plus metadata about how many
+inputs and outputs there are. <code>np.add</code> ships 22 of them,
+though I should say that <code>types</code> only lists the classic ones:
+loops registered the modern way (more on that distinction later) live in
+an internal mapping on the ufunc that Python never sees. The one we’re
+chasing today is <code>dd-&gt;d</code>: double, double, to double. The
+whole rest of this post is about how NumPy gets from your call to that
+one entry, and what happens once it’s found. Other paths may vary, it’s
+a big piece of kit!</p>
+<p>Let’s dive into the cave.</p>
+<h2 id="into-the-c">Into the C</h2>
+<p>When Python sees <code>np.add(a, b)</code>, it calls the ufunc
+object. The <code>ufunc</code> type implements the vectorcall protocol,
+so the call lands in <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/ufunc_object.c#L4905"><code>ufunc_generic_vectorcall</code></a>,
+which immediately forwards to the real workhorse, <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/ufunc_object.c#L4561"><code>ufunc_generic_fastcall</code></a>.
+That function is long, but it reads like a checklist, and it <em>is</em>
+the skeleton of the whole operation. Heavily abbreviated:</p>
+<div id="cb3"><pre><code><span id="cb3-1"><a aria-hidden="true" href="#cb3-1" tabindex="-1"></a><span>static</span> PyObject <span>*</span></span>
+<span id="cb3-2"><a aria-hidden="true" href="#cb3-2" tabindex="-1"></a>ufunc_generic_fastcall<span>(</span>PyUFuncObject <span>*</span>ufunc<span>,</span></span>
+<span id="cb3-3"><a aria-hidden="true" href="#cb3-3" tabindex="-1"></a>        PyObject <span>*</span><span>const</span> <span>*</span>args<span>,</span> Py_ssize_t len_args<span>,</span> PyObject <span>*</span>kwnames<span>,</span></span>
+<span id="cb3-4"><a aria-hidden="true" href="#cb3-4" tabindex="-1"></a>        npy_bool outer<span>)</span></span>
+<span id="cb3-5"><a aria-hidden="true" href="#cb3-5" tabindex="-1"></a><span>{</span></span>
+<span id="cb3-6"><a aria-hidden="true" href="#cb3-6" tabindex="-1"></a>    <span>/* ... extract inputs, outputs, and keyword arguments ... */</span></span>
+<span id="cb3-7"><a aria-hidden="true" href="#cb3-7" tabindex="-1"></a></span>
+<span id="cb3-8"><a aria-hidden="true" href="#cb3-8" tabindex="-1"></a>    <span>/* We now have all the information required to check for Overrides */</span></span>
+<span id="cb3-9"><a aria-hidden="true" href="#cb3-9" tabindex="-1"></a>    PyObject <span>*</span>override <span>=</span> NULL<span>;</span></span>
+<span id="cb3-10"><a aria-hidden="true" href="#cb3-10" tabindex="-1"></a>    errval <span>=</span> PyUFunc_CheckOverride<span>(</span>ufunc<span>,</span> method<span>,</span></span>
+<span id="cb3-11"><a aria-hidden="true" href="#cb3-11" tabindex="-1"></a>            full_args<span>.</span>in<span>,</span> full_args<span>.</span>out<span>,</span> where_obj<span>,</span></span>
+<span id="cb3-12"><a aria-hidden="true" href="#cb3-12" tabindex="-1"></a>            args<span>,</span> len_args<span>,</span> kwnames<span>,</span> <span>&amp;</span>override<span>);</span></span>
+<span id="cb3-13"><a aria-hidden="true" href="#cb3-13" tabindex="-1"></a>    <span>/* ... if an override was found, return its result ... */</span></span>
+<span id="cb3-14"><a aria-hidden="true" href="#cb3-14" tabindex="-1"></a></span>
+<span id="cb3-15"><a aria-hidden="true" href="#cb3-15" tabindex="-1"></a>    <span>/* ... convert arguments to arrays, extract their DTypes ... */</span></span>
+<span id="cb3-16"><a aria-hidden="true" href="#cb3-16" tabindex="-1"></a></span>
+<span id="cb3-17"><a aria-hidden="true" href="#cb3-17" tabindex="-1"></a>    PyArrayMethodObject <span>*</span>ufuncimpl <span>=</span> promote_and_get_ufuncimpl<span>(</span>ufunc<span>,</span></span>
+<span id="cb3-18"><a aria-hidden="true" href="#cb3-18" tabindex="-1"></a>            operands<span>,</span> signature<span>,</span> operand_DTypes<span>,</span> <span>...);</span></span>
+<span id="cb3-19"><a aria-hidden="true" href="#cb3-19" tabindex="-1"></a></span>
+<span id="cb3-20"><a aria-hidden="true" href="#cb3-20" tabindex="-1"></a>    <span>/* Find the correct descriptors for the operation */</span></span>
+<span id="cb3-21"><a aria-hidden="true" href="#cb3-21" tabindex="-1"></a>    <span>if</span> <span>(</span>resolve_descriptors<span>(</span>nop<span>,</span> ufunc<span>,</span> ufuncimpl<span>,</span> <span>...)</span> <span>&lt;</span> <span>0</span><span>)</span> <span>{</span></span>
+<span id="cb3-22"><a aria-hidden="true" href="#cb3-22" tabindex="-1"></a>        <span>goto</span> fail<span>;</span></span>
+<span id="cb3-23"><a aria-hidden="true" href="#cb3-23" tabindex="-1"></a>    <span>}</span></span>
+<span id="cb3-24"><a aria-hidden="true" href="#cb3-24" tabindex="-1"></a></span>
+<span id="cb3-25"><a aria-hidden="true" href="#cb3-25" tabindex="-1"></a>    <span>/*</span></span>
+<span id="cb3-26"><a aria-hidden="true" href="#cb3-26" tabindex="-1"></a><span>     * Do the final preparations and call the inner-loop.</span></span>
+<span id="cb3-27"><a aria-hidden="true" href="#cb3-27" tabindex="-1"></a><span>     */</span></span>
+<span id="cb3-28"><a aria-hidden="true" href="#cb3-28" tabindex="-1"></a>    errval <span>=</span> PyUFunc_GenericFunctionInternal<span>(</span>ufunc<span>,</span> ufuncimpl<span>,</span></span>
+<span id="cb3-29"><a aria-hidden="true" href="#cb3-29" tabindex="-1"></a>            operation_descrs<span>,</span> operands<span>,</span> casting<span>,</span> order<span>,</span> wheremask<span>);</span></span>
+<span id="cb3-30"><a aria-hidden="true" href="#cb3-30" tabindex="-1"></a></span>
+<span id="cb3-31"><a aria-hidden="true" href="#cb3-31" tabindex="-1"></a>    <span>/* ... wrap the outputs and return them ... */</span></span>
+<span id="cb3-32"><a aria-hidden="true" href="#cb3-32" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>Parse, check for overrides, pick a loop, run it, wrap the result.
+Looks like we have a plan! Now for the interesting parts.</p>
+<p>The light is getting dim in our cave.</p>
+<h2 id="an-escape-hatch">An escape hatch</h2>
+<p>Before NumPy commits to doing any work, it asks the arguments whether
+they’d rather do it themselves (always a good modus operandi). <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/override.c#L206"><code>PyUFunc_CheckOverride</code></a>
+walks all inputs and outputs and looks for a non-default
+<code>__array_ufunc__</code> method, the protocol defined in <a href="https://numpy.org/neps/nep-0013-ufunc-overrides.html">NEP
+13</a><sup><a href="#3">3</a></sup>. If any argument has one, NumPy
+calls it and returns whatever it produces, and none of the machinery
+we’re going to talk about below ever runs.</p>
+<p>This is the hook that makes
+<code>np.add(dask_array, cupy_array)</code> behave with third parties!
+Libraries like Dask and CuPy implement <code>__array_ufunc__</code> and
+take over. We can play that tune ourselves in four lines:</p>
+<div id="cb4"><pre><code><span id="cb4-1"><a aria-hidden="true" href="#cb4-1" tabindex="-1"></a><span>class</span> Diverted:</span>
+<span id="cb4-2"><a aria-hidden="true" href="#cb4-2" tabindex="-1"></a>    <span>def</span> __array_ufunc__(<span>self</span>, ufunc, method, <span>*</span>inputs, <span>**</span>kwargs):</span>
+<span id="cb4-3"><a aria-hidden="true" href="#cb4-3" tabindex="-1"></a>        <span>return</span> <span>f&#34;intercepted </span><span>{</span>ufunc<span>.</span><span>__name__</span><span>}</span><span>.</span><span>{</span>method<span>}</span><span>&#34;</span></span>
+<span id="cb4-4"><a aria-hidden="true" href="#cb4-4" tabindex="-1"></a></span>
+<span id="cb4-5"><a aria-hidden="true" href="#cb4-5" tabindex="-1"></a><span>&gt;&gt;&gt;</span> np.add(np.arange(<span>3</span>), Diverted())</span>
+<span id="cb4-6"><a aria-hidden="true" href="#cb4-6" tabindex="-1"></a><span>&#39;intercepted add.__call__&#39;</span></span></code></pre></div>
+<p>Our object does nothing but win the argument about who computes. For
+our trace we’ll assume both arguments are plain <code>ndarray</code>s,
+so nothing is overridden and we continue rappelling.</p>
+<h2 id="choosing-a-loop">Choosing a loop</h2>
+<p>Next, NumPy has to get from “two <code>float64</code> arrays” to
+“that one <code>dd-&gt;d</code> entry”. This is promotion and dispatch,
+and it lives in <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/dispatching.cpp"><code>dispatching.cpp</code></a>,
+whose header comment is the best documentation of the process I’ve found
+anywhere, so let me just quote it, typos and all:</p>
+<pre><code>The process of dispatching and promotion can be summarized in the following
+steps:
+
+1. Override any `operand_DTypes` from `signature`.
+2. Check if the new `operand_Dtypes` is cached (if it is, got to 4.)
+3. Find the best matching &#34;loop&#34;.  This is done using multiple dispatching
+   on all `operand_DTypes` and loop `dtypes`.  A matching loop must be
+   one whose DTypes are superclasses of the `operand_DTypes` (that are
+   defined).  The best matching loop must be better than any other matching
+   loop.  This result is cached.
+4. If the found loop is a promoter: We call the promoter. It can modify
+   the `operand_DTypes` currently.  Then go back to step 2.
+5. The final `ArrayMethod` is found, its registered `dtypes` is copied
+   into the `signature` so that it is available to the ufunc loop.</code></pre>
+<p>A few translations are in order. The <code>signature</code> is what
+you fix explicitly when you call <code>np.add(a, b, dtype=...)</code>;
+in our call it’s empty. A “promoter” is a registered helper that handles
+cases where no loop matches directly by rewriting the requested types
+and letting dispatch run again. Confusingly, the everyday mixed case,
+<code>np.add(int32_array, float64_array)</code>, doesn’t even use one:
+when dispatch comes up empty there, it falls back to the ufunc’s
+<em>old</em> type resolution machinery
+(<code>PyUFunc_AdditionTypeResolver</code>, in our case) to pick the
+common types, and then re-enters dispatch with those, landing on
+<code>dd-&gt;d</code>.</p>
+<p>And the cache in step 2 matters a lot! The full resolution only
+happens the first time you call a ufunc with a given combination of
+types. For an ordinary cacheable case like ours, every later call with
+the same types is a single hash lookup on the DType classes. It’s pure
+machinery, but it’s useful.</p>
+<p>To understand what we now have, we have to engage in some archaeology
+and word-slinging.</p>
+<p>What <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/dispatching.cpp#L1047"><code>promote_and_get_ufuncimpl</code></a>
+returns is a <code>PyArrayMethodObject</code>, the modern (post-<a href="https://numpy.org/neps/nep-0043-extensible-ufuncs.html">NEP
+43</a>) representation of “one concrete implementation of an operation
+for concrete DTypes”. For <code>float64</code> addition, though, the
+ArrayMethod is a thin wrapper around something much older. When the
+actual loop is needed, <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/legacy_array_method.c#L203"><code>get_wrapped_legacy_ufunc_loop</code></a>
+calls <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/ufunc_type_resolution.c#L1531"><code>PyUFunc_DefaultLegacyInnerLoopSelector</code></a>,
+which does exactly what one would write the first time around! It walks
+the ufunc’s <code>types</code> table, entry by entry, until it finds
+<code>dd-&gt;d</code>, and returns <code>ufunc-&gt;functions[i]</code>,
+a plain C function pointer. The wrapper that adapts it to the modern
+interface is adorable:</p>
+<div id="cb6"><pre><code><span id="cb6-1"><a aria-hidden="true" href="#cb6-1" tabindex="-1"></a><span>static</span> <span>int</span></span>
+<span id="cb6-2"><a aria-hidden="true" href="#cb6-2" tabindex="-1"></a>generic_wrapped_legacy_loop<span>(</span>PyArrayMethod_Context <span>*</span>NPY_UNUSED<span>(</span>context<span>),</span></span>
+<span id="cb6-3"><a aria-hidden="true" href="#cb6-3" tabindex="-1"></a>        <span>char</span> <span>*</span><span>const</span> <span>*</span>data<span>,</span> <span>const</span> npy_intp <span>*</span>dimensions<span>,</span> <span>const</span> npy_intp <span>*</span>strides<span>,</span></span>
+<span id="cb6-4"><a aria-hidden="true" href="#cb6-4" tabindex="-1"></a>        NpyAuxData <span>*</span>auxdata<span>)</span></span>
+<span id="cb6-5"><a aria-hidden="true" href="#cb6-5" tabindex="-1"></a><span>{</span></span>
+<span id="cb6-6"><a aria-hidden="true" href="#cb6-6" tabindex="-1"></a>    legacy_array_method_auxdata <span>*</span>ldata <span>=</span> <span>(</span>legacy_array_method_auxdata <span>*)</span>auxdata<span>;</span></span>
+<span id="cb6-7"><a aria-hidden="true" href="#cb6-7" tabindex="-1"></a></span>
+<span id="cb6-8"><a aria-hidden="true" href="#cb6-8" tabindex="-1"></a>    ldata<span>-&gt;</span>loop<span>((</span><span>char</span> <span>**)</span>data<span>,</span> dimensions<span>,</span> strides<span>,</span> ldata<span>-&gt;</span>user_data<span>);</span></span>
+<span id="cb6-9"><a aria-hidden="true" href="#cb6-9" tabindex="-1"></a>    <span>if</span> <span>(</span>ldata<span>-&gt;</span>pyerr_check <span>&amp;&amp;</span> PyErr_Occurred<span>())</span> <span>{</span></span>
+<span id="cb6-10"><a aria-hidden="true" href="#cb6-10" tabindex="-1"></a>        <span>return</span> <span>-</span><span>1</span><span>;</span></span>
+<span id="cb6-11"><a aria-hidden="true" href="#cb6-11" tabindex="-1"></a>    <span>}</span></span>
+<span id="cb6-12"><a aria-hidden="true" href="#cb6-12" tabindex="-1"></a>    <span>return</span> <span>0</span><span>;</span></span>
+<span id="cb6-13"><a aria-hidden="true" href="#cb6-13" tabindex="-1"></a><span>}</span></span></code></pre></div>
+<p>That <code>ldata-&gt;loop</code> call is the “classic” ufunc
+inner-loop interface, <code>PyUFuncGenericFunction</code>, unchanged for
+decades. It’s an array of data pointers, an element count, a stride per
+operand, and an opaque payload. Every builtin numeric loop in NumPy
+still has this shape. Everything above it exists to line up memory so
+that calling it is correct<sup><a href="#4">4</a></sup>.</p>
+<p>We are deep in the cave now. It’s almost entirely dark.</p>
+<h2 id="to-iterate-or-not-to-iterate">To iterate or not to iterate</h2>
+<p>We have a loop, now we need to feed it. That’s <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/ufunc_object.c#L2192"><code>PyUFunc_GenericFunctionInternal</code></a>,
+and it makes one interesting decision:</p>
+<div id="cb7"><pre><code><span id="cb7-1"><a aria-hidden="true" href="#cb7-1" tabindex="-1"></a><span>/*</span></span>
+<span id="cb7-2"><a aria-hidden="true" href="#cb7-2" tabindex="-1"></a><span> * This checks whether a trivial loop is ok, making copies of</span></span>
+<span id="cb7-3"><a aria-hidden="true" href="#cb7-3" tabindex="-1"></a><span> * scalar and one dimensional operands if that should help.</span></span>
+<span id="cb7-4"><a aria-hidden="true" href="#cb7-4" tabindex="-1"></a><span> */</span></span>
+<span id="cb7-5"><a aria-hidden="true" href="#cb7-5" tabindex="-1"></a><span>int</span> trivial_ok <span>=</span> check_for_trivial_loop<span>(</span>ufuncimpl<span>,</span></span>
+<span id="cb7-6"><a aria-hidden="true" href="#cb7-6" tabindex="-1"></a>        op<span>,</span> operation_descrs<span>,</span> casting<span>,</span> buffersize<span>);</span></span>
+<span id="cb7-7"><a aria-hidden="true" href="#cb7-7" tabindex="-1"></a><span>/* ... */</span></span>
+<span id="cb7-8"><a aria-hidden="true" href="#cb7-8" tabindex="-1"></a><span>if</span> <span>(</span>trivial_ok <span>&amp;&amp;</span> context<span>.</span>method<span>-&gt;</span>nout <span>==</span> <span>1</span><span>)</span> <span>{</span></span>
+<span id="cb7-9"><a aria-hidden="true" href="#cb7-9" tabindex="-1"></a>    <span>/* Try to handle everything without using the (heavy) iterator */</span></span>
+<span id="cb7-10"><a aria-hidden="true" href="#cb7-10" tabindex="-1"></a>    <span>int</span> retval <span>=</span> try_trivial_single_output_loop<span>(&amp;</span>context<span>,</span></span>
+<span id="cb7-11"><a aria-hidden="true" href="#cb7-11" tabindex="-1"></a>            op<span>,</span> order<span>,</span> errormask<span>);</span></span>
+<span id="cb7-12"><a aria-hidden="true" href="#cb7-12" tabindex="-1"></a>    <span>if</span> <span>(</span>retval <span>!=</span> <span>-</span><span>2</span><span>)</span> <span>{</span></span>
+<span id="cb7-13"><a aria-hidden="true" href="#cb7-13" tabindex="-1"></a>        <span>return</span> retval<span>;</span></span>
+<span id="cb7-14"><a aria-hidden="true" href="#cb7-14" tabindex="-1"></a>    <span>}</span></span>
+<span id="cb7-15"><a aria-hidden="true" href="#cb7-15" tabindex="-1"></a><span>}</span></span>
+<span id="cb7-16"><a aria-hidden="true" href="#cb7-16" tabindex="-1"></a></span>
+<span id="cb7-17"><a aria-hidden="true" href="#cb7-17" tabindex="-1"></a><span>return</span> execute_ufunc_loop<span>(&amp;</span>context<span>,</span> <span>0</span><span>,</span></span>
+<span id="cb7-18"><a aria-hidden="true" href="#cb7-18" tabindex="-1"></a>        op<span>,</span> order<span>,</span> buffersize<span>,</span> casting<span>,</span> op_flags<span>,</span> errormask<span>);</span></span></code></pre></div>
+<p>The fast path comes first: if the shapes match, nothing needs
+broadcasting or casting, and every operand is 1-D or contiguous, <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/ufunc_object.c#L869"><code>try_trivial_single_output_loop</code></a>
+calls the inner loop once over the entire data. No iterator is
+constructed at all. For the everyday <code>np.add(a, b)</code> of two
+well-behaved same-shape arrays, this is the path you’re on.</p>
+<p>Everything else goes through <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/ufunc_object.c#L1061"><code>execute_ufunc_loop</code></a>
+and <code>NpyIter</code>, NumPy’s general array iterator. The
+construction flags are a compact summary of everything it takes care of
+for the inner loop:</p>
+<div id="cb8"><pre><code><span id="cb8-1"><a aria-hidden="true" href="#cb8-1" tabindex="-1"></a>npy_uint32 iter_flags <span>=</span> ufunc<span>-&gt;</span>iter_flags <span>|</span></span>
+<span id="cb8-2"><a aria-hidden="true" href="#cb8-2" tabindex="-1"></a>             NPY_ITER_EXTERNAL_LOOP <span>|</span></span>
+<span id="cb8-3"><a aria-hidden="true" href="#cb8-3" tabindex="-1"></a>             NPY_ITER_REFS_OK <span>|</span></span>
+<span id="cb8-4"><a aria-hidden="true" href="#cb8-4" tabindex="-1"></a>             NPY_ITER_ZEROSIZE_OK <span>|</span></span>
+<span id="cb8-5"><a aria-hidden="true" href="#cb8-5" tabindex="-1"></a>             NPY_ITER_BUFFERED <span>|</span></span>
+<span id="cb8-6"><a aria-hidden="true" href="#cb8-6" tabindex="-1"></a>             NPY_ITER_GROWINNER <span>|</span></span>
+<span id="cb8-7"><a aria-hidden="true" href="#cb8-7" tabindex="-1"></a>             NPY_ITER_DELAY_BUFALLOC <span>|</span></span>
+<span id="cb8-8"><a aria-hidden="true" href="#cb8-8" tabindex="-1"></a>             NPY_ITER_COPY_IF_OVERLAP<span>;</span></span></code></pre></div>
+<p>Broadcasting, buffering of misaligned or casting operands, overlap
+detection between inputs and outputs, all of it is the iterator’s
+problem. The actual execution afterwards is almost anticlimactic:</p>
+<div id="cb9"><pre><code><span id="cb9-1"><a aria-hidden="true" href="#cb9-1" tabindex="-1"></a><span>int</span> res<span>;</span></span>
+<span id="cb9-2"><a aria-hidden="true" href="#cb9-2" tabindex="-1"></a><span>do</span> <span>{</span></span>
+<span id="cb9-3"><a aria-hidden="true" href="#cb9-3" tabindex="-1"></a>    res <span>=</span> strided_loop<span>(</span>context<span>,</span> dataptr<span>,</span> countptr<span>,</span> strides<span>,</span> auxdata<span>);</span></span>
+<span id="cb9-4"><a aria-hidden="true" href="#cb9-4" tabindex="-1"></a><span>}</span> <span>while</span> <span>(</span>res <span>==</span> <span>0</span> <span>&amp;&amp;</span> iternext<span>(</span>iter<span>));</span></span></code></pre></div>
+<p>The iterator hands the loop one contiguous-ish chunk at a time and
+advances the pointers in between. Dust off your hands, you’re done.</p>
+<p>But: both paths also share two bits of bookkeeping worth knowing
+about. First, unless the loop needs the Python API (our
+<code>float64</code> loop doesn’t, the <code>object</code> dtype loop
+does), NumPy releases the GIL around the whole thing, using a threshold
+so tiny arrays don’t pay the overhead. Second, floating-point status
+flags are cleared before and checked after the loop, which is where our
+old trusty <code>RuntimeWarning: overflow encountered in add</code>
+comes from. The inner loop itself never checks anything, it just
+computes and sets CPU flags.</p>
+<p>One caveat before we descend further (it bit me in a benchmark for
+this post). Strides alone don’t evict you from the trivial path. The
+trivial loop accepts any 1-D array and simply hands the actual stride to
+the inner loop, so even <code>a[::2]</code> is handled in a single call,
+no iterator in sight. I rebuilt NumPy with its ufunc tracing enabled to
+check, and it takes something the trivial path actually rejects, like a
+non-contiguous N-D view (think <code>base[:, ::2]</code>) or an
+<code>out=</code> that overlaps an input unsafely, to make it print
+“Making iterator”. (The overlap check is finer than you’d guess:
+<code>out=a[1:]</code> reading from <code>a[:-1]</code> spins up the
+iterator, while the other direction, where the write safely trails the
+read, does not). Hold that thought, it’ll matter in a minute.</p>
+<p>We’re in the central room of the cave now. Hushed whispers only, the
+ceiling is very fragile.</p>
+<h2 id="the-loop-itself">The loop itself</h2>
+<p>Before we look at the inner loop, let’s give it something to chew on.
+Same number of elements, same operation, but one version strides over
+every second element:</p>
+<div id="cb10"><pre><code><span id="cb10-1"><a aria-hidden="true" href="#cb10-1" tabindex="-1"></a>n <span>=</span> <span>10_000_000</span></span>
+<span id="cb10-2"><a aria-hidden="true" href="#cb10-2" tabindex="-1"></a>a, b, out <span>=</span> (np.random.rand(<span>2</span> <span>*</span> n) <span>for</span> _ <span>in</span> <span>range</span>(<span>3</span>))</span>
+<span id="cb10-3"><a aria-hidden="true" href="#cb10-3" tabindex="-1"></a>contig_a, contig_b, contig_out <span>=</span> (x[:n].copy() <span>for</span> x <span>in</span> (a, b, out))</span>
+<span id="cb10-4"><a aria-hidden="true" href="#cb10-4" tabindex="-1"></a>strided_a, strided_b, strided_out <span>=</span> (x[::<span>2</span>] <span>for</span> x <span>in</span> (a, b, out))</span>
+<span id="cb10-5"><a aria-hidden="true" href="#cb10-5" tabindex="-1"></a></span>
+<span id="cb10-6"><a aria-hidden="true" href="#cb10-6" tabindex="-1"></a>np.add(contig_a, contig_b, out<span>=</span>contig_out)     <span># 3.30 ms per call</span></span>
+<span id="cb10-7"><a aria-hidden="true" href="#cb10-7" tabindex="-1"></a>np.add(strided_a, strided_b, out<span>=</span>strided_out)  <span># 8.58 ms per call</span></span></code></pre></div>
+<p>A factor of 2.6 on my machine, for the same number of additions. And
+we know from the last section that both calls arrive here the same way.
+The trivial path, one call into the inner loop, real strides and all
+(that’s the thought you were supposed to hold, at ease now). So whatever
+explains the gap has to live inside <code>DOUBLE_add</code> itself. Part
+of it is memory bandwidth—the strided version touches twice the
+memory!—, but let’s see about the rest.</p>
+<p>So what does <code>DOUBLE_add</code> actually look like? Here I have
+to disappoint you first, because there is no file in the repository
+containing a function called <code>DOUBLE_add</code>. The elementwise
+loops live in template files like <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/loops_arithm_fp.dispatch.c.src"><code>loops_arithm_fp.dispatch.c.src</code></a>,
+which use NumPy’s in-house templating language, because every big
+project grows a config format and a templating language:</p>
+<div id="cb11"><pre><code><span id="cb11-1"><a aria-hidden="true" href="#cb11-1" tabindex="-1"></a><span>/**begin repeat</span></span>
+<span id="cb11-2"><a aria-hidden="true" href="#cb11-2" tabindex="-1"></a><span> * Float types</span></span>
+<span id="cb11-3"><a aria-hidden="true" href="#cb11-3" tabindex="-1"></a><span> *  #type = npy_float, npy_double#</span></span>
+<span id="cb11-4"><a aria-hidden="true" href="#cb11-4" tabindex="-1"></a><span> *  #TYPE = FLOAT, DOUBLE#</span></span>
+<span id="cb11-5"><a aria-hidden="true" href="#cb11-5" tabindex="-1"></a><span> *  #sfx  = f32, f64#</span></span>
+<span id="cb11-6"><a aria-hidden="true" href="#cb11-6" tabindex="-1"></a><span> */</span></span>
+<span id="cb11-7"><a aria-hidden="true" href="#cb11-7" tabindex="-1"></a><span>/**begin repeat1</span></span>
+<span id="cb11-8"><a aria-hidden="true" href="#cb11-8" tabindex="-1"></a><span> * Arithmetic</span></span>
+<span id="cb11-9"><a aria-hidden="true" href="#cb11-9" tabindex="-1"></a><span> * # kind = add, subtract, multiply, divide#</span></span>
+<span id="cb11-10"><a aria-hidden="true" href="#cb11-10" tabindex="-1"></a><span> * # intrin = add, sub, mul, div#</span></span>
+<span id="cb11-11"><a aria-hidden="true" href="#cb11-11" tabindex="-1"></a><span> * # OP = +, -, *, /#</span></span>
+<span id="cb11-12"><a aria-hidden="true" href="#cb11-12" tabindex="-1"></a><span> */</span></span>
+<span id="cb11-13"><a aria-hidden="true" href="#cb11-13" tabindex="-1"></a>NPY_NO_EXPORT <span>void</span> NPY_CPU_DISPATCH_CURFX<span>(</span>@TYPE@_@kind@<span>)</span></span>
+<span id="cb11-14"><a aria-hidden="true" href="#cb11-14" tabindex="-1"></a><span>(</span><span>char</span> <span>**</span>args<span>,</span> npy_intp <span>const</span> <span>*</span>dimensions<span>,</span> npy_intp <span>const</span> <span>*</span>steps<span>,</span> <span>void</span> <span>*</span>NPY_UNUSED<span>(</span>func<span>))</span></span>
+<span id="cb11-15"><a aria-hidden="true" href="#cb11-15" tabindex="-1"></a><span>{</span></span>
+<span id="cb11-16"><a aria-hidden="true" href="#cb11-16" tabindex="-1"></a>    npy_intp len <span>=</span> dimensions<span>[</span><span>0</span><span>];</span></span>
+<span id="cb11-17"><a aria-hidden="true" href="#cb11-17" tabindex="-1"></a>    <span>char</span> <span>*</span>src0 <span>=</span> args<span>[</span><span>0</span><span>],</span> <span>*</span>src1 <span>=</span> args<span>[</span><span>1</span><span>],</span> <span>*</span>dst <span>=</span> args<span>[</span><span>2</span><span>];</span></span>
+<span id="cb11-18"><a aria-hidden="true" href="#cb11-18" tabindex="-1"></a>    npy_intp ssrc0 <span>=</span> steps<span>[</span><span>0</span><span>],</span> ssrc1 <span>=</span> steps<span>[</span><span>1</span><span>],</span> sdst <span>=</span> steps<span>[</span><span>2</span><span>];</span></span>
+<span id="cb11-19"><a aria-hidden="true" href="#cb11-19" tabindex="-1"></a>    <span>...</span></span></code></pre></div>
+<p>At build time, a small script (<a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_build_utils/conv_template.py"><code>conv_template.py</code></a>)
+expands each <code>repeat</code> block for every value combination, so
+this one function body becomes <code>FLOAT_add</code>,
+<code>DOUBLE_add</code>, <code>FLOAT_subtract</code>, and so on, eight
+functions from one template. Note the signature: it’s the
+<code>PyUFuncGenericFunction</code> we met two sections ago. We’ve
+arrived. Don’t touch the cave walls, please.</p>
+<p>Inside, the function is a cascade of specializations. There’s a
+branch for the reduction case, then SIMD-accelerated versions for the
+common stride patterns (both inputs contiguous, one input a scalar),
+written against NumPy’s “universal intrinsics”, a portable SIMD
+abstraction where <code>npyv_add_f64</code> maps to whatever the target
+CPU calls adding a vector of doubles. And when no specialization fits,
+it falls through to the loop you would have written (though maybe you’re
+a bit less terse):</p>
+<div id="cb12"><pre><code><span id="cb12-1"><a aria-hidden="true" href="#cb12-1" tabindex="-1"></a>loop_scalar<span>:</span></span>
+<span id="cb12-2"><a aria-hidden="true" href="#cb12-2" tabindex="-1"></a>    <span>for</span> <span>(;</span> len <span>&gt;</span> <span>0</span><span>;</span> <span>--</span>len<span>,</span> src0 <span>+=</span> ssrc0<span>,</span> src1 <span>+=</span> ssrc1<span>,</span> dst <span>+=</span> sdst<span>)</span> <span>{</span></span>
+<span id="cb12-3"><a aria-hidden="true" href="#cb12-3" tabindex="-1"></a>        <span>const</span> @type@ a <span>=</span> <span>*((</span>@type@<span>*)</span>src0<span>);</span></span>
+<span id="cb12-4"><a aria-hidden="true" href="#cb12-4" tabindex="-1"></a>        <span>const</span> @type@ b <span>=</span> <span>*((</span>@type@<span>*)</span>src1<span>);</span></span>
+<span id="cb12-5"><a aria-hidden="true" href="#cb12-5" tabindex="-1"></a>        <span>*((</span>@type@<span>*)</span>dst<span>)</span> <span>=</span> a @OP@ b<span>;</span></span>
+<span id="cb12-6"><a aria-hidden="true" href="#cb12-6" tabindex="-1"></a>    <span>}</span></span></code></pre></div>
+<p>And there’s the rest of our 2.6x performance gap. The SIMD
+specializations all guard on their operands being contiguous or scalar,
+so the strided call from our benchmark fails every check and spends its
+whole life in this scalar branch, while the contiguous call gets the
+vectorized one. What’s left of the gap after the bandwidth tax is the
+price of ending up down here in the sad loop.</p>
+<p>All this way down, and at the bottom of NumPy there’s a
+pointer-bumping <code>for</code> loop adding two doubles. We’re all just
+fumbling in the dark after all.</p>
+<p>But there’s a tiny grotto that hangs off of the main hall. Let’s take
+a look before we go, there couldn’t possibly be any eldritch horrors
+lurking in the deep with us.</p>
+<h2 id="where-the-loops-come-from">Where the loops come from</h2>
+<p>One mystery remains: how do those generated functions end up in the
+<code>ufunc-&gt;functions</code> table that the dispatch walked? The
+answer is, as ever, more code generation. The entire builtin ufunc
+inventory is defined in a Python dictionary in <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/code_generators/generate_umath.py#L355"><code>generate_umath.py</code></a>.
+Here’s the extremely readable entry for <code>add</code>:</p>
+<div id="cb13"><pre><code><span id="cb13-1"><a aria-hidden="true" href="#cb13-1" tabindex="-1"></a><span>&#39;add&#39;</span>:</span>
+<span id="cb13-2"><a aria-hidden="true" href="#cb13-2" tabindex="-1"></a>    Ufunc(<span>2</span>, <span>1</span>, Zero,</span>
+<span id="cb13-3"><a aria-hidden="true" href="#cb13-3" tabindex="-1"></a>          docstrings.get(<span>&#39;numpy._core.umath.add&#39;</span>),</span>
+<span id="cb13-4"><a aria-hidden="true" href="#cb13-4" tabindex="-1"></a>          <span>&#39;PyUFunc_AdditionTypeResolver&#39;</span>,</span>
+<span id="cb13-5"><a aria-hidden="true" href="#cb13-5" tabindex="-1"></a>          TD(<span>&#39;?&#39;</span>, cfunc_alias<span>=</span><span>&#39;logical_or&#39;</span>, dispatch<span>=</span>[(<span>&#39;loops_logical&#39;</span>, <span>&#39;?&#39;</span>)]),</span>
+<span id="cb13-6"><a aria-hidden="true" href="#cb13-6" tabindex="-1"></a>          TD(no_bool_times_obj, dispatch<span>=</span>[</span>
+<span id="cb13-7"><a aria-hidden="true" href="#cb13-7" tabindex="-1"></a>              (<span>&#39;loops_arithm_fp&#39;</span>, <span>&#39;fdFD&#39;</span>),</span>
+<span id="cb13-8"><a aria-hidden="true" href="#cb13-8" tabindex="-1"></a>              (<span>&#39;loops_autovec&#39;</span>, ints),</span>
+<span id="cb13-9"><a aria-hidden="true" href="#cb13-9" tabindex="-1"></a>          ]),</span>
+<span id="cb13-10"><a aria-hidden="true" href="#cb13-10" tabindex="-1"></a>          [TypeDescription(<span>&#39;M&#39;</span>, FullTypeDescr, <span>&#39;Mm&#39;</span>, <span>&#39;M&#39;</span>),</span>
+<span id="cb13-11"><a aria-hidden="true" href="#cb13-11" tabindex="-1"></a>           TypeDescription(<span>&#39;m&#39;</span>, FullTypeDescr, <span>&#39;mm&#39;</span>, <span>&#39;m&#39;</span>),</span>
+<span id="cb13-12"><a aria-hidden="true" href="#cb13-12" tabindex="-1"></a>           TypeDescription(<span>&#39;M&#39;</span>, FullTypeDescr, <span>&#39;mM&#39;</span>, <span>&#39;M&#39;</span>),</span>
+<span id="cb13-13"><a aria-hidden="true" href="#cb13-13" tabindex="-1"></a>          ],</span>
+<span id="cb13-14"><a aria-hidden="true" href="#cb13-14" tabindex="-1"></a>          TD(O, f<span>=</span><span>&#39;PyNumber_Add&#39;</span>),</span>
+<span id="cb13-15"><a aria-hidden="true" href="#cb13-15" tabindex="-1"></a>          indexed<span>=</span>intfltcmplx</span>
+<span id="cb13-16"><a aria-hidden="true" href="#cb13-16" tabindex="-1"></a>          ),</span></code></pre></div>
+<p>I might need a drink.</p>
+<p>This is the 22-entry <code>types</code> list from the beginning of
+the post, in its source form. You can read the whole design of
+<code>add</code> off of it: booleans reuse <code>logical_or</code>, the
+float and complex types (<code>&#39;fdFD&#39;</code>) get their loops from
+<code>loops_arithm_fp</code>, integers get auto-vectorized loops,
+datetimes get hand-written special cases, and <code>object</code> arrays
+simply call Python’s own <code>PyNumber_Add</code>. At build time this
+dictionary is rendered into a C file, <code>__umath_generated.c</code>,
+containing the function table and a call that constructs the
+<code>np.add</code> object when you import NumPy.</p>
+<p>There’s one final (I promise!) trick hiding in that generated file.
+The <code>dispatch=</code> markers above mean the loop is compiled
+<em>multiple times</em>, once per interesting CPU feature set (the file
+suffix <code>.dispatch.c.src</code> tells the build system to do this).
+Which compiled variant actually gets installed into the table is decided
+at import time by a macro that expands to a chain of runtime CPU checks.
+The <a href="https://github.com/numpy/numpy/blob/v2.5.2/meson_cpu/main_config.h.in#L226">documentation
+in the build config</a> shows the shape of the expansion with a made-up
+example (illustrative only, the features are per-loop and there is no
+AVX-512 variant of our <code>add</code>):</p>
+<div id="cb14"><pre><code><span id="cb14-1"><a aria-hidden="true" href="#cb14-1" tabindex="-1"></a>NPY_CPU_DISPATCH_CALL<span>(</span>func <span>=</span> add<span>);</span></span>
+<span id="cb14-2"><a aria-hidden="true" href="#cb14-2" tabindex="-1"></a></span>
+<span id="cb14-3"><a aria-hidden="true" href="#cb14-3" tabindex="-1"></a><span>// Unwrapped version:</span></span>
+<span id="cb14-4"><a aria-hidden="true" href="#cb14-4" tabindex="-1"></a>func <span>=</span> NPY_CPU_HAVE<span>(</span>AVX512_SKX<span>)</span> <span>?</span> add_AVX512_SKX <span>:</span></span>
+<span id="cb14-5"><a aria-hidden="true" href="#cb14-5" tabindex="-1"></a>           <span>(</span>NPY_CPU_HAVE<span>(</span>AVX2<span>)</span> <span>?</span> add_AVX2 <span>:</span></span>
+<span id="cb14-6"><a aria-hidden="true" href="#cb14-6" tabindex="-1"></a>               add<span>);</span>  <span>// baseline</span></span></code></pre></div>
+<p>The real targets for each loop family live in
+<code>meson.build</code>. For <code>loops_arithm_fp</code> they are
+<code>X86_V3, X86_V2, ASIMD, NEON</code>, where <code>X86_V3</code> is
+the <code>x86-64-v3</code> microarchitecture level, which is to say
+AVX2. So the <code>DOUBLE_add</code> pointer sitting in the table has
+already been chosen for your particular CPU when <code>numpy</code> was
+imported. You can even ask NumPy which variant you got:</p>
+<div id="cb15"><pre><code><span id="cb15-1"><a aria-hidden="true" href="#cb15-1" tabindex="-1"></a><span>&gt;&gt;&gt;</span> <span>from</span> numpy.lib <span>import</span> introspect</span>
+<span id="cb15-2"><a aria-hidden="true" href="#cb15-2" tabindex="-1"></a><span>&gt;&gt;&gt;</span> introspect.opt_func_info(func_name<span>=</span><span>&#34;add&#34;</span>, signature<span>=</span><span>&#34;float64&#34;</span>)</span>
+<span id="cb15-3"><a aria-hidden="true" href="#cb15-3" tabindex="-1"></a>{<span>&#39;add&#39;</span>: {<span>&#39;ddd&#39;</span>: {<span>&#39;current&#39;</span>: <span>&#39;baseline(NEON NEON_FP16 NEON_VFPV4 ASIMD)&#39;</span>,</span>
+<span id="cb15-4"><a aria-hidden="true" href="#cb15-4" tabindex="-1"></a>                 <span>&#39;available&#39;</span>: <span>&#39;baseline(NEON NEON_FP16 NEON_VFPV4 ASIMD)&#39;</span>}}}</span></code></pre></div>
+<p>On my ARM-based Mac there’s only one candidate, since NEON is
+unconditionally available. On an x86 machine you’d see the
+<code>X86_V3</code>/<code>X86_V2</code> ladder instead.</p>
+<p>Okay, okay, time to jumar back up. It’s getting spooky in here.</p>
+<h2 id="fin">Fin</h2>
+<p>Let’s walk the route once more, to recap. <code>np.add</code> is an
+object holding a table of 22 loops. A call parses arguments, offers
+everyone a chance to override, resolves the input types to one table
+entry (cached after the first time), picks an iteration strategy (a
+single call if the memory is friendly, <code>NpyIter</code> if it
+isn’t), releases the GIL, and runs a CPU-specific, template-generated C
+function that, in its most general branch, is a plain <code>for</code>
+loop.</p>
+<p>To stay with our metaphor, what impressed me most while exploring
+this is how visible the geology is. The inner loop signature and the
+<code>types</code> table are decades old, and they’re still the core of
+the machine. The <code>ArrayMethod</code> layer, the override protocol,
+and the SIMD dispatch were each deposited on top without displacing
+their history. The file that wraps the old interface is literally called
+<code>legacy_array_method.c</code>, and it’s not deprecated machinery,
+it <em>is</em> the machinery, running an unfathomable number of
+additions every single day. Now that is a legacy.</p>
+<p>But the old strata aren’t frozen in place, and I have evidence,
+because I stumbled into it. I read the source on the main branch first
+and then re-verified everything against the 2.5.2 tag before quoting it,
+and one of my searches failed, because the legacy loop lookup from
+earlier has already been refactored on main. Instead of the selector
+scanning the <code>types</code> table every time a loop is set up, the
+scan now runs once, when the <code>ArrayMethod</code> is registered, and
+the found loop is cached on it. The selector, and its <code>TODO</code>
+comment wishing for “a loop selection acceleration structure, like a
+hash table”, both live on, they just do their work once instead of on
+every call now.</p>
+<p>The motive is the best part: this belongs to a family of changes
+preparing NumPy for free-threaded Python, where lazily initialized
+global state turns from a code smell into a real
+problem<sup><a href="#5">5</a></sup>. Somebody looked at one of the
+most-executed codepaths in numerical Python, decades in, battle-proven
+if anything ever was, and reworked it, because the world had changed.
+The oldest layer is still being tended to, even with all the deposits on
+top. It’s beautiful.</p>
+<p>I hope you enjoyed the descent! If this post made you want to go
+further, building NumPy from source and putting a breakpoint in
+<code>ufunc_generic_fastcall</code> is a surprisingly pleasant
+afternoon. Just keep a beverage at hand. See you around!</p>
+<p><em>Thanks to <a href="https://github.com/ngoldbaum">Nathan
+Goldbaum</a> for reviewing this blog post!</em></p>
+
+<p><span id="1">1.</span> I mean it! Part of the machinery described in
+this post has already been reworked on NumPy’s main branch, as we’ll see
+in the Fin. People still hack on <code>np.add</code> between
+releases.</p>
+<p><span id="2">2.</span> Specifically, it lives in the C extension
+module <code>numpy._core._multiarray_umath</code>. The unwieldy name is,
+apparently, a historical artifact: the array machinery
+(<code>multiarray</code>) and the ufunc machinery (<code>umath</code>)
+were separate C modules for most of NumPy’s life, and were merged by <a href="https://numpy.org/neps/nep-0015-merge-multiarray-umath.html">NEP
+15</a>. If you’ve ever wondered why older NumPy guides reference modules
+that no longer exist, that’s why. The joys of software refactoring.</p>
+<p><span id="3">3.</span> Not to be confused with
+<code>__array_function__</code> from <a href="https://numpy.org/neps/nep-0018-array-function-protocol.html">NEP
+18</a>, which is the analogous protocol for non-ufunc functions like
+<code>np.concatenate</code>. My old notes for this post confidently
+claimed both are checked on the ufunc path; they are not, ufuncs only
+consult <code>__array_ufunc__</code>. The notes came from an LLM
+conversation, which is a lesson in itself.</p>
+<p><span id="4">4.</span> Nothing about the ArrayMethod layer requires
+wrapping old-style loops, it exists just so that new dtypes can register
+loops natively. The string dtype work in NumPy 2.0 is an example of
+modern loops: <a href="https://github.com/numpy/numpy/blob/v2.5.2/numpy/_core/src/umath/stringdtype_ufuncs.cpp#L2732">here
+is where <code>StringDType</code> registers its <code>add</code>
+loop</a>, and it never appears in <code>np.add.types</code>, which only
+reflects the classic table. That mapping I mentioned at the top, the one
+Python never sees, is where such loops live. For the builtin numeric
+types, though, the “legacy” interface remains the real thing.</p>
+<p><span id="5">5.</span> This came to me by way of NumPy core developer
+<a href="https://github.com/ngoldbaum">Nathan Goldbaum</a> reviewing a
+draft of this post (thank you!). One example from the same family: <a href="https://github.com/numpy/numpy/commit/c412bedf8e4b0b14f455d3b2cee8034899543e85">a
+fix</a> moving reduction-initial-value setup from call time to ufunc
+initialization, motivated by multithreaded reductions. The dispatch
+cache itself, a <code>PyArrayIdentityHash</code>, also recently got a
+concurrency-minded overhaul, described in Quansight’s <a href="https://labs.quansight.org/blog/scaling-numpy-on-free-threaded-python">“Scaling
+NumPy on free-threaded Python”</a>.</p>
+
+      
+    </div></div>
+  </body>
+</html>
