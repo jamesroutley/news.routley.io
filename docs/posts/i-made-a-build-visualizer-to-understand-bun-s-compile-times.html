@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://lalitm.com/post/buildprof/">Original</a>
+    <h1>I made a build visualizer to understand Bun&#39;s compile times</h1>
+    
+    <div id="readability-page-1" class="page"><section><p>I built <a href="https://buildprof.lalitm.com">buildprof</a>
+(<a href="https://github.com/lalitMaganti/buildprof">Github</a>), an open-source tracing
+tool that shows where the time goes when you compile software on Linux. Here’s a
+realtime video of it profiling a clean build of ripgrep:</p><p><video src="/assets/buildprof/buildprof-initial-demo-v2.mp4" autoplay="" muted="" loop="" playsinline=""><a href="https://lalitm.com/assets/buildprof/buildprof-initial-demo-v2.mp4">Watch the buildprof demo</a></video></p><p>Sometimes, builds are slow because there is simply a lot of code to compile. But
+more often than not, there are fixable problems: poor parallelism, repeated
+work, dependency downloads or a huge compiler/linker invocation. buildprof makes
+all of this clearly visible, so you can see what’s worth investigating and
+optimizing.</p><p>You run it by putting <code>buildprof --</code> in front of any build command you already
+use:</p><div><pre tabindex="0"><code data-lang="sh"><span><span>buildprof -- make -j16
+</span></span><span><span>buildprof -- cargo build
+</span></span><span><span>buildprof -- ninja -C out/target
+</span></span><span><span>buildprof -- just build
+</span></span><span><span>buildprof -- ./dev/custom-build-script.sh
+</span></span></code></pre></div><p>buildprof records every process your build command launches, including their
+subprocesses (and their subprocesses…), and lays them out on one timeline.
+Time moves from left to right, bar width shows duration, and child processes
+appear beneath whatever launched them.</p><p><img src="https://lalitm.com/assets/buildprof/ripgrep-overview.png" alt="A ripgrep build: Cargo spans the whole build, rustc invocations compile crates in parallel, and the final rustc invocation launches a linker chain."/></p><p>I made buildprof because
+<a href="https://x.com/jarredsumner/status/2090619419059974620">this tweet</a> from Jarred
+Sumner, chief architect of the Bun JavaScript runtime, was living rent free in
+my head:</p><p><img src="https://lalitm.com/assets/buildprof/jarred-bun-rust-compile-times.png" alt="Jarred Sumner’s comparison showing a 30 minute 6 second median Linux build for Bun 1.3.14 and 5 minute 37 second median for Bun 1.4.0."/></p><p>Specifically, the claim that Bun’s new Rust build was &gt;5× faster on Linux than
+its old Zig build really bothered me. In my experience, Zig projects had usually
+compiled <em>much</em> faster than Rust projects of similar complexity. That intuition
+was enough to make me feel there was a mystery to solve.</p><p>This was further compounded by another important, yet easily missed, detail in
+the tweet: the Zig build used Full LTO, while the Rust build used ThinLTO.</p><p>Compilers normally optimize separate compilation units largely in
+isolation.<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup> Link-time optimization (LTO) lets them optimize
+<strong>across</strong> those boundaries. Full LTO brings those units together into one large
+optimization job, while ThinLTO preserves more separation so much of the work
+can run in parallel.</p><p>From past experience, this difference can have an <strong>enormous</strong> effect on build
+time. The tweet mentioned it in passing, but I wondered how much of the headline
+improvement it explained.</p><p>I started by trying to reproduce the numbers.</p><h2 id="the-numbers-reproduced-but-now-what">The numbers reproduced. But now what?<a aria-label="Permalink to The numbers reproduced. But now what?" href="#the-numbers-reproduced-but-now-what">#</a></h2><p>I checked out
+<a href="https://github.com/oven-sh/bun/releases/tag/bun-v1.3.14">Bun 1.3.14</a> and
+<a href="https://github.com/oven-sh/bun/releases/tag/bun-v1.4.0">Bun 1.4.0</a> and wrote
+<a href="https://github.com/LalitMaganti/blog-code/tree/main/buildprof-bun">some scripts</a>
+to replay their Linux x64 CI builds on a 6-core, 12-thread Linux VM. The scripts
+preserved the build steps and their dependencies, running everything on one
+machine.<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup></p><p>My timings were in the same ballpark as Jarred’s:</p><table><thead><tr><th>Linux x64 build</th><th>Zig era</th><th>Rust era</th></tr></thead><tbody><tr><td>Bun’s reported CI median</td><td>30m06s</td><td>5m37s</td></tr><tr><td>My single-machine CI-profile replay</td><td>24m24s</td><td>5m40s</td></tr></tbody></table><p>OK, so the gap showed up on my machine too. But a lot had changed between the
+two measurements besides the language; so what was actually responsible? Was it
+the Zig compiler that was taking all that extra time? Or maybe it was the Full
+LTO link? Or perhaps there was something else in Bun’s build I hadn’t even
+thought to look at?</p><p>This is where my profiling and developer-tools brain kicked in. Usually, when
+I’m trying to understand why something is slow, I want a trace: what happened,
+when it happened and how long it took. It would be really cool to have that for
+these builds, to put them on a timeline and see where their time actually went.</p><p>But a build involves a lot of different tools, each with its own idea of what’s
+happening. What could I record that would let me see across all of them?</p><h2 id="builds-are-process-trees">Builds are process trees<a aria-label="Permalink to Builds are process trees" href="#builds-are-process-trees">#</a></h2><p>When you type <code>cargo build</code> or <code>zig build</code>, it feels like you are running one
+program. The build system works out what needs to be rebuilt, the ordering
+between those pieces and what can run in parallel. But generally, it does not
+perform all that work itself; it launches compilers, code generators, archivers,
+linkers and arbitrary scripts. Which can launch more programs which launch some
+more…</p><p>Different build systems describe that work in different ways. Cargo sees crates,
+Ninja sees build edges and CMake generates instructions for another build
+system. From the operating system’s point of view, however, they (mostly) look
+like processes launching other processes.<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup></p><p>A Rust build, for example, might contain a chain like this:</p><div><pre tabindex="0"><code data-lang="text"><span><span>cargo
+</span></span><span><span>└── rustc
+</span></span><span><span>    └── cc
+</span></span><span><span>        └── collect2
+</span></span><span><span>            └── ld.lld
+</span></span></code></pre></div><p>If we record when each subprocess starts and ends, we can lay them out on a
+timeline. Here’s what that chain looks like in buildprof:</p><p><img src="https://lalitm.com/assets/buildprof/ripgrep-process-chain.png" alt="The final link in a ripgrep build, showing cargo launching rustc, then cc, collect2 and ld.lld beneath it."/></p><p>There are also several nice properties to visualizing a build at this layer:</p><ol><li><strong>It’s build-system agnostic</strong>: Cargo, Ninja, Zig, Make and most other build
+systems do much of their work by spawning processes, so we do not need to
+write a special integration for each one.</li><li><strong>It naturally includes custom scripts</strong>: This includes both scripts above
+the build system (repository setup, dependency fetching) and scripts
+underneath it (code generators, asset processors).</li><li><strong>We can follow the files between build steps</strong>: recording which files each
+process reads and writes lets us see which steps produce the inputs for
+others. This even works across build systems!</li></ol><p>This gave me a starting point for buildprof: record the process tree, then turn
+it into a timeline I could explore. There are plenty more details to get into,
+which I will do later. But once I had that working, I could finally go back to
+my initial question: what was Bun doing for those twenty-four minutes?</p><h2 id="pointing-it-at-bun">Pointing it at Bun<a aria-label="Permalink to Pointing it at Bun" href="#pointing-it-at-bun">#</a></h2><h3 id="why-was-the-zig-ci-build-so-much-slower">Why was the Zig CI build so much slower?<a aria-label="Permalink to Why was the Zig CI build so much slower?" href="#why-was-the-zig-ci-build-so-much-slower">#</a></h3><p>I started by recording the Zig-era CI build with buildprof, using the
+<a href="https://github.com/LalitMaganti/blog-code/blob/main/buildprof-bun/scripts/record-original-zig-ci.sh">same scripts as before</a>:</p><p><img src="https://lalitm.com/assets/buildprof/zig-ci-overview-notes.png" alt="The complete Zig-era CI build"/></p><p><em><a href="https://buildprof.lalitm.com/v0.2.2/#!/?url=https%3A%2F%2Fblogexamples.lalitm.com%2Fbuildprof-bun%2F2026-09-04%2Fbun-zig-original-ci-b5a45845003ecae0.buildprof">Explore in buildprof</a></em></p><p>Right away we can see a huge problem: the <code>ld.lld</code> linker invocation <em>dominates</em>
+the build time. It ran alone at the very end for over sixteen minutes, about
+two-thirds of the entire build. What the heck was it doing for all that time?</p><p>Clicking on the linker shows its command line, which buildprof captures
+automatically:</p><p><img src="https://lalitm.com/assets/buildprof/zig-full-lto-command-notes.png" alt="The selected Zig-era linker and its Full LTO flag"/></p><p>There’s Full LTO, just as Jarred said. Given how long the link was taking, it
+was now my main suspect.</p><p>But the process tree alone couldn’t tell me whether LTO was actually responsible
+for those sixteen minutes. Thankfully, LLD records its own internal timing
+events, and buildprof can include them when you use <code>--compiler-traces</code>.</p><p>I
+<a href="https://github.com/LalitMaganti/blog-code/blob/main/buildprof-bun/scripts/record-zig-full-lto-link-detail.sh">recorded the final link again</a>,
+this time with <code>--compiler-traces</code> enabled:</p><p><img src="https://lalitm.com/assets/buildprof/zig-full-lto-linker-internals-notes.png" alt="LLD’s internal phases"/></p><p><em><a href="https://buildprof.lalitm.com/v0.2.2/#!/?url=https%3A%2F%2Fblogexamples.lalitm.com%2Fbuildprof-bun%2F2026-09-04%2Fbun-zig-full-lto-link-detail-d1e7a0e1dd7750d4.buildprof">Explore in buildprof</a></em></p><p>Now we can see that LTO <em>is</em> where almost all the time goes. The linker is
+running compiler passes over the program, not just combining already-compiled
+files. The <code>OptModule</code> bar alone takes just over ten minutes and includes the
+passes which generate machine code.<sup id="fnref:4"><a href="#fn:4" role="doc-noteref">4</a></sup></p><h4 id="how-did-the-rust-ci-build-differ">How did the Rust CI build differ?<a aria-label="Permalink to How did the Rust CI build differ?" href="#how-did-the-rust-ci-build-differ">#</a></h4><p>With so much of the Zig build spent in LTO, I wanted to see how much time the
+Rust build spent linking. I recorded that build too:</p><p><img src="https://lalitm.com/assets/buildprof/rust-ci-overview-notes.png" alt="The complete Rust-era CI build"/></p><p><em><a href="https://buildprof.lalitm.com/v0.2.2/#!/?url=https%3A%2F%2Fblogexamples.lalitm.com%2Fbuildprof-bun%2F2026-09-04%2Fbun-rust-original-ci-4c9dbcbe6d041d98.buildprof">Explore in buildprof</a></em></p><p>Just 2m24s. And this time, as expected, the linker command contains
+<code>-plugin-opt=thinlto</code>:</p><p><img src="https://lalitm.com/assets/buildprof/rust-ci-thinlto-notes.png" alt="The Rust linker invocation with ThinLTO enabled"/></p><p>Both builds were doing LTO, but with different settings and very different link
+times. What if I kept Bun’s Zig code and changed Full LTO to ThinLTO? How much
+of the gap would that close?</p><h4 id="trying-thinlto">Trying ThinLTO<a aria-label="Permalink to Trying ThinLTO" href="#trying-thinlto">#</a></h4><p>I
+<a href="https://github.com/LalitMaganti/blog-code/blob/main/buildprof-bun/patches/zig-thinlto.patch">switched Zig Bun’s build flags to ThinLTO</a>
+and recorded another clean build, along with a fresh Full-LTO build for
+comparison:</p><p><img src="https://lalitm.com/assets/buildprof/zig-lto-pair-comparison-notes.png" alt="The matched Full-LTO build and partial ThinLTO experiment"/></p><p><em>Explore in buildprof: <a href="https://buildprof.lalitm.com/v0.2.2/#!/?url=https%3A%2F%2Fblogexamples.lalitm.com%2Fbuildprof-bun%2F2026-09-04%2Fbun-zig-ci-dag-full-lto-6111eb9fd9486a35.buildprof">Full LTO</a> · <a href="https://buildprof.lalitm.com/v0.2.2/#!/?url=https%3A%2F%2Fblogexamples.lalitm.com%2Fbuildprof-bun%2F2026-09-04%2Fbun-zig-ci-dag-thin-lto-fdfb05e3d506d810.buildprof">partial ThinLTO</a></em></p><p>The link got 3m40s faster in this pair of recordings, but it was still taking
+nearly thirteen minutes. Why was linking still so expensive?</p><p>Looking back at the compiler trace, a lot of the work was on functions with
+<code>JSC</code> in their names. That’s JavaScriptCore, the engine Bun uses to execute
+JavaScript. The linker was spending time compiling the JavaScript engine
+too.<sup id="fnref:5"><a href="#fn:5" role="doc-noteref">5</a></sup></p><p>Clicking on the linker invocation showed the
+<a href="https://github.com/oven-sh/WebKit/tree/5488984d20e0dbfe4be2c3ba8fb18eb81a5e0e8b">WebKit</a>
+libraries among its inputs, including <code>libJavaScriptCore.a</code>:</p><p><img src="https://lalitm.com/assets/buildprof/zig-thinlto-webkit-inputs-notes.png" alt="The linker command has ThinLTO enabled but still includes WebKit’s libraries, including libJavaScriptCore.a."/></p><p>Following those inputs back through the build, I found that Bun wasn’t compiling
+these libraries itself. It was downloading them from a separate WebKit build.
+And when I checked
+<a href="https://github.com/oven-sh/WebKit/blob/5488984d20e0dbfe4be2c3ba8fb18eb81a5e0e8b/Dockerfile#L4">that build’s flags</a>,
+there it was again: <code>-flto=full</code>. The Rust build used a newer WebKit revision
+whose
+<a href="https://github.com/oven-sh/WebKit/blob/0f966e81b78c84bb/Dockerfile#L4">build recipe selected ThinLTO</a>.</p><p>Even though I had changed how Bun compiled its own code, those downloaded
+libraries still contained Full-LTO inputs and so the linker still had to
+optimize that code and turn it into machine code. To change that, I would have
+to rebuild WebKit too.</p><h4 id="rebuilding-webkit">Rebuilding WebKit<a aria-label="Permalink to Rebuilding WebKit" href="#rebuilding-webkit">#</a></h4><p>I checked out the historical WebKit revision and rebuilt it and its ICU
+dependencies with compatible ThinLTO settings. Then I replaced the downloaded
+libraries with the ones I had built, keeping the ThinLTO changes to Bun.</p><p>Here are the recorded builds:<sup id="fnref:6"><a href="#fn:6" role="doc-noteref">6</a></sup></p><table><thead><tr><th>Zig-era build</th><th>Whole build</th><th>Final linker</th></tr></thead><tbody><tr><td>Original Full LTO</td><td>24m24s</td><td>16m35s</td></tr><tr><td>Bun ThinLTO; original WebKit archives</td><td>20m20s</td><td>12m55s</td></tr><tr><td>Bun ThinLTO; rebuilt ThinLTO WebKit and ICU</td><td>15m11s</td><td>7m22s</td></tr></tbody></table><p>The link now took 7m22s. Still slower than the Rust build, but enough of an
+improvement that I wanted to look beyond the linker.</p><h4 id="what-about-the-rest-of-the-build">What about the rest of the build?<a aria-label="Permalink to What about the rest of the build?" href="#what-about-the-rest-of-the-build">#</a></h4><p>The build still took fifteen minutes, and nearly eight of those passed before
+the linker even started. What was it waiting for? I went back to the original CI
+trace to follow the inputs from Bun’s own code.</p><p>buildprof also records which files each process reads and writes. If a process
+reads a file another wrote, it links the two together under the hood. Turning on
+“Show on timeline” draws those links as arrows. Here, the linker reads
+<code>libbun-profile.a</code> from the C++ compilation and <code>bun-zig.o</code> from Zig. Both
+arrive through copy steps; following those back takes us to the processes which
+produced them:</p><p><img src="https://lalitm.com/assets/buildprof/zig-ci-dependency-combined-notes.png" alt="Following the linker’s dependency arrows through the copy steps to the C++ and Zig producers. The producer panels use the same time scale; C++ finishes first."/></p><p>The C++ side of the compilation finished first. The linker was waiting for
+<code>bun-zig.o</code>, so it could not begin until the Zig branch had finished too.</p><p>It was at this point I went back to the Rust build and compared against how it
+worked, and the main reason the Rust build was faster became obvious: Bun has
+been split into &gt;90 crates, while in Zig it was all trying to compile as a
+single Zig module!</p><p><img src="https://lalitm.com/assets/buildprof/rust-crates-vs-zig-object-notes.png" alt="Cargo fanning out into named rustc processes across Bun’s crates, next to the single zig build-obj process which spawns nothing at all."/></p><p>This meant that the Zig build cannot parallelise the same way Rust can. I also
+suspect, though I did not prove this, that it explains the slow linking: the
+linker has to optimize one huge ThinLTO bitcode module instead of the same work
+spread across crates.</p><p>It was at this point I had to stop: to go any further, I would have to split up
+the Zig module myself, and given that this code is all obsolete anyway, I didn’t
+think it was worth doing that.</p><p>Summarizing:</p><ul><li>The huge outlier in the initial Zig build vs the Rust build was the massive
+linker step which ran alone at the end of the build.</li><li>Changing the LTO settings for just Bun was not sufficient as WebKit, a
+significant part of the build, still used Full LTO.</li><li>Once I had done this, the Zig build dropped from twenty-four minutes to
+fifteen.</li><li>Even after this, linking still took 7 minutes and the whole build 15 minutes.</li><li>The overwhelming difference which remained was structural: Rust spreads
+compilation across &gt;90 crates while the Zig build funnelled everything through
+a single module.</li></ul><p>And fwiw, the traces had also turned up a few things I couldn’t resist poking
+at…</p><h3 id="other-things-hiding-in-the-build">Other things hiding in the build<a aria-label="Permalink to Other things hiding in the build" href="#other-things-hiding-in-the-build">#</a></h3><h4 id="a-build-can-contain-almost-anything">A build can contain almost anything<a aria-label="Permalink to A build can contain almost anything" href="#a-build-can-contain-almost-anything">#</a></h4><p>In the middle of Bun’s CI build, I found commands asking the public internet for
+the machine’s IP address, inspecting running Docker containers and reading the
+latest Git commit message.</p><p><img src="https://lalitm.com/assets/buildprof/zig-ci-diagnostic-probes-notes.png" alt="Small CI setup commands visible in the process tree"/></p><p>These take well under a second altogether. Nothing to optimize but I just wasn’t
+expecting to find them in a build trace.</p><h4 id="a-cold-dependency-fetch">A cold dependency fetch<a aria-label="Permalink to A cold dependency fetch" href="#a-cold-dependency-fetch">#</a></h4><p>The builds above reused downloaded dependencies, so I also
+<a href="https://github.com/LalitMaganti/blog-code/blob/main/buildprof-bun/scripts/capture-bun-cold-prebuilt.sh">recorded a fresh WebKit fetch</a>.
+Downloading and extracting the archive took about twenty seconds. For the first
+twelve, all we see is Node running. Then it launches <code>tar</code> and <code>gzip</code>, and we
+can see the extraction separately.</p><p><img src="https://lalitm.com/assets/buildprof/zig-cold-webkit-download-article.png" alt="A cold WebKit download and extraction"/></p><h4 id="looking-inside-one-c-compilation">Looking inside one C++ compilation<a aria-label="Permalink to Looking inside one C++ compilation" href="#looking-inside-one-c-compilation">#</a></h4><p>Earlier, we followed the linker’s inputs back to Bun’s C++ compilation. We can
+look inside those compiler invocations too. I picked one of the last files to
+finish, <code>ZigGeneratedClasses.cpp</code>, and
+<a href="https://github.com/LalitMaganti/blog-code/blob/main/buildprof-bun/scripts/capture-bun-compiler-detail.sh">replayed its Ninja command</a>
+with <code>--compiler-traces</code>. For Clang, buildprof enables <code>-ftime-trace</code> and adds
+its internal timings to the process timeline.<sup id="fnref:7"><a href="#fn:7" role="doc-noteref">7</a></sup></p><p><img src="https://lalitm.com/assets/buildprof/zig-generated-classes-compiler-phases-article.png" alt="Clang’s frontend and backend phases while compiling ZigGeneratedClasses.cpp"/></p><p>The replay took about twelve seconds, split almost evenly between Clang’s
+frontend and backend. Zooming in further, we see <code>ModuleInlinerWrapperPass</code>, one
+of the phases of Clang, accounts for over four seconds of the backend’s work.</p><h2 id="how-buildprof-works-under-the-hood">How buildprof works under the hood<a aria-label="Permalink to How buildprof works under the hood" href="#how-buildprof-works-under-the-hood">#</a></h2><p>The recording side of buildprof uses <code>ptrace</code>, the same Linux interface used by
+debuggers. I did consider both eBPF and ftrace, but <code>ptrace</code> is just straight up
+perfect for exactly this type of problem; eBPF tracing means <code>CAP_BPF</code> and
+<code>CAP_PERFMON</code> permissions and hooking into potentially unstable
+tracepoints/kernel functions. While with ftrace, I’d have to juggle tracing
+instances to avoid interfering with other users, and getting the filters perfect
+for just the build process and all its descendants is
+cumbersome.<sup id="fnref:8"><a href="#fn:8" role="doc-noteref">8</a></sup></p><p>With <code>ptrace</code>, I can launch the build and follow its children directly. Its
+built-in events tell buildprof when processes fork, exec a new program or exit.
+And for filesystem activity, buildprof uses a seccomp filter to intercept only
+the calls it needs.</p><p>How much buildprof costs is almost entirely down to how many files the build
+opens. For ripgrep, recording barely changed the build time. Redis opened files
+much more often, and recording added about five seconds:<sup id="fnref:9"><a href="#fn:9" role="doc-noteref">9</a></sup></p><table><thead><tr><th>Build</th><th>Untraced</th><th>Processes only</th><th>Processes + files</th></tr></thead><tbody><tr><td>ripgrep / Cargo</td><td>12.27s</td><td>12.30s</td><td>12.43s</td></tr><tr><td>Redis / Make</td><td>26.78s</td><td>27.04s</td><td>31.89s</td></tr></tbody></table><p>If that overhead gets in the way, you can turn off filesystem tracing with
+<code>--no-file-events</code> and keep the process timeline.</p><p>I work on <a href="https://github.com/google/perfetto">Perfetto</a>, so it was a natural
+starting point for the UI; buildprof’s UI is a soft fork of the Perfetto UI. I
+could have just opened the recordings on
+<a href="https://ui.perfetto.dev">ui.perfetto.dev</a>, but I wanted control over how the
+process tree was laid out, which details appeared when you clicked a command,
+and things like those on-demand arrows between file producers and consumers.</p><p>Fortunately, we’ve spent the last several years working on making the Perfetto
+UI extensible through
+<a href="https://perfetto.dev/docs/contributing/ui-plugins">plugins</a>. Most of
+buildprof’s UI is reusing that infrastructure. Perfetto handles the hard stuff
+(parsing traces, querying events, rendering the timeline and managing
+workspaces) and I get to focus on what makes those things useful for builds.</p><p>I plan on going into a lot more detail about the recorder and UI in a separate
+technical post. <a href="https://lalitm.com/page/subscribe/">Subscribe</a> if you’d like to
+be notified when it comes out! :)</p><h2 id="did-i-need-to-build-something-new">Did I need to build something new?<a aria-label="Permalink to Did I need to build something new?" href="#did-i-need-to-build-something-new">#</a></h2><p>These days it’s very easy to make a tool just because you can. But that wasn’t
+the case here; before building buildprof, I looked long and hard for an existing
+tool that could give me this view.</p><p>I started with <a href="https://github.com/nico/ninjatracing">ninjatracing</a>, which I’ve
+used many times. It turns Ninja’s build log into a timeline showing what ran and
+how much ran in parallel.</p><p><a href="https://ui.perfetto.dev/#!/?url=https%3A%2F%2Fraw.githubusercontent.com%2FLalitMaganti%2Fblog-code%2Fmain%2Fbuildprof-bun%2Fresults%2Fbun-zig-ci-ninjatracing.json">Here’s the Ninja log from the Zig-era build</a>.</p><p>But Ninja only sees part of Bun’s build. The scripts which invoke it are missing
+from its log, and commands it runs appear as single blocks even when they launch
+whole trees of subprocesses.</p><p>There were several other tools, each covering different parts of the problem:</p><ul><li><a href="https://doc.rust-lang.org/cargo/reference/timings.html">Cargo timings</a> works
+well for Cargo-managed builds, but cannot break down arbitrary work inside
+<code>build.rs</code> or see wrapper scripts above Cargo. In Bun, Cargo is only part of
+the build:
+<a href="https://lalitm.com/assets/buildprof/bun-rust-ci-cargo-timings.html">the report I captured</a>
+covered 1m51s of a 5m40s CI build.</li><li><a href="https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-ftime-trace">Clang’s <code>-ftime-trace</code></a>
+gave us the detail inside a compiler invocation, but cannot show what the rest
+of the build is doing while
+<a href="https://ziglang.org/learn/overview/#performance-and-safety-choose-two">Zig’s Tracy integration</a>
+goes deeper still and is intended more for understanding the compiler itself.</li><li><a href="https://strace.io/"><code>strace</code></a> and
+<a href="https://github.com/kxxt/tracexec"><code>tracexec</code></a> can follow arbitrary processes
+through <code>fork</code> and <code>exec</code>, but show general process events rather than a
+build-oriented timeline.</li></ul><p><a href="https://danielchasehooper.com/posts/syscall-build-snooping/">What the Fork</a>
+(<a href="https://news.ycombinator.com/item?id=44902127">via</a>) came closest: it follows
+processes across build systems and presents a build-specific view. But as far as
+I could tell, it still appears to be in private beta and there don’t seem to be
+any plans to make it open source.</p><h2 id="whats-next-for-buildprof">What’s next for buildprof<a aria-label="Permalink to What’s next for buildprof" href="#whats-next-for-buildprof">#</a></h2><p>buildprof already does what I wanted it to do, and I plan to keep working on it
+as I use it on my own builds. But there are a few things I’d like to improve.</p><p>Recording overhead is one; the Redis measurements showed there’s room to improve
+filesystem tracing, especially for builds which open lots of files. I’d also
+like to support <a href="https://github.com/LalitMaganti/buildprof/issues/2">macOS</a>
+where I do some of my work and maybe
+<a href="https://github.com/LalitMaganti/buildprof/issues/3">Windows</a> if there’s
+interest.</p><p>There are also more build systems and toolchains I’d like to test, including
+npm, Gradle and Bazel. Computing critical paths would also be a big improvement:
+we followed dependencies by hand in this post, but buildprof could help identify
+the chain of work holding up the build and automatically annotate it.</p><p>I’ll probably tackle these as and when I need them. But if you try buildprof and
+there’s something you wish it could do, I’d be interested to
+<a href="https://github.com/LalitMaganti/buildprof/issues">hear about it</a>. What people
+find useful will help me decide where to spend more time.</p><h2 id="conclusion">Conclusion<a aria-label="Permalink to Conclusion" href="#conclusion">#</a></h2><p>I managed to satiate my curiosity, though I ended up spending rather more time
+on this than I expected. Along the way I built a tool I now want to have around
+whenever a build is taking too long.</p><p>I know I’ll come back to buildprof the next time a slow build annoys me. If you
+have one of those builds too,
+<a href="https://github.com/LalitMaganti/buildprof#quick-start">give it a try</a>. I’d love
+to hear what you find!</p></section></div>
+  </body>
+</html>
