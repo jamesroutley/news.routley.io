@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://nathannaveen.dev/posts/dropping-ebpf-cpu-cost-by-90/">Original</a>
+    <h1>Dropping eBPF CPU Cost by About 90% with Memoization (Not AI Gen)</h1>
+    
+    <div id="readability-page-1" class="page"><div><p>My brother and I spent a lot of time designing our eBPF security agent to be really fast from the ground up, but recently we discovered we could make it much faster using memoization!</p><p>A couple of weeks ago, I profiled the eBPF code and found that the most expensive part of the protection isn’t actually enforcing a policy (allow/deny), but figuring out which policy applies to a given file open.</p><p>Our policies are path based, so our eBPF leverages an LSM hook that triggers on file open. We then reconstruct the path, walk up parent dentries, and check whether the file or any ancestor directory has a matching policy. While this works, it isn’t performant, and we end up repeating much of the work for files we have already seen (for example, database accesses that repeatedly reaccess file paths).</p><p>So, we cache which policy applies for each inode. This dropped our kernel CPU cost by about 90%.</p><p>Additionally, we recently open sourced our repo, so everything in this blog post can be found at <a href="https://github.com/bomfather/agent">https://github.com/bomfather/agent</a>.</p><p>Before the cache, every file open would walk through the entire path. So the flow would look like this:</p><ol><li>Get the file path.</li><li>Walk up the file path with dentries.</li><li>At each level, check whether a policy exists for the path.</li><li>Then combine the results to get a final policy, which we can use to decide whether to allow or deny.</li></ol><p>This works, but if the same file is opened multiple times or multiple files in the same subtree are opened, we have to repeat these steps for each file.</p><p>For example: In Postgres, if we only want Postgres to be able to touch <code>/var/lib/postgres</code>, we can have this example policy:</p><pre tabindex="0"><code>policies:
+  - executable: &#34;filepath = /usr/lib/postgresql/16/bin/postgres&#34;
+    can_access_dirs:
+      - &#34;/var/lib/postgres:read&#34;
+</code></pre><p>Then Postgres retrieves files from <code>var/lib/postgres/data/base/123</code>, <code>var/lib/postgres/data/base/234</code>, and <code>var/lib/postgres/data/base/345</code>. We would have to walk the entire path of dentries for each of these file accesses, which is really inefficient.</p><p>For the rest of this blog post, I’ll call this inefficient path walk “the slow path.”</p><p>Our solution is to use a cache. But we need to make sure the cache isn’t heavy and that it’s safe to reuse cached items.</p><p>We were thinking of using dentries, but dentries are pointers, and pointers can’t be stored inside eBPF maps. If we wanted to use dentries, we could store the dentries’ contents in a struct and use that struct as the map key, but it would be a pretty heavy struct.</p><p>So instead, we decided to use an <code>inode</code> based cache. Our cache key has three fields: the mount namespace ID, the mount ID, and the inode number.</p><p>We can’t cache the <code>inode</code> by itself because inode numbers are unique to a specific mount tree (so if a policy covers multiple mount trees, inodes could overlap). The mount ID helps us identify which mounted tree we observed the file through. The mount namespace ID also prevents us from using cached entries in a different namespace.</p><p>The cache value has two parts: an <code>access_index</code> and a cache state. We store our policies as bitmasks for space efficiency, and the <code>access_index</code> is the bit position for the path policy (<a href="https://nathannaveen.dev/posts/optimizing-ebpf-policies-for-speed-and-space/%29">https://nathannaveen.dev/posts/optimizing-ebpf-policies-for-speed-and-space/)</a>.</p><p>So, our cache, along with the keys and values, looks something like this:</p><pre tabindex="0"><code>#define INODE_POLICY_CACHE_NO_POLICY 0
+#define INODE_POLICY_CACHE_ACCESS_INDEX 1
+#define INODE_POLICY_CACHE_GLOBAL_READ_ONLY 2
+#define INODE_POLICY_CACHE_ACCESS_INDEX_AND_GLOBAL_RO 3 
+
+struct inode_cache_key {
+    u64 mntns_id;
+    u64 mount_id;
+    u64 inode;
+};
+
+struct inode_policy_cache_value {
+    u32 access_index;
+    u8 state;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10000);
+    __type(key, struct inode_cache_key);
+    __type(value, struct inode_policy_cache_value);
+} bomfather_inode_policy_cache SEC(&#34;.maps&#34;);
+</code></pre><p>Now with the cache, our flow looks something like this:</p><ol><li>We need to build the cache key.</li><li>We can look up the key in the LRU hash map.</li><li>If there is a hit, we can enforce the file open based on the cached result.</li><li>If there is a miss, we can do the slow path and store the result in the cache.</li></ol><p><img src="https://nathannaveen.dev/img/BMBlogDiagram.jpeg" alt="On a cache hit, file open builds an inode cache key and goes straight to allow or deny. On a miss, it walks parent dentries, merges the policy, stores the result, then allows or denies."/></p><p>In our benchmark tests, we opened the same file 200,000 times to analyze performance; the cache reduced kernel cycles from 28 billion to 3.03 billion. Without the cache, our <code>tail_call_security_check</code> appeared on the stack 89.2%, <code>is_restricted_filepath</code> 81.9%, and <code>path_check_callback</code> 63.7% of the time.</p><p>In the flamegraphs below, we can see that with the cache, the expense from path traversal pretty much disappears after the first lookup. For example, <code>is_restricted_filepath</code> and <code>path_check_callback</code> each shrink to roughly 0.02%, which is small enough to effectively disappear from the graph.</p><p><strong>Before (without cache):</strong></p><p><img src="https://nathannaveen.dev/img/kernel-flamegraph-no-cache-annotated.svg" alt="Kernel flamegraph without the inode cache, with tail_call_security_check, is_restricted_filepath, and path_check_callback dominating the stack."/></p><p><strong>After (with cache):</strong></p><p><img src="https://nathannaveen.dev/img/kernel-flamegraph-cache-annotated.svg" alt="Kernel flamegraph with the inode cache, where path traversal cost has mostly disappeared after the first lookup."/></p><p>We profiled the kernel CPU with <code>perf</code> using the <code>cycles:k</code> event. This measures kernel side CPU cost during file opens.</p><p>One thing we had to account for with this cache is that multiple paths can share a single inode. Hardlinks are the easiest example; with a hardlink, two different paths can share the same inode. This is a big problem because accurate results matter more than cache performance.</p><p>Our solution is more of a workaround than a real solution. Inodes have a link count (<code>i_nlink</code>) that tells us how many paths point to the inode; we can read it, and if it is greater than 1, we don’t use that cache entry and fall back to the slow path.</p><pre tabindex="0"><code>if (BPF_CORE_READ_INTO(&amp;nlink, inode, i_nlink)) {
+    return false;
+}
+
+if (nlink != 1) {
+    inode_cache_stats_inc(INODE_CACHE_STATS_SKIPS_NLINK);
+    return false;
+}
+</code></pre><p>This is a trade off since we are giving up some cache coverage, but I don’t think it is too big a deal because having an accurate cache is most important.</p><p>In the end, this was a really fun thing to work on since I had to work through multiple different ideas for the cache until I landed on this.</p><p>I am also pretty happy the cache is entirely internal, so a user’s policy doesn’t need to change for the agent to speed up!</p></div></div>
+  </body>
+</html>
