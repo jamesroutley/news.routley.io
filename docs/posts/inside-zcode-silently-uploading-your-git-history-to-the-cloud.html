@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://blog.ferstar.org/en/posts/zcode-silent-workspace-snapshot-upload/">Original</a>
+    <h1>Inside ZCode: Silently uploading your Git history to the cloud</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+          <blockquote><p>I am not a native English speaker; this article was translated by AI.</p>
+</blockquote><p>It started with a routine check while freeing up disk space: <code>~/.zcode</code> was taking up over 700MB. After digging into it intermittently, I confirmed something pretty wild:</p>
+<p><strong>Whenever you are logged in, ZCode (Zhipu’s official AI coding desktop app) silently packages your entire workspace — complete <code>.git</code> history, LFS asset cache, reflogs, and global app configs — encrypts it, and uploads it directly to Aliyun OSS.</strong></p>
+<p>Even more ironic: <strong>the RSA public key used for encryption is delivered on the fly by the server, while the private key lives exclusively in the cloud.</strong> You cannot decrypt that multi-hundred-megabyte ciphertext sitting right on your own disk, and neither can the ZCode client itself.</p>
+<p>Here is the complete record of the investigation, the evidence chain, and a one-liner defense that permanently shuts it down.</p>
+
+<h2>The Starting Point: A 313MB Archive Stuck in Pending
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#the-starting-point-a-313mb-archive-stuck-in-pending">#</a>
+    </span>
+    
+</h2>
+<p><code>~/.zcode</code> is the data root of ZCode. The size breakdown looked roughly like this:</p>
+<ul>
+<li><code>cli/</code>: ~257MB (session databases, execution logs)</li>
+<li><code>computer-use/</code>: ~130MB (bundled app and runtime dependencies)</li>
+<li><code>v2/checkpoints/</code>: ~303MB (the main suspect)</li>
+</ul>
+<p>Inside <code>v2/checkpoints/</code>, I found a 313MB <code>.enc</code> file alongside a state metadata file:</p>
+<div><div><pre tabindex="0"><code data-lang="json"><span><span><span>{</span>
+</span></span><span><span>  <span>&#34;workspacePath&#34;</span><span>:</span> <span>&#34;/Users/ferstar/myprojects/&lt;a commercial project&gt;&#34;</span><span>,</span>
+</span></span><span><span>  <span>&#34;lastCompressedSize&#34;</span><span>:</span> <span>{</span>
+</span></span><span><span>    <span>&#34;encryptedSizeBytes&#34;</span><span>:</span> <span>313070842</span><span>,</span>
+</span></span><span><span>    <span>&#34;workspaceSizeBytes&#34;</span><span>:</span> <span>345549173</span>
+</span></span><span><span>  <span>},</span>
+</span></span><span><span>  <span>&#34;kind&#34;</span><span>:</span> <span>&#34;baseline&#34;</span><span>,</span>
+</span></span><span><span>  <span>&#34;failureCount&#34;</span><span>:</span> <span>564</span>
+</span></span><span><span><span>}</span></span></span></code></pre></div></div>
+<p>The story was straightforward:</p>
+<ol>
+<li>The client scanned my active commercial project, excluded <code>node_modules</code> and a few others, and packaged the remaining 345MB into a 313MB encrypted archive labeled <code>baseline</code> (full snapshot);</li>
+<li>It recorded 564 failed upload attempts, leaving it sitting in the local <code>pending/</code> directory waiting for the next retry.</li>
+</ol>
+<p>The repository totaled 10GB; minus dependencies, the remaining 345MB was almost entirely core intellectual property.</p>
+
+<h2>Where It Goes: From Logs to asar Reverse Engineering
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#where-it-goes-from-logs-to-asar-reverse-engineering">#</a>
+    </span>
+    
+</h2>
+<p>The logs contained no explicit upload URLs, so I cracked open the client’s <code>app.asar</code>. The reconstructed upload flow:</p>
+<pre>sequenceDiagram
+    participant C as ZCode client
+    participant S as zcode.z.ai
+    participant O as Aliyun OSS
+    C-&gt;&gt;S: POST /api/v1/snapshot/upload-credential
+    S--&gt;&gt;C: snapshot_id + RSA public key + max_size + OSS form credentials + callback
+    C-&gt;&gt;C: tar.gz pack → AES-256-CTR encrypt → RSA-OAEP wrap key
+    C-&gt;&gt;O: PostObject direct upload of tar.gz.enc
+    O-&gt;&gt;S: callback confirms receipt
+</pre>
+
+<p>The pipeline runs in two stages:</p>
+<ol>
+<li><strong>Request credentials from coordinator</strong>: The client calls <code>https://zcode.z.ai</code> (<code>VITE_ZCODE_ENDPOINT_ORIGIN</code> in code). The server returns OSS form signatures (<code>policy</code>, <code>x-oss-signature</code>), a dynamic Object Key, size limits, and the RSA public key for this encryption round;</li>
+<li><strong>Direct form POST to OSS</strong>: After archiving and streaming encryption locally, the client <strong>bypasses ZCode’s own application servers and posts <code>tar.gz.enc</code> directly to Aliyun OSS via an HTTP POST form</strong>. OSS then calls back to Zhipu’s backend to register the snapshot.</li>
+</ol>
+<p>Inspecting active sockets confirmed this: the running ZCode process maintained persistent HTTPS connections to <code>zcode.z.ai</code> IP endpoints plus two Aliyun OSS storage nodes.</p>
+
+<h2>The Most Ironic Part: The Key Belongs to the Server
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#the-most-ironic-part-the-key-belongs-to-the-server">#</a>
+    </span>
+    
+</h2>
+<p>The encryption implementation uses textbook envelope encryption:</p>
+<div><div><pre tabindex="0"><code data-lang="javascript"><span><span><span>keyId</span><span>:</span> <span>String</span><span>(</span><span>i</span><span>.</span><span>encryption</span><span>.</span><span>key_version</span><span>),</span>
+</span></span><span><span><span>keyWrapAlgorithm</span><span>:</span> <span>&#34;rsa-oaep-sha256&#34;</span><span>,</span>
+</span></span><span><span><span>publicKeySpkiPem</span><span>:</span> <span>Ylt</span><span>(</span><span>i</span><span>.</span><span>encryption</span><span>.</span><span>public_key</span><span>)</span></span></span></code></pre></div></div>
+<ul>
+<li>Content is encrypted using an ephemeral symmetric key via AES-256-CTR;</li>
+<li>The symmetric key is wrapped using RSA-OAEP-SHA256 with the public key supplied by the server.</li>
+</ul>
+<p>The critical catch is that public key: <strong>it is handed down by the server during credential negotiation, and the corresponding private key never touches your machine.</strong> Unwrapping the envelope key with all local private keys on my system failed, as expected.</p>
+<p>In other words: that 313MB ciphertext on your drive cannot be opened by you or the client. Only Zhipu’s backend holds the key to unlock it.</p>
+<p>If this feature were genuinely built for user-facing rollback or cross-device sync, the keys would live locally (just like Git or Time Machine). <strong>A key that only the server can use serves exactly one purpose: making sure the server can read your code whenever it wants.</strong></p>
+
+<h2>What Gets Packed: Nearly 90% Is .git
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#what-gets-packed-nearly-90-is-git">#</a>
+    </span>
+    
+</h2>
+<p>Even though the ciphertext is locked, the Manifest (file inventory) generated during packaging is saved locally in plaintext. Breaking down a snapshot of 42,411 files:</p>
+<table>
+  <thead>
+      <tr>
+          <th>Content</th>
+          <th>Size</th>
+          <th>Proportion</th>
+          <th>Information Contained</th>
+      </tr>
+  </thead>
+  <tbody>
+      <tr>
+          <td><code>.git/lfs/</code></td>
+          <td>196.1 MB</td>
+          <td>56.8%</td>
+          <td>LFS cache — all binary assets and large media ever downloaded</td>
+      </tr>
+      <tr>
+          <td><code>.git/objects/</code></td>
+          <td>102.2 MB</td>
+          <td>29.6%</td>
+          <td>Complete commit history object store (commits, trees, blobs)</td>
+      </tr>
+      <tr>
+          <td><code>.git/logs/</code></td>
+          <td>0.6 MB</td>
+          <td>0.2%</td>
+          <td>reflogs — local branch history and unpushed operational traces</td>
+      </tr>
+      <tr>
+          <td>Source code &amp; docs</td>
+          <td>~46.2 MB</td>
+          <td>13.4%</td>
+          <td><code>src/</code>, config files, internal documentation</td>
+      </tr>
+  </tbody>
+</table>
+<p>The <code>.git</code> directory alone accounts for <strong>86.6%</strong> of the payload.</p>
+<p>Once uploaded, the cloud receives far more than your current working tree — it gets <strong>the entire lineage of your repository since day one</strong>:</p>
+<ul>
+<li>Historical API keys and sensitive configs that were deleted in later commits;</li>
+<li>Unpushed local branch names (which reveal unreleased feature plans);</li>
+<li>Internal GitLab hostnames and repository paths configured in <code>.git/config</code>.</li>
+</ul>
+<p>Furthermore, an extra manifest named <code>repo_snapshot_extra_manifest</code> hashes your global ZCode configuration files (such as <code>settings.behavior.json</code>) and bundles them across workspaces with every snapshot.</p>
+
+<h2>The Truth About the Switches: UI Toggles Don’t Stop It
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#the-truth-about-the-switches-ui-toggles-dont-stop-it">#</a>
+    </span>
+    
+</h2>
+<p>The natural reaction is checking settings to toggle it off. I cross-referenced the UI options with the codebase:</p>
+<table>
+  <thead>
+      <tr>
+          <th>Switch</th>
+          <th>What you expect it to do</th>
+          <th>What it actually does</th>
+      </tr>
+  </thead>
+  <tbody>
+      <tr>
+          <td><strong>Optimize Experience</strong> (<code>optimizeAgentExperienceEnabled</code>)</td>
+          <td>Disables telemetry / data collection</td>
+          <td><strong>Only controls whether data is authorized for model training</strong>. Snapshot capture and upload still run</td>
+      </tr>
+      <tr>
+          <td><strong>Repo Snapshot Indexing</strong> (<code>repoSnapshotIndexingEnabled</code>)</td>
+          <td>Disables the snapshot feature</td>
+          <td><strong>Only controls whether the server indexes uploaded snapshots</strong>. Local packaging and upload continue uninterrupted</td>
+      </tr>
+  </tbody>
+</table>
+<p>Looking at host assembly code makes it crystal clear: the capture/upload sidecar is <strong>instantiated unconditionally</strong> at startup. There are no gating <code>if</code> checks on user preferences; the only requirement is that <code>tokenProvider</code> can return a valid JWT.</p>
+<p><strong>Bottom line: as long as you are logged in, this background pipeline is permanently active, and no UI setting can turn it off.</strong></p>
+<p>Capture triggers occur at two points: <code>captureBeforePrompt</code> (before every prompt) and on task completion tagged with <code>repo-wiki-update</code>. In session logs, a single active session generated up to 62 capture events.</p>
+
+<h2>What the Privacy Policy Says
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#what-the-privacy-policy-says">#</a>
+    </span>
+    
+</h2>
+<p>Checking ZCode’s privacy policy, it explicitly states that it collects “text, files, and code submitted during conversations” — standard practice for feeding context to LLMs.</p>
+<p>However, across the entire policy, FAQs, and changelogs, there is <strong>not a single mention of silently packaging and uploading entire workspaces and full Git histories</strong>.</p>
+<p>The closest mention is the generic template statement: “optimization program is off by default, and inputs will not be used for training without consent”.</p>
+
+<h2>Defense: Deleting Is Whack-a-Mole; Lock the Directory
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#defense-deleting-is-whack-a-mole-lock-the-directory">#</a>
+    </span>
+    
+</h2>
+<p>When I first found the pending package, I simply deleted it. Within half an hour, it re-captured — a fresh 313MB archive with the retry counter ticking from 564 to 565. When the uploader sees the file is gone, it just packs a new one. Manual deletion is whack-a-mole.</p>
+<p>The cleanest and most effective solution is setting an immutability flag at the filesystem level, denying write access at the kernel level:</p>
+
+<h3>macOS
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#macos">#</a>
+    </span>
+    
+</h3>
+<div><div><pre tabindex="0"><code data-lang="bash"><span><span><span># Wipe and lock the checkpoints directory</span>
+</span></span><span><span>rm -rf ~/.zcode/v2/checkpoints
+</span></span><span><span>mkdir -p ~/.zcode/v2/checkpoints
+</span></span><span><span>chflags uchg ~/.zcode/v2/checkpoints
+</span></span><span><span>
+</span></span><span><span><span># Verify: should output &#34;Operation not permitted&#34;</span>
+</span></span><span><span>touch ~/.zcode/v2/checkpoints/test</span></span></code></pre></div></div>
+
+<h3>Linux
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#linux">#</a>
+    </span>
+    
+</h3>
+<div><div><pre tabindex="0"><code data-lang="bash"><span><span><span># Wipe and lock the checkpoints directory</span>
+</span></span><span><span>rm -rf ~/.zcode/v2/checkpoints
+</span></span><span><span>mkdir -p ~/.zcode/v2/checkpoints
+</span></span><span><span>sudo chattr +i ~/.zcode/v2/checkpoints
+</span></span><span><span>
+</span></span><span><span><span># Verify: should output &#34;Operation not permitted&#34;</span>
+</span></span><span><span>touch ~/.zcode/v2/checkpoints/test</span></span></code></pre></div></div>
+
+<h3>Impact &amp; Rollback
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#impact--rollback">#</a>
+    </span>
+    
+</h3>
+<ul>
+<li><strong>Result</strong>: The capture logic gets blocked by the kernel whenever it attempts disk I/O. Without local artifacts, the upload pipeline has nothing to send;</li>
+<li><strong>Trade-off</strong>: The “checkpoint rollback / timeline” UI feature won’t work (which always required uploading your code in the first place). Normal chat, autocomplete, and tool executions work without issue. Swallowed I/O errors in logs are harmless;</li>
+<li><strong>To restore</strong>: Run <code>chflags nouchg ~/.zcode/v2/checkpoints</code> (macOS) or <code>sudo chattr -i ~/.zcode/v2/checkpoints</code> (Linux).</li>
+</ul>
+
+<h2>Closing Thoughts
+    
+    
+    <span>
+        <a aria-label="Anchor" href="#closing-thoughts">#</a>
+    </span>
+    
+</h2>
+<p>When using AI tools, model inference inevitably needs code context — everyone accepts that going in. But this behavior clearly crosses the line in two ways:</p>
+<p>First, <strong>data scope</strong>. Inference sends task-relevant context; snapshotting exfiltrates the entire repository along with years of Git commit history.</p>
+<p>Second, <strong>architectural posture</strong>. If this were genuinely designed for user-side restore or syncing, the decryption keys would belong to the user. An encryption key held exclusively by the server, zero disclosure in privacy policies, unstoppable background uploads, and stubborn re-packaging upon deletion — this looks less like backup and far more like collection.</p>
+<p>Tools are tools, but users must draw their own boundaries. If the software won’t let you turn it off, use the OS kernel to lock it in a cage.</p>
+
+          
+          
+          
+        </div></div>
+  </body>
+</html>
