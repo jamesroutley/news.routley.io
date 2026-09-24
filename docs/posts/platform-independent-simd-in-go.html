@@ -1,0 +1,1877 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://go.dev/blog/simd-experiment">Original</a>
+    <h1>Platform-independent SIMD in Go</h1>
+    
+    
+<div id="blog"><div id="content">
+  <div id="content">
+
+    <div class="Article" data-slug="/blog/simd-experiment">
+    
+    <h1 class="small"><a href="/blog/">The Go Blog</a></h1>
+    
+
+    <h1>Platform-independent SIMD in Go</h1>
+      
+      <p class="author">
+      David Chase and Junyang Shao<br>
+      24 September 2026
+      </p>
+      
+      <div class='markdown'>
+<p>Go 1.26 and 1.27 include experimental APIs for Single Instruction Multiple Data (SIMD) operations. SIMD is a native feature of many modern CPUs that allows software to perform uniform operations across vectors of data very quickly, such as adding 8 pairs of <code>float64</code> values in a single instruction. It can significantly speed up many computationally-intensive tasks, ranging from cryptography to data processing to AI. In fact, Go&rsquo;s <a href="/blog/greenteagc">Green Tea garbage collector</a> even makes use of SIMD to accelerate scanning memory for live objects.</p>
+<p>Prior to these new experimental APIs, the only way to access this functionality from Go was by writing Go assembly. This was only worth it for truly performance-critical compute kernels, which meant plenty of software that could benefit from SIMD simply left a lot of the CPU unused.</p>
+<p>Go 1.26 introduced a SIMD API for amd64, and Go 1.27 added APIs for arm64 (specifically NEON) and wasm. However, a basic challenge for a SIMD API is the enormous variation between platforms, not simply in what operations they support, but even in how vectors are represented. Some platforms provide fixed-size vectors, typically between 128 bits and 512 bits, while on others the vector size isn&rsquo;t known at build time and must be queried when the program starts. To provide full access to the breadth of these platforms, these APIs live in an architecture-dependent <code>archsimd</code> package.</p>
+<p>But Go 1.27 goes beyond these architecture-dependent APIs and introduces an experimental, fully portable, platform- and size-agnostic SIMD interface,
+loosely based on <a href="https://google.github.io/highway/en/master/index.html" rel="noreferrer" target="_blank">Highway</a> for C++.  The goal is to support write-once near-asm-performance “simd” code on platforms with SIMD support, and to provide a competent emulation on those platforms that do not (yet) have SIMD support.  The <code>simd</code> package currently supports AVX, AVX2, and AVX512 on amd64, NEON on arm64, and wasm’s SIMD instructions.</p>
+<h2 id="motivation-variation-among-simd-architectures">Motivation: variation among SIMD architectures</h2>
+<p>SIMD architectures vary in several dimensions.  Some provide a single fixed vector size (wasm, PowerPC, and s390x, 128 bits).  Some provide several fixed vector sizes (amd64, with 128, 256, and 512; loong64 with 128 and 256).  Riscv64 supports vectors of unspecified size between 128 and 65536 bits, though the length is limited to powers of 2.  Arm64 supports one fixed size (128 bits, NEON), and one variable size (128-2048 bits, powers of two only, SVE).  On a given instance of a particular architecture, determining what sizes that particular instance happens to support requires feature checks: amd64, but is it AVX, AVX2, or AVX512?  Arm64, but is it NEON or SVE?  If SVE, how large? Which variant of SVE: SVE, SVE2, or SVE2.1?</p>
+<p>Different SIMD architectures vary in how they handle vector masking. For vectors, if-then-else across a vector can be implemented with masks; do the operation, but only assign the result (or load, or store) where the mask is “true”.  Some SIMD variants do not provide masks; all operations work across all elements, and “masking” is done with vector bitmasks and vector boolean operations (wasm, AVX, AVX2, NEON).  Some provide special mask registers, with one bit governing operations on one vector element (AVX512 and RVV).  Others (SVE) allocate one bit per vector byte, but the least-significant bit of each element’s mask bits governs masked operations.  AVX2 also supports masked loads and stores, but using a plain vector as the mask, and with the most-significant bit governing the operation.</p>
+<p>A third source of variation is in the operations themselves.  Each architecture provides its own primitives for rearranging vector elements; some require constant inputs, others support variable inputs.  Different SIMD architectures support different crypto-related operations.  Even basic arithmetic can have varying support; for example wasm lacks comparisons for vectors of 64-bit integers.  Even for a given vector length on a particular architecture, instruction support depends on “features” that must be checked.</p>
+<p>Even though Go’s architecture-dependent <code>archsimd</code> package was designed to be as uniform as possible across architectures, many of these quirks remain, and make designing, writing, and testing code for multiplatform SIMD onerous.  We could do more in the <code>archsimd</code> package to make the different architectures appear more similar, but we can only go so far without compromising efficiency.</p>
+<h2 id="overview">Overview</h2>
+<p>The new <code>simd</code> package hides these differences by removing fixed-size vectors from the type system, and by only supporting those operations that are in the intersection of all the different platforms, and fills gaps in the intersection with efficient emulation in terms of other SIMD instructions.  The goal is a set of operations that is</p>
+<ol>
+<li>adequate to support many data processing algorithms that benefit from a vectorized implementation (but are not tied to a particular vector size),</li>
+<li>is as efficient as assembly language when the source code operations match the underlying hardware,</li>
+<li>is otherwise emulated as well as possible,</li>
+<li>and is easy to read and understand (even/especially if an LLM ends up writing the code).</li>
+</ol>
+<p>On platforms that lack SIMD instructions or that lack support in <code>archsimd</code>, all of the operations are emulated,
+so that can written using the <code>simd</code> package will always run.</p>
+<p>To use this experimental package, set <code>GOEXPERIMENT=simd</code>, just like using the experimental <code>archsimd</code> package.</p>
+<p>The <code>simd</code> vector types are just capitalized, plural, primitive types, for example <code>simd.Uint8s</code> or <code>simd.Float32s</code>. Vectors are loaded from and stored to slices, for example:</p>
+<pre><code class="language-go">// innerProduct returns the inner product of x and y.
+func innerProduct(x, y []float32) float32 {
+    var a simd.Float32s
+    var i int
+    for i = 0; i &lt; len(x)-a.Len()+1; i += a.Len() {
+        u := simd.LoadFloat32s(x[i : i+a.Len()])
+        v := simd.LoadFloat32s(y[i : i+a.Len()])
+        a = u.MulAdd(v, a)
+    }
+    if i &lt; len(x) {
+        u, _ := simd.LoadFloat32sPart(x[i:])
+        v, _ := simd.LoadFloat32sPart(y[i:])
+        a = u.MulAdd(v, a)
+    }
+    return sum(a)
+}
+// sum returns scalar sum of elements of x.
+func sum(x simd.Float32s) float32 {
+    s := make([]float32, x.Len())
+    x.Store(s)
+    var r float32
+    for _, e := range s {
+        r += e
+    }
+    return r
+}
+</code></pre>
+<p>This example also shows one of the limitations of the first experimental release of this package; because there’s no common way to sum across all the elements of a vector, it’s not supported by <code>simd</code> in Go 1.27, though <code>ReduceSum</code> will appear in the next release so <code>sum</code> can be replaced with just <code>simd.ReduceSum</code>.</p>
+<p>SIMD comparisons produce mask values, which are specific to the corresponding vector element width, so that comparisons of <code>Int8s</code> produce <code>Mask8s</code>, etc., and mask values can be used to select and filter vectors.</p>
+<h2 id="supported-simd-package-operations-as-of-go-127">Supported <code>simd</code> package operations as of Go 1.27</h2>
+<p>In this table, <code>V</code> and <code>U</code> are vector types, <code>M</code> is a mask type, <code>E</code> is a scalar type, and <code>W</code> is a width.</p>
+<h3 id="package-level-load--broadcast-functions">Package-Level Load / Broadcast Functions</h3>
+<style>
+div.markdown table {
+  table-layout: fixed;
+  width: max-content;
+}
+div.markdown th,
+div.markdown td {
+  padding: 0.075em 0.2em;
+}
+div.markdown th:first-child,
+div.markdown td:first-child {
+  width: 14.5em;
+}
+div.markdown th:nth-child(2),
+div.markdown td:nth-child(2) {
+  width: 3em;
+}
+</style>
+<div style="overflow-x:auto"><table>
+<thead>
+<tr>
+<th style="text-align:left">Function</th>
+<th style="text-align:center"><code>Int8s</code></th>
+<th style="text-align:center"><code>Int16s</code></th>
+<th style="text-align:center"><code>Int32s</code></th>
+<th style="text-align:center"><code>Int64s</code></th>
+<th style="text-align:center"><code>Uint8s</code></th>
+<th style="text-align:center"><code>Uint16s</code></th>
+<th style="text-align:center"><code>Uint32s</code></th>
+<th style="text-align:center"><code>Uint64s</code></th>
+<th style="text-align:center"><code>Float32s</code></th>
+<th style="text-align:center"><code>Float64s</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>LoadV([]E) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>LoadVPart([]E) (V, int)</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>BroadcastV(E) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="storestring-operations">Store/String operations</h3>
+<div style="overflow-x:auto"><table>
+<thead>
+<tr>
+<th style="text-align:left"><code>(x V).Method(...)</code></th>
+<th style="text-align:center"><code>Int8s</code></th>
+<th style="text-align:center"><code>Int16s</code></th>
+<th style="text-align:center"><code>Int32s</code></th>
+<th style="text-align:center"><code>Int64s</code></th>
+<th style="text-align:center"><code>Uint8s</code></th>
+<th style="text-align:center"><code>Uint16s</code></th>
+<th style="text-align:center"><code>Uint32s</code></th>
+<th style="text-align:center"><code>Uint64s</code></th>
+<th style="text-align:center"><code>Float32s</code></th>
+<th style="text-align:center"><code>Float64s</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>Store(s []E)</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>StorePart(s []E) int</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>String() string</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="arithmetic-operations">Arithmetic operations</h3>
+<div style="overflow-x:auto"><table>
+<thead>
+<tr>
+<th style="text-align:left"><code>(x V).Method(...) V</code></th>
+<th style="text-align:center"><code>Int8s</code></th>
+<th style="text-align:center"><code>Int16s</code></th>
+<th style="text-align:center"><code>Int32s</code></th>
+<th style="text-align:center"><code>Int64s</code></th>
+<th style="text-align:center"><code>Uint8s</code></th>
+<th style="text-align:center"><code>Uint16s</code></th>
+<th style="text-align:center"><code>Uint32s</code></th>
+<th style="text-align:center"><code>Uint64s</code></th>
+<th style="text-align:center"><code>Float32s</code></th>
+<th style="text-align:center"><code>Float64s</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>Abs() V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Add(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>AddSaturated(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Average(y V) V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Div(y V) V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>IfElse(mask MaskWs, y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Len() int</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Masked(mask MaskWs) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Max(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Min(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Mul(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>MulAdd(y V, z V) V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Neg() V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Not() V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Or(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Sqrt() V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Sub(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>SubSaturated(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Xor(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="boolean-and-vector-masking-operations">Boolean and vector masking operations</h3>
+<div style="overflow-x:auto"><table>
+<thead>
+<tr>
+<th style="text-align:left"><code>(x V).Method(...) V</code></th>
+<th style="text-align:center"><code>Int8s</code></th>
+<th style="text-align:center"><code>Int16s</code></th>
+<th style="text-align:center"><code>Int32s</code></th>
+<th style="text-align:center"><code>Int64s</code></th>
+<th style="text-align:center"><code>Uint8s</code></th>
+<th style="text-align:center"><code>Uint16s</code></th>
+<th style="text-align:center"><code>Uint32s</code></th>
+<th style="text-align:center"><code>Uint64s</code></th>
+<th style="text-align:center"><code>Float32s</code></th>
+<th style="text-align:center"><code>Float64s</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>And(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>AndNot(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>CarrylessMultiplyEven(y V) V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>CarrylessMultiplyOdd(y V) V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>IfElse(mask MaskWs, y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Masked(mask MaskWs) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Not() V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Or(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Xor(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="comparison-operations">Comparison operations</h3>
+<div style="overflow-x:auto"><table>
+<thead>
+<tr>
+<th style="text-align:left"><code>(x V).Method(...) M</code></th>
+<th style="text-align:center"><code>Int8s</code></th>
+<th style="text-align:center"><code>Int16s</code></th>
+<th style="text-align:center"><code>Int32s</code></th>
+<th style="text-align:center"><code>Int64s</code></th>
+<th style="text-align:center"><code>Uint8s</code></th>
+<th style="text-align:center"><code>Uint16s</code></th>
+<th style="text-align:center"><code>Uint32s</code></th>
+<th style="text-align:center"><code>Uint64s</code></th>
+<th style="text-align:center"><code>Float32s</code></th>
+<th style="text-align:center"><code>Float64s</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>Equal(y V) MaskWs</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Greater(y V) MaskWs</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>GreaterEqual(y V) MaskWs</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Less(y V) MaskWs</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>LessEqual(y V) MaskWs</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>NotEqual(y V) MaskWs</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="conversion-operations">Conversion operations</h3>
+<div style="overflow-x:auto"><table>
+<thead>
+<tr>
+<th style="text-align:left"><code>(x V).Method(...) U</code></th>
+<th style="text-align:center"><code>Int8s</code></th>
+<th style="text-align:center"><code>Int16s</code></th>
+<th style="text-align:center"><code>Int32s</code></th>
+<th style="text-align:center"><code>Int64s</code></th>
+<th style="text-align:center"><code>Uint8s</code></th>
+<th style="text-align:center"><code>Uint16s</code></th>
+<th style="text-align:center"><code>Uint32s</code></th>
+<th style="text-align:center"><code>Uint64s</code></th>
+<th style="text-align:center"><code>Float32s</code></th>
+<th style="text-align:center"><code>Float64s</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>ConvertToFloatW() FloatWs</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ConvertToIntW() IntWs</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ConvertToUintW() UintWs</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ToMask() (to MaskWs)</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="mask-methods">Mask Methods</h3>
+<div style="overflow-x:auto"><table>
+<thead>
+<tr>
+<th style="text-align:left"><code>(m M).Method(...) M)</code></th>
+<th style="text-align:center"><code>Mask8s</code></th>
+<th style="text-align:center"><code>Mask16s</code></th>
+<th style="text-align:center"><code>Mask32s</code></th>
+<th style="text-align:center"><code>Mask64s</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>And(y M) M</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>Or(y V) V</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>String() string</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ToIntWs() (to IntWs)</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="shift-and-rotate-operations">Shift and rotate operations</h3>
+<div style="overflow-x:auto"><table>
+<thead>
+<tr>
+<th style="text-align:left"><code>(x V).Method() V</code></th>
+<th style="text-align:center"><code>Int8s</code></th>
+<th style="text-align:center"><code>Int16s</code></th>
+<th style="text-align:center"><code>Int32s</code></th>
+<th style="text-align:center"><code>Int64s</code></th>
+<th style="text-align:center"><code>Uint8s</code></th>
+<th style="text-align:center"><code>Uint16s</code></th>
+<th style="text-align:center"><code>Uint32s</code></th>
+<th style="text-align:center"><code>Uint64s</code></th>
+<th style="text-align:center"><code>Float32s</code></th>
+<th style="text-align:center"><code>Float64s</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>RotateAllLeft(dist uint64) V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>RotateAllRight(dist uint64) V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ShiftAllLeft(dist uint64) V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ShiftAllRight(dist uint64) V</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="zero-cost-reshaping-operations">Zero-cost reshaping operations</h3>
+<div style="overflow-x:auto"><table>
+<thead>
+<tr>
+<th style="text-align:left"><code>(x V).Method(...) U</code></th>
+<th style="text-align:center"><code>Int8s</code></th>
+<th style="text-align:center"><code>Int16s</code></th>
+<th style="text-align:center"><code>Int32s</code></th>
+<th style="text-align:center"><code>Int64s</code></th>
+<th style="text-align:center"><code>Uint8s</code></th>
+<th style="text-align:center"><code>Uint16s</code></th>
+<th style="text-align:center"><code>Uint32s</code></th>
+<th style="text-align:center"><code>Uint64s</code></th>
+<th style="text-align:center"><code>Float32s</code></th>
+<th style="text-align:center"><code>Float64s</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left"><code>ToBits() UintWs</code></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ReshapeToUint8s() Uint8s</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ReshapeToUint16s() Uint16s</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ReshapeToUint32s() Uint32s</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>ReshapeToUint64s() Uint64s</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>BitsToFloatW() FloatWs</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+<tr>
+<td style="text-align:left"><code>BitsToIntW() IntWs</code></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center">Y</td>
+<td style="text-align:center"></td>
+<td style="text-align:center"></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="transition-tofrom-platform-specific-code">Transition to/from platform-specific code</h2>
+<p>It may happen that the <code>simd</code> package is too limited for all parts of a particular application, or that we have not yet provided an adequate emulation for some necessary feature.  For that case, the <code>simd</code> package supports transition to and from architecture-specific SIMD.  Each vector type in the <code>simd</code> package has a conversion method <code>ToArch()</code> returning an <code>any</code>.  That <code>any</code> can be type-asserted to one of the architecture-specific types for a platform.  To convert back, use one of the <code>simd.&lt;SimdType&gt;FromArch</code> functions.  For portable code this creates an obligation to write architecture-specific code for each of the platforms, including an emulation.</p>
+<p>Here’s a complete example for a method/function that is currently missing, but should be added in Go 1.28. Suppose your algorithm needs <code>Int8s.OnesCount()</code> (which <code>simd</code> in Go 1.27 lacks).  Rather than rewriting the entire algorithm for each platform, it’s possible to just implement the missing operation.</p>
+<p>First, for amd64, which lacks the instruction for AVX and AVX2, but not AVX512:</p>
+<pre><code class="language-go">//go:build goexperiment.simd &amp;&amp; amd64
+package simd_test
+import (
+    &quot;simd&quot;
+    &quot;simd/archsimd&quot;
+)
+var popcnt4x16 = [16]int8{0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4}
+var popcnt4x32 = [32]int8{
+    0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+    0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+}
+// OnesCount returns the number of one bits for each element.
+func OnesCount(v simd.Int8s) simd.Int8s {
+    switch x := v.ToArch().(type) {
+    case archsimd.Int8x16:
+        lut := archsimd.LoadInt8x16Array(&amp;popcnt4x16)
+        mask0f := archsimd.BroadcastInt8x16(0x0f)
+        lo := x.And(mask0f)
+        hi := x.ToBits().ReshapeToUint16s().ShiftAllRight(4).
+                ReshapeToUint8s().BitsToInt8().And(mask0f)
+        return simd.Int8sFromArch(lut.PermuteOrZero(lo).
+                Add(lut.PermuteOrZero(hi)))
+    case archsimd.Int8x32:
+        lut := archsimd.LoadInt8x32Array(&amp;popcnt4x32)
+        mask0f := archsimd.BroadcastInt8x32(0x0f)
+        lo := x.And(mask0f)
+        hi := x.ToBits().ReshapeToUint16s().ShiftAllRight(4).
+                ReshapeToUint8s().BitsToInt8().And(mask0f)
+        return simd.Int8sFromArch(lut.PermuteOrZeroGrouped(lo).
+                Add(lut.PermuteOrZeroGrouped(hi)))
+    case archsimd.Int8x64:
+        return simd.Int8sFromArch(x.OnesCount())
+    default:
+        // GODEBUG=simd=0 emulation
+        return OnesCountEmulated(v)
+    }
+}
+</code></pre>
+<p>The interface conversion and type switch look like they should be inefficient, but the compiler-side implementation of <code>simd</code> specializes code and optimizes away the type switch.</p>
+<p>NEON and Wasm both support <code>Int8s.OnesCount()</code>, so their implementation is much simpler, though it still uses <code>Int8s.ToArch</code> and <code>Int8sFromArch</code>.</p>
+<pre><code class="language-go">//go:build goexperiment.simd &amp;&amp; (wasm || arm64)
+package simd_test
+import (
+    &quot;simd&quot;
+    &quot;simd/archsimd&quot;
+)
+// OnesCount returns the number of one bits for each element.
+func OnesCount(v simd.Int8s) simd.Int8s {
+    // TODO when SVE is added, this won't work
+    switch x := v.ToArch().(type) {
+    case archsimd.Int8x16:
+        return simd.Int8sFromArch(x.OnesCount())
+    default:
+        // GODEBUG=simd=0 emulation
+        return OnesCountEmulated(v)
+    }
+}
+</code></pre>
+<p>Don’t forget that some people don’t have hardware SIMD support:</p>
+<pre><code class="language-go">//go:build goexperiment.simd &amp;&amp; !(amd64 || wasm || arm64)
+
+package simd_test
+import (
+    &quot;simd&quot;
+)
+// OnesCount returns the number of one bits for each element.
+func OnesCount(v simd.Int8s) simd.Int8s {
+    return OnesCountEmulated(v)
+}
+</code></pre>
+<p>And to complete the exercise, a separate emulation function shared as a fallback across all implementations:</p>
+<pre><code class="language-go">//go:build goexperiment.simd
+package simd_test
+import (
+    &quot;simd&quot;
+)
+// OnesCountEmulated returns the number of one bits for each element.
+func OnesCountEmulated(v simd.Int8s) simd.Int8s {
+    a := [2]uint64{}
+    v.ToBits().ReshapeToUint64s().Store(a[:])
+    a0, a1 := a[0], a[1]
+    m1 := uint64(0x5555555555555555)
+    m2 := uint64(0x3333333333333333)
+    m4 := uint64(0x0f0f0f0f0f0f0f0f)
+    a0 = (a0 &amp; m1) + ((a0 &gt;&gt; 1) &amp; m1)
+    a1 = (a1 &amp; m1) + ((a1 &gt;&gt; 1) &amp; m1)
+    a0 = (a0 &amp; m2) + ((a0 &gt;&gt; 2) &amp; m2)
+    a1 = (a1 &amp; m2) + ((a1 &gt;&gt; 2) &amp; m2)
+    a0 = (a0 &amp; m4) + ((a0 &gt;&gt; 4) &amp; m4)
+    a1 = (a1 &amp; m4) + ((a1 &gt;&gt; 4) &amp; m4)
+    a[0], a[1] = a0, a1
+    return simd.LoadUint64s(a[:]).ReshapeToUint8s().BitsToInt8()
+}
+</code></pre>
+<h2 id="api-intersection-and-method-emulation">API intersection and method emulation</h2>
+<p>Whatever operations the <code>simd</code> package offers need to run acceptably well on most architectures.  As a first step, any operation that is supported everywhere, can easily be supported on <code>simd</code>.  This tends to include loads, stores, arithmetic, and comparisons (but not all comparisons!).</p>
+<p>A naive intersection across SIMD methods from different architectures still leaves plenty of holes.
+These are filled by adding emulations to the various architecture-specific <code>archsimd</code> APIs.
+These APIs already contain many trivial emulations to simplify life for Go programmers;
+signed and unsigned integer addition use the same instruction,
+but in the same way that Go supports the <code>+</code> operator for both <code>int</code> and <code>uint</code>,
+the <code>archsimd</code> package provides both <code>Int8x16.Add(Int8x16)</code> and <code>Uint8x16.Add(Uint8x16)</code>,
+even though those compile to the same instruction.
+Modern programming languages also don’t expect programmers to know how to implement floating point negation and absolute value with bit fiddling,
+so <code>archsimd</code> implements that where necessary, or “emulates” if you look at it just so.</p>
+<p>There are many emulations that require just 2 or 3 instructions; for example, some architectures support only a same-value shift distance across vector elements, while others support a different shift distance for each vector element.  To support scalar shifting in <code>simd</code>, we emulate scalar shift with vector shift.  Some architectures lack some unsigned comparisons–these are just signed comparison, plus two XORs with a constant.</p>
+<p>Not all missing instructions are that simple.  The “carryless multiply” instruction is important to cryptography and CRC checksumming, but it isn’t always supported.  Leaving that out of the <code>simd</code> API would prevent its use for some important algorithms.  Therefore, we provide an emulation, and because one important use is in crypto, its run time does not vary depending on its inputs.</p>
+<p>In other cases, rather than implement a primitive instruction like “add pairs” (also called “horizontal addition”), for the <code>simd</code> package in the next release we will provide the higher level operation that add pairs is usually used for, which is sum reduction.  This also helps insulate users from vector-length dependence; even given the hardware instruction for adding pairs, the number of reduction steps depends on the vector length.</p>
+<p>The constraint of supporting all platforms, including ones that we predict will appear in <code>archsimd</code> within the next year or so, forces a somewhat conservative approach to which methods we add to <code>simd</code>.  Riscv64, ppc64, s390x, and loong64 all have their own SIMD extensions.</p>
+<h2 id="godebug-settings">GODEBUG settings</h2>
+<p>On platforms where there is some hardware support, behavior can be modified with GODEBUG, to make it easier to test <code>simd</code>-using code with various hardware configurations.  In Go 1.27, levels of SIMD support are roughly described by vector length:</p>
+<ul>
+<li><code>GODEBUG=simd=0</code> means use emulation for SIMD operations even if the hardware support is available.</li>
+<li><code>GODEBUG=simd=128</code> means use 128-bit vectors and their features.  If the features aren’t available, panic immediately.</li>
+<li><code>GODEBUG=simd=256</code> means use 256-bit vectors and their features, if possible.</li>
+<li><code>GODEBUG=simd=512</code> means use 512-bit vectors and their features, if possible.</li>
+<li><code>GODEBUG=simd=+128</code> means use 128-bit vectors and their features even if some features are not supported. If unsupported instructions are used, the code will panic, but if they are not it may still run.  An example of this is Raspberry Pi, which supports NEON but lacks PMULL (carryless multiply).</li>
+<li><code>GODEBUG=simd=+256</code> means use 256-bit vectors and their features even if some features are not supported. If unsupported instructions are used, the code will panic, but if they are not it may still run.  An example of this is Apple Silicon’s amd64 emulation, which supports AVX2 but not VPCLMULQDQ (again, carryless multiply).</li>
+<li><code>GODEBUG=simd=+512</code> means use 512-bit vectors, even if some features are not supported.</li>
+</ul>
+<h2 id="implementation-details">Implementation details</h2>
+<p>If you are debugging code that uses <code>simd</code>, or even just look at a stack trace, you will notice some weird extra types and methods.  The reason is that <code>simd</code> is both a package, an internal implementation package, and some AST rewriting in the front end of the compiler.</p>
+<p>The AST rewrite creates multiple specialized copies of functions, variables, and types that mention <code>simd</code> types, where <code>simd</code> types are replaced with references to size-specialized types in <code>simd/internal/bridge</code>.  Each of these bridge types is defined as an <code>archsimd</code> type, but with a restricted set of methods.  The specialized functions, variables, and types acquire a suffix of the form <code>@simdNNN</code>, where <code>NNN</code> is either a vector length (128, 256, or 512) or 0, indicating emulation.  Functions that mention <code>simd</code> internally, but not in their signature, are converted to wrappers that switch on the SIMD level detected at program start, and call the appropriate specialized version of that function.  Specialized functions call other specialized functions directly without dispatch overhead (and perhaps with inlining).  This rewrite strategy was chosen as a compromise between code duplication and SIMD performance; the overhead is hoisted as high as necessary to avoid dispatch within SIMD computations, but not higher.  If SIMD dispatch appears “too low” in a computation, a gratuitous mention of a <code>simd</code> type will move it upwards, as in this example:</p>
+<pre><code class="language-go">func BenchmarkVpsumdSIMD(b *testing.B) {
+    // mention &quot;simd&quot; so the benchmark loop calls specialized vpsumd3 directly
+    var _ simd.Uint64s
+    var w, x, y, z uint64 = ... // magic constants omitted.
+    var lo, hi uint64
+    for b.Loop() {
+        // vpsumd3 does simd stuff, but lacks a simd signature,
+        // so that it can be compared with non-SIMD emulations.
+        lo, hi = vpsumd3(w, x, y, z)
+    }
+    sinkLo, sinkHi = lo, hi
+}
+</code></pre>
+<h2 id="whats-coming">What’s coming</h2>
+<p>We plan to publish a blog post describing <code>archsimd</code> in greater detail soon.</p>
+<p>For Go 1.28, we intend to add SVE support to <code>archsimd</code>, and also hope to add that to <code>simd</code>.  More importantly, we hope to add additional SIMD operations to those that the <code>simd</code> package already supports (e.g., OnesCount, mask operations, reduction operations, vector shuffling operations). Go 1.28 will also include a small number of “feature variants” to avoid downgrading all the way to full emulation for platforms that have a hardware vector implementation but just lack one or a few operations, such as Raspberry Pi.</p>
+</div>
+
+    </div>
+
+    
+    <div class="Article prevnext">
+    
+    
+      
+        <p>
+        
+        
+          
+            <b>Previous article: </b><a href="/blog/size-specialized-allocations">Size-Specialized Memory Allocation</a><br>
+          
+        
+        <b><a href="/blog/all">Blog Index</a></b>
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+    </div>
+    
+
+  </div>
+</div>
+
+<script src="/js/play.js"></script>
+
+
+  </body>
+</html>
