@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://www.datahaskell.org/blog/2026/09/18/writing-parquet-files-using-haskell.html">Original</a>
+    <h1>Writing Parquet files using Haskell</h1>
+    
+    <div id="readability-page-1" class="page"><div itemprop="articleBody">
+    <p>We implemented a parquet writer in <a href="https://github.com/DataHaskell/dataframe">DataHaskell/Dataframe</a>. Using it is simple; you need only pass your dataframe into the <code>writeParquet</code> function which writes a parquet file with sane defaults for row group and page sizes. An example:</p>
+
+<div><div><pre><code><span>import</span> <span>qualified</span> <span>DataFrame</span> <span>as</span> <span>D</span>
+<span>import</span> <span>qualified</span> <span>DataFrame.Functions</span> <span>as</span> <span>F</span>
+<span>import</span> <span>DataFrame</span> <span>(</span><span>as</span><span>,</span> <span>(</span><span>|&gt;</span><span>))</span>
+
+<span>main</span> <span>=</span> <span>do</span>
+    <span>sales</span> <span>&lt;-</span> <span>D</span><span>.</span><span>readParquet</span> <span>&#34;sales_data.parquet&#34;</span>
+    
+    <span>sales</span>
+        <span>|&gt;</span> <span>D</span><span>.</span><span>groupBy</span> <span>[</span><span>&#34;product&#34;</span><span>]</span>
+        <span>|&gt;</span> <span>D</span><span>.</span><span>aggregate</span> <span>[</span> <span>F</span><span>.</span><span>sum</span> <span>(</span><span>F</span><span>.</span><span>col</span> <span>@</span><span>Int</span> <span>&#34;amount&#34;</span><span>)</span> <span>`</span><span>as</span><span>`</span> <span>&#34;total&#34;</span>
+                       <span>,</span> <span>F</span><span>.</span><span>count</span> <span>(</span><span>F</span><span>.</span><span>col</span> <span>@</span><span>Int</span> <span>&#34;amount&#34;</span><span>)</span> <span>`</span><span>as</span><span>`</span> <span>&#34;orders&#34;</span>
+                       <span>]</span>
+        <span>|&gt;</span> <span>D</span><span>.</span><span>writeParquet</span> <span>&#34;total_orders.parquet&#34;</span>
+</code></pre></div></div>
+
+<p>If you need more fine-grained control over the parquet file you’ll want to use <code>writeParquetWithOptions</code>. Read on to see what those options are and how they affect the final file.</p>
+
+<h2 id="parquet-for-haskell">Parquet For Haskell</h2>
+
+<p>For Haskell to interoperate with the data ecosystem, it must be able to understand the standard formats in use by that ecosystem. For a long time our options for serializing data<sup id="fnref:0" role="doc-noteref"><a href="#fn:0" rel="footnote">1</a></sup> in Haskell came down to CSV, JSON, or to simply dump it into a ByteString. While CSV and JSON have their place, they come with considerable disadvantages as the volume of data expands. They are slow and cumbersome to read, write, and query, and any custom homegrown formats tend to lack interoperability with standard data science tools.</p>
+
+<p>The parquet format trades simplicity for efficient storage and querying of the data stored therein. We want our data to have high compression ratios and we want to minimize reading data irrelevant to our specific query. The ability to read and write parquet files for long term storage, sending over the network, or for interop with other programs, especially given the universality of Parquet in the data science ecosystem, is a rather useful tool that we should like to have in a Dataframe library.</p>
+
+<h2 id="parqué">Parqué?</h2>
+
+<p>Feel free to skip this section if you already know the structure of a parquet file.</p>
+
+<p>Parquet files are a series of row groups followed by metadata at the end of the file with information that allows readers to locate relevant column chunks and pages. It also contains useful information like statistics and bloom filters so that, for example, a reader / query planner can decide whether or not to read a specific row group.</p>
+
+<p>Each row group is a collection of column chunks, each of which contain the same number of rows. Each column chunk is a series of data pages. Since each column chunk is a series of pages, and each row group is a series of column chunks, the final file simply looks like a series of pages from each column one after the other. We’re able to make sense of it all by using the metadata to identify the offset and size of each row group and column chunk.</p>
+
+<p>A data page is where we actually store all of our data. It consists of first the page metadata, describing its encoding, the number of values, the statistics, among other things. There are actually <a href="https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift#L699">two</a> <a href="https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift#L752">versions</a> of the data page with subtle differences.</p>
+
+<p>Next we have definition levels and repetition levels. They’re an inexpensive encoding of nullability and nested structure. A detailed description of definition levels and repetition levels is out of scope for this article; refer to the <a href="https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/36632.pdf">Dremel paper</a> for that. For our purposes we currently only support writing definition levels up to one to denote nullable values.</p>
+
+<p>Finally we have our actual <a href="https://github.com/apache/parquet-format/blob/master/Encodings.md">encoded</a> and <a href="https://github.com/apache/parquet-format/blob/master/Compression.md">compressed</a> data (depending on which data page we’re using we compress either just the data or both the definition/repetition levels and the data). The encoding is determined per page, while compression is determined per column chunk.</p>
+
+<h2 id="the-implementation">The Implementation</h2>
+
+<p>What follows is a technical discussion of the design of the Parquet writer and the tradeoffs we made.</p>
+<h3 id="write-options">Write Options</h3>
+
+<p>It follows from the description of the parquet format above that a writer needs to expose the appropriate set of fiddle factors to allow the user to tune the writer to produce a parquet file that is efficient for the specific data it is being applied to. That is, we want a parquet writer that compresses well with appropriately sized row groups and pages, so that a reader can effectively apply parallelism, projection pushdown (read only relevant column chunks), predicate pushdown (read only relevant row groups/ prune irrelevant pages), IO pushdown (read only relevant files, assuming the data is chunked into multiple files), etc<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">2</a></sup>.</p>
+
+<div><div><pre><code><span>data</span> <span>ParquetWriteOptions</span> <span>=</span> <span>ParquetWriteOptions</span>
+    <span>{</span> <span>pageSize</span> <span>::</span> <span>!</span><span>Int</span>
+    <span>,</span> <span>rowGroupSize</span> <span>::</span> <span>!</span><span>Int</span>
+    <span>,</span> <span>batchRows</span> <span>::</span> <span>!</span><span>Int</span>
+    <span>,</span> <span>subBatchRows</span> <span>::</span> <span>!</span><span>Int</span>
+    <span>,</span> <span>compressionCodec</span> <span>::</span> <span>!</span><span>CompressionCodec</span>
+    <span>,</span> <span>strategy</span> <span>::</span> <span>!</span><span>WriterStrategy</span>
+    <span>,</span> <span>maxRowsPerFile</span> <span>::</span> <span>!</span><span>(</span><span>Maybe</span> <span>Int</span><span>)</span>
+    <span>}</span>
+
+</code></pre></div></div>
+
+<p>Both <code>pageSize</code> and <code>rowGroupSize</code> are the target size in bytes of each page and each row group. But each column chunk in a row group must contain the same number of rows, and depending on the specific data being encoded, the encoding, and the compression algorithm we’re using, each column chunk will hold a different number of rows before reaching the target size. The same holds true for each page. So how do we ensure our page size target, our row group size target, and have the same number of rows in each column chunk?</p>
+
+<p>We must consider both the target <code>pageSize</code> and <code>rowGroupSize</code> to be best effort; they could be somewhat above or below the target. We run our columns through batches of size <code>batchRows</code> and check the state of the row group after each batch. So each row group contains an integer multiple of <code>batchRows</code> rows; pages also will contain an integer multiple of <code>subBatchRows</code> rows (with the exception of the final page and the final column chunk). Sub-batching at the page level allows us to reduce the amount of IORef book-keeping we have to do after each write, granting us significant speedups.<sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">3</a></sup></p>
+
+<h3 id="memory">Memory</h3>
+
+<p>Due to the constraints described in the previous section, it’s difficult to know how big to make our buffers ahead of time. This is even more true of column chunk buffers – each column will fit a very different number of rows / pages in the same amount of data, and we may expect that some column chunk buffers will be significantly bigger than others and dominate the space per row group.</p>
+
+<p>So we must be able to grow our memory. One of the more convenient ways of handling raw memory without resorting to the FFI is <code>MutableByteArray</code>.</p>
+
+<div><div><pre><code><span>data</span> <span>MemoryBuffer</span> <span>=</span> <span>MemoryBuffer</span>
+    <span>{</span> <span>arrayRef</span> <span>::</span> <span>!</span><span>(</span><span>IORef</span> <span>(</span><span>MutableByteArray</span> <span>RealWorld</span><span>))</span>
+    <span>,</span> <span>positionRef</span> <span>::</span> <span>!</span><span>(</span><span>IORef</span> <span>Int</span><span>)</span>
+    <span>}</span>
+</code></pre></div></div>
+
+<p>For our implementation we use pinned <code>ByteArray</code>s, as we would like to convert it into a <code>Ptr Word8</code> when it’s time to flush into either another buffer, for example when flushing a page buffer into a column chunk buffer, or into a file, as we would when flushing a row group to file.</p>
+
+<p>Using pinned <code>ByteArray</code>s results in a slight complication when trying to grow the memory buffer. We must not use the <code>grow</code> function provided by <code>Data.Primitive</code>, instead we must allocate a new pinned ByteArray and allow the old one to be GCed. One might be worried about heap fragmentation because a single pinned object in a 4KB GHC block can keep the whole block alive but  we expect that our buffers will tend to be much larger than 4KB. Furthermore grows ought to be rare especially after the first few Pages and the first RowGroup.</p>
+
+<div><div><pre><code><span>ensureCapacity</span> <span>::</span> <span>MemoryBuffer</span> <span>-&gt;</span> <span>Int</span> <span>-&gt;</span> <span>IO</span> <span>(</span><span>MutableByteArray</span> <span>RealWorld</span><span>)</span>
+<span>ensureCapacity</span> <span>buffer</span> <span>needed</span> <span>=</span> <span>do</span>
+    <span>array</span> <span>&lt;-</span> <span>readIORef</span> <span>buffer</span><span>.</span><span>arrayRef</span>
+    <span>maxSize</span> <span>&lt;-</span> <span>getSizeofMutableByteArray</span> <span>array</span>
+    <span>if</span> <span>needed</span> <span>&lt;=</span> <span>maxSize</span>
+        <span>then</span> <span>pure</span> <span>array</span>
+        <span>else</span> <span>do</span>
+            <span>position</span> <span>&lt;-</span> <span>readIORef</span> <span>buffer</span><span>.</span><span>positionRef</span>
+            <span>grown</span> <span>&lt;-</span> <span>newPinnedByteArray</span> <span>(</span><span>needed</span> <span>+</span> <span>(</span><span>needed</span> <span>`</span><span>div</span><span>`</span> <span>2</span><span>))</span>
+            <span>copyMutableByteArray</span> <span>grown</span> <span>0</span> <span>array</span> <span>0</span> <span>position</span>
+            <span>writeIORef</span> <span>buffer</span><span>.</span><span>arrayRef</span> <span>grown</span>
+            <span>pure</span> <span>grown</span>
+<span>{-# INLINE ensureCapacity #-}</span>
+
+</code></pre></div></div>
+
+<p>We also write helper functions for writing <code>Word8</code>s, <code>Word32</code>s, <code>Word64</code>s, <code>Int32</code>s, <code>Int64</code>s, <code>Integer</code>s, <code>Float</code>s, <code>Double</code>s, and <code>ByteString</code>s to a buffer. Finally, we have a <code>flushBufferToBuffer :: MemoryBuffer -&gt; MemoryBuffer -&gt; IO ()</code> and a <code>flushBufferToFile :: WritableBinaryHandle -&gt; MemoryBuffer -&gt; IO ()</code><sup id="fnref:3" role="doc-noteref"><a href="#fn:3" rel="footnote">4</a></sup>.</p>
+
+<h3 id="the-core-loop">The Core Loop</h3>
+
+<p>Here we provide a high level sketch of the main loop of the Parquet Writer. There is considerable complexity we omit in favor of explaining the design as simply as possible. For the full implementation refer to <a href="https://github.com/DataHaskell/dataframe/blob/main/dataframe-parquet/src/DataFrame/IO/Parquet/Writer.hs">Writer.hs</a>.</p>
+
+<p>At a high level we can think of the Parquet writer as an effectful fold over the dataframe<sup id="fnref:4" role="doc-noteref"><a href="#fn:4" rel="footnote">5</a></sup> (Also known as <code>reduce</code> in some languages or, more rare, <code>accumulate</code>). A fold can be thought of as a loop, that is, we iterate over the rows in our dataframe. Folds are usually pure, but ‘effectful’ means that each iteration produces some kind of side-effect, in our case writing to and from memory and to disk. Finally the fold produces a final singular result from the iteration, and that is the file metadata that we must append to the end of the file.</p>
+
+<p>First we must define the state threaded through the writer to accomplish this:</p>
+
+<div><div><pre><code><span>data</span> <span>ParquetWriterState</span> <span>=</span> <span>ParquetWriterState</span>
+    <span>{</span> <span>outputFileHandle</span> <span>::</span> <span>!</span><span>WritableBinaryHandle</span> <span>-- newtype over a handle specifically for us to write to</span>
+    <span>,</span> <span>columnChunks</span> <span>::</span> <span>!</span><span>(</span><span>VB</span><span>.</span><span>Vector</span> <span>ColumnChunkState</span><span>)</span> <span>-- effectively our row group buffer</span>
+    <span>,</span> <span>currentFileOffsetRef</span> <span>::</span> <span>!</span><span>(</span><span>IORef</span> <span>Int64</span><span>)</span>
+    <span>,</span> <span>scratchBuffer</span> <span>::</span> <span>!</span><span>MemoryBuffer</span>
+    <span>,</span> <span>rowGroupMetadataRef</span> <span>::</span> <span>!</span><span>(</span><span>IORef</span> <span>[</span><span>RowGroup</span><span>])</span>
+    <span>,</span> <span>rowNumberRef</span> <span>::</span> <span>!</span><span>(</span><span>IORef</span> <span>Int</span><span>)</span>
+    <span>}</span>
+
+<span>data</span> <span>ColumnChunkState</span> <span>=</span> <span>ColumnChunkState</span>
+    <span>{</span> <span>columnName</span> <span>::</span> <span>!</span><span>T</span><span>.</span><span>Text</span>
+    <span>,</span> <span>nullable</span> <span>::</span> <span>!</span><span>Bool</span>
+    <span>,</span> <span>schema</span> <span>::</span> <span>!</span><span>SchemaElement</span>
+    <span>,</span> <span>encoder</span> <span>::</span> <span>!</span><span>Encoder</span>
+    <span>,</span> <span>buffer</span> <span>::</span> <span>!</span><span>MemoryBuffer</span>
+    <span>,</span> <span>uncompressedBufferSize</span> <span>::</span> <span>!</span><span>(</span><span>IORef</span> <span>Int64</span><span>)</span>
+    <span>,</span> <span>pageState</span> <span>::</span> <span>!</span><span>PageState</span>
+    <span>}</span>
+
+<span>data</span> <span>PageState</span> <span>=</span> <span>PageState</span>
+    <span>{</span> <span>pageBuffer</span> <span>::</span> <span>!</span><span>MemoryBuffer</span> <span>-- Each column has its own pageBuffer</span>
+    <span>,</span> <span>definitionLevels</span> <span>::</span> <span>!</span><span>DefLevels</span>
+    <span>,</span> <span>currentRowCount</span> <span>::</span> <span>!</span><span>(</span><span>IORef</span> <span>Int</span><span>)</span>
+    <span>}</span>
+    
+<span>-- In Encoder.hs</span>
+
+<span>data</span> <span>Encoder</span> <span>=</span> <span>Encoder</span>
+    <span>{</span> <span>encType</span> <span>::</span> <span>!</span><span>ThriftType</span>
+    <span>,</span> <span>convertedType</span> <span>::</span> <span>!</span><span>(</span><span>Maybe</span> <span>ConvertedType</span><span>)</span>
+    <span>,</span> <span>logicalType</span> <span>::</span> <span>!</span><span>(</span><span>Maybe</span> <span>LogicalType</span><span>)</span>
+    <span>,</span> <span>encodeValue</span> <span>::</span> <span>!</span><span>(</span><span>MemoryBuffer</span> <span>-&gt;</span> <span>Int</span> <span>-&gt;</span> <span>Int</span> <span>-&gt;</span> <span>IO</span> <span>(</span><span>Int</span><span>,</span> <span>Bool</span><span>))</span>
+    <span>,</span> <span>finishValues</span> <span>::</span> <span>!</span><span>(</span><span>MemoryBuffer</span> <span>-&gt;</span> <span>Int</span> <span>-&gt;</span> <span>IO</span> <span>Int</span><span>)</span> <span>-- in case cleanup or post processing is required</span>
+    <span>}</span>
+</code></pre></div></div>
+<p>The buffers for each ColumnChunk are flushed into the final file while the individual page buffers are flushed into ColumnChunk buffers (or more accurately are used to assemble the data that is eventually flushed into the ColumnChunk buffer as we need to flush the data along with the page metadata and definition levels).</p>
+
+<p>If we dispense with the ceremony of setting up the initial <code>writerState</code> and other variables, our core loop is quite simple</p>
+
+<div><div><pre><code><span>loop</span> <span>::</span> <span>Int</span> <span>-&gt;</span> <span>IO</span> <span>()</span>
+<span>loop</span> <span>rowNum</span>
+    <span>|</span> <span>rowNum</span> <span>&gt;=</span> <span>endRow</span> <span>=</span> <span>pure</span> <span>()</span>
+    <span>|</span> <span>otherwise</span> <span>=</span> <span>do</span>
+        <span>let</span> <span>batchEnd</span> <span>=</span> <span>rowNum</span> <span>+</span> <span>min</span> <span>interval</span> <span>(</span><span>endRow</span> <span>-</span> <span>rowNum</span><span>)</span>
+        <span>writeBatch</span> <span>rowNum</span> <span>batchEnd</span>
+        <span>size</span> <span>&lt;-</span> <span>bufferedSize</span> <span>writerState</span><span>.</span><span>columnChunks</span>
+        <span>when</span>
+            <span>(</span><span>size</span> <span>&gt;=</span> <span>options</span><span>.</span><span>rowGroupSize</span><span>)</span>
+            <span>(</span><span>flushRowGroup</span> <span>options</span> <span>writerState</span><span>)</span> <span>-- Write to file</span>
+        <span>loop</span> <span>batchEnd</span>
+</code></pre></div></div>
+
+<p>then <code>writeBatch</code>:</p>
+
+<div><div><pre><code><span>writeBatch</span> <span>::</span> <span>Int</span> <span>-&gt;</span> <span>Int</span> <span>-&gt;</span> <span>IO</span> <span>()</span>
+<span>writeBatch</span> <span>rowNum</span> <span>batchEnd</span>
+    <span>|</span> <span>rowNum</span> <span>&gt;=</span> <span>batchEnd</span> <span>=</span> <span>pure</span> <span>()</span>
+    <span>|</span> <span>otherwise</span> <span>=</span> <span>do</span>
+        <span>let</span> <span>count</span> <span>=</span> <span>min</span> <span>options</span><span>.</span><span>subBatchRows</span> <span>(</span><span>batchEnd</span> <span>-</span> <span>rowNum</span><span>)</span>
+        <span>forM_</span> <span>writerState</span><span>.</span><span>columnChunks</span> <span>(</span><span>writeRows</span> <span>options</span> <span>scratchBuffer</span> <span>rowNum</span> <span>count</span><span>)</span>
+        <span>modifyIORef</span> <span>writerState</span><span>.</span><span>rowNumberRef</span> <span>(</span><span>+</span> <span>count</span><span>)</span>
+        <span>writeBatch</span> <span>(</span><span>rowNum</span> <span>+</span> <span>count</span><span>)</span> <span>batchEnd</span>
+        
+</code></pre></div></div>
+
+<p>The <code>scratchBuffer</code> is a re-usable buffer that we’ll later use to assemble the page as the individual page buffers hold only the values, but our definition levels live in a different buffer and the page metadata doesn’t exist yet. It is the <code>scratchBuffer</code> that is eventually flushed to a ColumnChunk buffer.</p>
+
+<p>The internal workings of <code>writeRows</code> are somewhat similar to the <code>loop</code> we saw earlier.</p>
+
+<div><div><pre><code><span>rowWriterLoop</span> <span>!</span><span>options</span> <span>!</span><span>columnChunkState</span> <span>!</span><span>end</span> <span>!</span><span>size</span> <span>!</span><span>position</span> <span>!</span><span>row</span>
+    <span>|</span> <span>row</span> <span>&gt;=</span> <span>end</span> <span>=</span> <span>writeIORef</span> <span>columnChunkState</span><span>.</span><span>pageState</span><span>.</span><span>pageBuffer</span><span>.</span><span>positionRef</span> <span>position</span>
+    <span>|</span> <span>position</span> <span>+</span> <span>options</span><span>.</span><span>pageSize</span> <span>&gt;</span> <span>size</span> <span>=</span> <span>do</span>
+        <span>let</span> <span>page</span> <span>=</span> <span>columnChunkState</span><span>.</span><span>pageState</span>
+        <span>writeIORef</span> <span>page</span><span>.</span><span>pageBuffer</span><span>.</span><span>positionRef</span> <span>position</span>
+        <span>arr&#39;</span> <span>&lt;-</span> <span>ensureCapacity</span>
+                    <span>page</span><span>.</span><span>pageBuffer</span>
+                    <span>(</span><span>position</span> <span>+</span> <span>max</span>
+                                    <span>options</span><span>.</span><span>pageSize</span>
+                                    <span>((</span><span>end</span> <span>-</span> <span>row</span><span>)</span> <span>*</span> <span>64</span><span>)</span>
+                    <span>)</span>
+        <span>size&#39;</span> <span>&lt;-</span> <span>getSizeOfMutableByteArray</span> <span>arr&#39;</span>
+        <span>rowWriterLoop</span> <span>options</span> <span>columnChunkState</span> <span>end</span> <span>size&#39;</span> <span>position</span> <span>row</span>
+    <span>|</span> <span>otherwise</span> <span>=</span> <span>do</span>
+        <span>let</span> <span>page</span> <span>=</span> <span>columnChunkState</span><span>.</span><span>pageState</span>
+            <span>encode</span> <span>=</span> <span>columnChunkState</span><span>.</span><span>encoder</span><span>.</span><span>encodeValue</span>
+        <span>(</span><span>position&#39;</span><span>,</span> <span>notNull</span><span>)</span> <span>&lt;-</span> <span>encode</span> <span>page</span><span>.</span><span>pageBuffer</span> <span>position</span> <span>row</span>
+        <span>when</span> <span>columnChunkState</span><span>.</span><span>nullable</span> <span>$</span>
+            <span>pushDef</span> <span>page</span><span>.</span><span>definitionLevels</span> <span>(</span><span>if</span> <span>notNull</span> <span>then</span> <span>1</span> <span>else</span> <span>0</span><span>)</span>
+        <span>rowWriterLoop</span> <span>options</span> <span>columnChunkState</span> <span>end</span> <span>size</span> <span>position&#39;</span> <span>(</span><span>row</span> <span>+</span> <span>1</span><span>)</span>
+</code></pre></div></div>
+
+<p>Note that we only handle definition levels up to 1 for our writer and we don’t support definition levels greater than 1 and repetition levels greater than 0 as, currently, we specifically only want to support dataframes which have flat schemas.</p>
+
+<p>When a page is filled up we can flush it to the parent <code>columnChunkState.buffer</code>.</p>
+
+<div><div><pre><code><span>pageResidency</span> <span>&lt;-</span> <span>readIORef</span> <span>page</span><span>.</span><span>pageBuffer</span><span>.</span><span>positionRef</span>
+<span>defResidency</span> <span>&lt;-</span> <span>readIORef</span> <span>page</span><span>.</span><span>definitionLevels</span><span>.</span><span>dlBuf</span><span>.</span><span>positionRef</span>
+<span>when</span>
+    <span>(</span><span>pageResidency</span> <span>+</span> <span>defResidency</span> <span>&gt;=</span> <span>options</span><span>.</span><span>pageSize</span><span>)</span>
+    <span>(</span><span>flushPage</span> <span>options</span> <span>scratchBuffer</span> <span>columnChunkState</span><span>)</span> 
+</code></pre></div></div>
+
+<h2 id="future-work">Future Work</h2>
+
+<p>Currently the Parquet Writer supports only</p>
+<ul>
+  <li>Snappy and Uncompressed compression</li>
+  <li>Plain Encoding</li>
+  <li>Only definition levels up to 1</li>
+</ul>
+
+<p>The next step would first be to support the full gamut of compressions and encodings offered by Parquet. The current Writer is also completely single threaded, so we may explore adding concurrency and/or parallelism in limited ways – so long as there’s a performance justification for doing so.</p>
+
+<p>Currently optional metadata fields like statistics for columns/pages and bloom filters are not recorded. As we mentioned earlier, these are very useful for parquet readers to optimize querying the data in a parquet file.</p>
+
+<p>Finally, currently all of our buffers live in memory while they wait to be flushed to disk. In memory constrained systems writing Parquet files that require particularly large pages/rowgroups, we may end up running out of memory (an entire row group must be held in memory in its entirety). So we plan to implement a two pass strategy where we use much smaller in memory buffers and write to on-disk temporary files instead of keeping data in memory.</p>
+
+<hr/>
+
+
+
+  </div></div>
+  </body>
+</html>
