@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://frn.sh/go-gc/">Original</a>
+    <h1>A 40ms Go garbage collector pause caused by swap</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+        <p>I’m writing this so you don’t slap your forehead like I <em>almost</em> did when I decided to run swap in production to absorb memory spikes.</p>
+<p>I had a cgroup with two processes: one is a Go process that calls <code>io.ReadAll</code> and then <code>proto.Unmarshal</code>, creating a blob and then a graph struct (which is marked as <code>scan</code> by Go’s allocator). The other process is an HTTP server that mostly stays quiet.</p>
+<p>Whenever the collector runs, it reads those <code>scan</code> spans, pointer by pointer, and decides what to do with them. So I thought: ok, under memory pressure, the kernel is going to evict pages to the swap device, but since the eviction is per cgroup, and not per process, both processes’ pages are going to be evicted - so there is only a small chance that this will turn into a sad dance of swap-in and swap-out between the kernel and the garbage collector.</p>
+<p>I was wrong. While experimenting with this, I found a problem that could’ve hurt me: Go’s garbage collector reads its metadata (outside the heap, in a region that is not <a href="https://cs.opensource.google/go/go/+/release-branch.go1.23:src/runtime/HACKING.md;l=214">freed</a>) in a stop-the-world pause, and that metadata can be in swap.</p>
+<p>I did a mock run on a Hetzner box using kernel 6.8 with MGLRU enabled<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup><span><sup>1</sup> You can find everything about these experiments: plots, the mock allocator, bpf scripts, python scripts, etc., here: <a href="https://github.com/frnsimoes/go-gc-swap-cost">https://github.com/frnsimoes/go-gc-swap-cost</a></span>. The median pause was around 51 us. With the metadata on the NVMe, the worst pause was 40ms.</p>
+<figure><img src="https://frn.sh/gogc/hz-strip-pauses.svg" alt="alt"/>
+</figure>
+
+<p>To check where those 40ms went, I wrote a small <a href="https://github.com/frnsimoes/go-gc-swap-cost/blob/main/bpf/stw.bt">bpf script</a> that counts page faults while the world is stopped. This was the worst one: <code>39902 us, faults during it 228, 39013 us in faults</code>. 39 of those 40ms were spent in 228 page faults. Those faults happened inside the GC’s bookkeeping:</p>
+<pre tabindex="0"><code>// addr2line output
+0x42e5c8  runtime.(*spanSet).reset         /usr/local/go/src/internal/runtime/atomic/types.go:194
+0x4219de  runtime.finishsweep_m            /usr/local/go/src/runtime/mcentral.go:71
+0x4629cf  runtime.gcStart.func2            /usr/local/go/src/runtime/mgc.go:724
+0x46dd8a  runtime.systemstack              /usr/local/go/src/runtime/asm_amd64.s:518
+0x4169dc  runtime.gcStart                  /usr/local/go/src/runtime/mgc.go:722
+
+0x4276a4  runtime.nextMarkBitArenaEpoch    /usr/local/go/src/runtime/mheap.go:2481
+0x421a65  runtime.finishsweep_m            /usr/local/go/src/runtime/mgcsweep.go:268
+0x4629cf  runtime.gcStart.func2            /usr/local/go/src/runtime/mgc.go:724
+0x46dd8a  runtime.systemstack              /usr/local/go/src/runtime/asm_amd64.s:518
+0x4169dc  runtime.gcStart                  /usr/local/go/src/runtime/mgc.go:722
+</code></pre><p>That’s a potential failure mode. Go’s GC has to stop the world at two points: when it performs a <a href="https://cs.opensource.google/go/go/+/release-branch.go1.23:src/runtime/mgc.go;l=24">sweep termination</a>, and when it performs a <a href="https://cs.opensource.google/go/go/+/release-branch.go1.23:src/runtime/mgc.go;l=61">mark termination</a>. We had 312 of those pauses in 30 minutes.</p>
+<p>So here is why this happens: the runtime allocates those pages. They are not freed, but reused. Those pages are read in GC cycles. Because the kernel evicts pages <a href="https://elixir.bootlin.com/linux/v6.8/source/include/linux/mmzone.h">by age</a>, it sends the least recently accessed pages to swap. The GC runs, stops the world, tries to read those pages, but now we have a major page fault. The kernel needs to <a href="https://elixir.bootlin.com/linux/v6.8/source/mm/memory.c#L5154">read PTEs</a>, and then <a href="https://elixir.bootlin.com/linux/v6.8/source/mm/memory.c#L5167">call <code>do_swap_page</code></a>, find a <a href="https://elixir.bootlin.com/linux/v6.8/source/mm/swap_state.c#L454">new frame</a>, <a href="https://elixir.bootlin.com/linux/v6.8/source/mm/swap_state.c#L498">charge it to the cgroup</a>, <a href="https://elixir.bootlin.com/linux/v6.8/source/mm/memory.c#L3913">read the pages</a>, <a href="https://elixir.bootlin.com/linux/v6.8/source/mm/page_io.c#L482">submit a bio</a>, <a href="https://elixir.bootlin.com/linux/v6.8/source/mm/memory.c#L3946">wait for the disk</a>, and put them <a href="https://elixir.bootlin.com/linux/v6.8/source/mm/memory.c#L4105">back in memory</a> - just to keep it short.</p>
+<p>Those 40ms seem harmless at first. But we are talking about a stop-the-world pause. Those 40ms mean everything has stopped - in Go’s terminology, <a href="https://cs.opensource.google/go/go/+/release-branch.go1.23:src/runtime/proc.go;l=1586">every <code>P</code> has stopped</a>, so, for example, if a goroutine was waiting for I/O, during that pause the I/O might return and there would be no one to handle it. 40ms is 800 times the median pause. It happens two or three times per memory spike during the test. <em>It is</em> a lot.</p>
+<p>And then I noticed another thing: building one 511 KiB message, which usually takes 3-5 ms, jumped to 105 ms on the NVMe and 903 ms on Hetzner’s network volume. Per message, this costs more than the metadata pause. But only the goroutine doing the allocation pays that price, so at least it’s localized, and not global like the metadata one.</p>
+<figure><img src="https://frn.sh/gogc/hz-alloc-step.svg" alt="alt"/>
+</figure>
+
+<p>I haven’t confirmed where that time goes, but even so I wanted to mention it here, because that’s another cost you would have to pay. In any case, I agree with <a href="https://chrisdown.name/2018/01/02/in-defence-of-swap.html">Chris Down</a>, swap is not <em>evil</em>. But, yeah, it didn’t behave well with garbage collection, and, in production, I’m collecting a lot.</p>
+<hr/>
+<p><strong>Update, September 14</strong>.</p>
+<p>Someone asked me if Go 1.26’s <a href="https://go.dev/blog/greenteagc">Green Tea garbage collector</a> changed the way the GC reads metadata. I measured it, and the impact is negligible.</p>
+<figure><img src="https://frn.sh/gogc/stw-fault-sites.svg" alt="alt"/>
+  </figure>
+
+
+
+    </div></div>
+  </body>
+</html>
