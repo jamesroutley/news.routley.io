@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://go.dev/blog/http-connection-reuse">Original</a>
+    <h1>Better HTTP/1 connection reuse</h1>
+    
+    
+<div id="blog"><div id="content">
+  <div id="content">
+
+    <div class="Article" data-slug="/blog/http-connection-reuse">
+    
+    <h1 class="small"><a href="/blog/">The Go Blog</a></h1>
+    
+
+    <h1>Better HTTP/1 connection reuse</h1>
+      
+      <p class="author">
+      Nicholas Husin and Damien Neil<br>
+      14 October 2026
+      </p>
+      
+      <div class='markdown'>
+<p>Take a look at the following function:</p>
+<pre><code class="language-go">func getStatus(url string) (int, error) {
+    resp, err := http.Get(url)
+    if err != nil {
+        return 0, err
+    }
+    defer resp.Body.Close()
+    return resp.StatusCode, nil
+}
+</code></pre>
+<p>It sends a <code>GET</code> request to <code>url</code> and returns the HTTP status code.</p>
+<p>Using HTTP/1 (<code>GODEBUG=http2client=0</code>), calling this function 100 times against
+<a href="https://index.golang.org" rel="noreferrer" target="_blank">index.golang.org</a> takes ~710 milliseconds on Go 1.26
+on my machine. On Go 1.27, the same program takes ~150 milliseconds.</p>
+<p>That is almost 5 times faster! How is such a drastic performance difference
+possible?</p>
+<h2 id="the-cost-of-establishing-http-connections">The cost of establishing HTTP connections</h2>
+<p>To understand the difference, consider what happens on the network when we make
+an HTTP request.</p>
+<p>Go&rsquo;s <a href="/pkg/net/http"><code>net/http</code></a> package supports HTTP/1.0, HTTP/1.1, and
+HTTP/2. All three run over TCP, and usually over TLS when talking to HTTPS
+endpoints. Making a request over a new connection looks something like this:</p>
+<img src="http-connection-reuse/http-cost.svg" />
+<ol>
+<li><strong>TCP handshake (1 RTT)</strong>: the client sends a <code>SYN</code> packet, the server
+replies with <code>SYN-ACK</code>, and the client replies with <code>ACK</code>. Because the
+client can send the first TLS message alongside that final <code>ACK</code>,
+establishing the TCP connection takes 1 round-trip time (RTT).</li>
+<li><strong>TLS handshake (2 RTT)</strong>: next, a TLS handshake exchanges encryption keys
+and verifies the server&rsquo;s identity; using TLS 1.2, this takes 2 RTT.</li>
+<li><strong>HTTP request</strong>: with the keys exchanged, HTTP requests can finally be sent
+after a total of 3 RTT.</li>
+</ol>
+<p>These round trips (plus some CPU time spent on TLS handshakes) add up quickly.
+In cross-region communications, one-way latencies often reach or exceed the 50
+ms (100 ms RTT) shown in the diagram above. Compared to the 300 ms spent just
+setting up the connection, the HTTP request itself can be cheap to serve, taking
+only a little over 1 RTT when bandwidth is plentiful or the HTTP response is
+small.</p>
+<p>Even in more favorable conditions, opening a new connection can still be
+expensive. Our opening benchmark queries
+<a href="https://index.golang.org" rel="noreferrer" target="_blank">index.golang.org</a>, which is distributed worldwide and
+supports TLS 1.3. This means that latency is relatively low, and the TLS
+handshake can actually finish in just 1 RTT. Even so, the performance difference
+is still very noticeable.</p>
+<h2 id="connection-reuse">Connection reuse</h2>
+<p>To avoid paying this setup cost on every request, HTTP clients and servers try
+to reuse existing connections across multiple requests when possible. The
+mechanics of this differ based on the HTTP version:</p>
+<ul>
+<li><strong>HTTP/1.0</strong>: while not part of the official specification, clients and
+servers often opt into connection reuse by sending a <code>Connection: keep-alive</code> header. Reuse continues until either endpoint omits the header
+or sends a <code>Connection: close</code> header.</li>
+<li><strong>HTTP/1.1</strong>: connections are persistent by default, and can be reused for
+subsequent requests and responses unless either side declares otherwise by
+sending a <code>Connection: close</code> header.</li>
+<li><strong>HTTP/2</strong>: multiple requests and responses can be multiplexed over a single
+TCP connection.</li>
+</ul>
+<h2 id="when-connection-reuse-fails">When connection reuse fails</h2>
+<p>In HTTP/1 (both HTTP/1.0 and HTTP/1.1), multiple requests and responses on the
+same connection are sent sequentially on the wire. If two <code>GET</code> requests are
+sent to <a href="https://index.golang.org" rel="noreferrer" target="_blank">index.golang.org</a> over the same TCP
+connection, the responses arrive as a single stream of bytes:</p>
+<img src="http-connection-reuse/http-framing.svg" />
+<p>As shown in the diagram, <a href="/pkg/net/http#Get"><code>net/http.Get</code></a> reads and parses
+the status line and headers from the byte stream to populate
+<a href="/pkg/net/http#Response"><code>net/http.Response</code></a>, then returns immediately. The
+response body remains unread on the connection and is consumed only as the
+caller reads from <a href="/pkg/net/http#Response.Body"><code>net/http.Response.Body</code></a>.</p>
+<p>Because responses are sent back-to-back on the same stream,
+<a href="/pkg/net/http"><code>net/http</code></a> can only find the start of the next response after
+the current response body has been read to the very end (as determined by the
+<code>Content-Length</code> or <code>Transfer-Encoding</code> header).</p>
+<p>Now look back at our example program, where we never read <code>resp.Body</code>:</p>
+<pre><code class="language-go">func getStatus(url string) (int, error) {
+    resp, err := http.Get(url)
+    if err != nil {
+        return 0, err
+    }
+    defer resp.Body.Close()
+    return resp.StatusCode, nil
+}
+</code></pre>
+<p>Through Go 1.26, when <code>resp.Body.Close</code> is called, <a href="/pkg/net/http"><code>net/http</code></a>
+sees that there is still an unread response body. Realizing that it cannot reuse
+the connection, it abandons the existing connection and creates new connections
+for its next requests, causing it to repeatedly incur the cost of establishing
+new connections.</p>
+<p>(HTTP/2 does not have this problem. Because it multiplexes streams of frames
+over a single connection rather than sending responses strictly back-to-back, an
+unread response body on one stream does not block other requests from sharing
+the connection.)</p>
+<h2 id="where-failed-connection-reuse-hurts">Where failed connection reuse hurts</h2>
+<p>This subtlety of HTTP/1 connection reuse can cause silent performance
+degradation in seemingly innocuous code.</p>
+<p>As in our opening example, a client might only care about an API response&rsquo;s
+status code. However, the API endpoint it is talking to might send bodies that
+provide more detailed but ultimately unused information, such as <code>{&quot;success&quot;: true, &quot;message&quot;: &quot;update processed&quot;}</code>. This will unfortunately cause connection
+reuse to fail.</p>
+<p>Even programs that do read the response body can run into this issue if they
+stop just short of the end of the body. For example,
+<a href="/pkg/encoding/json#Decoder"><code>encoding/json.Decoder</code></a> stops reading as soon as
+it sees the closing <code>}</code> of a JSON object. If a server sends a JSON response
+terminated with a newline, decoding the JSON object will leave the newline still
+unread. The connection cannot be reused for a new request until that newline is
+consumed. Thus, a healthy connection might end up being abandoned, even though
+it was only a single byte away from being reusable.</p>
+<h2 id="the-manual-solution">The manual solution</h2>
+<p>The unread body problem has been a long-standing sharp edge. Over the years,
+many Go developers came up with their own workarounds. Most commonly, this is
+done by draining the response body prior to closing it:</p>
+<pre><code class="language-go">func getStatus(url string) (int, error) {
+    resp, err := http.Get(url)
+    if err != nil {
+        return 0, err
+    }
+    drainAndCloseBody(resp.Body)
+    return resp.StatusCode, nil
+}
+
+func drainAndCloseBody(body io.ReadCloser) {
+    io.Copy(io.Discard, body) // Drain the response body before closing it.
+    body.Close()
+}
+</code></pre>
+<p>While this works for small responses, if the unread body is large, establishing
+a new TCP connection can be faster than downloading and discarding the rest of
+the body. A better approach is to cap the number of bytes we are willing to
+drain:</p>
+<pre><code class="language-go">func drainAndCloseBody(body io.ReadCloser) {
+    io.CopyN(io.Discard, body, 256&lt;&lt;10) // Only drain up to 256 KB.
+    body.Close()
+}
+</code></pre>
+<p>However, a server might send a response body that trickles in slowly, so we also
+need to cap the time we spend draining:</p>
+<pre><code class="language-go">func drainAndCloseBody(body io.ReadCloser) {
+    drainDone := make(chan struct{}, 1)
+    go func() {
+        io.CopyN(io.Discard, body, 256&lt;&lt;10) // Only drain up to 256 KB.
+        drainDone &lt;- struct{}{}
+    }()
+    // Only spend at most 50 ms trying to drain the response body.
+    select {
+    case &lt;-drainDone:
+    case &lt;-time.After(50 * time.Millisecond):
+        // If we reach the 50 ms timeout, body.Close will run and interrupt the
+        // io.CopyN, preventing goroutine leaks.
+    }
+    body.Close()
+}
+</code></pre>
+<p>Of course, we also do not want to block for up to 50 milliseconds when closing a
+response body. Instead, we can drain the body asynchronously in the background
+and let it race against subsequent requests:</p>
+<pre><code class="language-go">func drainAndCloseBody(body io.ReadCloser) {
+    drainDone := make(chan struct{}, 1)
+    go func() {
+        io.CopyN(io.Discard, body, 256&lt;&lt;10) // Only drain up to 256 KB.
+        drainDone &lt;- struct{}{}
+    }()
+    go func() {
+        // Only spend at most 50 ms trying to drain the response body.
+        select {
+        case &lt;-drainDone:
+            // If the drain can finish before a new request is sent, the
+            // connection will be reused; otherwise, a new connection is
+            // created, and the current connection will be put in a pool of
+            // idle connections, potentially being reused for another future
+            // request.
+        case &lt;-time.After(50 * time.Millisecond):
+            // If we reach the 50 ms timeout, body.Close will run and interrupt
+            // the io.CopyN, preventing goroutine leaks.
+        }
+        body.Close()
+    }()
+}
+</code></pre>
+<p>As we can see, draining response bodies safely is surprisingly tricky and
+cumbersome. Worse, as the practice of draining response bodies spread, some
+nuances were often lost. This has led to misunderstandings such as attempting to
+drain response bodies for HTTP/2 connections, when doing so is unnecessary.</p>
+<h2 id="the-current-state-and-conclusion">The current state and conclusion</h2>
+<p>Starting in Go 1.27, <a href="/pkg/net/http#Transport"><code>net/http.Transport</code></a>
+automatically does everything we have implemented in the code above: it will
+asynchronously drain an unread HTTP/1 response body for up to 50 ms or 256 KB.
+It also implements additional optimizations; for example, when a response
+contains the <code>Connection: close</code> header, draining the body is guaranteed to be
+wasted work, and it therefore skips doing so. Note that this behavior might
+evolve in future versions of Go, as other possible enhancements become apparent.</p>
+<p>As a general best practice, we now recommend that users simply close their HTTP
+bodies once they no longer need them, like in our original example:</p>
+<pre><code class="language-go">func getStatus(url string) (int, error) {
+    resp, err := http.Get(url)
+    if err != nil {
+        return 0, err
+    }
+    defer resp.Body.Close()
+    return resp.StatusCode, nil
+}
+</code></pre>
+<p>Go is all about simplicity. Let your code stay clean and simple, and let
+<a href="/pkg/net/http"><code>net/http</code></a> deal with the complexities on your behalf.</p>
+</div>
+
+    </div>
+
+    
+    <div class="Article prevnext">
+    
+    
+      
+        <p>
+        
+        
+          
+            <b>Previous article: </b><a href="/blog/archsimd">Arch-specific SIMD in Go</a><br>
+          
+        
+        <b><a href="/blog/all">Blog Index</a></b>
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+    </div>
+    
+
+  </div>
+</div>
+
+<script src="/js/play.js"></script>
+
+
+  </body>
+</html>
