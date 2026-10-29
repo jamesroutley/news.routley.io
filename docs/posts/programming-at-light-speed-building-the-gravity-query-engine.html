@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://malisper.me/programming-at-light-speed/">Original</a>
+    <h1>Programming at Light Speed: Building the Gravity Query Engine</h1>
+    
+    <div id="readability-page-1" class="page"><article id="post-1689">
+			<!-- .entry-header -->
+		<div>
+		<p>With the release of pgrust v0.4-beta, our new query engine, Gravity, is now <a href="https://benchmark.clickhouse.com/">as much as 3x faster than ClickHouse on ClickBench</a>, the benchmark that ClickHouse themselves designed to show off how fast ClickHouse is. Even better, Gravity achieves that speed while supporting the full Postgres SQL dialect and type system.</p>
+<p>In a couple of previous posts, I wrote about how we used batching, operator fusion, and SIMD to make pgrust hundreds of times faster than Postgres for analytical queries, and how we built a copy-and-patch JIT compiler that compiles stencils in 5 microseconds. All of that work, built up over several releases, is what became Gravity.</p>
+<p>Copy-and-patch was a great starting point, but gluing pre-compiled templates together only gets us so far. Because we did not have a real intermediate representation or register allocation across the whole loop, we ended up leaving a lot of performance on the table compared to an optimizing compiler like rustc or Clang. For pgrust v0.4, we wanted to go all the way and build a query compiler that generates optimal machine code for any SQL query. That is why we built Gravity.</p>
+<p>Normally, when engineers try to make software faster, they work from the bottom up. They run a benchmark, look at a flamegraph, find a hotspot, and figure out how to speed up their code by 15% or 20%. The problem with working from the bottom up is that you don’t know what the ceiling is. You might be 20% away from the fastest possible code the hardware can run, or you might be 100x away.</p>
+<p>When we started building Gravity, we flipped this question around. We asked ourselves: how fast can a database actually be? Instead of incrementally speeding up our existing query engine, we wanted to start from the physical speed limit of our hardware and file format and work backward. I like to call this “programming at light speed”.</p>
+<p>To find out what “light speed” looked like, we had Claude write standalone, heavily optimized Rust programs directly against our columnar storage crates for a corpus of analytical queries. These programs bypassed the entire SQL executor and just ran hand-tuned, multithreaded Rust loops with SIMD directly over our on-disk format. When we ran those handwritten Rust programs, they executed queries roughly 4x faster than existing analytical databases like ClickHouse across the board. We then mined those hand-tuned Rust loops for optimizations we could incorporate into Gravity.</p>
+<p>Our goal for Gravity became simple: for any SQL query, JIT compile machine code at runtime that gets within 20% of the handwritten Rust code Claude wrote directly against our file format.</p>
+<h2>The General Architecture of Gravity</h2>
+<p>Our main goal when designing Gravity’s architecture was to give ourselves a ton of flexibility in the generated output. We knew that if we made it easy to change Gravity to emit whatever low-level optimizations a query needed, it would become much easier for us to close the gap and approach light speed.</p>
+<p>Instead of hardcoding execution patterns or stitching fixed stencils together, we structured Gravity as a multi-stage compiler pipeline that progressively lowers a high-level Postgres plan down to raw assembly:</p>
+<pre data-enlighter-language="raw" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">SQL Query
+  -&gt; Postgres Plan
+  -&gt; Pipeline Graph
+  -&gt; Lisp IR
+  -&gt; Assembly</pre>
+<p>To see what a query looks like at each stage of the compilation process, let’s take the following query:</p>
+<pre data-enlighter-language="sql" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">SELECT UserID, extract(minute FROM EventTime) AS m, MIN(URL), COUNT(*)
+FROM hits
+WHERE URL LIKE &#39;%google%&#39;
+GROUP BY UserID, m
+ORDER BY COUNT(*) DESC
+LIMIT 10;</pre>
+<h3>Stage 1: The Postgres Plan</h3>
+<p>Gravity does not replace Postgres’ parser or query planner. When the query arrives, the pgrust planner analyzes the table statistics and produces a standard query plan.</p>
+<pre data-enlighter-language="raw" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">Limit (cost=... rows=10)
+  -&gt; Sort (Sort Key: count(*) DESC)
+       -&gt; HashAggregate (Group Key: userid, extract(minute FROM eventtime))
+            -&gt; Seq Scan on hits (Filter: (url ~~ &#39;%google%&#39;))</pre>
+<h3>Stage 2: The Pipeline Graph</h3>
+<p>Next, Gravity takes the query plan and converts it into a “pipeline graph”. This is an intermediate representation that expresses how data will flow throughout the query execution. Each pipeline represents how a row is transformed and operated on throughout the query.</p>
+<p>Here is a sketch of what the Pipeline graph looks like for our query:</p>
+<pre data-enlighter-language="raw" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">graph pipelines=3 breakers=2 root=p2
+
+p0 eligible end=breaker(slot=0 HashAgg)
+  source range rel=hits am=pgrc
+    lanes Attr(UserID):byval8 Attr(EventTime):byval8 Attr(URL):dict4
+  filter like(URL, param0)
+  project (key0=UserID, key1=extract_minute(EventTime), agg0=min(URL), agg1=count_star())
+
+p1 serial end=breaker(slot=1 TopK)
+  source breaker slot=0
+  topk k=10 order=agg1:DESC
+
+p2 serial end=sink
+  source breaker slot=1
+  project (UserID, m, min_url, count) -&gt; wire</pre>
+<p>In this case, the query is split into three pipelines:</p>
+<ul>
+<li>p0 takes the rows out of the hits table, filters for rows where the url contains “google”, and then inserts the rows into a hash table to calculate COUNT(*) and MIN(url) grouped by the user_id and minute of the event time</li>
+<li>p1 takes the resulting hash table and puts them into a heap of size 10 to calculate the 10 groups with the highest COUNT(*)</li>
+<li>p2 takes the resulting heap and pulls out the rows and sends them over the wire</li>
+</ul>
+<h3>Stage 3: The Lisp IR</h3>
+<p>Next, Gravity compiles each pipeline into a single function in our Lisp-based, assembly-like intermediate representation. Because the IR is general, we can fuse the scan, filter, projection, and aggregation inside p0 into whatever loop structure we want. Here’s a sample of the code for p0:</p>
+<pre data-enlighter-language="raw" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">;; ── loop head: one trip per row ─────────────────────────────── (Seq Scan)
+(block b210 ((v2574 i64) ...)                   ; v2574 = row index; loop state rides along as block params
+  (v2585 (icmp slt v2574 v103))                 ; more rows in this batch?
+  (condbr v2585 (b211) (b35 ...)))              ;   no -&gt; fetch the next batch
+
+(block b213 ((v2587 i64))                       ; ── read the row&#39;s columns ── (Seq Scan)
+  (v2591 (ptr_add v105 v2587 8 0))              ; &amp;EventTime[row]
+  (v2592 (ptr_add v109 v2587 8 0))              ; &amp;UserID[row]
+  (v2593 (ptr_add v113 v2587 4 0))              ; &amp;URL[row]   (dictionary code)
+  (v2612 (loadz i32 v2593 0))                   ; ── WHERE URL LIKE &#39;%google%&#39; ── (Filter)
+  (v2616 (load i64 (ptr_add v2605 (ushr v2612 6) 8 0)))
+  (v2621 (iand (ushr v2616 (iand v2612 63)) 1)) ;   one bit per distinct URL
+  ;; …                                          ;   row fails -&gt; straight to the next row
+  )
+
+(block b227 ()                                  ; ── extract(minute FROM EventTime) ── (Projection)
+  (v2695 (load i64 v2591 0))
+  (v2711 (iadd v2695 211813660800000000))
+  (v2715 (umulh (ushr v2711 10) 10746007285463371))
+  (v2720 (isub v2711 (imul (ushr v2715 11) 3600000000)))
+  (v2726 (ushr (imul (ushr v2720 8) 18764999) 42)) ; minute
+  (v2732 (load i64 v2592 0))                    ; UserID
+  ;; …
+  )
+
+(block b229 ()                                  ; ── GROUP BY UserID, m ── (HashAggregate)
+  (v2897 (icmp eq v2576 v2732))                 ;   same UserID as the group in registers?
+  (v2898 (icmp eq v2577 v2739))                 ;   same minute?
+  (v2899 (iand v2897 v2898))
+  (condbr v2901 (b249) (b250)))                 ;   no -&gt; write it to the hash table (b250), start a new group
+
+(block b249 ()                                  ; ── MIN(URL), COUNT(*) ── (HashAggregate)
+  (v2903 (loadz i32 v2593 0))                   ;   this row&#39;s URL code
+  (v2911 (icmp ule v2903 (iand v2581 4294967295)))
+  (v2912 (select v2911 v2908 v2581))            ;   MIN: keep the smaller code
+  (v2921 (iadd v2584 1))                        ;   COUNT(*) += 1
+  (br b228 v2576 v2577 v2578 v2579 v12 v2912 v2913 v2915 v2921))
+
+(block b228 (...)                               ; ── next row ──
+  (br b214 ...))                                ; -&gt; b214: row index + 1 -&gt; back to b210</pre>
+<h3>Stage 4: Assembly</h3>
+<p>Finally, we have backends for each target that compile the IR into assembly:</p>
+<pre data-enlighter-language="asm" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">;; ── b210  loop head ─────────────────────────────────────────── (Seq Scan)
+2b3c  cmp   x10, x24                 ; v2585 = row &lt; rows_in_batch
+2b40  b.lt  0x2b70                   ; condbr v2585 (b211) (b35)
+
+;; ── b213  read the row&#39;s columns ───────────────────────────── (Seq Scan)
+                                     ; v2591/v2592/v2593 (ptr_add) emit no instructions:
+                                     ; they fold into the indexed loads below ([base, row, lsl #n])
+2b8c  ldr   w6, [x27, x5, lsl #2]    ; v2612 = URL[row]            (loadz i32)
+
+;; ── WHERE URL LIKE &#39;%google%&#39; ──────────────────────────────── (Filter)
+2b90  lsr   x7, x6, #6               ;        code &gt;&gt; 6
+2b94  ldr   x8, [x0, x7, lsl #3]     ; v2616 = words
+2b98  and   x0, x6, #0x3f            ;        code &amp; 63
+2b9c  lsr   x7, x8, x0               ;        word &gt;&gt; (code &amp; 63)
+2ba0  and   x7, x7, #0x1             ; v2621 = matched bit
+
+;; ── b227  extract(minute FROM EventTime) ───────────────────── (Projection)
+2e04  ldr   x1, [x25, x5, lsl #3]    ; v2695 = EventTime[row]
+2e38  mov   x7, #0x2000              ;  ┐
+2e3c  movk  x7, #0xfa8f, lsl #16     ;  │ constant 211813660800000000
+2e40  movk  x7, #0x8366, lsl #32     ;  │
+2e44  movk  x7, #0x2f0, lsl #48      ;  ┘
+2e48  add   x1, x1, x7               ; v2711
+2e4c  lsr   x7, x1, #10              ;        v2711 &gt;&gt; 10
+2e50  mov   x8, #0xf94b              ;  ┐
+2e54  movk  x8, #0xcb00, lsl #16     ;  │ constant 10746007285463371
+2e58  movk  x8, #0x2d6f, lsl #32     ;  │
+2e5c  movk  x8, #0x26, lsl #48       ;  ┘
+2e60  umulh x7, x7, x8               ; v2715
+2e64  lsr   x7, x7, #11              ;        v2715 &gt;&gt; 11   (hours)
+2e68  mov   x8, #0xa400              ;  ┐ constant 3600000000
+2e6c  movk  x8, #0xd693, lsl #16     ;  ┘
+2e70  mul   x7, x7, x8               ;        hours * 3600000000
+2e74  sub   x1, x1, x7               ; v2720 = µs into the hour
+2e78  lsr   x1, x1, #8               ;        v2720 &gt;&gt; 8
+2e7c  mov   x7, #0x54c7              ;  ┐ constant 18764999
+2e80  movk  x7, #0x11e, lsl #16      ;  ┘
+2e84  mul   x1, x1, x7
+2e88  lsr   x1, x1, #42              ; v2726 = minute
+2e9c  ldr   x0, [x26, x5, lsl #3]    ; v2732 = UserID[row]
+
+;; ── b229  same group as the run in registers? ──────────────── (HashAggregate)
+2eb0  cmp   x12, x0                  ; v2897 = run.UserID == UserID
+2eb4  ccmp  x13, x1, #0x0, eq        ; v2898, v2899 = &amp;&amp; run.minute == minute
+2eb8  ccmp  x14, x6, #0x0, eq        ; v2901 = &amp;&amp; run.flags == flags   (the third key compare, cut from the IR sample)
+2ec8  b.ne  0x2efc                   ; condbr v2901 (b249) (b250)
+
+;; ── b249  MIN(URL), COUNT(*) ───────────────────────────────── (HashAggregate)
+2ecc  ldr   w7, [x27, x5, lsl #2]    ; v2903 = URL[row]   (loaded again)
+2ed0  ldr   w8, [x19, #264]          ;  ┐ v2908 = (part &lt;&lt; 32) | code
+2ed4  orr   x0, x7, x8, lsl #32      ;  ┘   (the select&#39;s operand; its definition is cut from the IR sample)
+2ed8  and   x8, x30, #0xffffffff     ;        v2581 &amp; 0xFFFFFFFF   (run.min lives in x30)
+2edc  cmp   x7, x8                   ;  ┐ v2911 = code &lt;= run.min&#39;s code
+2ee0  cset  x7, ls                   ;  ┘
+2ee4  cmp   x7, #0x0                 ;  ┐ v2912 = select(v2911, v2908, v2581)
+2ee8  csel  x30, x0, x30, ne         ;  ┘
+2ef0  add   x4, x4, #0x1             ; v2921 = COUNT(*) + 1   (count lives in x4)
+2ef8  b     0x337c                   ; br b228 …
+
+;; ── b228 → b214  next row ──────────────────────────────────────
+337c  mov   x18, #0x1                ; block argument v12 (&#34;a run is open&#34;)
+3380  add   x10, x10, #0x1           ; row + 1
+3384  b     0x2b3c                   ; back to b210</pre>
+<h2>Starting from the Bottom: Designing and Benchmarking the Lisp IR First</h2>
+<p>The first part of Gravity we built was the backends. We wanted to prove that our IR and code generator were actually capable of matching rustc -O3 before we built a SQL compiler on top of them. Once we had the Lisp IR and the backends working, we tested them by having Claude write optimized IR programs that mirrored the previous handwritten Rust code.</p>
+<p>Benchmarking those hand-written IR programs gave us a huge piece of news: our Lisp IR compiled in under a millisecond and ran within 10% to 20% of the handwritten Rust code compiled by rustc. Even more importantly, across almost every query we tested, we didn&#39;t need to invent any fancy new IR instructions. The IR was expressive enough that the entire gap between our naive SQL engine and &#34;light speed&#34; came down to compiling SQL queries to the IR.</p>
+<h2>Teaching the Planner New Algorithms</h2>
+<p>When we compared Gravity against Claude&#39;s handwritten Rust across our query corpus, we found queries where the handwritten code was still orders of magnitude faster, not because of how it compiled the loop, but because it was running a fundamentally different algorithm. Even though we kept Postgres’ planner, standard Postgres plan nodes could not express the light-speed algorithms. We had to make sure our plans could encode them.</p>
+<p>Across the queries we optimized, we found three algorithms we needed to add to the planner. All three algorithms are specific to a columnar format, so it makes sense that the Postgres planner can&#39;t support them. Keep in mind that for a columnar table, you usually specify a sort key, so the data is usually in an order that places similar values close to each other. The three algorithms:</p>
+<ul>
+<li>ZoneWalk - For a query like ORDER BY … LIMIT n, Postgres would execute this either by using an index or by scanning the whole table. pgrcolumnar enables an additional way of executing the query. pgrcolumnar breaks the table into batches of 8192 rows called granules. Each granule has metadata that tracks the min and max values for that batch. Instead of scanning the whole table and sorting to find the top n rows, we use the min/max bounds to read the granules in order and stop as soon as n rows are resolved.</li>
+<li>ZoneTopK - For a query with the shape GROUP BY ... LIMIT n, we can use an algorithm very similar to the ZoneWalk. Instead of scanning the entire table and hashing every row just to return n groups, we can use the metadata to walk the granules in order by the GROUP BY key. Once we have seen n complete groups whose maximum possible keys are below the minimum key of every remaining batch, we can stop scanning immediately. ClickHouse 26.10 has a similar optimization, <a href="https://github.com/ClickHouse/ClickHouse/blob/c6428ebcc39fdff48bb0f50e128b2078701901d5/src/Processors/QueryPlan/Optimizations/optimizeGroupByTopK.cpp#L228"><code>enable_group_by_top_k_dynamic_filtering</code></a>, which also requires complete groups.</li>
+<li>TwoPass  - For a query of the shape GROUP BY ... ORDER BY count(*) DESC LIMIT 10, if one of the columns in the group by has high cardinality, it can be faster to execute the query in two passes:
+<ol>
+<li>Compute an upper bound on the size of each group by counting rows per key: SELECT unique_key, COUNT(*) ... GROUP BY unique_key</li>
+<li>Then go back and fetch only the groups whose upper bound is big enough that they could make the top 10</li>
+</ol>
+</li>
+</ul>
+<p>This works because the most expensive part of the query is the first pass. You’re able to save a lot of memory bandwidth by fetching only one column on the first pass and then fetching the rest on a second pass</p>
+<p>All three of these plans were added as costed plans to the pgrust planner. At plan time, the planner estimates how many granules a walk will actually have to read before stopping, and only picks the rewrite if it is cheaper than the standard scan.</p>
+<p>Now that our queries used the same algorithms as the light speed implementations and we knew our IR was fast enough to compile our query plans, the last step was compiling SQL to our IR.</p>
+<h2>Optimizing SQL→IR Compilation</h2>
+<p>For the SQL→IR compilation, all that mattered was how optimized we could make the IR. Because we used the same algorithms as the light-speed Rust programs, we could diff our code against the Rust code and see where the differences came from. This led to over 100 optimizations. Here’s three of them to give you a sense of what makes Gravity so fast.</p>
+<h3>1. Inlining Function Calls and Aggregates</h3>
+<p>In standard Postgres, evaluating a SQL function like extract(minute FROM EventTime) or updating an aggregate like AVG or MIN makes a function call through Postgres&#39;s function manager (fmgr) on every row. Making a function call once per row (or even once per small batch) completely destroys performance.</p>
+<p>To fix this, we categorized all of Postgres&#39;s built-in functions into tiers and, for 238 core functions and aggregates, we directly inline them into our Lisp IR. A query with a COUNT(*) and SUM will instead look something like this:</p>
+<pre data-enlighter-language="raw" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">(block b32 ()
+  (v313 (load i64 v307 24))         ; load count from aggregate state
+  (v314 (iadd v313 v194))           ; count + 1
+  ((store v307 24 v314))
+  (v315 (load i64 v307 32))         ; load sum from aggregate state
+  (v316 (iadd v315 v309))           ; sum + val
+  ((store v307 32 v316))
+  (br b22 v197))</pre>
+<p>Benchmarking the performance of AVG, inlining dropped the loop from 392 instructions per row down to 120 instructions per row and made the query 2.56x faster.</p>
+<h3>2. Late Materialization</h3>
+<p>In our columnar format, text columns like URL are dictionary-encoded: each part of the table stores a dictionary of unique strings, and the rows themselves store integer codes into the dictionary.</p>
+<p>Our early versions of Gravity decided how to emit IR for an expression based only on its SQL type (TEXT, INT4, NUMERIC). Because url has the SQL type TEXT, Gravity decoded the dictionary code into a string and copied it into every row. When we looked at Claude&#39;s handwritten Rust for these queries, it never touched strings inside the row loop. It used late materialization. It operated on the dictionary code for as long as possible and only materialized the actual string at the very end.</p>
+<p>We redesigned Gravity so that every value is materialized as late as possible. When computing a filter such as url LIKE &#39;%google%&#39; on every row, the compiler emits a step that runs our heavily optimized substring matcher once per unique entry in the dictionary and creates a bitmap of which dictionary codes match the filter.  By default, v0.4-beta keeps that bitmap in server memory, keyed by the filter with its constants and by the table part, so a later query with the same LIKE on unchanged data reuses it instead of running the matcher again. Setting <code>pgrust.dict_filter_cache = off</code>, or <code>pgrust.condition_cache</code> to <code>granule</code> or <code>off</code>, makes every query build its own.</p>
+<p>To compute an aggregate like MIN(URL), Gravity doesn&#39;t compare strings per row. The compression dictionaries are sorted, so for two strings encoded from the same dictionary, the string with a smaller code is the smaller string. Because of this, when computing the minimum string within a range of rows compressed with the same dictionary, it becomes mostly integer comparison rather than string comparison.</p>
+<h3>3. Run Collapse in Registers</h3>
+<p>Even when our filter and expressions are inlined, probing a multi-key hash table on millions of rows is expensive.</p>
+<p>When we compared Gravity’s output against Claude&#39;s handwritten Rust on GROUP BY ... queries, we noticed something interesting. In real-world tables, values for a column like UserID or event timestamps are often partially clustered on disk, meaning we frequently see runs of consecutive rows that belong to the exact same group. Claude&#39;s Rust code exploited this by keeping the current group&#39;s keys and running count in local variables (which rustc kept in CPU registers). As long as the next row had the same key as the previous row, it just incremented the counter in a register and only probed the hash table when the run ended. On a 100-million-row table, that collapsed 100 million hash table probes down to 22 million.</p>
+<p>We modified Gravity to track the previous group key and probe the hash table only when a new group key is seen.</p>
+<h2>Making Sure It Generalizes</h2>
+<p>One challenge we had when building Gravity was there was a tendency for Claude to overfit the optimizations to our corpus queries. Often Claude would write the optimizations only for exactly the query we were benchmarking. If a user writes strpos(URL, &#39;google&#39;) &gt; 0 instead of URL LIKE &#39;%google%&#39;, or groups by a column wrapped in a Postgres DOMAIN type, a brittle pattern matcher will miss the fast path and silently fall back to slow code.</p>
+<p>To counteract that, we made a catalog of every optimization. We then wrote a fuzzer that took a single optimization and tested it across many different query shapes. It would try a variety of types (int2, int4, int8, numeric, text, domain) group bys, and much more to confirm the optimization kicked in across many queries and not just one. Dan Luu <a href="https://danluu.com/ambitious/">wrote about</a> how much testing goes into pgrust, which has also turned up real bugs in Postgres itself.</p>
+<h2>Where Gravity Stands Today</h2>
+<p>Designing our Lisp IR against handwritten Rust first, and then teaching Gravity to emit inlined, late-materialized, register-optimized IR, got us remarkably close to our &#34;speed of light&#34; target. Across a wide range of analytical queries, Gravity&#39;s runtime JIT compiles queries in under a millisecond and executes within 10% to 20% of the handwritten Rust code Claude wrote directly against our file format.</p>
+<p>When we isolate the query engine by running the exact same pgrust binary over the exact same columnar table with Gravity turned on versus our Volcano row executor, Gravity is 102x faster cold and 499x faster hot, and runs as much as 3x faster than ClickHouse while supporting Postgres&#39;s full SQL dialect and type system. For anyone coming from Postgres: on ClickBench&#39;s c6a.4xlarge machine, pgrust v0.4-beta&#39;s combined score is more than 1,000x better than PostgreSQL 17&#39;s, and 1,365x better on cold runs.</p>
+<p>If you want to dig into the Lisp IR, the TPDE backend, or the lowerer, you can check out the code and follow our regular commits at <a href="https://github.com/malisper/pgrust">github.com/malisper/pgrust</a>.</p>
+<p>A note on our earlier v0.4-preview ClickBench entry: <a href="https://news.ycombinator.com/item?id=50209450">I wrote about what happened on Hacker News</a>.</p>
+			</div><!-- .entry-content -->
+
+	<!-- .entry-footer -->
+</article></div>
+  </body>
+</html>
