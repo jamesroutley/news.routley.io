@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://pivotlake.io/blog/its-the-memory-latency-stupid/">Original</a>
+    <h1>It&#39;s the Memory Latency, Stupid</h1>
+    
+    <div id="readability-page-1" class="page"><div>
+
+<p>When you see your databases CPU at 100%, what is it <em>actually</em> doing? We like to act as though CPUs run code linearly for simplicity&#39;s sake, but in truth CPUs are incredibly complex beasts; they can potentially do many instructions at once, or sometimes none at all (despite our console showing 100%). Because CPUs can do so many things, one CPU at 100% may be doing much less than another at 100%. A CPU is considered &#34;idle&#34; only if no task (Linux task) needs CPU time; this does not mean the CPU itself is being fully saturated. So why would a CPU not be fully utilized, even if it appears to be at 100%?</p>
+<p>The answer is usually <strong>memory</strong>.</p>
+<p>Memory accesses are orders of magnitude slower than internal CPU operations. To give a good picture of how much so, a modern CPU might be able to process somewhere in the realm of 4-8 instructions per nanosecond. A memory access to RAM can take somewhere in the realm of 50-100ns. To ease your mathing, that means a modern CPU can do around 400-800 instructions for every <em>one</em> memory access from RAM.</p>
+<figure><div><div><div><p>CPU</p></div><div><p><span>CPU core</span><span>4–8 instr / ns</span></p></div><div></div><div><p><span>L1 cache</span><span>~1 ns</span></p><p>~64 KB · ~4–8 instructions per access</p></div><div></div><div><p><span>L2 cache</span><span>~3–4 ns</span></p><p>~1 MB · ~15–30 instructions per access</p></div><div></div><div><p><span>L3 cache</span><span>~10–15 ns</span></p><p>up to a few hundred MB · ~50–100 instructions per access</p></div><div></div><div><p><span>DRAM</span><span>~50–100 ns</span></p><p>GBs · ~400–800 instructions per access</p></div></div></div></figure>
+<p>Given this, CPUs are built from the ground up to work their way around this. The most obvious way this is dealt with is CPU caches. CPU caches keep memory closer to the CPU than RAM, literally baked into the CPU chip. The closest cache (the L1 cache) takes around 1ns per memory operation- that&#39;s 50-100x faster than RAM! The &#34;problem&#34; here of course is that the CPU caches are fairly small; the L1 cache for a modern CPU is probably around ~64KB, while the farther caches max out at a few hundred MB for top end processors. A good database tries manipulating data in small &#34;chunks&#34; to take full advantage of caches, and you&#39;ll often hear cache utilization as being one of the top concerns of performance engineering.</p>
+<p>Let&#39;s look at GROUP BY aggregations to get a better grip on cache utilization. In GROUP BY, we&#39;re looking to take a dataset, group it by a certain column (or more), and perform certain aggregations (for example, count, or sum on another column). The &#34;naive&#34; method might be to open a HashTable keyed by the group key that grows ever larger. For every new row, you would check if that key exists- if it does, go to it&#39;s corresponding aggregation and update the result. Simple, right? The problem is that if you have millions of unique groups, you&#39;re not utilizing your cache at all! Nearly every HashTable access will be a &#34;cold&#34; hit that goes to RAM. This means that although your CPU may /look/ like it&#39;s 100% utilized, in truth it&#39;ll constantly be waiting for cold memory accesses.</p>
+<p>To demonstrate this, we&#39;ll take our state-of-the-art Pivot engine and ravage it! We&#39;ll remove all our complex logic and replace it with simplicity:</p>
+<div><pre><code><span>fn</span> <span>consume</span>(
+    &amp;<span>mut</span> <span>self</span>,
+    batch: <span>RecordBatch</span>,
+    _sender: &amp;<span>mut</span> <span>dyn</span> <span>Sender</span>&lt;<span>RecordBatch</span>&gt;,
+) -&gt; unary::<span>Result</span>&lt;()&gt; {
+    <span>let</span> group_keys = batch.<span>column</span>(<span>self</span>.key_column).<span>as_primitive</span>::&lt;<span>Int64Type</span>&gt;();
+    <span>for</span> &amp;key <span>in</span> group_keys.<span>values</span>() {
+        <span>// If the Group Key doesn&#39;t exist- set it to 0</span>
+        <span>// Afterwards, add 1 to the group- this will give us a count(*) GROUP BY key_column</span>
+        *<span>self</span>.counts.<span>entry</span>(key).<span>or_insert</span>(<span>0</span>) += <span>1</span>;
+    }
+}</code></pre></div>
+<p>We&#39;ll then run a simple query <code>SELECT count(*), UserID FROM hits GROUP BY UserID</code> on the &#34;hits&#34; dataset ClickBench provides (99m rows). This query will give us a count per <code>UserID</code>, meaning we&#39;ll have an entry in our HashMap per <code>UserID</code>- I&#39;ll give a spoiler here that there are ~17m unique <code>UserID</code>.</p>
+<p>To run it:</p>
+<div><pre><code><span>cat</span> &gt; config.yaml &lt;&lt;<span>&#39;EOF&#39;</span>
+<span>server</span>:
+  <span>bind</span>: 127.0.0.1:5440
+<span>workers</span>: 1
+<span>datastores</span>:
+  <span>default</span>:
+    <span>kind</span>: pivotlake
+    <span>location</span>: ./data
+    <span>default</span>: true
+<span>users</span>:
+  <span>pivot</span>:
+    <span>auth</span>:
+      <span>method</span>: trust
+<span>EOF</span>
+<span>taskset</span> <span>-c</span> 3 <span>pivot</span> server <span>--config</span> config.yaml &amp;
+<span>taskset</span> <span>-c</span> 7 <span>psql</span> <span>-h</span> 127.0.0.1 <span>-p</span> 5440 <span>-U</span> pivot <span>-c</span> <span>&#39;\timing on&#39;</span> <span>-c</span> <span>&#34;SELECT count(*) FROM (SELECT COUNT(*), UserID FROM hits GROUP BY UserID)&#34;</span></code></pre></div>
+<p>This takes... a whopping 3.9 seconds. Is that good? Is that bad? Everything in this world is relative, or so they say. If we run the query again (without restarting the server), it takes 3.6s. The second run is the one we&#39;re more interested in- there&#39;s no disk involved as everything is already sitting in our page-cache.</p>
+<p>You&#39;ll notice we did <code>taskset -c</code>. This pins the process to a given CPU; this will allow us to run <code>perf stat</code> on that CPU and see what&#39;s going on internally. We&#39;ll measure two metric groups- percentage of CPU slots stalling because of memory (and not doing anything in the meanwhile), and percentage of CPU slots actually retiring a micro-op:</p>
+<div><pre><code><span>sudo</span> <span>perf</span> stat <span>-C</span> 3 <span>-M</span> backend_bound_memory,retiring -- <span>taskset</span> <span>-c</span> 7 <span>psql</span> <span>-h</span> 127.0.0.1 <span>-p</span> 5440 <span>-U</span> pivot <span>-c</span> <span>&#34;SELECT count(*) FROM (SELECT COUNT(*), UserID FROM hits GROUP BY UserID)&#34;</span></code></pre></div>
+<p>and we get back this</p>
+<div><pre><code>Performance counter stats for &#39;CPU(s) 3&#39;:
+
+        8364109137      ex_no_retire.load_not_complete   #     50.1 %  backend_bound_memory
+       38233214040      de_no_dispatch_per_slot.backend_stalls
+        8977647849      ex_no_retire.not_complete
+       11861387798      ls_not_halted_cyc
+       11431618219      ex_ret_ops                       #     16.1 %  retiring
+       11858248045      ls_not_halted_cyc
+
+       4.030148989 seconds time elapsed</code></pre></div>
+<p>This tells us that 50.1% of the time, the CPU couldn&#39;t do anything because it was stalling on memory! And only 16.1% of the time the CPU was actually retiring (aka doing) operations.</p>
+<p>Another interesting stat to get is how many of our CPU memory loads are coming from DRAM (and not from caches):</p>
+<div><pre><code><span>sudo</span> <span>perf</span> stat <span>-C</span> 3   <span>-e</span> ls_dmnd_fills_from_sys.dram_io_near   -- <span>taskset</span> <span>-c</span> 7 <span>psql</span> <span>-h</span> 127.0.0.1 <span>-p</span> 5440 <span>-U</span> pivot <span>-c</span> <span>&#34;SELECT count(*) FROM (SELECT COUNT(*), UserID FROM hits GROUP BY UserID)&#34;</span></code></pre></div>
+<p>And the result:</p>
+<div><pre><code> Performance counter stats for &#39;CPU(s) 3&#39;:
+
+          76190837      ls_dmnd_fills_from_sys.dram_io_near
+
+       3.996301634 seconds time elapsed</code></pre></div>
+<p>Every load is 64 bytes (the minimum amount you can bring, a cache line), so we can multiply by 64 to see we pulled 4.5GB during this query from DRAM on CPU loads (this is without any prefetching).</p>
+<p>Let&#39;s now try to improve our algorithm to take advantage of the CPU caches. To do this, we&#39;ll use a method called radix partitioning. The idea is to split the merge into two distinct phases:</p>
+<p><strong>Phase 1:</strong> In this phase, we&#39;re simply going to separate the keys into 4096 different partitions (simply a Vec of SlabVecs- a SlabVec is a data structure similar to a Vec that is above memory that is already paged in. We don&#39;t use Vecs for raw memory in Pivot because it creates a lot of variance; not something for this blog post!). The partition will be decided by hashing the key and taking it&#39;s top 12 bits (2**12=4096).</p>
+<div><pre><code><span>fn</span> <span>consume</span>(
+    &amp;<span>mut</span> <span>self</span>,
+    batch: <span>RecordBatch</span>,
+    _sender: &amp;<span>mut</span> <span>dyn</span> <span>Sender</span>&lt;<span>RecordBatch</span>&gt;,
+) -&gt; unary::<span>Result</span>&lt;()&gt; {
+    <span>let</span> keys = batch.<span>column</span>(<span>self</span>.key_column).<span>as_primitive</span>::&lt;<span>Int64Type</span>&gt;();
+    <span>for</span> &amp;key <span>in</span> keys.<span>values</span>() {
+        <span>let</span> hash = <span>self</span>.hasher.<span>hash_one</span>(key);
+        <span>// Since we want top 12 bits, we shift the hash (a u64) 52 bits to the right</span>
+        <span>let</span> partition = (hash &gt;&gt; <span>52</span>) <span>as</span> usize;
+        <span>self</span>.partitions[partition].<span>push</span>(&amp;<span>mut</span> <span>self</span>.allocator, (hash, key));
+    }
+    <span>Ok</span>(())
+}</code></pre></div><figure><div><div><table><thead><tr><th>UserID</th><th>hash(UserID)</th></tr></thead><tbody><tr><td><span>7</span></td><td>0x<b>002</b>A91F3…</td></tr><tr><td><span>42</span></td><td>0x<b>000</b>7C4E2…</td></tr><tr><td><span>13</span></td><td>0x<b>FFF</b>3B05D…</td></tr><tr><td><span>7</span></td><td>0x<b>002</b>A91F3…</td></tr><tr><td><span>5</span></td><td>0x<b>001</b>D6A88…</td></tr><tr><td><span>42</span></td><td>0x<b>000</b>7C4E2…</td></tr><tr><td><span>99</span></td><td>0x<b>002</b>E17B4…</td></tr><tr><td><span>7</span></td><td>0x<b>002</b>A91F3…</td></tr></tbody></table><p><span>→</span></p><div><p>partition = <code>hash &gt;&gt; 52</code>, the first 3 hex digits</p><div><div><p><b>Partition 0</b><span>0x000000… –</span></p><p><span>42</span><span>42</span></p></div><div><p><b>Partition 1</b><span>0x001000… –</span></p><p><span>5</span></p></div><div><p><b>Partition 2</b><span>0x002000… –</span></p><p><span>7</span><span>7</span><span>99</span><span>7</span></p></div><div><p><b>Partition 4095</b><span>0xFFF000… –</span></p><p><span>13</span></p></div></div></div></div></div></figure>
+<p><strong>Phase 2:</strong> When all data has come through, go partition by partition, each time creating a HashMap, aggregating the partition into it, and then outputting it. This phase is very similar to our original algorithm, but we&#39;re going to use the hash from phase 1.</p>
+<div><pre><code><span>fn</span> <span>into_outputter</span>(<span>self</span>) -&gt; unary::<span>Result</span>&lt;<span>Option</span>&lt;<span>Self</span>::<span>Outputter</span>&gt;&gt; {
+    <span>let</span> <span>mut</span> groups = <span>Vec</span>::<span>new</span>();
+    <span>for</span> rows <span>in</span> &amp;<span>self</span>.partitions {
+        <span>let</span> <span>mut</span> table: <span>HashTable</span>&lt;(u64, i64, u64)&gt; = <span>HashTable</span>::<span>new</span>();   <span>// (hash, key, count)</span>
+        rows.<span>for_each</span>(|(hash, key)| {
+            <span>match</span> table.<span>entry</span>(hash, |group| group.<span>1</span> == key, |group| group.<span>0</span>) {
+                <span>Entry</span>::<span>Occupied</span>(<span>mut</span> group) =&gt; group.<span>get_mut</span>().<span>2</span> += <span>1</span>,
+                <span>Entry</span>::<span>Vacant</span>(slot) =&gt; { slot.<span>insert</span>((hash, key, <span>1</span>)); }
+            }
+        });
+        groups.<span>extend</span>(table.<span>into_iter</span>().<span>map</span>(|(_, key, count)| (key, count)));
+    }
+    <span>Ok</span>(<span>Some</span>(<span>Outputter</span>::<span>new</span>(groups)))
+}</code></pre></div><figure><div><div><p>Partitions, one at a time</p><p><span>0–1 done</span><span>2 in progress</span><span>3–4095 waiting</span></p></div><div><p>Partition 2</p><p>HashTable</p><p>Output</p><p><span>7</span><span>7</span><span>99</span><span>7</span></p><p><span>→</span></p><div><p><span>UserID</span><span>count</span></p><p><span>7</span><span>3</span></p><p><span>99</span><span>1</span></p></div><p><span>→</span></p><div><p><span>(UserID, count)</span></p><p><span>(7, 3)</span></p><p><span>(99, 1)</span></p></div></div></div></figure>
+<p>At first glance, this solution may seem rather odd. We&#39;re doing <strong>more</strong> operations here, not less! Every row, in both solutions, is hashed and sent into a HashMap. But in this solution, we&#39;re first pushing rows into seemingly meaningless vecs.</p>
+<p>The key here (no pun intended) is to understand why we&#39;ve done this; it&#39;s to make the aggregating HashMaps <strong>smaller</strong>. By dividing our group by into 4096 pieces, we&#39;ve made our working HashMaps much likelier to fit into our CPU caches. Every time we do a lookup on our HashMap, our CPU is more likely to find the relevant memory sitting in it&#39;s caches, which saves a big chunk of time. But why trust me? Let&#39;s run it!</p>
+<div><pre><code><span>taskset</span> <span>-c</span> 7 <span>psql</span> <span>-h</span> 127.0.0.1 <span>-p</span> 5440 <span>-U</span> pivot <span>-c</span> <span>&#39;\timing on&#39;</span> <span>-c</span> <span>&#34;SELECT count(*) FROM (SELECT COUNT(*), UserID FROM hits GROUP BY UserID)&#34;</span></code></pre></div>
+<p>And... Boom! 3.3 seconds, and then on second run 2.7 seconds! We&#39;ve definitely made an improvement. But to really drive this point home, let&#39;s run perf again:</p>
+<div><pre><code><span>sudo</span> <span>perf</span> stat <span>-C</span> 3 <span>-M</span> backend_bound_memory,retiring -- <span>taskset</span> <span>-c</span> 7 <span>psql</span> <span>-h</span> 127.0.0.1 <span>-p</span> 5440 <span>-U</span> pivot <span>-c</span> <span>&#34;SELECT count(*) FROM (SELECT COUNT(*), UserID FROM hits GROUP BY UserID)&#34;</span></code></pre></div>
+<p>And our results:</p>
+<div><pre><code> Performance counter stats for &#39;CPU(s) 3&#39;:
+
+        3790955223      ex_no_retire.load_not_complete   #     23.5 %  backend_bound_memory
+       20376118172      de_no_dispatch_per_slot.backend_stalls
+        5442424751      ex_no_retire.not_complete
+       10083617764      ls_not_halted_cyc
+       19350459182      ex_ret_ops                       #     32.2 %  retiring
+       10023435553      ls_not_halted_cyc
+
+       3.575992317 seconds time elapsed</code></pre></div>
+<p>Now we can see the picture has completely changed- 23.5% of the time is spent on waiting for memory (as opposed to 50% before), 32% for actually retiring operations. You may notice we&#39;re actually doing <strong>more</strong> work, not less- in this run, we did 19350459182 operations (the <code>ex_ret_ops</code> counter), whereas before the database did 11431618219 operations. This is worth it though, because as we said before- if we can translate cold DRAM accesses into CPU instructions, it&#39;s nearly always a good trade to make. In this case, we went down from 8364109137 CPU slots stalled because of memory to 3790955223.</p>
+<p>To complete the picture and really see we&#39;re pulling less memory from the DRAM, let&#39;s again check how many our memory loads come from DRAM:</p>
+<div><pre><code><span>sudo</span> <span>perf</span> stat <span>-C</span> 3   <span>-e</span> ls_dmnd_fills_from_sys.dram_io_near   -- <span>taskset</span> <span>-c</span> 7 <span>psql</span> <span>-h</span> 127.0.0.1 <span>-p</span> 5440 <span>-U</span> pivot <span>-c</span> <span>&#34;SELECT count(*) FROM (SELECT COUNT(*), UserID FROM hits GROUP BY UserID)&#34;</span></code></pre></div><div><pre><code> Performance counter stats for &#39;CPU(s) 3&#39;:
+
+          25688280      ls_dmnd_fills_from_sys.dram_io_near
+
+       3.009547012 seconds time elapsed</code></pre></div>
+<p>Whoo! That means that on demand we pulled 1.5GB from DRAM, instead of 4.5GB in the naive version.</p>
+<p>That, of course, isn&#39;t the limit of how much we can utilize our CPU cache for GROUP BYs. And utilizing our CPU cache isn&#39;t the only way we can &#34;hide&#34; DRAM latency; another trick is prefetching memory to our cache before we need it, and yet another trick is creating algorithms that allow maximization of memory throughput- but that&#39;s not for this blog! We&#39;ll go into that in our next blog where we look at our /seemingly very weird/ implementation of JOIN probing.</p>
+<p>For now, without explaining too much, I&#39;ll leave you with Pivot&#39;s speed for this query on a single core:</p>
+<div><pre><code>Time: 1848.353 ms (00:01.848)</code></pre></div>
+<p>and the amount of RAM we bring:</p>
+<div><pre><code> Performance counter stats for &#39;CPU(s) 3&#39;:
+
+          14917958      ls_dmnd_fills_from_sys.dram_io_near
+
+       2.182674864 seconds time elapsed</code></pre></div>
+<p>Which comes out to 954 MB.</p>
+<p>Of course, Pivot knows to run in parallel on our 16 cores (where there are many other interesting cases), in which case it comes out to:</p>
+
+<p>nice :)</p>
+<p>Try out Pivot if you want to have super speeds above parquets (OSS fun!), see you next time.</p>
+</div></div>
+  </body>
+</html>
