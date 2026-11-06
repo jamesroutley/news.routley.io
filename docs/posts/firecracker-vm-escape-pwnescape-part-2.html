@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://pwn.ai/blog/firecracker-escape">Original</a>
+    <h1>Firecracker VM Escape: PwnEscape Part 2</h1>
+    
+    <div id="readability-page-1" class="page"><article><div><div><p>Firecracker is supposed to keep untrusted code inside a microVM. We escaped it and achieved code execution as root on the host.</p>
+<p>We found how it saved registers, changed where it would resume, and made it execute a call of our choosing when it returned from KVM. The guest then restored the temporary stack changes. Firecracker kept running, and the VM remained accessible over SSH.</p>
+<p><a href="https://pwn.ai/blog/pwnescape" rel="noopener noreferrer" target="_blank">PwnEscape Part 1</a> introduced the host memory primitive behind this work. Here we follow the next part of the chain: using that access to find Firecracker in memory and take over a live thread from inside the guest. This is a continuation to show CVE-2026-99999 on a Firecracker setup.</p>
+<h2>00 / Choosing where to take control</h2>
+<p>A Firecracker microVM has a process on the host that manages it. Each virtual CPU, or vCPU, has a thread in that process. The thread enters KVM to run the guest and returns to Firecracker when an event needs handling in userspace. Firecracker documents this arrangement in its <a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#internal-architecture" rel="noopener noreferrer" target="_blank">architecture overview</a>.</p>
+<figure><img src="https://pwn.ai/api/blog/images/firecracker-host-integration-dbdde36ef234.png" alt="firecracker-host-integration-dbdde36ef234" loading="lazy"/><figcaption>firecracker-host-integration-dbdde36ef234</figcaption></figure>
+<p>The call that runs the virtual CPU looks like this:</p>
+
+<p>While the thread is in that system call, the host kernel holds its saved userspace registers in a structure called <code>pt_regs</code>. These registers describe the Firecracker thread: its instruction pointer says where execution should resume, and its stack pointer says which userspace stack it should use.</p>
+<p>That made the return from <code>KVM_RUN</code> an attractive target. If we could locate and modify the saved frame, we could choose the code Firecracker executed when the thread returned to userspace. A guest operation that caused such a return would provide the trigger.</p>
+<p>We already had access to selected host physical memory through a guest mapping. To use it, we needed to identify the Firecracker process, find code we could call in that process, and locate the register frame belonging to its active vCPU thread. The starting point was a page of memory we controlled inside the guest.</p>
+<figure><img src="https://pwn.ai/api/blog/images/01-guest-to-vmm-chain-5c0fbee0cb07.png" alt="01-guest-to-vmm-chain-5c0fbee0cb07" loading="lazy"/><figcaption>01-guest-to-vmm-chain-5c0fbee0cb07</figcaption></figure>
+<p><em>Figure 1. The guest identifies its Firecracker process, finds the saved registers for a vCPU thread, and redirects the thread when it returns from KVM.</em></p>
+<h2>01 / Finding our guest page on the host</h2>
+<p>The guest and host use different physical address spaces. A page has a guest physical address, or GPA, inside the VM and a host physical address, or HPA, in the machine backing it. On the target, Extended Page Tables (EPT) provide the translation between them.</p>
+<p>We placed a recognizable byte pattern, a nonce, in a guest page. The first resolver took that page&#39;s known GPA and its contents as inputs. Together, they gave us an address to translate and a way to check whether the translation reached our page.</p>
+<p>The resolver searched the host physical ranges covered by the memory primitive for candidate EPT roots. An EPT root is the starting point of the translation tables. For each candidate, the resolver followed the entries selected by the guest address until it reached a physical page, then checked that page for the nonce.</p>
+<p>The snippets below are explanatory pseudocode with descriptive helper names. They show the data passed between stages and the checks used to connect them.</p>
+
+<p>The nonce check connected a proposed translation to memory we controlled. The broader search produced two candidates; validation of the nested page tables reduced them to one EPT root. Walking that root gave us the host physical address of our guest page.</p>
+<p>We called this result <code>guest_page_hpa</code> and passed it to the next resolver. We now had a recognizable object in host memory. The next task was finding the host process that mapped it.</p>
+<h2>02 / Finding the Firecracker process</h2>
+<p>Firecracker maps memory used by the guest into its own address space. That mapping gave us a way to work backward from the guest page to the process.</p>
+<p>Host processes use page tables to translate their virtual addresses into physical memory. The top level is called the page global directory, or PGD. Recovering the appropriate PGD would let us translate addresses inside Firecracker and read its code and stack through the memory primitive.</p>
+<p>Our reverse mapper searched the native host page tables for a mapping of <code>guest_page_hpa</code>. A normal page table walk starts with a virtual address and produces a physical address. Here, we looked for a mapping to a physical page we already knew, then recovered the virtual address and page table root associated with it.</p>
+<p>The check runs in both directions:</p>
+
+<p>This connected the host process&#39;s virtual mapping to the physical page found through EPT. The reverse mapper returned one validated address space. We retained its root as <code>host_pgd</code> and used it to inspect the process.</p>
+<p>The next resolver looked for the Firecracker executable in those mappings. It identified an ELF image and checked a known byte sequence in Firecracker&#39;s <code>write(2)</code> wrapper. That connected the recovered address space to the binary we were targeting.</p>
+<p>ASLR changes where an executable is loaded. The difference between an address in the ELF image and its corresponding runtime address is the load bias. Once the mapper had identified the image, it could recover that bias and use it to locate the code required by the exploit:</p>
+
+<p>The mapper returned the load bias as <code>firecracker_base</code>. With that value and <code>host_pgd</code>, we could locate code in the running process, translate its virtual address to host physical memory, and compare the bytes there with the expected binary.</p>
+<p>We checked three locations: the <code>write(2)</code> wrapper that would produce our proof, the continuation after the KVM ioctl, and a short <code>xor eax,eax; ret</code> sequence needed to return cleanly. Their purposes become relevant when we construct the return path below.</p>
+<p>At this point, the guest could inspect the Firecracker image and its private mappings. We still needed the saved registers of the thread currently running our VM.</p>
+<figure><img src="https://pwn.ai/api/blog/images/02-address-resolution-0e47fd8bf102.png" alt="02-address-resolution-0e47fd8bf102" loading="lazy"/><figcaption>02-address-resolution-0e47fd8bf102</figcaption></figure>
+<p><em>Figure 2. The nonce identifies the guest page in host memory. Its mapping leads to a host page table root, which lets the next resolver locate and validate the Firecracker image.</em></p>
+<h2>03 / Locating the live vCPU frame</h2>
+<p>The frame finder took <code>host_pgd</code> and <code>firecracker_base</code> from the preceding stages. It used them to recognize the host thread&#39;s saved state.</p>
+<p>The most useful clue was the return address. A vCPU thread in <code>KVM_RUN</code> should have a saved instruction pointer at the corresponding ioctl continuation in Firecracker. We could calculate that address from the validated binary and its load bias.</p>
+<p>We then searched host memory for a <code>pt_regs</code> frame consistent with that call. An address match alone would also pick up stale stack contents, so the candidate had to satisfy several related checks:</p>
+<table><thead><tr><th>Saved state</th><th>What we checked</th></tr></thead><tbody><tr><td>System call</td><td>The syscall identity and in-progress state matched an active ioctl.</td></tr><tr><td>Request argument</td><td>The ioctl request was <code>KVM_RUN</code>.</td></tr><tr><td>File descriptor</td><td>The descriptor fell within the helper&#39;s expected range.</td></tr><tr><td>Instruction pointer</td><td>It matched the validated Firecracker ioctl continuation.</td></tr><tr><td>Stack pointer</td><td>It translated through the recovered host PGD.</td></tr><tr><td>Segment selectors and flags</td><td>They described a valid return to userspace.</td></tr><tr><td>Caller return address</td><td>It fell inside the validated Firecracker text mapping.</td></tr></tbody></table>
+<p>The stack check tied the frame to the same address space we had recovered from the guest page. The instruction and caller addresses tied it to the Firecracker image. The syscall fields tied it to the operation running the vCPU.</p>
+<p>The search left one candidate. Its location was stored as <code>frame_hpa</code>, the host physical address of the saved register frame. We passed it, the PGD, and the load bias to the final helper.</p>
+<p>Before changing memory, the helper repeated the code signature, frame, and stack checks. This ensured that the active stage used the same process state the resolvers had identified. The subsequent execution and recovery checks would establish that the selected frame was live.</p>
+<figure><img src="https://pwn.ai/api/blog/images/03-live-kvm-run-frame-ddb3ad26cf50.png" alt="03-live-kvm-run-frame-ddb3ad26cf50" loading="lazy"/><figcaption>03-live-kvm-run-frame-ddb3ad26cf50</figcaption></figure>
+<p><em>Figure 3. The candidate register frame must agree with the KVM ioctl, the recovered process page tables, and the validated Firecracker code.</em></p>
+<h2>04 / Redirecting the return from KVM</h2>
+<p>We chose a simple payload: make the Firecracker process write a recognizable string to its own stderr. This would give the host runner an observable result from the process we had taken over.</p>
+<p>The string was <code>N8V23M2\n</code>, seven characters followed by a newline. It occupies eight bytes and fits in one stack word. The call we wanted Firecracker to execute was:</p>
+
+<p>Here <code>2</code> is Firecracker&#39;s stderr file descriptor. The buffer pointer must refer to the string in Firecracker&#39;s address space, so we stored the string on its private userspace stack.</p>
+<p>We saved three stack words before modifying them. One held the string; the other two held the return addresses for the temporary call sequence. We then changed the saved register frame to supply the wrapper address, its arguments, and a stack pointer for that sequence:</p>
+
+<p>Returning from <code>write</code> also needed care. A successful write of eight bytes returns <code>8</code>, while a successful <a href="https://docs.kernel.org/virt/kvm/api.html#kvm-run" rel="noopener noreferrer" target="_blank"><code>KVM_RUN</code> call returns zero</a>. We placed the address of <code>xor eax,eax; ret</code> first in the return sequence. It clears the return value before the second address brings execution back to Firecracker&#39;s original ioctl continuation.</p>
+<p>The resulting control flow was:</p>
+
+<p>With the stack and saved registers prepared, the guest wrote one byte to its serial port. That operation caused the vCPU thread to return from <code>KVM_RUN</code>. The kernel restored the modified registers, and Firecracker entered the <code>write</code> wrapper with our arguments.</p>
+<p>The wrapper emitted the marker, the return sequence cleared <code>eax</code>, and the thread rejoined its original execution path. After control returned to the guest, the helper restored all three stack words.</p>
+<figure><img src="https://pwn.ai/api/blog/images/04-reversible-control-flow-10ae6af41746.png" alt="04-reversible-control-flow-10ae6af41746" loading="lazy"/><figcaption>04-reversible-control-flow-10ae6af41746</figcaption></figure>
+<p><em>Figure 4. The saved register frame enters the write wrapper. Two return addresses lead through the return-value adjustment and back into the original Firecracker path.</em></p>
+<h2>05 / Checking execution and recovery</h2>
+<p>The host runner captured Firecracker&#39;s stderr separately from the guest. The complete output was:</p>
+
+<p>The capture contained exactly eight bytes, including the final newline. Firecracker was still running, guest SSH was responsive, and the helper had restored the three temporary stack words.</p>
+<p>We checked recovery with a fresh pass that made no memory changes. It was given the same frame address and repeated the register, code, and stack checks after the trigger. The checks passed, and it found no stale marker in the temporary stack location.</p>
+<p>These observations answered three different questions. The guest log recorded the trigger and restoration. The host capture showed that Firecracker executed the selected operation. The final validation checked the state after execution.</p>
+<table><thead><tr><th>Check</th><th>Recorded result</th></tr></thead><tbody><tr><td>Firecracker stderr</td><td>One copy of the marker, eight bytes in total</td></tr><tr><td>Firecracker process</td><td>PID <code>2936</code>, alive after the trigger</td></tr><tr><td>Guest health</td><td>SSH responsive; uptime <code>1615.72</code> seconds</td></tr><tr><td>Temporary stack state</td><td>All three original words restored</td></tr><tr><td>Executable text and shared libraries</td><td>Unmodified</td></tr><tr><td>Host kernel errors after the trigger</td><td>None observed</td></tr><tr><td>Validation after restoration</td><td>The supplied frame address and surrounding invariants passed</td></tr></tbody></table>
+<figure><img src="https://pwn.ai/api/blog/images/05-proof-receipt-6e8ad89bf50c.png" alt="05-proof-receipt-6e8ad89bf50c" loading="lazy"/><figcaption>05-proof-receipt-6e8ad89bf50c</figcaption></figure>
+<p><em>Figure 5. The guest log, Firecracker stderr capture, and final validation record the trigger, host execution, and restored state.</em></p>
+<h2>06 / Root execution on the host</h2>
+<p>By the time the marker appeared, the guest had selected the host thread&#39;s instruction pointer, function arguments, stack data, and return path. Firecracker executed the call using its own privileges.</p>
+<p>The target was Firecracker v1.16.1 on x86-64, with host kernel <code>7.0.0-1011-aws</code> and guest kernel <code>6.18.44+</code>. We launched Firecracker directly as root under <code>systemd-run</code> and pinned it with <code>taskset</code>. Consequently, the controlled call executed as root on the host.</p>
+<p>The existing write wrapper gave us a compact proof of that control. Extending it to other calls would require choosing code and arguments compatible with the process&#39;s mappings and syscall policy.</p>
+<p>The configuration used here had no jailer. Firecracker&#39;s <a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#sandboxing" rel="noopener noreferrer" target="_blank">production containment</a> includes dropping privileges and restricting the process through namespaces and seccomp. A deployment using those controls requires a separate assessment of the privileges and resources available after compromising its VMM.</p>
+<p>The address discovery is what lets the exploit follow the running instance. The EPT resolver connects a guest page to host memory; the reverse mapper recovers the host address space; the image mapper locates Firecracker under ASLR; and the frame finder identifies the vCPU&#39;s saved state. Adapting the final stage to another build requires validating that binary&#39;s code signatures and return path.</p>
+<p>The guest had used access to host memory to take over the thread running the VM itself. A serial write supplied the trigger, and the next userspace operation belonged to us.</p>
+<h2>Captured resolver values and artifacts</h2>
+<p>The following values come from the preserved execution record. The methods above use symbolic names so that the role of each value is clear; this table connects those names to the recorded addresses.</p>
+<table><thead><tr><th>Value</th><th>Recorded address</th><th>Where it enters the chain</th></tr></thead><tbody><tr><td><code>guest_gpa</code></td><td><code>0x08f03000</code></td><td>The guest physical address of the nonce page, supplied to the first resolver</td></tr><tr><td><code>guest_page_hpa</code></td><td><code>0x165610000</code></td><td>The host address of that page, found by the EPT resolver</td></tr><tr><td><code>host_pgd</code></td><td><code>0x14afc2000</code></td><td>The host page table root recovered by the reverse mapper</td></tr><tr><td><code>firecracker_base</code></td><td><code>0x7298c2400000</code></td><td>The Firecracker load bias recovered by the image mapper</td></tr><tr><td><code>frame_hpa</code></td><td><code>0x13a5bff48</code></td><td>The saved register frame selected for the active stage</td></tr></tbody></table>
+<p>The records use run ID <code>eventpath-v23-0907self02</code> and boot ID <code>2b3cd5ac-2311-427f-a50a-6a79ecb8daa7</code>. These identifiers connect the resolver records, host capture, and validation after restoration.</p>
+<p>The earlier memory provider also received host-selected task and canary page frame numbers as independent validation overlays after constructing the memory aperture. Those addresses were not consumed by the EPT resolver, reverse mapper, Firecracker mapper, frame finder, or final marker helper.</p>
+<p>The release bundle contains the final helper source, JSONL resolver records, host capture, recovery manifest, four preserved read-only resolver binaries with provenance, and SHA-256 manifests. The final helper accepts the PGD, load bias, and frame HPA produced by the resolvers. Its checks cover the run identifier, address ranges, code signatures, saved registers, and stack geometry; its dry-run mode performs validation without writing memory.</p>
+<h2>Proof of Concept</h2>
+
+<p>The artifact hashes are:</p>
+
+<p>Verify the bundle against its manifest with:</p>
+<div><div><div><pre><code>shasum -a 256 -c SHA256SUMS
+</code></pre></div></div></div>
+<h2>Technical references</h2>
+<ul>
+<li><a href="https://pwn.ai/blog/pwnescape" rel="noopener noreferrer" target="_blank">PwnEscape Part 1</a></li>
+<li><a href="https://vercel.com/blog/findings-from-the-1-million-dollar-vercel-sandbox-challenge#the-kernel-zero-day" rel="noopener noreferrer" target="_blank">Vercel: Findings from the $1M Sandbox challenge</a></li>
+<li><a href="https://docs.kernel.org/virt/kvm/api.html#kvm-run" rel="noopener noreferrer" target="_blank">KVM API: KVM_RUN</a></li>
+<li><a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md" rel="noopener noreferrer" target="_blank">Firecracker architecture and containment</a></li>
+<li><a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md" rel="noopener noreferrer" target="_blank">Firecracker jailer documentation</a></li>
+<li><a href="https://github.com/firecracker-microvm/firecracker/blob/main/docs/seccomp.md" rel="noopener noreferrer" target="_blank">Firecracker seccomp documentation</a></li>
+</ul></div></div></article></div>
+  </body>
+</html>
