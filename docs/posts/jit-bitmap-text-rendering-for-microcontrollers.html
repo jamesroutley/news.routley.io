@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://linebender.org/blog/jit-bitmap-text/">Original</a>
+    <h1>JIT bitmap text rendering for microcontrollers</h1>
+    
+    <div id="readability-page-1" class="page"><div aria-label="Content">
+            <div>
+                
+
+<h3>Raph Levien, November 7, 2026</h3>
+<p>I&#39;ve been working on <a href="https://github.com/raphlinus/vic-2350">vic-2350</a>, a re-envisioning of an 80s home computer on an RP2350 microcontroller board.
+Of course, such a project needs text rendering.
+Though bitmap fonts are now out of favor, I chose them both for efficiency and because, at low resolutions, I prefer the aesthetic of a crisp, intentionally designed bitmap font over the blurry mush of antialiased font rendering.
+They still have a niche, if a narrow one.</p>
+<p>I also wanted proportional spacing and kerning, again because I love the aesthetic of early Macintosh and its predecessors.
+Most text rendering in RP2350 projects is based on a fixed character cell, as achieving good performance is tricky.</p>
+<p><img src="https://linebender.org/blog/jit-bitmap-text/textdemo.png" alt="Demo of bitmap text rendering on RP2350"/></p>
+<p>This blog post presents a technique for extremely fast rendering of bitmap text on microcontrollers such as the RP2350.
+I&#39;ve implemented it as part of my race-the-beam renderer, but the same technique would work when writing into a framebuffer as well.
+The core idea is a JIT to generate highly optimized code on the fly for rendering a string.</p>
+<h2 id="racing-the-beam">Racing the beam</h2>
+<p>Around the mid-80s, a split was happening in the way computers displayed text.
+The established technique was a fixed cell size, and hardware that looked up characters in a font ROM on the fly as the image was scanned out to the monitor.
+The advantage was very fast update and responsiveness with limited hardware.
+A lot of terminals worked this way, as did home computers.
+The downside was the lack of flexibility.
+In particular, only monospace fonts were supported.</p>
+<p>The newer technique was a bitmap framebuffer, as pioneered on a line of computers originating with the <a href="https://en.wikipedia.org/wiki/Xerox_Alto">Xerox Alto</a>, continuing through the Apple Lisa, and finally becoming popular with the Macintosh.
+The framebuffer was vastly more flexible, but required a lot more computing power to keep updated.
+In the early 80s, you would generally watch text progressively render.
+I should also mention, graphics modes were generally available on home computers, but they were typically lower resolution than text mode and a 1MHz 6502 (or similar) was just not powerful enough, so serious text-based programs like word processors and spreadsheets used text mode.</p>
+<p>Fast forward to the RP2350.
+It is capable of DVI video out with the help of the HSTX peripheral, but it is still entirely up to software to fill the video buffer.
+Some projects choose a framebuffer, but there&#39;s only 520kB of SRAM on the chip, so a framebuffer must be limited in either resolution or bit depth or both, and it would also be good for that RAM to be available to the app for other purposes.
+I&#39;ve chosen instead to race the beam, filling a video buffer each scanline.
+That allows more visual richness and much lower latency, but is a hard performance constraint on the renderer.
+There&#39;s a budget of approximately 6 cycles per pixel.
+The lower we come in under budget, the more is available for rendering other graphical objects, and for other app functions.</p>
+<p>Rust is not capable of meeting the performance requirement, so I started writing ARM assembly language.
+The renderer, and much of vic-2350, is now written in <a href="https://github.com/raphlinus/symbolasm">symbolasm</a>, a programming language I&#39;ve created for extremely high performance Cortex-M33 programming.
+Employing a JIT speeds up rendering further.</p>
+<h2 id="the-rendering-pipeline">The rendering pipeline</h2>
+<p>Rendering is often modeled as a pipeline, and the vic-2350 renderer is no exception.
+The interface between application and renderer is a <em>display list.</em> At heart, that&#39;s just what it says, a list of <em>display objects.</em> The display list is double-buffered; one is being rendered and scanned out, and the other is built by the application.
+At each vsync, if the app is ready, the display list is swapped.
+Building the display list is not computationally intensive, but of course the app might be busy doing other things.</p>
+<p>As the display list is of unknown size at compile time, it allocates.
+Display objects are packed into two vectors; one holds the display objects themselves, the other a list of indices into the first vector.
+A display object consists of a vtable, a bounding rectangle, and the object-specific payload.
+Allocation is acceptable because <em>building</em> the display list is not timing critical.
+Rendering is a different story.
+That said, it is important for the display list to be memory efficient, especially as there are two copies.</p>
+<p>Before presenting, the indices are sorted into ascending y0 order.</p>
+<p>During rendering, the renderer maintains an <em>active list,</em> which is just the subset of display objects that intersect the current scanline.
+At each scanline, objects for which y1 = y are deleted from the active list, and new objects with y0 = y are inserted, which is the reason for the sort earlier; it is exactly the order objects are inserted into the active list.
+The active list is kept in display object order.</p>
+<p>Then the renderer just calls the <code>render</code> method for each display object in the active list.
+I&#39;ll do a bit more optimization soon, tracking opaque spans and eliding rendering work for spans of pixels that will be overwritten later, but that&#39;s not fundamental to the text rendering as presented here.</p>
+<p>At the start and end of an object (when it&#39;s inserted and deleted) the renderer calls <code>start</code> and <code>end</code> methods on the display object.
+These methods can allocate scratch space and do other work to set up rendering of the object.
+There&#39;s a specialized bitmap allocator, which is both fast and deterministic.</p>
+<h3 id="text-display-objects">Text display objects</h3>
+<p>All this gives us everything we need to implement text rendering as an instance of display objects.</p>
+<p>The text object itself contains the string (1 byte per character), a pointer to the font, and foreground and background colors.
+RAM is precious, and more so for the display list because it&#39;s double buffered.
+In an earlier iteration of the renderer, I had an expanded version of the text stored in the display list, and that created unacceptable memory pressure when the screen was filled with text.</p>
+<p>The <code>start</code> method allocates scratch space for both the JIT code and a 1 bit per pixel intermediate buffer, and invokes the JIT compiler, expanding the string into code.</p>
+<p>The <code>render</code> method calls that code, which fills the 1 bit per pixel buffer, then runs a second pass to expand that 1 bit per pixel buffer into 16 bit per pixel RGB (565 format).
+This second pass runs at a sustained rate of 1.75 cycles per pixel.</p>
+<p>The font is stored in extremely packed format.
+All the &#34;ink&#34; for glyphs is stored in a wide bitmap image, same height as the font.
+The packing also makes sure no glyph straddles a 32-pixel chunk boundary, so one row of font pixels can always be read with a single 32 bit load.
+If a glyph has space on either side of the glyph, that&#39;s not stored in the packed bitmap; rather, the space is in the per-glyph metadata.</p>
+<p>In the spirit of micro-optimization, the packing algorithm also detects overlaps, as there&#39;s no requirement that pixels be unique to a single glyph.
+This optimization reduces the size of the font bitmap from 1140 to 960 bytes.
+Every byte counts, and more so as we add more fonts.
+The font bitmap needs to live in SRAM, as having it in flash could cause stalls during rendering at video rate.</p>
+<p><img src="https://linebender.org/blog/jit-bitmap-text/font-shared-grid-marked-4x.png" alt="A bitmap font packed very tightly into 32 bit words, with overlap. Word boundaries are alternating blue and yellow shading, and overlap is slightly darker shading"/></p>
+<p>I especially liked the <code>{][}</code> sequence (near the start of the second row).
+Any glyph contained within another glyph doesn&#39;t need to be packed separately.
+There are a few examples, some surprising.
+For example, <code>l</code> is the left side of <code>U</code>, and <code>0</code> is identical to <code>()</code> with the space between them removed.</p>
+<p>The per-glyph metadata (not counting kerning) is conceptually four fields: the x position and width of the ink within the bitmap, the space on the left, and the advance.
+All this is tightly packed into a 32 bit integer.</p>
+<h2 id="jit">JIT</h2>
+<p>In the generated JIT code, registers are assigned as follows:</p>
+<ul>
+<li>r0 points to the beginning of the row of the packed font bitmap</li>
+<li>r1 is the output buffer, a one-line 1 bit per pixel image buffer</li>
+<li>r2 is the accumulator for the output bitmap</li>
+<li>r3 holds the bits of one glyph, extracted from r4</li>
+<li>r4 holds 32 bits loaded from the glyph bitmap</li>
+</ul>
+<p>In the simplest case, we add one glyph to the accumulator.
+The code looks like this:</p>
+<pre data-lang="asm"><code data-lang="asm"><span>    ldr r4</span><span>, [</span><span>r0</span><span>, </span><span>#(x_offset / </span><span>32 </span><span>* </span><span>4</span><span>)</span><span>]
+</span><span>    ubfx r3</span><span>, </span><span>r4</span><span>, </span><span>#(x_offset % </span><span>32</span><span>)</span><span>, </span><span>#(width)
+</span><span>    orr r2</span><span>, </span><span>r3</span><span>, </span><span>lsl </span><span>#(x % </span><span>32</span><span>)
+</span></code></pre>
+<p>There&#39;s additional code to output a word when it&#39;s finished (<code>stmia r1!, {r2}</code>), and to handle cases when a glyph straddles a 32 bit boundary.
+These are documented in <a href="https://github.com/raphlinus/vic-2350/blob/62f2fae7e672b9a01011cdc320b031cda29fb5c8/text.sy">text.sy</a>.
+But there is one trick I do want to mention here: the code as above has a result-use delay between the <code>ldr</code> and <code>ubfx</code> (unsigned bit field extract).
+This is solved by shuffling the order of instructions somewhat: the last instruction for glyph <code>i</code> is reordered to follow the first instruction (<code>ldr</code>) of glyph <code>i + 1</code>, filling the delay slot, and reducing the cycle cost from 4 to 3.</p>
+<p>Here&#39;s the inner loop of the code generator, focusing only on the case where the glyph doesn&#39;t straddle the accumulator.
+For each glyph, several values are packed into the <code>g</code> variable, then unpacked below: the offset within the packed font bitmap (which further breaks down into a bit offset and a word offset), the width of the inked part, the left side bearing, and the advance.</p>
+<pre data-lang="rust"><code data-lang="rust"><span>    </span><span>loop </span><span>{
+</span><span>        g @r12 = *(glyphs + c * </span><span>4</span><span>)
+</span><span>        </span><span>// the next character, reading one past the end
+</span><span>        c = *text++
+</span><span>        width @r7 = g[</span><span>20</span><span>..</span><span>26</span><span>]
+</span><span>        bit_offset @r4 = g &amp; </span><span>31
+</span><span>        </span><span>if</span><span> width == </span><span>0</span><span> goto blank
+</span><span>        </span><span>// ubfx r3, r4, #offset % 32, #width
+</span><span>        ubfx_instr @r11 = *(ubfx_table + bit_offset * </span><span>4</span><span>)
+</span><span>        </span><span>// ldr r4, [r0, #offset / 32]; the font is narrower than 32 words,
+</span><span>        </span><span>// so the offset fits, and strh leaves out what&#39;s above it.
+</span><span>        word_offset @r4 = g &gt;&gt; </span><span>5
+</span><span>        ldr @r4 = ldr_base + (word_offset &lt;&lt; </span><span>6</span><span>)
+</span><span>        ubfx_instr += width &lt;&lt; </span><span>16
+</span><span>        *slot = ldr
+</span><span>        </span><span>// left side bearing
+</span><span>        left @r4 = (g as </span><span>i32</span><span>)[</span><span>16</span><span>..</span><span>20</span><span>]
+</span><span>        *(code as *</span><span>u32</span><span>) = ubfx_instr
+</span><span>        </span><span>// shift: where the glyph starts, relative to the word in r2. Branch is
+</span><span>        </span><span>// also taken if negative.
+</span><span>        shift @r4 = pen + left
+</span><span>        room @r7 = </span><span>32 </span><span>- width
+</span><span>        pen += g &gt;&gt; </span><span>26
+</span><span>        #(shift - room)
+</span><span>        </span><span>if </span><span>#hi goto off_word
+</span><span>        </span><span>// the delay: orr r2, r2, r3, lsl #shift
+</span><span>        d @r12 = *(orr_table + shift * </span><span>4</span><span>)
+</span><span>        *((code + </span><span>6</span><span>) as *</span><span>u32</span><span>) = d
+</span><span>        slot = code + </span><span>4
+</span><span>        code += </span><span>10
+</span><span>        #(n -= </span><span>1</span><span>)
+</span><span>        </span><span>if </span><span>#ne goto </span><span>loop
+</span><span>    }
+</span></code></pre>
+<p>Here&#39;s the compiled ARM assembly code from the above symbolasm code, along with cycle count analysis from the symbolasm analysis tool:</p>
+<pre><code><span>  134: f859 c028           1 ldr r12, [r9, r8, lsl #2]
+</span><span>  136: f811 8b01           1 ldrb r8, [r1], #1
+</span><span>  137: f3cc 5705           1 ubfx r7, r12, #20, #6
+</span><span>  138: f00c 041f           1 and r4, r12, #31
+</span><span>  139: b387              1/2 cbz r7, .Ljit_text.blank
+</span><span>  141: f855 b024           1 ldr r11, [r5, r4, lsl #2]
+</span><span>  144: ea4f 145c H         1 lsr r4, r12, #5
+</span><span>  145: eb0a 1484           1 add r4, r10, r4, lsl #6
+</span><span>  146: eb0b 4b07           1 add r11, r11, r7, lsl #16
+</span><span>  147: 801c                1 strh r4, [r3]
+</span><span>  149: f34c 4403           1 sbfx r4, r12, #16, #4
+</span><span>  150: f8c0 b000 H         1 str r11, [r0]
+</span><span>  153: 1934                1 adds r4, r6, r4
+</span><span>  154: f1c7 0720           1 rsb r7, r7, #32
+</span><span>  155: eb06 669c           1 add r6, r6, r12, lsr #26
+</span><span>  156: 42bc                1 cmp r4, r7
+</span><span>  157: d821        K     0/2 bhi .Ljit_text.off_word
+</span><span>  159: f85e c024           1 ldr r12, [lr, r4, lsl #2]
+</span><span>  160: f8c0 c006           1 str r12, [r0, #6]
+</span><span>  161: 1d03                1 adds r3, r0, #4
+</span><span>  162: 300a                1 adds r0, r0, #10
+</span><span>  163: 3a01                1 subs r2, r2, #1
+</span><span>  164: d1da        K     0/2 bne .Ljit_text_0_loop
+</span><span>   loop 134-164: 23 cycles per iteration
+</span></code></pre>
+<p>The <code>K</code> flags indicate a possible delay in branches because the condition isn&#39;t known until the cycle before the branch.
+Here, <code>0/2</code> indicates 0 cycles if the branch is not taken, and 2 if it is.
+Neither of these can be optimized.
+The <code>H</code> flag indicates the instruction is 32 bits rather than 16 because of the use of &#34;hi&#34; registers (r8-r15).
+These are available in the LSP as well.</p>
+<p>Without a JIT, it would be possible to write text rendering as a loop, but in the proportionally spaced case, there&#39;d be a huge amount of setup to work out the shift amounts, plus branching to handle cases like straddling a 32 bit boundary.
+Earlier implementations of the idea in <a href="https://github.com/DusterTheFirst/pico-dvi-rs">pico-dvi-rs</a> struggled to display a full screen of text.
+Of course, for fixed width text all that is known statically, so a tight loop without JIT is fine.</p>
+<h2 id="performance">Performance</h2>
+<p>The basic loop is 23 cycles per glyph for the JIT plus 3 cycles times height for the bitmap generation.
+There&#39;s an additional cost of about 20 cycles for JIT and 2 cycles times height per 32 bits of output width.</p>
+<p>This is astonishingly fast.
+The textdemo in vic-2350 takes about 21k cycles for the JIT and 42k cycles to run the JIT code.
+That adds up to about 2.6% of the available throughput of a single core of the RP2350.
+Expanding to 565 is actually about 3x more expensive.
+So it&#39;s fair to say it&#39;s as optimized as it can get.</p>
+<p>While this was designed for race-the-beam rendering, it would work just as well writing into a framebuffer, especially a one bit per pixel framebuffer.
+Just generate the code, run it for each scanline.</p>
+<p>It&#39;s tempting to cache the JIT output, but saving RAM is more important.
+The JIT output is about a 10x expansion over the input string.
+And, from the numbers above, it&#39;s clear that the cost of running the JIT is minimal.</p>
+<p>The name &#34;just in time&#34; is apt; in the implementation in vic-2350, the JIT compiler runs under 100µs before scanout of the video line.</p>
+<p>I wasn&#39;t able to find a direct performance comparison to an existing RP2350 text renderer.
+Probably the closest is <a href="https://github.com/adafruit/Adafruit-DVI-HSTX">dvhstx</a> by Michael Bell and forked by Adafruit.
+That also ends up spending approximately 2-2.5 cycles total per pixel, but is limited to a 14x24 grid and also uses an RGB 222 mode, so its output bandwidth is only half as much (and this is where the lion&#39;s share of the time goes).</p>
+<h2 id="dot-product-kerning">Dot Product Kerning</h2>
+<p>Kerning is a very important refinement for text rendering, otherwise the spacing looks irregular.
+The general mechanism in OpenType fonts is quite complex.
+For this project, I wanted something simple and efficient, so dusted off an idea that was originally motivated by trying to do text layout on GPU.</p>
+<p>Basically, each glyph has two bitvectors, one each for the left and right side.
+To kern two glyphs, take the <code>and</code> of the right bitvector of the first glyph and the left bitvector of the second, then the popcount (number of <code>1</code> bits) of that, resulting in the number of pixels to kern.
+That&#39;s actually just the dot product of the two vectors, bits interpreted as 0 and 1.
+The kern tables require only two bytes per glyph, and kerning is super fast to evaluate.</p>
+<p>Even so, kerning evaluation is done at display list build time, not racing the beam.
+When the kern is nonzero, a special negative space character is inserted into the string in the text display object.</p>
+<p>For this font, I built the <a href="https://github.com/raphlinus/vic-2350/blob/62f2fae7e672b9a01011cdc320b031cda29fb5c8/fonts/vic-sans-14.kern">kerning table</a> manually.
+Each bit is a specific feature, for example bit 0 represents the top right of the first glyph projecting out, and a corresponding lack of ink in the top left of the next glyph.
+So it is set for the right of <code>T</code> and <code>Y</code>, and also at the left of most lowercase letters and also <code>A</code>.
+It&#39;s not hard to imagine a tool that might help automate this, perhaps distilling kerning information prepared in other ways.</p>
+<p>I haven&#39;t done a real implementation yet, but I suspect this idea might scale to real fonts: instead of bits and an integer kerning amount, the vectors would store continuous values (reasonably quantized).
+An additional nonlinear step after the multiplication but before the sum may also help.
+Dot products are of course ridiculously efficient to compute on GPU, while doing index chasing through OpenType tables is not.
+But that exploration is for another day.</p>
+<p>Kerning improves quality considerably:</p>
+<p><img src="https://linebender.org/blog/jit-bitmap-text/kern.png" alt="Comparison of kerning, first line is not kerned, second is"/></p>
+<h2 id="ai-disclosure">AI disclosure</h2>
+<p>This work is a refinement of the text rendering in <a href="https://github.com/DusterTheFirst/pico-dvi-rs">pico-dvi-rs</a>, which was hand-written.
+My draft of the JIT core was hand-written in Rust, then I used Claude to translate it to symbolasm and refine and optimize it.
+This blog is hand-written.</p>
+<p>The symbolasm compiler and analysis tool is heavily LLM assisted, though it too evolved from an initial hand-written version.</p>
+<p>I did a <a href="https://en.wikipedia.org/wiki/Microtypography">microtypography</a> experiment that was a pretty cool result, but decided not to include it, partially because it would have increased the fraction of LLM content.</p>
+<p>Like most other people in the industry, I struggle with the balance between quality and the acceleration that LLMs provide.
+Claude is exceedingly good at the low level tasks of coding; it easily found an edge case in my draft of the JIT compiler.
+I find that when used judiciously, LLM can improve quality, and I strive for that.</p>
+
+<p>I wasn&#39;t able to find much precedent for JIT specifically for text rendering.
+Of course, there is a massive literature on JIT in general.
+On-the-fly code generation for bitblt was done for the <a href="https://en.wikipedia.org/wiki/Blit_(computer_terminal)">Blit</a> around 1982.
+See <a href="https://pdos.csail.mit.edu/%7Ersc/pike84bitblt.pdf">Bitmap Graphics SIGGRAPH 84</a> for more.
+An interesting detail is that they claim about 2500 characters per second; the raw performance of this on RP2350 hardware is almost 3 orders of magnitude greater, just counting the output to 1bpp (which is how the Blit&#39;s framebuffer was configured).</p>
+<p>Edit added later: David Fuchs pointed out [US Patent 6377261], filed in 1996, which compiled glyphs to machine code.
+It&#39;s highly optimized for speed, and has a lot in common with the idea here, but depends on a cache to be reasonably RAM efficient.
+Even so, it absolutely counts as prior art.</p>
+<p>Discuss on <a href="https://news.ycombinator.com/item?id=50412072">Hacker News</a>.</p>
+
+
+            </div>
+        </div></div>
+  </body>
+</html>
