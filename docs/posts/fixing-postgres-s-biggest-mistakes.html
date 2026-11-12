@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>James Routley | Feed</title>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="../styles.css"
+      media="screen"
+    />
+  </head>
+  <body>
+    <a href="/index.html">Back</a>
+    <a href="https://malisper.me/fixing-postgress-biggest-mistakes/">Original</a>
+    <h1>Fixing Postgres’s biggest mistakes</h1>
+    
+    <div id="readability-page-1" class="page"><article id="post-1696">
+			<!-- .entry-header -->
+		<div>
+		<p>Postgres is one of the greatest databases out there. It’s the default choice for almost every startup I talk to. Calling its design choices “mistakes” is a little unfair, since most of them made total sense on 1990s hardware. Still, in 2026, if you run Postgres long enough without a dedicated database person, you’ll hit the same four problems over and over. I wrote about them back in May in <a href="https://malisper.me/the-four-horsemen-behind-thousands-of-postgres-outages/">The four horsemen behind thousands of Postgres outages</a>:</p>
+<ol>
+<li>VACUUM and transaction ID wraparound</li>
+<li>Connection limits and query parallelism</li>
+<li>Bad query plans</li>
+<li>Missing jsonb statistics</li>
+</ol>
+<p>When I wrote that post, <a href="https://github.com/malisper/pgrust">pgrust</a> (our reimplementation of Postgres for modern hardware) was still early, and most of our plans to fix those four problems were still ideas on a whiteboard.</p>
+<p>Since then, pgrust <a href="https://malisper.me/postgres-in-rust-regression-suite/">hit a 100% pass rate on Postgres’s upstream regression suite</a>, and none of the four horsemen are whiteboard ideas anymore. We’ve already shipped our fix for one of them, and we have internal prototypes for the other three that we’re wiring into pgrust right now. Here’s how we’re fixing all four.</p>
+<h2>1. VACUUM and Transaction ID Wraparound</h2>
+<p>VACUUM is probably the number one cause of Postgres outages I hear about. Suppose you run a harmless looking update on a busy table:</p>
+<pre data-enlighter-language="sql" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">UPDATE users SET last_seen_at = now() WHERE id = $1;</pre>
+<p>Postgres doesn’t overwrite last_seen_at in place. Instead, Postgres writes a brand new copy of the entire row and marks the old row copy as dead. If that new copy lands on a different page, Postgres also has to insert new entries into every index on users, even when none of the indexed columns changed. Later on, a background VACUUM job has to scan your tables and indexes, physically clean up those dead rows, and reclaim old transaction IDs before they wrap around and Postgres shuts down your database to prevent corruption.</p>
+<p>This creates a nasty operational trap on tables with heavy writes. Run VACUUM too aggressively and it’ll eat up I/O that your live queries need. Run it too slowly and dead rows pile up, your tables and indexes bloat, queries slow down scanning half empty pages, and you’ll creep toward transaction ID wraparound.</p>
+<p>Back in May, I wrote about looking into storage designs that don’t need VACUUM at all. Since then, we’ve built an internal prototype of a new storage engine around an undo log and a lock free buffer pool. It draws on ideas from <a href="https://www.cidrdb.org/cidr2020/papers/p29-neumann-cidr20.pdf">Umbra</a>, <a href="https://github.com/orioledb/orioledb">OrioleDB</a>, <a href="https://db.in.tum.de/~leis/papers/leanstore.pdf">LeanStore</a>, <a href="https://db.in.tum.de/~muehlbau/papers/mvcc.pdf">HyPer</a>, and InnoDB, with a few twists of our own after benchmarking on real hardware.</p>
+<p>Instead of scattering dead row copies across your table, we keep the newest version of each row right in place (like HyPer and Umbra) and push older versions into compact undo deltas for active snapshots and rollbacks. Once active transactions move past an old version, that undo space gets reused directly without scanning your tables. Updating an unindexed column like last_seen_at doesn’t touch secondary indexes, dead tuples don’t bloat your pages, and there’s no transaction ID wraparound cliff.</p>
+<p>The early numbers from our standalone prototype are pretty wild. On sysbench with durable commits, the prototype ran many times faster than stock Postgres with lower tail latency. Right now, we’re wiring that engine into pgrust as a Table Access Method and testing it on real SQL workloads.</p>
+<h2>2. Connection Limits and Query Parallelism</h2>
+<p>When you spin up a Postgres instance, you have to pick a hard max_connections limit up front. Changing it requires restarting your database. If traffic spikes past that limit, Postgres won’t let new clients connect and your app goes down. Most teams end up running PgBouncer in front of Postgres just to survive connection spikes.</p>
+<p>Postgres has this problem because it spawns a separate OS process for every client connection. Processes are expensive to spin up and expensive to keep around. That’s painful in two ways. It caps how many concurrent connections you can hold, and it makes parallelizing work within a single query expensive enough that Postgres only bothers spinning up parallel worker processes on big, long running queries.</p>
+<p>We tackled this in two steps.</p>
+<p>First, we architected pgrust from day one as a single process database using threads. One big reason C Postgres stuck with processes for decades is fault isolation, since a stray pointer bug in one C process is less likely to corrupt another process’s memory. Because pgrust is written in Rust, we get memory safety at compile time without paying for OS process isolation. Queries run on a <a href="https://db.in.tum.de/~leis/papers/morsels.pdf">morsel-based</a> shared work stealing thread pool, which makes parallelizing work both across connections and within individual queries cheap.</p>
+<p>Second, we wanted to go further than OS threads for connection scaling. Threads are much lighter than processes, though holding tens of thousands of mostly idle connections from serverless functions or microservices still wastes a lot of RAM.</p>
+<p>To fix that properly, we’ve built an internal prototype of lightweight fibers in user space. Whenever a session has to wait on a client socket between statements, a row lock, a WAL commit flush, or a page read from disk, the fiber suspends at that wait point and lets another session run on the same core.</p>
+<p>When a connection sits idle between queries, it returns its execution stack to a pool and uses 1/10th the memory of an idle thread backend, while context switches run orders of magnitude faster than OS thread switches. You can hold tens of thousands of connections directly against pgrust without PgBouncer in front.</p>
+<h2>3. Bad Query Plans</h2>
+<p>Postgres’s query planner is smart, right up until it isn’t. Most of the time it picks a great plan. When it gets a plan wrong, though, a fast query can suddenly run hundreds of times slower. Worse yet, stock Postgres doesn’t give you planner hints out of the box. When a bad plan hits production, you have very few levers to pull. At a previous company I worked at, we had to turn off nested loop joins globally because Postgres kept picking them and tanking query latency.</p>
+<p>A big reason this happens is how Postgres estimates row counts across filters and joins. Suppose you run a query like this:</p>
+<pre data-enlighter-language="sql" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">SELECT count(*)
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+JOIN shipments s ON s.order_id = o.id
+WHERE c.country = &#39;CA&#39;
+  AND c.currency = &#39;CAD&#39;
+  AND o.status = &#39;disputed&#39;;</pre>
+<p>Postgres keeps single column histograms and mostly assumes conditions across columns and tables are independent. In real data, country and currency are heavily correlated, so multiplying their selectivities together badly underestimates how many customers match. Across several joins, those underestimates compound by orders of magnitude. Once Postgres thinks an intermediate join will return two rows when it actually returns two hundred thousand, a routine ANALYZE can flip a fast hash join into a disastrous nested loop join.</p>
+<p>Back in May, an adaptive query planner was the most theoretical item on my list. Since then, we’ve built internal prototypes that tackle bad plans both before and after a query runs.</p>
+<p>The key idea powering the adaptive planner is a <a href="https://www.vldb.org/conf/2001/P019.pdf">feedback loop</a>. Whenever a query finishes, pgrust compares the planner’s estimated row counts against the actual row counts observed at each join and learns a correction weight where the estimate missed badly.</p>
+<p>When we first built that feedback loop, we actually saw performance get worse. After some research, we found we hit a well-known trap: “<a href="https://www.vldb.org/conf/2005/papers/p373-markl.pdf">fleeing from knowledge to ignorance</a>.” Suppose the planner underestimates two candidate join orders, picks Plan A, and discovers at runtime that Plan A actually produces way more rows than expected. On the next run, the planner now knows Plan A’s true cost, while Plan B is still wildly underestimated. So the planner “flees” from the plan it just measured to the unmeasured, still underestimated Plan B! On one <a href="https://www.vldb.org/pvldb/vol9/p204-leis.pdf">Join Order Benchmark</a> query in our early tests, that made the query run over 10x slower after feedback than before.</p>
+<h2>4. Missing jsonb Statistics</h2>
+<p>Postgres makes it super easy to store and query semi structured data with jsonb. It also makes it super easy to shoot yourself in the foot once that table grows.</p>
+<p>At Heap, we used jsonb heavily and it was a <a href="https://www.heap.io/blog/when-to-avoid-jsonb-in-a-postgresql-schema">massive query planning headache</a>. Imagine a query filtering on a jsonb property and joining against another table:</p>
+<pre data-enlighter-language="sql" data-enlighter-linenumbers="false" data-enlighter-theme="dracula">SELECT e.user_id, e.created_at
+FROM events e
+JOIN accounts a ON a.id = e.account_id
+WHERE e.properties-&gt;&gt;&#39;plan&#39; = &#39;enterprise&#39;
+  AND e.created_at &gt;= now() - interval &#39;7 days&#39;;</pre>
+<p>For normal columns like created_at, Postgres collects rich statistics during ANALYZE, including histograms, most common values, and distinct counts. For keys and values inside e.properties, stock Postgres collects none of that. When you filter on a jsonb field, Postgres falls back to a hardcoded magic number and guesses that 0.1% of rows will match.</p>
+<p>The real match rate might be almost every row in the table or almost none of them. Postgres has no idea either way. As soon as you combine jsonb filters with joins, that 0.1% guess causes the planner to pick terrible join orders and wrong indexes all the time.</p>
+<p>Unlike the first three horsemen, you don’t have to wait on our internal prototypes for this one. We shipped native jsonb statistics in <a href="https://malisper.me/pgrust-v0-4-beta/">pgrust v0.4-beta</a>. During ANALYZE, pgrust inspects the keys and values inside your jsonb columns and builds real statistics on your JSON paths instead of guessing 0.1%. Because the planner actually understands the distribution of data inside your jsonb documents, it can pick sane join orders and index scans out of the box without forcing you to maintain manual expression indexes for every path you filter on. Depending on your workload, jsonb queries can run orders of magnitude faster right away.</p>
+<h2>Try an Early Version or Follow Along</h2>
+<p>To be clear, pgrust is still in beta today, so don’t put data you can’t afford to lose on it yet. Native JSONB statistics and our thread-based execution model are already out in pgrust v0.4-beta, and we’re wiring our new storage engine, user-space fibers, and adaptive query planner into pgrust next.</p>
+<p>If you’re interested in trying an early version of any of the pieces I covered here, shoot me an email at <a href="mailto:malis@pgrust.com">malis@pgrust.com</a>. Running against real test workloads and replicas helps us a ton. Even if you just want to chat about gnarly Postgres problems you’re running into in production, I’d love to hear from you.</p>
+<p>Thanks for reading. If you want to support pgrust, the best way to help out is to <a href="https://github.com/malisper/pgrust">give us a star on GitHub</a>. You can also follow along and reach us here:</p>
+<ul>
+<li>Email: <a href="mailto:malis@pgrust.com">malis@pgrust.com</a></li>
+<li>GitHub: <a href="https://github.com/malisper/pgrust">github.com/malisper/pgrust</a></li>
+<li>Discord: <a href="https://discord.gg/FZZ4dbdvwU">discord.gg/FZZ4dbdvwU</a></li>
+<li>X: <a href="https://x.com/mmalisper">Malis</a> · <a href="https://x.com/pgrustdb">pgrust</a></li>
+<li>LinkedIn: <a href="https://www.linkedin.com/in/michael-malis-270354150/">Michael Malis</a></li>
+<li>Mailing list: <a href="https://pgrust.com/#updates">pgrust.com/#updates</a></li>
+<li>Website: <a href="https://pgrust.com/">pgrust.com</a></li>
+</ul>
+			</div><!-- .entry-content -->
+
+	<!-- .entry-footer -->
+</article></div>
+  </body>
+</html>
